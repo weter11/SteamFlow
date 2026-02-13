@@ -24,21 +24,6 @@ enum LibraryFolderRecord {
     Ignore(#[allow(dead_code)] HashMap<String, serde_json::Value>),
 }
 
-#[derive(Debug, Deserialize)]
-struct AppManifestFile {
-    #[serde(rename = "AppState", alias = "appstate")]
-    app_state: AppState,
-}
-
-#[derive(Debug, Deserialize)]
-struct AppState {
-    appid: String,
-    #[allow(dead_code)]
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    installdir: String,
-}
 
 pub async fn find_local_games() -> Result<Vec<LocalGame>> {
     let installed_paths = scan_installed_app_paths().await?;
@@ -197,23 +182,57 @@ async fn parse_app_manifest_install_path(path: &Path) -> Result<Option<(u32, Pat
         .await
         .with_context(|| format!("failed reading {}", path.display()))?;
 
-    let parsed = keyvalues_serde::from_str::<AppManifestFile>(&raw)
-        .with_context(|| format!("failed to parse app manifest {}", path.display()))?;
+    let mut app_id = None;
+    let mut install_dir_name = None;
 
-    let app_id = match parsed.app_state.appid.parse::<u32>() {
-        Ok(v) => v,
-        Err(e) => {
-            println!("WARNING: Failed to parse appid from {:?}: {}", path, e);
-            return Ok(None);
+    for line in raw.lines() {
+        let parts = extract_quoted_values(line.trim());
+        if parts.len() >= 2 {
+            let key = parts[0].to_lowercase();
+            let value = &parts[1];
+
+            if key == "appid" {
+                app_id = value.parse::<u32>().ok();
+            } else if key == "installdir" {
+                install_dir_name = Some(value.to_string());
+            }
         }
-    };
 
-    let install_dir = path
-        .parent()
-        .map(|p| p.join("common").join(parsed.app_state.installdir))
-        .unwrap_or_default();
+        if app_id.is_some() && install_dir_name.is_some() {
+            break;
+        }
+    }
 
-    Ok(Some((app_id, install_dir)))
+    match (app_id, install_dir_name) {
+        (Some(id), Some(dir)) => {
+            let install_dir = path
+                .parent()
+                .map(|p| p.join("common").join(dir))
+                .unwrap_or_default();
+            Ok(Some((id, install_dir)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn extract_quoted_values(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_quote = false;
+    let mut current = String::new();
+    for ch in line.chars() {
+        if ch == '"' {
+            if in_quote {
+                out.push(current.clone());
+                current.clear();
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            current.push(ch);
+        }
+    }
+    out
 }
 
 pub fn build_game_library(

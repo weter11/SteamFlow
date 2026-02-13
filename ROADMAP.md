@@ -21,7 +21,7 @@
 5. [x] Integrate PICS metadata fetch into the main `SteamClient` launch flow.
 6. [ ] Add per-game launch profiles (env vars, custom args, compat tool preset).
 7. [x] Add settings view for Proton runtime and Steam library path discovery.
-8. Extend CI to publish signed .deb artifacts from tags.
+8. [ ] Extend CI to publish signed .deb artifacts from tags.
 9. [x] Implement Steam Cloud Sync (Enumerate/Download/Upload).
 
 10. [x] Add Depot Browser developer tooling (depot list, manifest tree, single-file download).
