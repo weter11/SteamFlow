@@ -1,0 +1,28 @@
+<Project>
+    <PropertyGroup>
+    <CommonNetVersion>net9.0</CommonNetVersion>
+		<CommonOSWVersion>1.2.0</CommonOSWVersion>
+    <ProjectRootDir>$(MSBuildThisFileDirectory)</ProjectRootDir>
+    <PublishTrimmed>true</PublishTrimmed>
+		<EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+		<!-- This property switches using the OSW package and a source-built OSW. This option is meant for debugging. -->
+		<!-- Empty = Use package -->
+		<!-- Any other value = Use source build from given path -->
+		<!-- Do not commit anything else except an empty tag to VCS. -->
+		<!-- Example value: <DevOSW>/home/onni/Documents/opensteamclient/OpenSteamworks</DevOSW> -->
+		<DevOSW></DevOSW>
+    </PropertyGroup>
+
+    <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+        <ArtifactsPath>$(MSBuildThisFileDirectory)artifacts</ArtifactsPath>
+    </PropertyGroup>
+
+	<!-- Working towards NativeAOT and trimming. Note that this is a long term goal, and not something we can reasonably accomplish soon, due to extensive usage of reflection and runtime type generation. -->
+	<PropertyGroup Condition="'$(MSBuildProjectExtension)'=='.csproj'">
+		<!-- <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault> -->
+		<EnableAotAnalyzer>true</EnableAotAnalyzer>
+		<EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+		<EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+	</PropertyGroup>
+</Project>
