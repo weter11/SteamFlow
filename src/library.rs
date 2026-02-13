@@ -21,7 +21,7 @@ enum LibraryFolderRecord {
         #[serde(flatten)]
         _other: HashMap<String, serde_json::Value>,
     },
-    Ignore(HashMap<String, serde_json::Value>),
+    Ignore(#[allow(dead_code)] HashMap<String, serde_json::Value>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +33,7 @@ struct AppManifestFile {
 #[derive(Debug, Deserialize)]
 struct AppState {
     appid: String,
+    #[allow(dead_code)]
     #[serde(default)]
     name: String,
     #[serde(default)]

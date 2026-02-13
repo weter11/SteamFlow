@@ -984,7 +984,7 @@ impl SteamClient {
                 };
                 cmd.env("LD_LIBRARY_PATH", new_ld);
 
-                return cmd.spawn().context("failed to spawn native linux game");
+                cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
                 let proton = proton_path
@@ -1013,7 +1013,7 @@ impl SteamClient {
                 cmd.arg("run").arg(&executable).args(args);
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("STEAM_COMPAT_DATA_PATH", compat_data_path);
-                return cmd.spawn().context("failed to spawn proton game");
+                cmd.spawn().context("failed to spawn proton game")
             }
         }
     }
