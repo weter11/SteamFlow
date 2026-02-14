@@ -1023,7 +1023,10 @@ impl SteamClient {
     ) -> Result<LaunchInfo> {
         let prefer_proton = proton_path.is_some();
         let launch_options = self.get_product_info(app.app_id, prefer_proton).await?;
-        let launch_info = launch_options.first().cloned().ok_or_else(|| anyhow!("no launch options"))?;
+        let launch_info = launch_options
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("no launch options"))?;
 
         let launcher_config = load_launcher_config().await.unwrap_or_default();
         let chosen_proton_path = match launch_info.target {
@@ -1046,12 +1049,13 @@ impl SteamClient {
             );
             let root = default_cloud_root(client.steam_id(), app.app_id)?;
             tracing::info!(appid = app.app_id, path = %root.display(), "Syncing Cloud...");
-            client.sync_down(app.app_id, &root).await?;
+            let _ = client.sync_down(app.app_id, &root).await;
             cloud_client = Some(client);
             local_root = Some(root);
         }
 
-        let mut child = self.spawn_game_process(app, &launch_info, chosen_proton_path)?;
+        let mut child =
+            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config)?;
         child
             .wait()
             .context("failed waiting for game process exit")?;
@@ -1064,13 +1068,14 @@ impl SteamClient {
         Ok(launch_info)
     }
 
-    pub fn launch_game(
+    pub async fn launch_game(
         &self,
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
     ) -> Result<()> {
-        self.spawn_game_process(app, launch_info, proton_path)?;
+        let launcher_config = load_launcher_config().await.unwrap_or_default();
+        self.spawn_game_process(app, launch_info, proton_path, &launcher_config)?;
         Ok(())
     }
 
@@ -1333,6 +1338,7 @@ impl SteamClient {
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
+        launcher_config: &crate::config::LauncherConfig,
     ) -> Result<std::process::Child> {
         let install_dir = PathBuf::from(
             app.install_path
@@ -1345,8 +1351,19 @@ impl SteamClient {
 
         match launch_info.target {
             LaunchTarget::NativeLinux => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&executable) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&executable, perms);
+                    }
+                }
+
                 let mut cmd = Command::new(&executable);
                 cmd.args(args);
+                cmd.current_dir(&install_dir);
 
                 let bin_dir = executable.parent().unwrap_or_else(|| Path::new("."));
                 let existing_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
@@ -1360,11 +1377,6 @@ impl SteamClient {
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
-                let launcher_config = match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => handle.block_on(load_launcher_config()).unwrap_or_default(),
-                    Err(_) => crate::config::LauncherConfig::default(),
-                };
-
                 let proton = if let Some(forced) = launcher_config
                     .game_configs
                     .get(&app.app_id)
@@ -1378,7 +1390,7 @@ impl SteamClient {
                 };
 
                 let compat_data_path = if launcher_config.use_shared_compat_data {
-                    PathBuf::from(launcher_config.steam_library_path)
+                    PathBuf::from(launcher_config.steam_library_path.clone())
                         .join("steamapps/compatdata")
                         .join(app.app_id.to_string())
                 } else {
@@ -1392,6 +1404,7 @@ impl SteamClient {
 
                 let mut cmd = Command::new(proton);
                 cmd.arg("run").arg(&executable).args(args);
+                cmd.current_dir(&install_dir);
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("STEAM_COMPAT_DATA_PATH", compat_data_path);
                 cmd.spawn().context("failed to spawn proton game")
@@ -1429,37 +1442,41 @@ fn map_confirmation(method: &ConfirmationMethod) -> ConfirmationPrompt {
 }
 
 fn score_launch_option(exe: &str, prefer_proton: bool) -> i32 {
-    let exe = exe.to_lowercase();
+    let mut score = 0;
+    let exe_low = exe.to_lowercase();
+
     if prefer_proton {
-        if exe.ends_with(".exe") {
-            100
-        } else if exe.ends_with(".bat") {
-            90
-        } else if exe.ends_with(".app") || exe.contains("x86") {
-            0
-        } else if !exe.is_empty() {
-            10
-        } else {
-            0
+        if exe_low.ends_with(".exe") {
+            score = 100;
+        } else if exe_low.ends_with(".bat") {
+            score = 90;
+        } else if exe_low.ends_with(".app") || exe_low.contains("x86") {
+            score = 0;
+        } else if !exe_low.is_empty() {
+            score = 10;
         }
     } else {
         // Linux Preference
-        if exe.contains("x86_64") {
-            100
-        } else if exe.contains("x86") {
-            90
-        } else if exe.ends_with(".sh") {
-            80
-        } else if !exe.contains(".") && !exe.is_empty() {
-            50
-        } else if exe.ends_with(".exe") || exe.ends_with(".app") {
-            0
-        } else if !exe.is_empty() {
-            10
-        } else {
-            0
+        if exe_low.contains("x86_64") {
+            score = 100;
+        } else if exe_low.contains("x86") {
+            score = 80;
+        } else if exe_low.ends_with(".sh") {
+            score = 70;
+        } else if !exe_low.contains(".") && !exe_low.is_empty() {
+            score = 50;
+        } else if exe_low.ends_with(".exe") || exe_low.ends_with(".app") {
+            score = 0;
+        } else if !exe_low.is_empty() {
+            score = 10;
         }
     }
+
+    if score > 0 && exe_low.contains("launcher") {
+        score -= 40;
+    }
+
+    score.max(0)
 }
 
 fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, prefer_proton: bool) -> Result<Vec<LaunchInfo>> {
@@ -1479,41 +1496,15 @@ fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, prefer_proton: bool) ->
         bail!("no launch entries found for app {appid}")
     }
 
-    let mut options = Vec::new();
+    let mut options_with_scores = Vec::new();
     for (id, entry) in &config.launch {
         let exe = entry.executable.as_deref().unwrap_or("");
         let score = score_launch_option(exe, prefer_proton);
 
         if score > 0 {
-            options.push(LaunchInfo {
-                app_id: appid,
-                id: id.clone(),
-                description: entry.description.clone().unwrap_or_else(|| {
-                    if exe.is_empty() {
-                        format!("Launch Option {id}")
-                    } else {
-                        exe.to_string()
-                    }
-                }),
-                executable: exe.to_string(),
-                arguments: entry.arguments.clone().unwrap_or_default(),
-                target: if prefer_proton {
-                    LaunchTarget::WindowsProton
-                } else {
-                    LaunchTarget::NativeLinux
-                },
-            });
-        }
-    }
-
-    if options.is_empty() {
-        // Fallback: if preferred OS found nothing, try the other preference
-        for (id, entry) in &config.launch {
-            let exe = entry.executable.as_deref().unwrap_or("");
-            let score = score_launch_option(exe, !prefer_proton);
-
-            if score > 0 {
-                options.push(LaunchInfo {
+            options_with_scores.push((
+                score,
+                LaunchInfo {
                     app_id: appid,
                     id: id.clone(),
                     description: entry.description.clone().unwrap_or_else(|| {
@@ -1525,22 +1516,58 @@ fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, prefer_proton: bool) ->
                     }),
                     executable: exe.to_string(),
                     arguments: entry.arguments.clone().unwrap_or_default(),
-                    target: if !prefer_proton {
+                    target: if prefer_proton {
                         LaunchTarget::WindowsProton
                     } else {
                         LaunchTarget::NativeLinux
                     },
-                });
+                },
+            ));
+        }
+    }
+
+    if options_with_scores.is_empty() {
+        // Fallback: if preferred OS found nothing, try the other preference
+        for (id, entry) in &config.launch {
+            let exe = entry.executable.as_deref().unwrap_or("");
+            let score = score_launch_option(exe, !prefer_proton);
+
+            if score > 0 {
+                options_with_scores.push((
+                    score,
+                    LaunchInfo {
+                        app_id: appid,
+                        id: id.clone(),
+                        description: entry.description.clone().unwrap_or_else(|| {
+                            if exe.is_empty() {
+                                format!("Launch Option {id}")
+                            } else {
+                                exe.to_string()
+                            }
+                        }),
+                        executable: exe.to_string(),
+                        arguments: entry.arguments.clone().unwrap_or_default(),
+                        target: if !prefer_proton {
+                            LaunchTarget::WindowsProton
+                        } else {
+                            LaunchTarget::NativeLinux
+                        },
+                    },
+                ));
             }
         }
     }
 
-    if options.is_empty() {
+    if options_with_scores.is_empty() {
         bail!("no suitable launch option found for app {appid}");
     }
 
-    // Sort options: prefer key "0" at the top, then by original order (which might be random due to HashMap, so maybe sort by id?)
-    options.sort_by(|a, b| {
+    // Sort options: prefer higher score, then key "0", then by id
+    options_with_scores.sort_by(|(score_a, a), (score_b, b)| {
+        if score_a != score_b {
+            return score_b.cmp(score_a);
+        }
+
         if a.id == "0" {
             return std::cmp::Ordering::Less;
         }
@@ -1550,7 +1577,7 @@ fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, prefer_proton: bool) ->
         a.id.cmp(&b.id)
     });
 
-    Ok(options)
+    Ok(options_with_scores.into_iter().map(|(_, info)| info).collect())
 }
 
 #[derive(Debug, Deserialize)]

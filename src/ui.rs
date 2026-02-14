@@ -220,12 +220,24 @@ impl SteamLauncher {
                 return;
             }
 
-            let path = cache_dir.join(format!("{appid}_library_600x900.jpg"));
+            let path = cache_dir.join(format!("{appid}_library_capsule_2x.jpg"));
             if tokio::fs::metadata(&path).await.is_err() {
                 let candidates = [
                     (
                         format!(
-                            "https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_600x900.jpg"
+                            "https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.jpg"
+                        ),
+                        path.clone(),
+                    ),
+                    (
+                        format!(
+                            "https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.png"
+                        ),
+                        path.clone(),
+                    ),
+                    (
+                        format!(
+                            "https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_600x900_2x.jpg"
                         ),
                         path.clone(),
                     ),
@@ -566,7 +578,7 @@ impl SteamLauncher {
             }
 
             let mut child: std::process::Child =
-                match client.spawn_game_process(&game, &launch_info, chosen_proton_path) {
+                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config) {
                     Ok(child) => child,
                     Err(e) => {
                         let _ = tx.send(format!("Launch failed for {}: {e}", game.name));
@@ -1421,9 +1433,9 @@ impl eframe::App for SteamLauncher {
 
                 ui.horizontal(|ui| {
                     if let Some(texture) = self.image_cache.get(&game.app_id) {
-                        ui.add(egui::Image::new(texture).max_width(150.0));
+                        ui.add(egui::Image::new(texture).max_width(250.0));
                     } else {
-                        ui.allocate_ui(egui::vec2(150.0, 225.0), |ui| {
+                        ui.allocate_ui(egui::vec2(250.0, 375.0), |ui| {
                             ui.centered_and_justified(|ui| {
                                 ui.label("Loading...");
                             });
