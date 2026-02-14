@@ -431,7 +431,7 @@ impl SteamClient {
         Ok(platforms)
     }
 
-    pub fn install_game(
+    pub async fn install_game(
         &self,
         appid: u32,
         platform: DepotPlatform,
@@ -442,9 +442,9 @@ impl SteamClient {
             .cloned()
             .context("steam connection not initialized")?;
 
-        let cfg = tokio::runtime::Handle::current().block_on(load_launcher_config())?;
+        let cfg = load_launcher_config().await?;
         let library_root = cfg.steam_library_path.clone();
-        let game_name = self.resolve_install_game_name(appid);
+        let game_name = self.resolve_install_game_name(appid).await;
         let install_dir = Path::new(&library_root)
             .join("steamapps")
             .join("common")
@@ -629,8 +629,8 @@ impl SteamClient {
         Ok(rx)
     }
 
-    pub fn update_app_branch(&self, appid: u32, branch: &str) -> Result<()> {
-        let manifest_path = self.appmanifest_path(appid)?;
+    pub async fn update_app_branch(&self, appid: u32, branch: &str) -> Result<()> {
+        let manifest_path = self.appmanifest_path(appid).await?;
         if !manifest_path.exists() {
             bail!("appmanifest not found for app {appid}");
         }
@@ -645,8 +645,8 @@ impl SteamClient {
         Ok(())
     }
 
-    pub fn uninstall_game(&self, appid: u32, delete_prefix: bool) -> Result<()> {
-        let cfg = tokio::runtime::Handle::current().block_on(load_launcher_config())?;
+    pub async fn uninstall_game(&self, appid: u32, delete_prefix: bool) -> Result<()> {
+        let cfg = load_launcher_config().await?;
         let steamapps = PathBuf::from(cfg.steam_library_path).join("steamapps");
         let appmanifest = steamapps.join(format!("appmanifest_{appid}.acf"));
 
@@ -963,7 +963,7 @@ impl SteamClient {
             }
         }
 
-        let manifest_path = self.appmanifest_path(appid)?;
+        let manifest_path = self.appmanifest_path(appid).await?;
         let active_branch = if manifest_path.exists() {
             let raw = std::fs::read_to_string(&manifest_path).unwrap_or_default();
             parse_active_branch_from_acf(&raw)
@@ -1079,15 +1079,15 @@ impl SteamClient {
         Ok(())
     }
 
-    pub fn update_game(&self, appid: u32) -> Result<Receiver<DownloadProgress>> {
-        self.start_manifest_download(appid, false)
+    pub async fn update_game(&self, appid: u32) -> Result<Receiver<DownloadProgress>> {
+        self.start_manifest_download(appid, false).await
     }
 
-    pub fn verify_game(&self, appid: u32) -> Result<Receiver<DownloadProgress>> {
-        self.start_manifest_download(appid, true)
+    pub async fn verify_game(&self, appid: u32) -> Result<Receiver<DownloadProgress>> {
+        self.start_manifest_download(appid, true).await
     }
 
-    fn start_manifest_download(
+    async fn start_manifest_download(
         &self,
         appid: u32,
         smart_verify_existing: bool,
@@ -1098,12 +1098,13 @@ impl SteamClient {
             .cloned()
             .context("steam connection not initialized")?;
 
-        let install_root = self.install_root_for_app(appid)?;
-        let manifest_path = self.appmanifest_path(appid)?;
+        let install_root = self.install_root_for_app(appid).await?;
+        let manifest_path = self.appmanifest_path(appid).await?;
         let (tx, rx) = tokio::sync::mpsc::channel(128);
 
         let (local_manifests, active_branch) = self
             .local_manifest_info_for_appid(appid)
+            .await
             .unwrap_or_else(|_| (HashMap::new(), "public".to_string()));
 
         tokio::task::spawn(async move {
@@ -1218,15 +1219,15 @@ impl SteamClient {
         Ok(rx)
     }
 
-    fn appmanifest_path(&self, appid: u32) -> Result<PathBuf> {
-        let cfg = tokio::runtime::Handle::current().block_on(load_launcher_config())?;
+    async fn appmanifest_path(&self, appid: u32) -> Result<PathBuf> {
+        let cfg = load_launcher_config().await?;
         Ok(PathBuf::from(cfg.steam_library_path)
             .join("steamapps")
             .join(format!("appmanifest_{appid}.acf")))
     }
 
-    fn local_manifest_info_for_appid(&self, appid: u32) -> Result<(HashMap<u64, u64>, String)> {
-        let manifest_path = self.appmanifest_path(appid)?;
+    async fn local_manifest_info_for_appid(&self, appid: u32) -> Result<(HashMap<u64, u64>, String)> {
+        let manifest_path = self.appmanifest_path(appid).await?;
         if !manifest_path.exists() {
             return Ok((HashMap::new(), "public".to_string()));
         }
@@ -1237,8 +1238,8 @@ impl SteamClient {
         Ok((manifests, branch))
     }
 
-    fn install_root_for_app(&self, appid: u32) -> Result<PathBuf> {
-        let manifest_path = self.appmanifest_path(appid)?;
+    async fn install_root_for_app(&self, appid: u32) -> Result<PathBuf> {
+        let manifest_path = self.appmanifest_path(appid).await?;
         let steamapps = manifest_path
             .parent()
             .ok_or_else(|| anyhow!("invalid steamapps path for app {appid}"))?
@@ -1253,8 +1254,7 @@ impl SteamClient {
         }
 
         Ok(PathBuf::from(
-            tokio::runtime::Handle::current()
-                .block_on(load_launcher_config())?
+            load_launcher_config().await?
                 .steam_library_path,
         )
         .join("steamapps")
@@ -1302,9 +1302,8 @@ impl SteamClient {
         Ok(())
     }
 
-    fn resolve_install_game_name(&self, appid: u32) -> String {
-        tokio::runtime::Handle::current()
-            .block_on(load_library_cache())
+    async fn resolve_install_game_name(&self, appid: u32) -> String {
+        load_library_cache().await
             .ok()
             .and_then(|games| {
                 games

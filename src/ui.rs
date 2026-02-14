@@ -74,6 +74,15 @@ enum GameTab {
     Misc,
 }
 
+pub enum AsyncOp {
+    DownloadStarted(u32, tokio::sync::mpsc::Receiver<DownloadProgress>),
+    BranchUpdated(u32, String),
+    Uninstalled(u32, String),
+    PlatformsFetched(u32, Vec<DepotPlatform>),
+    ExtendedInfoFetched(u32, crate::steam_client::ExtendedAppInfo),
+    Error(String),
+}
+
 pub struct SteamLauncher {
     runtime: Runtime,
     pub client: SteamClient,
@@ -111,11 +120,14 @@ pub struct SteamLauncher {
     launch_selector: Option<LaunchSelectorState>,
     current_tab: GameTab,
     extended_info: HashMap<u32, crate::steam_client::ExtendedAppInfo>,
+    operation_tx: Sender<AsyncOp>,
+    operation_rx: Receiver<AsyncOp>,
 }
 
 impl SteamLauncher {
     pub fn new(runtime: Runtime, client: SteamClient, library: Vec<LibraryGame>) -> Self {
         let (image_tx, image_rx) = mpsc::channel();
+        let (operation_tx, operation_rx) = mpsc::channel();
         let authenticated = client.is_authenticated();
         let launcher_config = runtime.block_on(load_launcher_config()).unwrap_or_default();
         let (steam_protons, custom_protons) = scan_proton_runtimes();
@@ -163,6 +175,8 @@ impl SteamLauncher {
             launch_selector: None,
             current_tab: GameTab::Options,
             extended_info: HashMap::new(),
+            operation_tx,
+            operation_rx,
         }
     }
 
@@ -366,14 +380,72 @@ impl SteamLauncher {
 
     fn start_install(&mut self, app_id: u32, platform: DepotPlatform) {
         self.install_pipeline.enqueue(app_id);
-        match self.client.install_game(app_id, platform) {
-            Ok(rx) => {
-                self.download_receiver = Some(rx);
-                self.active_download_appid = Some(app_id);
-                self.status = format!("Started install for app {}", app_id);
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        self.runtime.spawn(async move {
+            match client.install_game(app_id, platform).await {
+                Ok(rx) => {
+                    let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!(
+                        "Failed to start install for {app_id}: {err}"
+                    )));
+                }
             }
-            Err(err) => {
-                self.status = format!("Failed to start install for {}: {err}", app_id);
+        });
+    }
+
+    fn poll_async_ops(&mut self) {
+        while let Ok(op) = self.operation_rx.try_recv() {
+            match op {
+                AsyncOp::DownloadStarted(appid, rx) => {
+                    self.download_receiver = Some(rx);
+                    self.active_download_appid = Some(appid);
+                    self.status = format!("Operation started for app {appid}");
+                }
+                AsyncOp::BranchUpdated(appid, branch) => {
+                    if let Some(game) = self.library.iter_mut().find(|g| g.app_id == appid) {
+                        game.active_branch = branch.clone();
+                        game.update_available = true;
+                        game.update_queued = true;
+                    }
+                    self.status = format!("Switched to branch {branch}");
+                }
+                AsyncOp::Uninstalled(appid, name) => {
+                    if let Some(game) = self.library.iter_mut().find(|g| g.app_id == appid) {
+                        game.is_installed = false;
+                        game.install_path = None;
+                        game.update_available = false;
+                        game.local_manifest_ids.clear();
+                    }
+                    self.status = format!("Uninstalled {name}");
+                }
+                AsyncOp::PlatformsFetched(appid, platforms) => {
+                    if platforms.len() > 1 {
+                        let game_name = self
+                            .library
+                            .iter()
+                            .find(|g| g.app_id == appid)
+                            .map(|g| g.name.clone())
+                            .unwrap_or_else(|| format!("App {appid}"));
+                        self.platform_selection = Some(PlatformSelectionState {
+                            app_id: appid,
+                            game_name,
+                            available: platforms,
+                        });
+                    } else {
+                        let platform =
+                            platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
+                        self.start_install(appid, platform);
+                    }
+                }
+                AsyncOp::ExtendedInfoFetched(appid, info) => {
+                    self.extended_info.insert(appid, info);
+                }
+                AsyncOp::Error(err) => {
+                    self.status = err;
+                }
             }
         }
     }
@@ -768,19 +840,20 @@ impl SteamLauncher {
         }
 
         if let Some((app_id, branch)) = new_branch {
-            match self.client.update_app_branch(app_id, &branch) {
-                Ok(()) => {
-                    if let Some(game) = self.library.iter_mut().find(|g| g.app_id == app_id) {
-                        game.active_branch = branch.clone();
-                        game.update_available = true;
-                        game.update_queued = true;
+            let client = self.client.clone();
+            let tx = self.operation_tx.clone();
+            self.runtime.spawn(async move {
+                match client.update_app_branch(app_id, &branch).await {
+                    Ok(()) => {
+                        let _ = tx.send(AsyncOp::BranchUpdated(app_id, branch));
                     }
-                    self.status = format!("Switched to branch {branch}");
+                    Err(err) => {
+                        let _ = tx.send(AsyncOp::Error(format!(
+                            "Failed to switch branch for {app_id}: {err}"
+                        )));
+                    }
                 }
-                Err(err) => {
-                    self.status = format!("Failed to switch branch: {err}");
-                }
-            }
+            });
         }
 
         if close {
@@ -849,14 +922,20 @@ impl SteamLauncher {
             };
             ui.label(format!("Current Version: {}", current_platform));
             if ui.button("Switch Platform").clicked() {
-                let platforms = self
-                    .runtime
-                    .block_on(self.client.get_available_platforms(game.app_id))
-                    .unwrap_or_default();
-                self.platform_selection = Some(PlatformSelectionState {
-                    app_id: game.app_id,
-                    game_name: game.name.clone(),
-                    available: platforms,
+                let app_id = game.app_id;
+                let mut client = self.client.clone();
+                let tx = self.operation_tx.clone();
+                self.runtime.spawn(async move {
+                    match client.get_available_platforms(app_id).await {
+                        Ok(platforms) => {
+                            let _ = tx.send(AsyncOp::PlatformsFetched(app_id, platforms));
+                        }
+                        Err(err) => {
+                            let _ = tx.send(AsyncOp::Error(format!(
+                                "Failed to fetch platforms for {app_id}: {err}"
+                            )));
+                        }
+                    }
                 });
             }
 
@@ -864,16 +943,21 @@ impl SteamLauncher {
             ui.heading("Maintenance");
             ui.horizontal(|ui| {
                 if ui.button("Verify Integrity").clicked() {
-                    match self.client.verify_game(game.app_id) {
-                        Ok(rx) => {
-                            self.download_receiver = Some(rx);
-                            self.active_download_appid = Some(game.app_id);
-                            self.status = format!("Started verify for app {}", game.app_id);
+                    let app_id = game.app_id;
+                    let client = self.client.clone();
+                    let tx = self.operation_tx.clone();
+                    self.runtime.spawn(async move {
+                        match client.verify_game(app_id).await {
+                            Ok(rx) => {
+                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
+                            }
+                            Err(err) => {
+                                let _ = tx.send(AsyncOp::Error(format!(
+                                    "Failed to verify {app_id}: {err}"
+                                )));
+                            }
                         }
-                        Err(err) => {
-                            self.status = format!("Failed to verify {}: {err}", game.app_id);
-                        }
-                    }
+                    });
                 }
 
                 if ui
@@ -896,17 +980,21 @@ impl SteamLauncher {
             ui.vertical_centered(|ui| {
                 ui.add_space(20.0);
                 if ui.button("Fetch Extended Info").clicked() {
-                    match self
-                        .runtime
-                        .block_on(self.client.get_extended_app_info(game.app_id))
-                    {
-                        Ok(info) => {
-                            self.extended_info.insert(game.app_id, info);
+                    let app_id = game.app_id;
+                    let client = self.client.clone();
+                    let tx = self.operation_tx.clone();
+                    self.runtime.spawn(async move {
+                        match client.get_extended_app_info(app_id).await {
+                            Ok(info) => {
+                                let _ = tx.send(AsyncOp::ExtendedInfoFetched(app_id, info));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AsyncOp::Error(format!(
+                                    "Failed to fetch extended info for {app_id}: {e}"
+                                )));
+                            }
                         }
-                        Err(e) => {
-                            self.status = format!("Failed to fetch extended info: {e}");
-                        }
-                    }
+                    });
                 }
             });
             return;
@@ -996,20 +1084,20 @@ impl SteamLauncher {
         }
 
         if let Some((app_id, game_name, delete_prefix)) = do_uninstall {
-            match self.client.uninstall_game(app_id, delete_prefix) {
-                Ok(()) => {
-                    if let Some(game) = self.library.iter_mut().find(|g| g.app_id == app_id) {
-                        game.is_installed = false;
-                        game.install_path = None;
-                        game.update_available = false;
-                        game.local_manifest_ids.clear();
+            let client = self.client.clone();
+            let tx = self.operation_tx.clone();
+            self.runtime.spawn(async move {
+                match client.uninstall_game(app_id, delete_prefix).await {
+                    Ok(()) => {
+                        let _ = tx.send(AsyncOp::Uninstalled(app_id, game_name));
                     }
-                    self.status = format!("Uninstalled {game_name}");
+                    Err(err) => {
+                        let _ = tx.send(AsyncOp::Error(format!(
+                            "Failed to uninstall {game_name}: {err}"
+                        )));
+                    }
                 }
-                Err(err) => {
-                    self.status = format!("Failed to uninstall {game_name}: {err}");
-                }
-            }
+            });
             self.uninstall_modal = None;
         } else if close {
             self.uninstall_modal = None;
@@ -1226,6 +1314,7 @@ impl eframe::App for SteamLauncher {
         self.poll_download_progress();
         self.process_install_pipeline();
         self.poll_play_result();
+        self.poll_async_ops();
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1476,22 +1565,23 @@ impl eframe::App for SteamLauncher {
                                         .add_enabled(!self.client.is_offline(), update_btn)
                                         .clicked()
                                     {
-                                        match self.client.update_game(game.app_id) {
-                                            Ok(rx) => {
-                                                self.download_receiver = Some(rx);
-                                                self.active_download_appid = Some(game.app_id);
-                                                self.status = format!(
-                                                    "Started update for app {}",
-                                                    game.app_id
-                                                );
+                                        let app_id = game.app_id;
+                                        let client = self.client.clone();
+                                        let tx = self.operation_tx.clone();
+                                        self.runtime.spawn(async move {
+                                            match client.update_game(app_id).await {
+                                                Ok(rx) => {
+                                                    let _ = tx.send(AsyncOp::DownloadStarted(
+                                                        app_id, rx,
+                                                    ));
+                                                }
+                                                Err(err) => {
+                                                    let _ = tx.send(AsyncOp::Error(format!(
+                                                        "Failed to update {app_id}: {err}"
+                                                    )));
+                                                }
                                             }
-                                            Err(err) => {
-                                                self.status = format!(
-                                                    "Failed to start update for {}: {err}",
-                                                    game.app_id
-                                                );
-                                            }
-                                        }
+                                        });
                                     }
                                 }
                             } else {
@@ -1505,21 +1595,23 @@ impl eframe::App for SteamLauncher {
 
                                 if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
                                 {
-                                    let platforms = self
-                                        .runtime
-                                        .block_on(self.client.get_available_platforms(game.app_id))
-                                        .unwrap_or_default();
-                                    if platforms.len() > 1 {
-                                        self.platform_selection = Some(PlatformSelectionState {
-                                            app_id: game.app_id,
-                                            game_name: game.name.clone(),
-                                            available: platforms,
-                                        });
-                                    } else {
-                                        let platform =
-                                            platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
-                                        self.start_install(game.app_id, platform);
-                                    }
+                                    let app_id = game.app_id;
+                                    let mut client = self.client.clone();
+                                    let tx = self.operation_tx.clone();
+                                    self.runtime.spawn(async move {
+                                        match client.get_available_platforms(app_id).await {
+                                            Ok(platforms) => {
+                                                let _ = tx.send(AsyncOp::PlatformsFetched(
+                                                    app_id, platforms,
+                                                ));
+                                            }
+                                            Err(err) => {
+                                                let _ = tx.send(AsyncOp::Error(format!(
+                                                    "Failed to fetch platforms for {app_id}: {err}"
+                                                )));
+                                            }
+                                        }
+                                    });
                                 }
                             }
                         });
