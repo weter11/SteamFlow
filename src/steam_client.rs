@@ -1332,6 +1332,33 @@ impl SteamClient {
         Ok(())
     }
 
+    fn resolve_proton_path(&self, proton_name: &str, library_root: &Path) -> PathBuf {
+        if proton_name.contains('/') || proton_name.contains('\\') {
+            return PathBuf::from(proton_name);
+        }
+
+        let standard_path = library_root
+            .join("steamapps/common")
+            .join(proton_name)
+            .join("proton");
+
+        if standard_path.exists() {
+            return standard_path;
+        }
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let custom_path = PathBuf::from(home)
+            .join(".local/share/Steam/compatibilitytools.d")
+            .join(proton_name)
+            .join("proton");
+
+        if custom_path.exists() {
+            return custom_path;
+        }
+
+        PathBuf::from(proton_name)
+    }
+
     pub(crate) fn spawn_game_process(
         &self,
         app: &LibraryGame,
@@ -1366,12 +1393,10 @@ impl SteamClient {
 
                 let bin_dir = executable.parent().unwrap_or_else(|| Path::new("."));
                 let existing_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-                let new_ld = if existing_ld.is_empty() {
-                    bin_dir.to_string_lossy().to_string()
-                } else {
-                    format!("{}:{}", bin_dir.to_string_lossy(), existing_ld)
-                };
-                cmd.env("LD_LIBRARY_PATH", new_ld);
+                let existing_path = std::env::var("PATH").unwrap_or_default();
+
+                cmd.env("LD_LIBRARY_PATH", format!("{}:{}", bin_dir.display(), existing_ld));
+                cmd.env("PATH", format!("{}:{}", bin_dir.display(), existing_path));
 
                 println!("EXECUTING COMMAND: {:?}", cmd);
                 println!("Working Dir: {:?}", install_dir);
@@ -1393,6 +1418,8 @@ impl SteamClient {
                 };
 
                 let library_root = PathBuf::from(&launcher_config.steam_library_path);
+                let resolved_proton = self.resolve_proton_path(proton, &library_root);
+
                 let compat_data_path = library_root
                     .join("steamapps")
                     .join("compatdata")
@@ -1401,7 +1428,7 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
-                let mut cmd = Command::new(proton);
+                let mut cmd = Command::new(resolved_proton);
                 cmd.arg("run").arg(&executable).args(args);
                 cmd.current_dir(&install_dir);
                 cmd.env("SteamAppId", app.app_id.to_string());
