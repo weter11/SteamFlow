@@ -1373,6 +1373,10 @@ impl SteamClient {
                 };
                 cmd.env("LD_LIBRARY_PATH", new_ld);
 
+                println!("EXECUTING COMMAND: {:?}", cmd);
+                println!("Working Dir: {:?}", install_dir);
+                println!("Environment: {:?}", cmd.get_envs());
+
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
@@ -1388,16 +1392,12 @@ impl SteamClient {
                         .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
                 };
 
-                let compat_data_path = if launcher_config.use_shared_compat_data {
-                    PathBuf::from(launcher_config.steam_library_path.clone())
-                        .join("steamapps/compatdata")
-                        .join(app.app_id.to_string())
-                } else {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                    PathBuf::from(home)
-                        .join(".local/share/SteamFlow/compatdata")
-                        .join(app.app_id.to_string())
-                };
+                let library_root = PathBuf::from(&launcher_config.steam_library_path);
+                let compat_data_path = library_root
+                    .join("steamapps")
+                    .join("compatdata")
+                    .join(app.app_id.to_string());
+
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
@@ -1405,7 +1405,13 @@ impl SteamClient {
                 cmd.arg("run").arg(&executable).args(args);
                 cmd.current_dir(&install_dir);
                 cmd.env("SteamAppId", app.app_id.to_string());
-                cmd.env("STEAM_COMPAT_DATA_PATH", compat_data_path);
+                cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+
+                println!("EXECUTING COMMAND: {:?}", cmd);
+                println!("Working Dir: {:?}", install_dir);
+                println!("Environment: {:?}", cmd.get_envs());
+
                 cmd.spawn().context("failed to spawn proton game")
             }
         }

@@ -80,6 +80,16 @@ pub enum AsyncOp {
     Uninstalled(u32, String),
     PlatformsFetched(u32, Vec<DepotPlatform>),
     ExtendedInfoFetched(u32, crate::steam_client::ExtendedAppInfo),
+    LibraryFetched(Vec<LibraryGame>),
+    Authenticated(crate::models::SessionState),
+    BranchesFetched(u32, Vec<String>),
+    DepotsFetched(u32, Vec<DepotInfo>),
+    ManifestFilesFetched(Vec<ManifestFileEntry>),
+    LaunchOptionsFetched(u32, Vec<crate::steam_client::LaunchInfo>, Option<String>),
+    AuthFailed(String),
+    UserProfileFetched(crate::models::UserProfile),
+    SettingsSaved(bool),
+    ScanCompleted(u32, HashMap<u32, String>),
     Error(String),
 }
 
@@ -311,17 +321,11 @@ impl SteamLauncher {
                     DownloadProgressState::Completed => {
                         self.status = "Install completed".to_string();
                         if let Some(appid) = self.active_download_appid {
-                            let installed_paths = self
-                                .runtime
-                                .block_on(scan_installed_app_paths())
-                                .unwrap_or_default();
-
-                            for g in &mut self.library {
-                                if g.app_id == appid {
-                                    g.install_path = installed_paths.get(&appid).cloned();
-                                    g.is_installed = g.install_path.is_some();
-                                }
-                            }
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                let installed_paths = scan_installed_app_paths().await.unwrap_or_default();
+                                let _ = tx.send(AsyncOp::ScanCompleted(appid, installed_paths));
+                            });
                         }
                         should_clear_receiver = true;
                     }
@@ -443,6 +447,106 @@ impl SteamLauncher {
                 AsyncOp::ExtendedInfoFetched(appid, info) => {
                     self.extended_info.insert(appid, info);
                 }
+                AsyncOp::LibraryFetched(library) => {
+                    self.library = library;
+                    self.status = format!("Library refreshed ({})", self.library.len());
+                    self.refresh_user_profile();
+                }
+                AsyncOp::Authenticated(_session) => {
+                    self.needs_reauth = false;
+                    self.auth_guard_code.clear();
+                    self.client.clear_pending_confirmations();
+                    self.status = if self.client.is_offline() {
+                        "OFFLINE MODE".to_string()
+                    } else {
+                        "Login successful".to_string()
+                    };
+                    self.refresh_library();
+                }
+                AsyncOp::AuthFailed(err) => {
+                    if self.client.is_offline() {
+                        self.needs_reauth = false;
+                        self.status = "OFFLINE MODE".to_string();
+                        self.refresh_library();
+                    } else {
+                        self.status = format!("Login failed: {err}");
+                        self.needs_reauth = true;
+                    }
+                }
+                AsyncOp::UserProfileFetched(profile) => {
+                    self.user_profile = Some(profile);
+                }
+                AsyncOp::SettingsSaved(success) => {
+                    self.status = if success {
+                        "Settings saved".to_string()
+                    } else {
+                        "Failed to save settings".to_string()
+                    };
+                }
+                AsyncOp::ScanCompleted(appid, installed_paths) => {
+                    for g in &mut self.library {
+                        if g.app_id == appid {
+                            g.install_path = installed_paths.get(&appid).cloned();
+                            g.is_installed = g.install_path.is_some();
+                        }
+                    }
+                }
+                AsyncOp::BranchesFetched(appid, branches) => {
+                    if let Some(game) = self.library.iter().find(|g| g.app_id == appid) {
+                        self.properties_modal = Some(PropertiesModalState {
+                            app_id: appid,
+                            game_name: game.name.clone(),
+                            available_branches: branches,
+                            active_branch: game.active_branch.clone(),
+                        });
+                    }
+                }
+                AsyncOp::DepotsFetched(appid, depots) => {
+                    if let Some(game) = self.library.iter().find(|g| g.app_id == appid) {
+                        let selected_depot = depots.first().map(|d| d.depot_id);
+                        let manifest_input = depots
+                            .first()
+                            .and_then(|d| d.public_manifest_id)
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "public".to_string());
+                        self.depot_browser = Some(DepotBrowserState {
+                            app_id: appid,
+                            game_name: game.name.clone(),
+                            depots,
+                            selected_depot,
+                            manifest_input,
+                            files: Vec::new(),
+                        });
+                    }
+                }
+                AsyncOp::ManifestFilesFetched(files) => {
+                    if let Some(state) = &mut self.depot_browser {
+                        state.files = files;
+                    }
+                }
+                AsyncOp::LaunchOptionsFetched(appid, options, proton_path) => {
+                    let game = self.library.iter().find(|g| g.app_id == appid).cloned();
+                    if let Some(game) = game {
+                        if let Some(preferred_id) = self.launcher_config.preferred_launch_options.get(&appid) {
+                            if let Some(option) = options.iter().find(|o| &o.id == preferred_id) {
+                                self.start_launch_task(&game, option.clone(), proton_path);
+                                return;
+                            }
+                        }
+
+                        if options.len() > 1 {
+                            self.launch_selector = Some(LaunchSelectorState {
+                                app_id: appid,
+                                game_name: game.name.clone(),
+                                selected_id: options[0].id.clone(),
+                                options,
+                                always_use: false,
+                            });
+                        } else if let Some(option) = options.first() {
+                            self.start_launch_task(&game, option.clone(), proton_path);
+                        }
+                    }
+                }
                 AsyncOp::Error(err) => {
                     self.status = err;
                 }
@@ -482,54 +586,53 @@ impl SteamLauncher {
     }
 
     fn refresh_user_profile(&mut self) {
-        self.user_profile = self
-            .runtime
-            .block_on(self.client.get_user_profile(self.library.len()))
-            .ok();
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        let len = self.library.len();
+        self.runtime.spawn(async move {
+            if let Ok(profile) = client.get_user_profile(len).await {
+                let _ = tx.send(AsyncOp::UserProfileFetched(profile));
+            }
+        });
     }
 
     fn refresh_library(&mut self) {
-        let owned = match self.runtime.block_on(self.client.fetch_owned_games()) {
-            Ok(games) => games,
-            Err(err) => {
-                if self.client.is_offline() {
-                    let cached = self
-                        .runtime
-                        .block_on(self.client.load_cached_owned_games())
+        let mut client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        self.runtime.spawn(async move {
+            let result = match client.fetch_owned_games().await {
+                Ok(owned) => {
+                    let installed = crate::library::scan_installed_app_info()
+                        .await
                         .unwrap_or_default();
-                    let installed = self
-                        .runtime
-                        .block_on(crate::library::scan_installed_app_info())
-                        .unwrap_or_default();
-                    self.library = build_game_library(cached, installed).games;
-                    let _ = self
-                        .runtime
-                        .block_on(self.client.check_for_updates(&mut self.library));
-                    self.status =
-                        format!("OFFLINE MODE: loaded {} cached games", self.library.len());
-                    self.refresh_user_profile();
-                    return;
+                    let mut lib = build_game_library(owned, installed).games;
+                    let _ = client.check_for_updates(&mut lib).await;
+                    Ok(lib)
                 }
+                Err(err) => {
+                    if client.is_offline() {
+                        let cached = client.load_cached_owned_games().await.unwrap_or_default();
+                        let installed = crate::library::scan_installed_app_info()
+                            .await
+                            .unwrap_or_default();
+                        let mut lib = build_game_library(cached, installed).games;
+                        let _ = client.check_for_updates(&mut lib).await;
+                        Ok(lib)
+                    } else {
+                        Err(err)
+                    }
+                }
+            };
 
-                self.status = format!("Failed to refresh library: {err}");
-                if SteamClient::is_auth_error_text(&err.to_string()) {
-                    self.needs_reauth = true;
-                    self.client.invalidate_session();
+            match result {
+                Ok(lib) => {
+                    let _ = tx.send(AsyncOp::LibraryFetched(lib));
                 }
-                return;
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!("Failed to refresh library: {err}")));
+                }
             }
-        };
-
-        let installed = self
-            .runtime
-            .block_on(crate::library::scan_installed_app_info())
-            .unwrap_or_default();
-        self.library = build_game_library(owned, installed).games;
-        let _ = self
-            .runtime
-            .block_on(self.client.check_for_updates(&mut self.library));
-        self.status = format!("Library refreshed ({})", self.library.len());
-        self.refresh_user_profile();
+        });
     }
 
     fn handle_auth_submit(&mut self) {
@@ -543,39 +646,26 @@ impl SteamLauncher {
             return;
         }
 
-        let result = self.runtime.block_on(self.client.login(
-            self.auth_username.trim().to_string(),
-            self.auth_password.clone(),
-            if self.auth_guard_code.trim().is_empty() {
-                None
-            } else {
-                Some(self.auth_guard_code.trim().to_string())
-            },
-        ));
+        let mut client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        let username = self.auth_username.trim().to_string();
+        let password = self.auth_password.clone();
+        let guard_code = if self.auth_guard_code.trim().is_empty() {
+            None
+        } else {
+            Some(self.auth_guard_code.trim().to_string())
+        };
 
-        match result {
-            Ok(_) => {
-                self.needs_reauth = false;
-                self.auth_guard_code.clear();
-                self.client.clear_pending_confirmations();
-                self.status = if self.client.is_offline() {
-                    "OFFLINE MODE".to_string()
-                } else {
-                    "Login successful".to_string()
-                };
-                self.refresh_library();
-            }
-            Err(err) => {
-                if self.client.is_offline() {
-                    self.needs_reauth = false;
-                    self.status = "OFFLINE MODE".to_string();
-                    self.refresh_library();
-                } else {
-                    self.status = format!("Login failed: {err}");
-                    self.needs_reauth = true;
+        self.runtime.spawn(async move {
+            match client.login(username, password, guard_code).await {
+                Ok(session) => {
+                    let _ = tx.send(AsyncOp::Authenticated(session));
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::AuthFailed(err.to_string()));
                 }
             }
-        }
+        });
     }
 
     fn handle_play_click(&mut self, game: &LibraryGame) {
@@ -587,32 +677,19 @@ impl SteamLauncher {
 
         let prefer_proton = proton_path.is_some();
         let mut client = self.client.clone();
-        let options = match self.runtime.block_on(client.get_product_info(game.app_id, prefer_proton)) {
-            Ok(opts) => opts,
-            Err(e) => {
-                self.status = format!("Failed to get launch options: {e}");
-                return;
-            }
-        };
+        let tx = self.operation_tx.clone();
+        let app_id = game.app_id;
 
-        if let Some(preferred_id) = self.launcher_config.preferred_launch_options.get(&game.app_id) {
-            if let Some(option) = options.iter().find(|o| &o.id == preferred_id) {
-                self.start_launch_task(game, option.clone(), proton_path);
-                return;
+        self.runtime.spawn(async move {
+            match client.get_product_info(app_id, prefer_proton).await {
+                Ok(options) => {
+                    let _ = tx.send(AsyncOp::LaunchOptionsFetched(app_id, options, proton_path));
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!("Failed to get launch options: {err}")));
+                }
             }
-        }
-
-        if options.len() > 1 {
-            self.launch_selector = Some(LaunchSelectorState {
-                app_id: game.app_id,
-                game_name: game.name.clone(),
-                selected_id: options[0].id.clone(),
-                options,
-                always_use: false,
-            });
-        } else if let Some(option) = options.first() {
-            self.start_launch_task(game, option.clone(), proton_path);
-        }
+        });
     }
 
     fn start_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
@@ -670,19 +747,18 @@ impl SteamLauncher {
     }
 
     fn open_properties_modal(&mut self, game: &LibraryGame) {
-        let branches = match self.runtime.block_on(self.client.fetch_branches(game.app_id)) {
-            Ok(b) => b,
-            Err(e) => {
-                self.status = format!("Failed to fetch branches: {e}");
-                Vec::new()
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        let app_id = game.app_id;
+        self.runtime.spawn(async move {
+            match client.fetch_branches(app_id).await {
+                Ok(branches) => {
+                    let _ = tx.send(AsyncOp::BranchesFetched(app_id, branches));
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!("Failed to fetch branches: {err}")));
+                }
             }
-        };
-
-        self.properties_modal = Some(PropertiesModalState {
-            app_id: game.app_id,
-            game_name: game.name.clone(),
-            available_branches: branches,
-            active_branch: game.active_branch.clone(),
         });
     }
 
@@ -695,28 +771,19 @@ impl SteamLauncher {
     }
 
     fn open_depot_browser(&mut self, game: &LibraryGame) {
-        let depots = self.runtime.block_on(self.client.fetch_depots(game.app_id));
-        match depots {
-            Ok(depots) => {
-                let selected_depot = depots.first().map(|d| d.depot_id);
-                let manifest_input = depots
-                    .first()
-                    .and_then(|d| d.public_manifest_id)
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "public".to_string());
-                self.depot_browser = Some(DepotBrowserState {
-                    app_id: game.app_id,
-                    game_name: game.name.clone(),
-                    depots,
-                    selected_depot,
-                    manifest_input,
-                    files: Vec::new(),
-                });
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        let app_id = game.app_id;
+        self.runtime.spawn(async move {
+            match client.fetch_depots(app_id).await {
+                Ok(depots) => {
+                    let _ = tx.send(AsyncOp::DepotsFetched(app_id, depots));
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!("Failed to load depots: {err}")));
+                }
             }
-            Err(err) => {
-                self.status = format!("Failed to load depots for {}: {err}", game.name);
-            }
-        }
+        });
     }
 
     fn draw_launch_selector_modal(&mut self, ctx: &egui::Context) {
@@ -754,7 +821,10 @@ impl SteamLauncher {
         if let Some((app_id, option, always_use)) = selection {
             if always_use {
                 self.launcher_config.preferred_launch_options.insert(app_id, option.id.clone());
-                let _ = self.runtime.block_on(self.launcher_config.save());
+                let config = self.launcher_config.clone();
+                self.runtime.spawn(async move {
+                    let _ = config.save().await;
+                });
             }
             let proton_path = if self.proton_path_for_windows.trim().is_empty() {
                 None
@@ -900,7 +970,10 @@ impl SteamLauncher {
 
             if self.launcher_config.game_configs.get(&game.app_id) != Some(&config) {
                 self.launcher_config.game_configs.insert(game.app_id, config);
-                let _ = self.runtime.block_on(self.launcher_config.save());
+                let config_to_save = self.launcher_config.clone();
+                self.runtime.spawn(async move {
+                    let _ = config_to_save.save().await;
+                });
             }
 
             ui.add_space(16.0);
@@ -1196,20 +1269,18 @@ impl SteamLauncher {
         }
 
         if let Some((appid, depot_id, manifest)) = request_refresh {
-            match self
-                .runtime
-                .block_on(self.client.fetch_manifest_files(appid, depot_id, &manifest))
-            {
-                Ok(files) => {
-                    if let Some(state) = &mut self.depot_browser {
-                        state.files = files;
+            let client = self.client.clone();
+            let tx = self.operation_tx.clone();
+            self.runtime.spawn(async move {
+                match client.fetch_manifest_files(appid, depot_id, &manifest).await {
+                    Ok(files) => {
+                        let _ = tx.send(AsyncOp::ManifestFilesFetched(files));
                     }
-                    self.status = format!("Loaded manifest {} for depot {}", manifest, depot_id);
+                    Err(err) => {
+                        let _ = tx.send(AsyncOp::Error(format!("Failed to fetch manifest files: {err}")));
+                    }
                 }
-                Err(err) => {
-                    self.status = format!("Failed to fetch manifest files: {err}");
-                }
-            }
+            });
         }
 
         if close {
@@ -1433,15 +1504,12 @@ impl eframe::App for SteamLauncher {
                         });
 
                     if ui.button("Save Settings").clicked() {
-                        if self
-                            .runtime
-                            .block_on(save_launcher_config(&self.launcher_config))
-                            .is_ok()
-                        {
-                            self.status = "Settings saved".to_string();
-                        } else {
-                            self.status = "Failed to save settings".to_string();
-                        }
+                        let config = self.launcher_config.clone();
+                        let tx = self.operation_tx.clone();
+                        self.runtime.spawn(async move {
+                            let success = save_launcher_config(&config).await.is_ok();
+                            let _ = tx.send(AsyncOp::SettingsSaved(success));
+                        });
                     }
 
                     ui.separator();
