@@ -780,7 +780,7 @@ impl SteamClient {
         })
     }
 
-    pub async fn get_product_info(&mut self, appid: u32) -> Result<LaunchInfo> {
+    pub async fn get_product_info(&mut self, appid: u32, prefer_proton: bool) -> Result<LaunchInfo> {
         let connection = self
             .connection
             .as_ref()
@@ -810,7 +810,7 @@ impl SteamClient {
             bail!("empty appinfo payload returned for app {appid}")
         }
 
-        let launch_info = parse_launch_info_from_vdf(appid, &raw_vdf)
+        let launch_info = parse_launch_info_from_vdf(appid, &raw_vdf, prefer_proton)
             .context("failed to parse launch metadata from PICS appinfo")?;
 
         println!("DEBUG PICS: {:#?}", launch_info);
@@ -822,7 +822,8 @@ impl SteamClient {
         app: &LibraryGame,
         proton_path: Option<&str>,
     ) -> Result<LaunchInfo> {
-        let launch_info = self.get_product_info(app.app_id).await?;
+        let prefer_proton = proton_path.is_some();
+        let launch_info = self.get_product_info(app.app_id, prefer_proton).await?;
 
         let launcher_config = load_launcher_config().await.unwrap_or_default();
         let chosen_proton_path = match launch_info.target {
@@ -1201,14 +1202,71 @@ fn map_confirmation(method: &ConfirmationMethod) -> ConfirmationPrompt {
     }
 }
 
-fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str) -> Result<LaunchInfo> {
+fn score_launch_option(exe: &str, prefer_proton: bool) -> i32 {
+    let exe = exe.to_lowercase();
+    if prefer_proton {
+        if exe.ends_with(".exe") {
+            100
+        } else if exe.ends_with(".bat") {
+            90
+        } else if exe.ends_with(".app") || exe.contains("x86") {
+            0
+        } else if !exe.is_empty() {
+            10
+        } else {
+            0
+        }
+    } else {
+        // Linux Preference
+        if exe.contains("x86_64") {
+            100
+        } else if exe.contains("x86") {
+            90
+        } else if exe.ends_with(".sh") {
+            80
+        } else if !exe.contains(".") && !exe.is_empty() {
+            50
+        } else if exe.ends_with(".exe") || exe.ends_with(".app") {
+            0
+        } else if !exe.is_empty() {
+            10
+        } else {
+            0
+        }
+    }
+}
+
+fn find_best_launch_option(
+    launch_options: &HashMap<String, ProductLaunchEntry>,
+    prefer_proton: bool,
+) -> Option<(&String, &ProductLaunchEntry, i32)> {
+    let mut best_option: Option<(i32, &ProductLaunchEntry, &String)> = None;
+
+    for (key, option) in launch_options {
+        let exe = option.executable.as_deref().unwrap_or("");
+        let score = score_launch_option(exe, prefer_proton);
+
+        if let Some((best_score, _, _)) = best_option {
+            if score > best_score || (score == best_score && key == "0") {
+                best_option = Some((score, option, key));
+            }
+        } else if score > 0 {
+            best_option = Some((score, option, key));
+        }
+    }
+
+    best_option.map(|(score, option, key)| (key, option, score))
+}
+
+fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, prefer_proton: bool) -> Result<LaunchInfo> {
     let parsed: ProductInfoEnvelope =
         keyvalues_serde::from_str(raw_vdf).context("failed to parse product info VDF")?;
 
     let config = parsed
         .appinfo
-        .and_then(|appinfo| appinfo.config)
-        .or(parsed.config)
+        .as_ref()
+        .and_then(|appinfo| appinfo.config.as_ref())
+        .or(parsed.config.as_ref())
         .ok_or_else(|| anyhow!("missing config section in product info for app {appid}"))?;
 
     println!("AppInfo Config: {:?}", config);
@@ -1217,27 +1275,24 @@ fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str) -> Result<LaunchInfo> {
         bail!("no launch entries found for app {appid}")
     }
 
-    let mut chosen = None;
-    for section in config.launch.values() {
-        let oslist = section.oslist.as_deref().unwrap_or_default();
-        if oslist.to_ascii_lowercase().contains("linux") {
-            chosen = Some((section, LaunchTarget::NativeLinux));
-            break;
-        }
+    let mut best = find_best_launch_option(&config.launch, prefer_proton);
+    let mut target = if prefer_proton {
+        LaunchTarget::WindowsProton
+    } else {
+        LaunchTarget::NativeLinux
+    };
+
+    if best.is_none() {
+        // Fallback: if preferred OS found nothing, try the other preference
+        best = find_best_launch_option(&config.launch, !prefer_proton);
+        target = if !prefer_proton {
+            LaunchTarget::WindowsProton
+        } else {
+            LaunchTarget::NativeLinux
+        };
     }
 
-    if chosen.is_none() {
-        for section in config.launch.values() {
-            let oslist = section.oslist.as_deref().unwrap_or_default();
-            if oslist.to_ascii_lowercase().contains("windows") {
-                chosen = Some((section, LaunchTarget::WindowsProton));
-                break;
-            }
-        }
-    }
-
-    let (section, target) =
-        chosen.ok_or_else(|| anyhow!("no linux/windows launch option found"))?;
+    let (_, section, _) = best.ok_or_else(|| anyhow!("no suitable launch option found for app {appid}"))?;
 
     Ok(LaunchInfo {
         app_id: appid,
@@ -1273,6 +1328,7 @@ struct ProductLaunchEntry {
     executable: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     oslist: Option<String>,
 }
@@ -1465,7 +1521,7 @@ mod tests {
   }
 }"#;
 
-        let launch = parse_launch_info_from_vdf(10, raw).expect("parse launch info");
+        let launch = parse_launch_info_from_vdf(10, raw, false).expect("parse launch info");
         assert_eq!(launch.target, LaunchTarget::NativeLinux);
         assert_eq!(launch.executable, "linux/game.sh");
         assert_eq!(launch.arguments, "-foo -bar");
