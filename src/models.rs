@@ -35,6 +35,12 @@ pub struct LocalGame {
     pub name: String,
     pub install_dir: PathBuf,
     pub proton_version: Option<String>,
+    #[serde(default = "default_branch")]
+    pub active_branch: String,
+}
+
+fn default_branch() -> String {
+    "public".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +70,10 @@ pub struct LibraryGame {
     pub local_manifest_ids: HashMap<u64, u64>,
     #[serde(default)]
     pub update_available: bool,
+    #[serde(default)]
+    pub update_queued: bool,
+    #[serde(default = "default_branch")]
+    pub active_branch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -88,6 +98,7 @@ pub enum SteamGuardReq {
 pub enum DownloadProgressState {
     Queued,
     Downloading,
+    Verifying,
     Completed,
     Failed,
 }

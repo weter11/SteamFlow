@@ -1,22 +1,22 @@
 # SteamFlow TODO & Roadmap
 
 ## Immediate Priorities (Alpha)
-- [ ] **Search & Filtering**
-  - Implement a search bar in the library sidebar.
-  - Filter by installed/uninstalled (partially done).
-  - Filter by genre/tags.
+- [x] **Search & Filtering**
+  - [x] Implement a search bar in the library sidebar.
+  - [x] Filter by installed/uninstalled.
+  - [ ] Filter by genre/tags.
 - [ ] **Download Manager Improvements**
-  - Better visualization of download progress (speed, time remaining).
-  - Queue management (pause, resume, reorder).
-  - Proper handling of multiple depots.
+  - [ ] Better visualization of download progress (speed, time remaining).
+  - [ ] Queue management (pause, resume, reorder).
+  - [ ] Proper handling of multiple depots.
 - [ ] **Game Launching Polish**
-  - Better Proton detection and selection.
-  - Support for custom launch options/arguments.
-  - Environment variable support for games.
-- [ ] **UI/UX Polish**
-  - Context menus for games (Install, Uninstall, Properties).
-  - Better error reporting in the UI.
-  - Responsive layout improvements.
+  - [x] Better Proton detection and selection.
+  - [ ] Support for custom launch options/arguments.
+  - [ ] Environment variable support for games.
+- [x] **UI/UX Polish**
+  - [x] Context menus for games (Install, Uninstall, Properties).
+  - [ ] Better error reporting in the UI.
+  - [ ] Responsive layout improvements.
 
 ## Medium Term (Beta)
 - [ ] **Friends & Social**
@@ -31,8 +31,8 @@
   - Custom local collections.
 
 ## Long Term / Future
-- [ ] **Depot Browser**
-  - Advanced tool for downloading specific game versions or individual files.
+- [x] **Depot Browser**
+  - [x] Advanced tool for downloading specific game versions or individual files.
 - [ ] **Achievements UI**
   - Display achievements and progress.
 - [ ] **Store/Community Proxy**

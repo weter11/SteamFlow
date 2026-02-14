@@ -2,8 +2,14 @@ use crate::models::{OwnedGame, SessionState};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct GameConfig {
+    pub forced_proton_version: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
@@ -12,6 +18,10 @@ pub struct LauncherConfig {
     pub enable_cloud_sync: bool,
     #[serde(default)]
     pub use_shared_compat_data: bool,
+    #[serde(default)]
+    pub preferred_launch_options: HashMap<u32, String>,
+    #[serde(default)]
+    pub game_configs: HashMap<u32, GameConfig>,
 }
 
 impl LauncherConfig {
@@ -38,6 +48,8 @@ impl Default for LauncherConfig {
             proton_version: "experimental".to_string(),
             enable_cloud_sync: true,
             use_shared_compat_data: false,
+            preferred_launch_options: HashMap::new(),
+            game_configs: HashMap::new(),
         }
     }
 }

@@ -43,7 +43,7 @@ Guard data is persisted through `FileGuardDataStore::user_cache()` so repeated S
   - not installed -> queue install/download pipeline skeleton
 
 ## Launch flow
-- Product metadata lookup through PICS is integrated into `SteamClient::get_launch_info`.
+- Product metadata lookup through PICS is integrated into `SteamClient::get_product_info`.
 - Linux-first launch target selection, then Windows fallback (Proton path required).
 
 ## Run

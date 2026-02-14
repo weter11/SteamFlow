@@ -6,7 +6,7 @@ A custom, lightweight Steam launcher and client written in Rust.
 SteamFlow is the modern successor to the OpenSteamClient project, leveraging Rust for performance, safety, and a better developer experience. It uses `steam-vent` for Steam network communication and `egui` for the user interface.
 
 # Current development status
-SteamFlow is currently in alpha. We are actively working on reaching feature parity with the legacy C# version and beyond.
+SteamFlow is in active development and serves as the primary project. It has reached a highly functional alpha state, supporting core Steam features like authentication, library management, game installation/updates, and cloud synchronization.
 
 ## SteamFlow Roadmap
 - [x] **Authentication**
@@ -19,18 +19,19 @@ SteamFlow is currently in alpha. We are actively working on reaching feature par
   - [x] Scan local installed games
   - [x] Display game covers (automated caching)
   - [x] Basic game launching
-- [ ] **Installation & Updates**
-  - [x] Download pipeline
+  - [x] Search & Filtering
+- [x] **Installation & Updates**
+  - [x] Download pipeline (Manifest -> Security -> Chunks)
   - [x] Update management
-  - [ ] Uninstall support
+  - [x] Uninstall support
+  - [x] Verify Integrity
 - [ ] **Features**
-  - [ ] Search bar
   - [ ] Collections / Categorization
   - [ ] Friends list & Chat
   - [x] Steam Cloud integration
   - [ ] Workshop management
   - [x] Proton/Wine integration improvements
-  - [ ] Depot browser (Download specific builds/files)
+  - [x] Depot browser (Download specific builds/files)
 
 # Getting Started
 ## Prerequisites (Linux)
@@ -55,7 +56,7 @@ cargo run --release
 ---
 
 # Legacy: OpenSteamClient (C#)
-The original C# implementation of OpenSteamClient is still available in the root directory but is no longer the primary focus of development.
+The original C# implementation of OpenSteamClient has been moved to the `OpenSteamClient/` directory. It is maintained for reference and legacy purposes but is no longer in active development.
 
 # Contributing
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.

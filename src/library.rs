@@ -21,49 +21,34 @@ enum LibraryFolderRecord {
         #[serde(flatten)]
         _other: HashMap<String, serde_json::Value>,
     },
-    Ignore(HashMap<String, serde_json::Value>),
+    Ignore(#[allow(dead_code)] HashMap<String, serde_json::Value>),
 }
 
-#[derive(Debug, Deserialize)]
-struct AppManifestFile {
-    #[serde(rename = "AppState", alias = "appstate")]
-    app_state: AppState,
-}
 
-#[derive(Debug, Deserialize)]
-struct AppState {
-    appid: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    installdir: String,
+#[derive(Debug, Clone)]
+pub struct InstalledAppInfo {
+    pub install_path: PathBuf,
+    pub active_branch: String,
 }
 
 pub async fn find_local_games() -> Result<Vec<LocalGame>> {
-    let installed_paths = scan_installed_app_paths().await?;
+    let installed_info = scan_installed_app_info().await?;
     let mut all_games = Vec::new();
 
-    for (app_id, install_path) in installed_paths {
+    for (app_id, info) in installed_info {
         all_games.push(LocalGame {
             app_id,
             name: format!("App {app_id}"),
-            install_dir: PathBuf::from(install_path),
+            install_dir: info.install_path,
             proton_version: None,
+            active_branch: info.active_branch,
         });
     }
 
     Ok(all_games)
 }
 
-pub async fn scan_installed_app_paths() -> Result<HashMap<u32, String>> {
-    let path_map = scan_installed_app_paths_pathbuf().await?;
-    Ok(path_map
-        .into_iter()
-        .map(|(appid, path)| (appid, path.to_string_lossy().to_string()))
-        .collect())
-}
-
-pub async fn scan_installed_app_paths_pathbuf() -> Result<HashMap<u32, PathBuf>> {
+pub async fn scan_installed_app_info() -> Result<HashMap<u32, InstalledAppInfo>> {
     let config_path = load_launcher_config().await.ok().and_then(|cfg| {
         let p = PathBuf::from(cfg.steam_library_path);
         if p.join("steamapps").exists() || p.join("Steam").join("steamapps").exists() {
@@ -77,10 +62,26 @@ pub async fn scan_installed_app_paths_pathbuf() -> Result<HashMap<u32, PathBuf>>
         .or_else(detect_steam_path)
         .unwrap_or_else(default_steam_root);
     println!("Scanning Library Root: {:?}", root);
-    scan_library(&root).await
+    scan_library_info(&root).await
 }
 
-pub async fn scan_library(root_path: &Path) -> Result<HashMap<u32, PathBuf>> {
+pub async fn scan_installed_app_paths() -> Result<HashMap<u32, String>> {
+    let info_map = scan_installed_app_info().await?;
+    Ok(info_map
+        .into_iter()
+        .map(|(appid, info)| (appid, info.install_path.to_string_lossy().to_string()))
+        .collect())
+}
+
+pub async fn scan_installed_app_paths_pathbuf() -> Result<HashMap<u32, PathBuf>> {
+    let info_map = scan_installed_app_info().await?;
+    Ok(info_map
+        .into_iter()
+        .map(|(appid, info)| (appid, info.install_path))
+        .collect())
+}
+
+pub async fn scan_library_info(root_path: &Path) -> Result<HashMap<u32, InstalledAppInfo>> {
     let mut installed = HashMap::new();
     let mut libraries = vec![root_path.to_path_buf()];
 
@@ -112,9 +113,9 @@ pub async fn scan_library(root_path: &Path) -> Result<HashMap<u32, PathBuf>> {
                 continue;
             }
 
-            match parse_app_manifest_install_path(&path).await {
-                Ok(Some((app_id, install_dir))) => {
-                    installed.insert(app_id, install_dir);
+            match parse_app_manifest_info(&path).await {
+                Ok(Some((app_id, info))) => {
+                    installed.insert(app_id, info);
                 }
                 Ok(None) => {}
                 Err(e) => println!("Skipping bad manifest {:?}: {}", path, e),
@@ -191,38 +192,102 @@ pub async fn parse_library_folders(path: PathBuf) -> Result<Vec<PathBuf>> {
     Ok(libraries)
 }
 
-async fn parse_app_manifest_install_path(path: &Path) -> Result<Option<(u32, PathBuf)>> {
+async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAppInfo)>> {
     let raw = fs::read_to_string(path)
         .await
         .with_context(|| format!("failed reading {}", path.display()))?;
 
-    let parsed = keyvalues_serde::from_str::<AppManifestFile>(&raw)
-        .with_context(|| format!("failed to parse app manifest {}", path.display()))?;
+    let mut app_id = None;
+    let mut install_dir_name = None;
+    let mut active_branch = "public".to_string();
 
-    let app_id = match parsed.app_state.appid.parse::<u32>() {
-        Ok(v) => v,
-        Err(e) => {
-            println!("WARNING: Failed to parse appid from {:?}: {}", path, e);
-            return Ok(None);
+    let mut in_user_config = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        let parts = extract_quoted_values(trimmed);
+
+        if parts.len() == 1 && parts[0].eq_ignore_ascii_case("userconfig") {
+            in_user_config = true;
+            continue;
         }
-    };
 
-    let install_dir = path
-        .parent()
-        .map(|p| p.join("common").join(parsed.app_state.installdir))
-        .unwrap_or_default();
+        if trimmed == "{" || trimmed == "}" {
+            if trimmed == "}" && in_user_config {
+                in_user_config = false;
+            }
+            continue;
+        }
 
-    Ok(Some((app_id, install_dir)))
+        if parts.len() >= 2 {
+            let key = parts[0].to_lowercase();
+            let value = &parts[1];
+
+            if !in_user_config {
+                if key == "appid" {
+                    app_id = value.parse::<u32>().ok();
+                } else if key == "installdir" {
+                    install_dir_name = Some(value.to_string());
+                }
+            } else if key == "betakey" {
+                if !value.trim().is_empty() {
+                    active_branch = value.to_string();
+                }
+            }
+        }
+    }
+
+    match (app_id, install_dir_name) {
+        (Some(id), Some(dir)) => {
+            let install_path = path
+                .parent()
+                .map(|p| p.join("common").join(dir))
+                .unwrap_or_default();
+            Ok(Some((
+                id,
+                InstalledAppInfo {
+                    install_path,
+                    active_branch,
+                },
+            )))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn extract_quoted_values(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_quote = false;
+    let mut current = String::new();
+    for ch in line.chars() {
+        if ch == '"' {
+            if in_quote {
+                out.push(current.clone());
+                current.clear();
+            }
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            current.push(ch);
+        }
+    }
+    out
 }
 
 pub fn build_game_library(
     owned: Vec<OwnedGame>,
-    installed_paths: HashMap<u32, String>,
+    installed_info: HashMap<u32, InstalledAppInfo>,
 ) -> GameLibrary {
     let mut games = Vec::new();
 
     for owned_game in owned {
-        let install_path = installed_paths.get(&owned_game.app_id).cloned();
+        let info = installed_info.get(&owned_game.app_id);
+        let install_path = info.map(|i| i.install_path.to_string_lossy().to_string());
+        let active_branch = info
+            .map(|i| i.active_branch.clone())
+            .unwrap_or_else(|| "public".to_string());
+
         games.push(LibraryGame {
             app_id: owned_game.app_id,
             name: owned_game.name,
@@ -231,10 +296,12 @@ pub fn build_game_library(
             install_path,
             local_manifest_ids: owned_game.local_manifest_ids,
             update_available: owned_game.update_available,
+            update_queued: false,
+            active_branch,
         });
     }
 
-    for (app_id, install_path) in installed_paths {
+    for (app_id, info) in installed_info {
         if games.iter().any(|g| g.app_id == app_id) {
             continue;
         }
@@ -244,9 +311,11 @@ pub fn build_game_library(
             name: format!("App {app_id}"),
             playtime_forever_minutes: None,
             is_installed: true,
-            install_path: Some(install_path),
+            install_path: Some(info.install_path.to_string_lossy().to_string()),
             local_manifest_ids: HashMap::new(),
             update_available: false,
+            update_queued: false,
+            active_branch: info.active_branch,
         });
     }
 

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use steamflow::config::load_session;
-use steamflow::library::{build_game_library, scan_installed_app_paths};
+use steamflow::library::{build_game_library, scan_installed_app_info};
 use steamflow::steam_client::SteamClient;
 use steamflow::ui::SteamLauncher;
 use tokio::runtime::Runtime;
@@ -28,17 +28,22 @@ fn main() -> Result<()> {
 
         if authenticated {
             let owned = client.fetch_owned_games().await.unwrap_or_default();
-            let installed = scan_installed_app_paths().await.unwrap_or_default();
+            let installed = scan_installed_app_info().await.unwrap_or_default();
             build_game_library(owned, installed)
         } else {
             build_game_library(
                 Vec::new(),
-                scan_installed_app_paths().await.unwrap_or_default(),
+                scan_installed_app_info().await.unwrap_or_default(),
             )
         }
     });
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([850.0, 680.0])
+            .with_min_inner_size([400.0, 300.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "SteamFlow",
         options,
