@@ -2,6 +2,7 @@ use crate::models::{OwnedGame, SessionState};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
 
@@ -12,6 +13,8 @@ pub struct LauncherConfig {
     pub enable_cloud_sync: bool,
     #[serde(default)]
     pub use_shared_compat_data: bool,
+    #[serde(default)]
+    pub preferred_launch_options: HashMap<u32, String>,
 }
 
 impl LauncherConfig {
@@ -38,6 +41,7 @@ impl Default for LauncherConfig {
             proton_version: "experimental".to_string(),
             enable_cloud_sync: true,
             use_shared_compat_data: false,
+            preferred_launch_options: HashMap::new(),
         }
     }
 }

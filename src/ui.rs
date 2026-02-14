@@ -9,6 +9,7 @@ use crate::models::{
     DownloadProgress, DownloadProgressState, LibraryGame, SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
+use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::collections::{HashMap, HashSet};
@@ -48,6 +49,15 @@ struct PlatformSelectionState {
     available: Vec<DepotPlatform>,
 }
 
+#[derive(Debug, Clone)]
+struct LaunchSelectorState {
+    app_id: u32,
+    game_name: String,
+    options: Vec<crate::steam_client::LaunchInfo>,
+    selected_id: String,
+    always_use: bool,
+}
+
 pub struct SteamLauncher {
     runtime: Runtime,
     pub client: SteamClient,
@@ -81,6 +91,7 @@ pub struct SteamLauncher {
     uninstall_modal: Option<UninstallModalState>,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
+    launch_selector: Option<LaunchSelectorState>,
 }
 
 impl SteamLauncher {
@@ -129,6 +140,7 @@ impl SteamLauncher {
             uninstall_modal: None,
             depot_browser: None,
             platform_selection: None,
+            launch_selector: None,
         }
     }
 
@@ -461,19 +473,87 @@ impl SteamLauncher {
             Some(self.proton_path_for_windows.trim().to_string())
         };
 
-        let game = game.clone();
+        let prefer_proton = proton_path.is_some();
         let mut client = self.client.clone();
+        let options = match self.runtime.block_on(client.get_product_info(game.app_id, prefer_proton)) {
+            Ok(opts) => opts,
+            Err(e) => {
+                self.status = format!("Failed to get launch options: {e}");
+                return;
+            }
+        };
+
+        if let Some(preferred_id) = self.launcher_config.preferred_launch_options.get(&game.app_id) {
+            if let Some(option) = options.iter().find(|o| &o.id == preferred_id) {
+                self.start_launch_task(game, option.clone(), proton_path);
+                return;
+            }
+        }
+
+        if options.len() > 1 {
+            self.launch_selector = Some(LaunchSelectorState {
+                app_id: game.app_id,
+                game_name: game.name.clone(),
+                selected_id: options[0].id.clone(),
+                options,
+                always_use: false,
+            });
+        } else if let Some(option) = options.first() {
+            self.start_launch_task(game, option.clone(), proton_path);
+        }
+    }
+
+    fn start_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
+        let game = game.clone();
+        let client = self.client.clone();
         let (tx, rx) = mpsc::channel();
         self.play_result_rx = Some(rx);
         self.status = format!("Syncing Cloud... {}", game.name);
 
         self.runtime.spawn(async move {
-            let result = client
-                .play_game(&game, proton_path.as_deref())
-                .await
-                .map(|info| format!("Upload Complete - {} ({})", game.name, info.app_id))
-                .unwrap_or_else(|err| format!("Launch failed for {}: {err}", game.name));
-            let _ = tx.send(result);
+            let launcher_config = load_launcher_config().await.unwrap_or_default();
+            let chosen_proton_path = match launch_info.target {
+                crate::steam_client::LaunchTarget::NativeLinux => None,
+                crate::steam_client::LaunchTarget::WindowsProton => {
+                    proton_path.as_deref().or(Some(launcher_config.proton_version.as_str()))
+                }
+            };
+
+            let cloud_enabled = launcher_config.enable_cloud_sync && !client.is_offline();
+            let mut cloud_client = None;
+            let mut local_root = None;
+
+            if cloud_enabled {
+                let c = crate::cloud_sync::CloudClient::new(
+                    client.connection()
+                        .cloned()
+                        .ok_or_else(|| anyhow!("steam connection not initialized"))
+                        .unwrap()
+                );
+                let root = crate::cloud_sync::default_cloud_root(c.steam_id(), game.app_id).unwrap();
+                tracing::info!(appid = game.app_id, path = %root.display(), "Syncing Cloud...");
+                let _ = c.sync_down(game.app_id, &root).await;
+                cloud_client = Some(c);
+                local_root = Some(root);
+            }
+
+            let mut child: std::process::Child =
+                match client.spawn_game_process(&game, &launch_info, chosen_proton_path) {
+                    Ok(child) => child,
+                    Err(e) => {
+                        let _ = tx.send(format!("Launch failed for {}: {e}", game.name));
+                        return;
+                    }
+                };
+
+            let _ = child.wait();
+
+            if let (Some(c), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
+                let _ = c.sync_up(game.app_id, root).await;
+                tracing::info!(appid = game.app_id, "Upload Complete");
+            }
+
+            let _ = tx.send(format!("Finished playing {}", game.name));
         });
     }
 
@@ -507,6 +587,58 @@ impl SteamLauncher {
             Err(err) => {
                 self.status = format!("Failed to load depots for {}: {err}", game.name);
             }
+        }
+    }
+
+    fn draw_launch_selector_modal(&mut self, ctx: &egui::Context) {
+        let mut selection = None;
+        let mut close = false;
+
+        if let Some(state) = &mut self.launch_selector {
+            egui::Window::new("Launch Configuration")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Select version of {} to launch:", state.game_name));
+                    ui.add_space(8.0);
+
+                    for option in &state.options {
+                        ui.radio_value(&mut state.selected_id, option.id.clone(), &option.description);
+                    }
+
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut state.always_use, "Always use this option");
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Play").clicked() {
+                            if let Some(opt) = state.options.iter().find(|o| o.id == state.selected_id) {
+                                selection = Some((state.app_id, opt.clone(), state.always_use));
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+        }
+
+        if let Some((app_id, option, always_use)) = selection {
+            if always_use {
+                self.launcher_config.preferred_launch_options.insert(app_id, option.id.clone());
+                let _ = self.runtime.block_on(self.launcher_config.save());
+            }
+            let proton_path = if self.proton_path_for_windows.trim().is_empty() {
+                None
+            } else {
+                Some(self.proton_path_for_windows.trim().to_string())
+            };
+            let game = self.library.iter().find(|g| g.app_id == app_id).cloned();
+            if let Some(game) = game {
+                self.start_launch_task(&game, option, proton_path);
+            }
+            self.launch_selector = None;
+        } else if close {
+            self.launch_selector = None;
         }
     }
 
@@ -1163,6 +1295,7 @@ impl eframe::App for SteamLauncher {
         self.draw_uninstall_modal(ctx);
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
+        self.draw_launch_selector_modal(ctx);
         ctx.request_repaint();
     }
 }
