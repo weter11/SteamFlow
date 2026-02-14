@@ -254,6 +254,12 @@ impl SteamLauncher {
                             progress.current_file, progress.bytes_downloaded, progress.total_bytes
                         );
                     }
+                    DownloadProgressState::Verifying => {
+                        self.status = format!(
+                            "Verifying {}: {} / {} bytes",
+                            progress.current_file, progress.bytes_downloaded, progress.total_bytes
+                        );
+                    }
                     DownloadProgressState::Completed => {
                         self.status = "Install completed".to_string();
                         if let Some(appid) = self.active_download_appid {
@@ -1191,7 +1197,7 @@ impl eframe::App for SteamLauncher {
                         egui::ProgressBar::new(fraction)
                             .show_percentage()
                             .text(format!(
-                                "Live install: {:?} - {} ({} / {} bytes)",
+                                "Live operation: {:?} - {} ({} / {} bytes)",
                                 progress.state,
                                 progress.current_file,
                                 progress.bytes_downloaded,
@@ -1229,6 +1235,32 @@ impl eframe::App for SteamLauncher {
                         if ui.add(button).clicked() {
                             self.handle_play_click(&game);
                         }
+
+                        ui.menu_button("⚙", |ui| {
+                            if ui.button("Verify Integrity").clicked() {
+                                match self.client.verify_game(game.app_id) {
+                                    Ok(rx) => {
+                                        self.download_receiver = Some(rx);
+                                        self.active_download_appid = Some(game.app_id);
+                                        self.status = format!("Started verify for app {}", game.app_id);
+                                    }
+                                    Err(err) => {
+                                        self.status = format!("Failed to verify {}: {err}", game.app_id);
+                                    }
+                                }
+                                ui.close();
+                            }
+
+                            if ui.button("Uninstall").clicked() {
+                                self.open_uninstall_modal(&game);
+                                ui.close();
+                            }
+
+                            if ui.button("Depot Browser").clicked() {
+                                self.open_depot_browser(&game);
+                                ui.close();
+                            }
+                        });
 
                         if game.update_available {
                             let update_button = egui::Button::new(

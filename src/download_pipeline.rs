@@ -360,8 +360,7 @@ impl DownloadState {
 
         let mut output = OpenOptions::new()
             .create(true)
-            .truncate(!self.smart_verify_existing)
-            .read(self.smart_verify_existing)
+            .read(true)
             .write(true)
             .open(&file_path)
             .await
@@ -384,8 +383,7 @@ impl DownloadState {
                 .unwrap_or(total_bytes);
             let expected_chunk_len = next_offset.saturating_sub(chunk_offset) as usize;
 
-            if self.smart_verify_existing
-                && file_exists
+            if file_exists
                 && expected_chunk_len > 0
                 && chunk_offset + expected_chunk_len as u64 <= existing_len
             {
@@ -514,6 +512,7 @@ pub async fn execute_multi_depot_download_async(
     app_id: u32,
     selections: Vec<ManifestSelection>,
     install_root: PathBuf,
+    smart_verify_existing: bool,
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<()> {
     for selection in selections {
@@ -523,7 +522,7 @@ pub async fn execute_multi_depot_download_async(
             manifest,
             security,
             install_root.clone(),
-            false,
+            smart_verify_existing,
             progress_tx.clone(),
         )
         .await?;
@@ -551,6 +550,7 @@ pub fn execute_four_step_download(
             plan.app_id,
             vec![selection],
             install_root.to_path_buf(),
+            false,
             None,
         )
         .await

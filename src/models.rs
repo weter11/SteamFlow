@@ -88,6 +88,7 @@ pub enum SteamGuardReq {
 pub enum DownloadProgressState {
     Queued,
     Downloading,
+    Verifying,
     Completed,
     Failed,
 }

@@ -508,12 +508,30 @@ impl SteamClient {
                 })
                 .await;
 
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::install::ProgressEvent>();
+            let tx_clone = tx.clone();
+            tokio::task::spawn(async move {
+                while let Some(event) = progress_rx.recv().await {
+                    let state = DownloadProgressState::Downloading;
+                    let _ = tx_clone
+                        .send(DownloadProgress {
+                            state,
+                            bytes_downloaded: event.bytes_downloaded,
+                            total_bytes: event.total_bytes,
+                            current_file: event.file_name,
+                        })
+                        .await;
+                }
+            });
+
             let result = download_pipeline::execute_multi_depot_download_async(
                 &connection,
                 appid,
                 selections,
                 install_dir,
-                None,
+                false,
+                Some(progress_tx),
             )
             .await;
 
@@ -928,13 +946,17 @@ impl SteamClient {
                     .unwrap_or_default()
             };
 
-            let selected = if smart_verify_existing {
-                local_manifests.iter().next().map(|(d, m)| (*d as u32, *m))
-            } else {
-                remote_manifests.iter().next().map(|(d, m)| (*d as u32, *m))
-            };
+            let mut selections = Vec::new();
+            for (depot_id, manifest_id) in &remote_manifests {
+                selections.push(ManifestSelection {
+                    app_id: appid,
+                    depot_id: *depot_id as u32,
+                    manifest_id: *manifest_id,
+                    appinfo_vdf: String::new(),
+                });
+            }
 
-            let Some((depot_id, manifest_id)) = selected else {
+            if selections.is_empty() {
                 let _ = tx
                     .send(DownloadProgress {
                         state: DownloadProgressState::Failed,
@@ -946,20 +968,39 @@ impl SteamClient {
                 return;
             };
 
-            let result = tokio::task::spawn_blocking(move || {
-                download_pipeline::execute_download_with_manifest_id(
-                    &connection,
-                    appid,
-                    depot_id,
-                    manifest_id,
-                    &install_root,
-                    smart_verify_existing,
-                )
-            })
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::unbounded_channel::<crate::install::ProgressEvent>();
+            let tx_clone = tx.clone();
+            tokio::task::spawn(async move {
+                while let Some(event) = progress_rx.recv().await {
+                    let state = if smart_verify_existing {
+                        DownloadProgressState::Verifying
+                    } else {
+                        DownloadProgressState::Downloading
+                    };
+                    let _ = tx_clone
+                        .send(DownloadProgress {
+                            state,
+                            bytes_downloaded: event.bytes_downloaded,
+                            total_bytes: event.total_bytes,
+                            current_file: event.file_name,
+                        })
+                        .await;
+                }
+            });
+
+            let result = download_pipeline::execute_multi_depot_download_async(
+                &connection,
+                appid,
+                selections,
+                install_root,
+                smart_verify_existing,
+                Some(progress_tx),
+            )
             .await;
 
             match result {
-                Ok(Ok(())) => {
+                Ok(()) => {
                     if !smart_verify_existing {
                         let _ = SteamClient::write_manifest_ids_at_path(
                             &manifest_path,
@@ -979,23 +1020,13 @@ impl SteamClient {
                         })
                         .await;
                 }
-                Ok(Err(err)) => {
-                    let _ = tx
-                        .send(DownloadProgress {
-                            state: DownloadProgressState::Failed,
-                            bytes_downloaded: 0,
-                            total_bytes: 0,
-                            current_file: err.to_string(),
-                        })
-                        .await;
-                }
                 Err(err) => {
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
                             bytes_downloaded: 0,
                             total_bytes: 0,
-                            current_file: format!("download task join failure: {err}"),
+                            current_file: err.to_string(),
                         })
                         .await;
                 }
