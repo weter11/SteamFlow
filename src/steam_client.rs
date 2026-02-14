@@ -629,7 +629,7 @@ impl SteamClient {
         })
     }
 
-    pub async fn get_launch_info(&mut self, appid: u32) -> Result<LaunchInfo> {
+    pub async fn get_product_info(&mut self, appid: u32) -> Result<LaunchInfo> {
         let connection = self
             .connection
             .as_ref()
@@ -659,8 +659,11 @@ impl SteamClient {
             bail!("empty appinfo payload returned for app {appid}")
         }
 
-        parse_launch_info_from_vdf(appid, &raw_vdf)
-            .context("failed to parse launch metadata from PICS appinfo")
+        let launch_info = parse_launch_info_from_vdf(appid, &raw_vdf)
+            .context("failed to parse launch metadata from PICS appinfo")?;
+
+        println!("DEBUG PICS: {:#?}", launch_info);
+        Ok(launch_info)
     }
 
     pub async fn play_game(
@@ -668,7 +671,7 @@ impl SteamClient {
         app: &LibraryGame,
         proton_path: Option<&str>,
     ) -> Result<LaunchInfo> {
-        let launch_info = self.get_launch_info(app.app_id).await?;
+        let launch_info = self.get_product_info(app.app_id).await?;
 
         let launcher_config = load_launcher_config().await.unwrap_or_default();
         let chosen_proton_path = match launch_info.target {
@@ -1056,6 +1059,8 @@ fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str) -> Result<LaunchInfo> {
         .and_then(|appinfo| appinfo.config)
         .or(parsed.config)
         .ok_or_else(|| anyhow!("missing config section in product info for app {appid}"))?;
+
+    println!("AppInfo Config: {:?}", config);
 
     if config.launch.is_empty() {
         bail!("no launch entries found for app {appid}")
