@@ -304,6 +304,54 @@ impl SteamClient {
         })
     }
 
+    pub async fn fetch_branches(&self, appid: u32) -> Result<Vec<String>> {
+        let connection = self
+            .connection
+            .as_ref()
+            .context("steam connection not initialized")?;
+
+        let mut request = CMsgClientPICSProductInfoRequest::new();
+        request
+            .apps
+            .push(cmsg_client_picsproduct_info_request::AppInfo {
+                appid: Some(appid),
+                ..Default::default()
+            });
+
+        let response: CMsgClientPICSProductInfoResponse = connection
+            .job(request)
+            .await
+            .context("failed requesting appinfo product info for branches")?;
+
+        let app = response
+            .apps
+            .iter()
+            .find(|entry| entry.appid() == appid)
+            .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
+
+        let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let parsed: AppInfoRoot =
+            keyvalues_serde::from_str(&appinfo_vdf).context("failed parsing appinfo VDF")?;
+
+        let branches = parsed
+            .appinfo
+            .map(|node| node.branches)
+            .unwrap_or(parsed.branches);
+
+        let mut names: Vec<String> = branches
+            .into_iter()
+            .filter(|(_, node)| node.pwdrequired.is_none()) // Ignore private
+            .map(|(name, _)| name)
+            .collect();
+
+        if !names.contains(&"public".to_string()) {
+            names.push("public".to_string());
+        }
+
+        names.sort();
+        Ok(names)
+    }
+
     pub async fn get_available_platforms(&mut self, appid: u32) -> Result<Vec<DepotPlatform>> {
         let connection = self
             .connection
@@ -567,6 +615,22 @@ impl SteamClient {
         Ok(rx)
     }
 
+    pub fn update_app_branch(&self, appid: u32, branch: &str) -> Result<()> {
+        let manifest_path = self.appmanifest_path(appid)?;
+        if !manifest_path.exists() {
+            bail!("appmanifest not found for app {appid}");
+        }
+
+        let raw = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed reading {}", manifest_path.display()))?;
+
+        let rewritten = rewrite_app_branch(&raw, branch);
+        std::fs::write(&manifest_path, rewritten)
+            .with_context(|| format!("failed writing {}", manifest_path.display()))?;
+
+        Ok(())
+    }
+
     pub fn uninstall_game(&self, appid: u32, delete_prefix: bool) -> Result<()> {
         let cfg = tokio::runtime::Handle::current().block_on(load_launcher_config())?;
         let steamapps = PathBuf::from(cfg.steam_library_path).join("steamapps");
@@ -700,15 +764,16 @@ impl SteamClient {
                 continue;
             }
 
-            let local = self.local_manifest_ids(game)?;
+            let (local, branch) = self.local_manifest_info(game)?;
             game.local_manifest_ids = local.clone();
+            game.active_branch = branch;
 
             if self.is_offline() || self.connection.is_none() {
                 continue;
             }
 
             let remote = self
-                .remote_manifest_ids(game.app_id)
+                .remote_manifest_ids(game.app_id, &game.active_branch)
                 .await
                 .unwrap_or_default();
             if remote.is_empty() {
@@ -723,28 +788,30 @@ impl SteamClient {
         Ok(())
     }
 
-    fn local_manifest_ids(&self, game: &LibraryGame) -> Result<HashMap<u64, u64>> {
+    fn local_manifest_info(&self, game: &LibraryGame) -> Result<(HashMap<u64, u64>, String)> {
         let install_path = match &game.install_path {
             Some(path) => PathBuf::from(path),
-            None => return Ok(HashMap::new()),
+            None => return Ok((HashMap::new(), "public".to_string())),
         };
 
         let steamapps = match install_path.parent().and_then(|p| p.parent()) {
             Some(path) => path.to_path_buf(),
-            None => return Ok(HashMap::new()),
+            None => return Ok((HashMap::new(), "public".to_string())),
         };
 
         let manifest_path = steamapps.join(format!("appmanifest_{}.acf", game.app_id));
         if !manifest_path.exists() {
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), "public".to_string()));
         }
 
         let raw = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("failed reading {}", manifest_path.display()))?;
-        Ok(parse_installed_depots_from_acf(&raw))
+        let manifests = parse_installed_depots_from_acf(&raw);
+        let branch = parse_active_branch_from_acf(&raw);
+        Ok((manifests, branch))
     }
 
-    async fn remote_manifest_ids(&self, appid: u32) -> Result<HashMap<u64, u64>> {
+    async fn remote_manifest_ids(&self, appid: u32, branch: &str) -> Result<HashMap<u64, u64>> {
         let connection = self
             .connection
             .as_ref()
@@ -770,7 +837,7 @@ impl SteamClient {
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
         let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf))
+        Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf, branch))
     }
 
     pub async fn get_user_profile(&self, current_library_len: usize) -> Result<UserProfile> {
@@ -922,7 +989,9 @@ impl SteamClient {
         let manifest_path = self.appmanifest_path(appid)?;
         let (tx, rx) = tokio::sync::mpsc::channel(128);
 
-        let local_manifests = self.local_manifest_ids_for_appid(appid).unwrap_or_default();
+        let (local_manifests, active_branch) = self
+            .local_manifest_info_for_appid(appid)
+            .unwrap_or_else(|_| (HashMap::new(), "public".to_string()));
 
         tokio::task::spawn(async move {
             let _ = tx
@@ -941,7 +1010,7 @@ impl SteamClient {
             let remote_manifests = if smart_verify_existing {
                 local_manifests.clone()
             } else {
-                SteamClient::remote_manifest_ids_static(&connection, appid)
+                SteamClient::remote_manifest_ids_static(&connection, appid, &active_branch)
                     .await
                     .unwrap_or_default()
             };
@@ -1043,14 +1112,16 @@ impl SteamClient {
             .join(format!("appmanifest_{appid}.acf")))
     }
 
-    fn local_manifest_ids_for_appid(&self, appid: u32) -> Result<HashMap<u64, u64>> {
+    fn local_manifest_info_for_appid(&self, appid: u32) -> Result<(HashMap<u64, u64>, String)> {
         let manifest_path = self.appmanifest_path(appid)?;
         if !manifest_path.exists() {
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), "public".to_string()));
         }
         let raw = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("failed reading {}", manifest_path.display()))?;
-        Ok(parse_installed_depots_from_acf(&raw))
+        let manifests = parse_installed_depots_from_acf(&raw);
+        let branch = parse_active_branch_from_acf(&raw);
+        Ok((manifests, branch))
     }
 
     fn install_root_for_app(&self, appid: u32) -> Result<PathBuf> {
@@ -1081,6 +1152,7 @@ impl SteamClient {
     async fn remote_manifest_ids_static(
         connection: &Connection,
         appid: u32,
+        branch: &str,
     ) -> Result<HashMap<u64, u64>> {
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
@@ -1102,7 +1174,7 @@ impl SteamClient {
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
         let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf))
+        Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf, branch))
     }
 
     fn write_manifest_ids_at_path(path: &Path, new_manifest_ids: &HashMap<u64, u64>) -> Result<()> {
@@ -1500,7 +1572,34 @@ fn parse_installed_depots_from_acf(raw: &str) -> HashMap<u64, u64> {
     manifests
 }
 
-fn parse_remote_depot_manifests_from_vdf(raw: &str) -> HashMap<u64, u64> {
+fn parse_active_branch_from_acf(raw: &str) -> String {
+    let mut in_user_config = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        let parts = extract_quoted_values(trimmed);
+
+        if parts.len() == 1 && parts[0].eq_ignore_ascii_case("userconfig") {
+            in_user_config = true;
+            continue;
+        }
+
+        if trimmed == "{" || trimmed == "}" {
+            if trimmed == "}" && in_user_config {
+                in_user_config = false;
+            }
+            continue;
+        }
+
+        if parts.len() >= 2 && in_user_config && parts[0].eq_ignore_ascii_case("betakey") {
+            if !parts[1].trim().is_empty() {
+                return parts[1].to_string();
+            }
+        }
+    }
+    "public".to_string()
+}
+
+fn parse_remote_depot_manifests_from_vdf(raw: &str, branch: &str) -> HashMap<u64, u64> {
     let mut manifests = HashMap::new();
     let mut in_depots = false;
     let mut current_depot: Option<u64> = None;
@@ -1530,17 +1629,71 @@ fn parse_remote_depot_manifests_from_vdf(raw: &str) -> HashMap<u64, u64> {
             if let Ok(depot_id) = u64::from_str(&quoted[0]) {
                 current_depot = Some(depot_id);
             }
-        } else if quoted.len() >= 2
-            && (quoted[0] == "public" || quoted[0] == "manifest")
-            && current_depot.is_some()
-        {
-            if let Ok(manifest) = u64::from_str(&quoted[1]) {
-                manifests.insert(current_depot.unwrap_or_default(), manifest);
+        } else if quoted.len() >= 2 && current_depot.is_some() {
+            if quoted[0] == branch || (branch != "public" && quoted[0] == "public") || quoted[0] == "manifest" {
+                if let Ok(manifest) = u64::from_str(&quoted[1]) {
+                    // If we already have a manifest for this depot, only overwrite if this is the requested branch
+                    // (prevents 'public' fallback from overwriting a previously found 'beta' manifest if it appeared first,
+                    // though usually branch manifests are inside a 'manifests' sub-section which we are not fully parsing yet)
+                    if !manifests.contains_key(&current_depot.unwrap()) || quoted[0] == branch {
+                         manifests.insert(current_depot.unwrap_or_default(), manifest);
+                    }
+                }
             }
         }
     }
 
     manifests
+}
+
+fn rewrite_app_branch(raw: &str, branch: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_user_config = false;
+    let mut branch_updated = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.eq_ignore_ascii_case("\"UserConfig\"") {
+            in_user_config = true;
+            out.push(line.to_string());
+            continue;
+        }
+
+        if in_user_config && trimmed == "{" {
+            out.push(line.to_string());
+            continue;
+        }
+
+        if in_user_config && trimmed == "}" {
+            if !branch_updated {
+                out.push(format!("\t\t\"BetaKey\"\t\t\"{branch}\""));
+            }
+            in_user_config = false;
+            out.push(line.to_string());
+            continue;
+        }
+
+        if in_user_config {
+            let quoted = extract_quoted_values(trimmed);
+            if !quoted.is_empty() && quoted[0].eq_ignore_ascii_case("betakey") {
+                let indent = line
+                    .chars()
+                    .take_while(|ch| ch.is_whitespace())
+                    .collect::<String>();
+                out.push(format!("{indent}\"BetaKey\"\t\t\"{branch}\""));
+                branch_updated = true;
+                continue;
+            }
+        }
+
+        out.push(line.to_string());
+    }
+
+    // If UserConfig was never found, we might need to add it, but for simplicity
+    // we assume it exists in a valid Steam manifest.
+
+    out.join("\n")
 }
 
 fn extract_quoted_values(line: &str) -> Vec<String> {

@@ -33,6 +33,14 @@ struct UninstallModalState {
 }
 
 #[derive(Debug, Clone)]
+struct PropertiesModalState {
+    app_id: u32,
+    game_name: String,
+    available_branches: Vec<String>,
+    active_branch: String,
+}
+
+#[derive(Debug, Clone)]
 struct DepotBrowserState {
     app_id: u32,
     game_name: String,
@@ -89,6 +97,7 @@ pub struct SteamLauncher {
     custom_protons: Vec<String>,
     user_profile: Option<UserProfile>,
     uninstall_modal: Option<UninstallModalState>,
+    properties_modal: Option<PropertiesModalState>,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
@@ -138,6 +147,7 @@ impl SteamLauncher {
             custom_protons,
             user_profile,
             uninstall_modal: None,
+            properties_modal: None,
             depot_browser: None,
             platform_selection: None,
             launch_selector: None,
@@ -393,7 +403,7 @@ impl SteamLauncher {
                         .unwrap_or_default();
                     let installed = self
                         .runtime
-                        .block_on(scan_installed_app_paths())
+                        .block_on(crate::library::scan_installed_app_info())
                         .unwrap_or_default();
                     self.library = build_game_library(cached, installed).games;
                     let _ = self
@@ -416,7 +426,7 @@ impl SteamLauncher {
 
         let installed = self
             .runtime
-            .block_on(scan_installed_app_paths())
+            .block_on(crate::library::scan_installed_app_info())
             .unwrap_or_default();
         self.library = build_game_library(owned, installed).games;
         let _ = self
@@ -563,6 +573,23 @@ impl SteamLauncher {
         });
     }
 
+    fn open_properties_modal(&mut self, game: &LibraryGame) {
+        let branches = match self.runtime.block_on(self.client.fetch_branches(game.app_id)) {
+            Ok(b) => b,
+            Err(e) => {
+                self.status = format!("Failed to fetch branches: {e}");
+                Vec::new()
+            }
+        };
+
+        self.properties_modal = Some(PropertiesModalState {
+            app_id: game.app_id,
+            game_name: game.name.clone(),
+            available_branches: branches,
+            active_branch: game.active_branch.clone(),
+        });
+    }
+
     fn open_uninstall_modal(&mut self, game: &LibraryGame) {
         self.uninstall_modal = Some(UninstallModalState {
             app_id: game.app_id,
@@ -681,6 +708,59 @@ impl SteamLauncher {
             self.platform_selection = None;
         } else if close {
             self.platform_selection = None;
+        }
+    }
+
+    fn draw_properties_modal(&mut self, ctx: &egui::Context) {
+        let mut new_branch = None;
+        let mut close = false;
+
+        if let Some(state) = &mut self.properties_modal {
+            egui::Window::new(format!("Properties - {}", state.game_name))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.heading("Betas");
+                    ui.label("Select the beta you would like to opt into:");
+
+                    egui::ComboBox::from_id_salt("branch_selector")
+                        .selected_text(&state.active_branch)
+                        .show_ui(ui, |ui| {
+                            for branch in &state.available_branches {
+                                if ui
+                                    .selectable_value(&mut state.active_branch, branch.clone(), branch)
+                                    .clicked()
+                                {
+                                    new_branch = Some((state.app_id, branch.clone()));
+                                }
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+        }
+
+        if let Some((app_id, branch)) = new_branch {
+            match self.client.update_app_branch(app_id, &branch) {
+                Ok(()) => {
+                    if let Some(game) = self.library.iter_mut().find(|g| g.app_id == app_id) {
+                        game.active_branch = branch.clone();
+                        game.update_available = true;
+                        game.update_queued = true;
+                    }
+                    self.status = format!("Switched to branch {branch}");
+                }
+                Err(err) => {
+                    self.status = format!("Failed to switch branch: {err}");
+                }
+            }
+        }
+
+        if close {
+            self.properties_modal = None;
         }
     }
 
@@ -1095,26 +1175,41 @@ impl eframe::App for SteamLauncher {
                 ui.checkbox(&mut self.show_installed_only, "Show Installed Only");
                 ui.separator();
 
-                let visible_games: Vec<(u32, String)> = self
-                    .visible_games()
-                    .into_iter()
-                    .map(|g| (g.app_id, g.name.clone()))
-                    .collect();
+                let visible_games: Vec<LibraryGame> =
+                    self.visible_games().into_iter().cloned().collect();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (app_id, name) in &visible_games {
-                        let selected = self.selected_app == Some(*app_id);
-                        let response = ui.selectable_label(selected, name);
+                    for game in &visible_games {
+                        let selected = self.selected_app == Some(game.app_id);
+                        let app_id = game.app_id;
+
+                        let mut job = egui::text::LayoutJob::default();
+                        job.append(&game.name, 0.0, egui::TextFormat {
+                            color: ui.visuals().text_color(),
+                            ..Default::default()
+                        });
+                        if game.active_branch != "public" {
+                            job.append(
+                                &format!(" [{}]", game.active_branch),
+                                0.0,
+                                egui::TextFormat {
+                                    color: egui::Color32::GRAY,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+
+                        let response = ui.selectable_label(selected, job);
                         if response.clicked() {
-                            self.selected_app = Some(*app_id);
+                            self.selected_app = Some(app_id);
                         }
 
                         response.context_menu(|ui| {
                             if ui.button("Verify Integrity").clicked() {
-                                match self.client.verify_game(*app_id) {
+                                match self.client.verify_game(app_id) {
                                     Ok(rx) => {
                                         self.download_receiver = Some(rx);
-                                        self.active_download_appid = Some(*app_id);
+                                        self.active_download_appid = Some(app_id);
                                         self.status = format!("Started verify for app {}", app_id);
                                     }
                                     Err(err) => {
@@ -1125,32 +1220,29 @@ impl eframe::App for SteamLauncher {
                             }
 
                             ui.menu_button("Manage", |ui| {
+                                if ui.button("Properties").clicked() {
+                                    self.open_properties_modal(game);
+                                    ui.close();
+                                }
                                 if ui.button("Uninstall").clicked() {
-                                    if let Some(game) = self.library.iter().find(|g| g.app_id == *app_id).cloned() {
-                                        self.open_uninstall_modal(&game);
-                                    }
+                                    self.open_uninstall_modal(game);
                                     ui.close();
                                 }
                             });
 
                             ui.menu_button("Advanced", |ui| {
                                 if ui.button("Depot Browser").clicked() {
-                                    if let Some(game) = self.library.iter().find(|g| g.app_id == *app_id).cloned() {
-                                        self.open_depot_browser(&game);
-                                    }
+                                    self.open_depot_browser(game);
                                     ui.close();
                                 }
                             });
                         });
 
-                        if self
-                            .library
-                            .iter()
-                            .find(|g| g.app_id == *app_id)
-                            .map(|g| g.update_available)
-                            .unwrap_or(false)
-                        {
-                            ui.colored_label(egui::Color32::from_rgb(66, 133, 244), "Update Available");
+                        if game.update_available {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(66, 133, 244),
+                                "Update Available",
+                            );
                         }
                     }
                 });
@@ -1251,6 +1343,11 @@ impl eframe::App for SteamLauncher {
                                 ui.close();
                             }
 
+                            if ui.button("Properties").clicked() {
+                                self.open_properties_modal(&game);
+                                ui.close();
+                            }
+
                             if ui.button("Uninstall").clicked() {
                                 self.open_uninstall_modal(&game);
                                 ui.close();
@@ -1324,6 +1421,7 @@ impl eframe::App for SteamLauncher {
             }
         });
 
+        self.draw_properties_modal(ctx);
         self.draw_uninstall_modal(ctx);
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);

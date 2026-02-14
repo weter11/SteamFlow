@@ -69,12 +69,16 @@ pub struct AppInfoRoot {
     pub appinfo: Option<AppInfoNode>,
     #[serde(default)]
     pub depots: HashMap<String, DepotNode>,
+    #[serde(default)]
+    pub branches: HashMap<String, BranchNode>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct AppInfoNode {
     #[serde(default)]
     pub depots: HashMap<String, DepotNode>,
+    #[serde(default)]
+    pub branches: HashMap<String, BranchNode>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -85,6 +89,16 @@ pub struct DepotNode {
     pub manifests: Option<DepotManifests>,
     #[serde(flatten)]
     pub _other: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BranchNode {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub pwdrequired: Option<String>,
+    #[serde(default)]
+    pub buildid: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
