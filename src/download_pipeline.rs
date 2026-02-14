@@ -68,17 +68,49 @@ pub struct AppInfoRoot {
     #[serde(default)]
     pub appinfo: Option<AppInfoNode>,
     #[serde(default)]
+    pub common: Option<CommonNode>,
+    #[serde(default)]
     pub depots: HashMap<String, DepotNode>,
     #[serde(default)]
     pub branches: HashMap<String, BranchNode>,
+    #[serde(default)]
+    pub config: Option<ConfigNode>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct AppInfoNode {
     #[serde(default)]
+    pub common: Option<CommonNode>,
+    #[serde(default)]
     pub depots: HashMap<String, DepotNode>,
     #[serde(default)]
     pub branches: HashMap<String, BranchNode>,
+    #[serde(default)]
+    pub config: Option<ConfigNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigNode {
+    #[serde(default)]
+    pub launch: HashMap<String, ProductLaunchEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ProductLaunchEntry {
+    #[serde(default)]
+    pub executable: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub oslist: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CommonNode {
+    #[serde(default)]
+    pub dlc: HashMap<String, String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

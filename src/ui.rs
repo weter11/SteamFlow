@@ -3,7 +3,7 @@ use crate::config::{
 };
 use crate::depot_browser::{DepotInfo, ManifestFileEntry};
 use crate::download_pipeline::DepotPlatform;
-use crate::install::{InstallPipeline, InstallStage, ProgressEvent};
+use crate::install::{InstallPipeline, ProgressEvent};
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
     DownloadProgress, DownloadProgressState, LibraryGame, SteamGuardReq, UserProfile,
@@ -66,6 +66,14 @@ struct LaunchSelectorState {
     always_use: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameTab {
+    Options,
+    Mods,
+    Info,
+    Misc,
+}
+
 pub struct SteamLauncher {
     runtime: Runtime,
     pub client: SteamClient,
@@ -101,6 +109,8 @@ pub struct SteamLauncher {
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
+    current_tab: GameTab,
+    extended_info: HashMap<u32, crate::steam_client::ExtendedAppInfo>,
 }
 
 impl SteamLauncher {
@@ -151,6 +161,8 @@ impl SteamLauncher {
             depot_browser: None,
             platform_selection: None,
             launch_selector: None,
+            current_tab: GameTab::Options,
+            extended_info: HashMap::new(),
         }
     }
 
@@ -764,6 +776,169 @@ impl SteamLauncher {
         }
     }
 
+    fn draw_options_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.heading("Compatibility Layer");
+            let mut config = self
+                .launcher_config
+                .game_configs
+                .get(&game.app_id)
+                .cloned()
+                .unwrap_or_default();
+            let mut force_proton = config.forced_proton_version.is_some();
+            if ui
+                .checkbox(&mut force_proton, "Force specific Proton/Wine version")
+                .changed()
+            {
+                if force_proton {
+                    config.forced_proton_version = Some(self.launcher_config.proton_version.clone());
+                } else {
+                    config.forced_proton_version = None;
+                }
+            }
+
+            if let Some(ref mut version) = config.forced_proton_version {
+                let selected_list = if self.proton_source == ProtonSource::Steam {
+                    &self.steam_protons
+                } else {
+                    &self.custom_protons
+                };
+
+                egui::ComboBox::from_id_salt("forced_proton_selector")
+                    .selected_text(version.clone())
+                    .show_ui(ui, |ui| {
+                        for entry in selected_list {
+                            ui.selectable_value(version, entry.clone(), entry);
+                        }
+                    });
+            }
+
+            if self.launcher_config.game_configs.get(&game.app_id) != Some(&config) {
+                self.launcher_config.game_configs.insert(game.app_id, config);
+                let _ = self.runtime.block_on(self.launcher_config.save());
+            }
+
+            ui.add_space(16.0);
+            ui.heading("Platform Preference");
+            let current_platform = if game.is_installed {
+                if game.active_branch.contains("experimental")
+                    || game
+                        .install_path
+                        .as_ref()
+                        .map(|p| p.contains("compatdata"))
+                        .unwrap_or(false)
+                {
+                    "Windows (Proton)"
+                } else {
+                    "Linux Native"
+                }
+            } else {
+                "Not Installed"
+            };
+            ui.label(format!("Current Version: {}", current_platform));
+            if ui.button("Switch Platform").clicked() {
+                let platforms = self
+                    .runtime
+                    .block_on(self.client.get_available_platforms(game.app_id))
+                    .unwrap_or_default();
+                self.platform_selection = Some(PlatformSelectionState {
+                    app_id: game.app_id,
+                    game_name: game.name.clone(),
+                    available: platforms,
+                });
+            }
+
+            ui.add_space(16.0);
+            ui.heading("Maintenance");
+            ui.horizontal(|ui| {
+                if ui.button("Verify Integrity").clicked() {
+                    match self.client.verify_game(game.app_id) {
+                        Ok(rx) => {
+                            self.download_receiver = Some(rx);
+                            self.active_download_appid = Some(game.app_id);
+                            self.status = format!("Started verify for app {}", game.app_id);
+                        }
+                        Err(err) => {
+                            self.status = format!("Failed to verify {}: {err}", game.app_id);
+                        }
+                    }
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Uninstall").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(200, 45, 45)),
+                    )
+                    .clicked()
+                {
+                    self.open_uninstall_modal(game);
+                }
+            });
+        });
+    }
+
+    fn draw_info_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
+        if !self.extended_info.contains_key(&game.app_id) {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                if ui.button("Fetch Extended Info").clicked() {
+                    match self
+                        .runtime
+                        .block_on(self.client.get_extended_app_info(game.app_id))
+                    {
+                        Ok(info) => {
+                            self.extended_info.insert(game.app_id, info);
+                        }
+                        Err(e) => {
+                            self.status = format!("Failed to fetch extended info: {e}");
+                        }
+                    }
+                }
+            });
+            return;
+        }
+
+        let info = self.extended_info.get(&game.app_id).cloned().unwrap();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Branches");
+            ui.label(format!("Active Branch: {}", info.active_branch));
+            if ui.button("Switch Branch...").clicked() {
+                self.open_properties_modal(game);
+            }
+
+            ui.add_space(8.0);
+            ui.heading("DLCs");
+            if info.dlcs.is_empty() {
+                ui.label("None found");
+            } else {
+                for dlc_id in &info.dlcs {
+                    ui.label(format!("AppID: {}", dlc_id));
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Depots");
+            if ui.button("Open Depot Browser...").clicked() {
+                self.open_depot_browser(game);
+            }
+            for (id, name) in &info.depots {
+                ui.label(format!("{}: {}", id, name));
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Launch Options");
+            for opt in &info.launch_options {
+                ui.group(|ui| {
+                    ui.label(format!("Executable: {}", opt.executable));
+                    ui.label(format!("Arguments: {}", opt.arguments));
+                });
+            }
+        });
+    }
+
     fn draw_uninstall_modal(&mut self, ctx: &egui::Context) {
         let mut do_uninstall = None;
         let mut close = false;
@@ -1205,37 +1380,23 @@ impl eframe::App for SteamLauncher {
                         }
 
                         response.context_menu(|ui| {
-                            if ui.button("Verify Integrity").clicked() {
-                                match self.client.verify_game(app_id) {
-                                    Ok(rx) => {
-                                        self.download_receiver = Some(rx);
-                                        self.active_download_appid = Some(app_id);
-                                        self.status = format!("Started verify for app {}", app_id);
-                                    }
-                                    Err(err) => {
-                                        self.status = format!("Failed to verify {}: {err}", app_id);
-                                    }
+                            if ui.button("Play").clicked() {
+                                if game.is_installed {
+                                    self.handle_play_click(game);
+                                } else {
+                                    self.status = "Game not installed".to_string();
                                 }
                                 ui.close();
                             }
-
-                            ui.menu_button("Manage", |ui| {
-                                if ui.button("Properties").clicked() {
-                                    self.open_properties_modal(game);
-                                    ui.close();
-                                }
-                                if ui.button("Uninstall").clicked() {
-                                    self.open_uninstall_modal(game);
-                                    ui.close();
-                                }
-                            });
-
-                            ui.menu_button("Advanced", |ui| {
-                                if ui.button("Depot Browser").clicked() {
-                                    self.open_depot_browser(game);
-                                    ui.close();
-                                }
-                            });
+                            if ui.button("Cloud Saves").clicked() {
+                                self.status = "Cloud Saves modal (placeholder)".to_string();
+                                ui.close();
+                            }
+                            if ui.button("Properties").clicked() {
+                                self.selected_app = Some(app_id);
+                                self.current_tab = GameTab::Options;
+                                ui.close();
+                            }
                         });
 
                         if game.update_available {
@@ -1258,25 +1419,102 @@ impl eframe::App for SteamLauncher {
             if let Some(game) = self.selected_game().cloned() {
                 self.ensure_image_requested(game.app_id);
 
-                if let Some(texture) = self.image_cache.get(&game.app_id) {
-                    ui.image(texture);
-                } else {
-                    ui.label("Loading cover...");
-                    ui.add_space(8.0);
-                }
+                ui.horizontal(|ui| {
+                    if let Some(texture) = self.image_cache.get(&game.app_id) {
+                        ui.add(egui::Image::new(texture).max_width(150.0));
+                    } else {
+                        ui.allocate_ui(egui::vec2(150.0, 225.0), |ui| {
+                            ui.centered_and_justified(|ui| {
+                                ui.label("Loading...");
+                            });
+                        });
+                    }
 
-                ui.heading(egui::RichText::new(game.name.clone()).size(30.0));
-                ui.label(format!("AppID: {}", game.app_id));
-                if let Some(job) =
-                    self.install_pipeline.jobs().iter().find(|job| {
-                        job.app_id == game.app_id && job.stage != InstallStage::Complete
-                    })
-                {
-                    ui.label(format!(
-                        "Install pipeline stage: {:?} ({}%)",
-                        job.stage, job.progress_percent
-                    ));
-                }
+                    ui.vertical(|ui| {
+                        ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
+                        ui.label(format!("AppID: {}", game.app_id));
+
+                        ui.add_space(20.0);
+
+                        ui.horizontal(|ui| {
+                            if game.is_installed {
+                                let play_btn = egui::Button::new(
+                                    egui::RichText::new("PLAY")
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(egui::Color32::from_rgb(46, 125, 50))
+                                .min_size(egui::vec2(120.0, 40.0));
+
+                                if ui.add(play_btn).clicked() {
+                                    self.handle_play_click(&game);
+                                }
+
+                                if game.update_available {
+                                    ui.add_space(50.0);
+                                    let update_btn = egui::Button::new(
+                                        egui::RichText::new("UPDATE AVAILABLE")
+                                            .color(egui::Color32::WHITE)
+                                            .strong(),
+                                    )
+                                    .fill(egui::Color32::from_rgb(33, 150, 243))
+                                    .min_size(egui::vec2(120.0, 40.0));
+
+                                    if ui
+                                        .add_enabled(!self.client.is_offline(), update_btn)
+                                        .clicked()
+                                    {
+                                        match self.client.update_game(game.app_id) {
+                                            Ok(rx) => {
+                                                self.download_receiver = Some(rx);
+                                                self.active_download_appid = Some(game.app_id);
+                                                self.status = format!(
+                                                    "Started update for app {}",
+                                                    game.app_id
+                                                );
+                                            }
+                                            Err(err) => {
+                                                self.status = format!(
+                                                    "Failed to start update for {}: {err}",
+                                                    game.app_id
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                let install_btn = egui::Button::new(
+                                    egui::RichText::new("INSTALL")
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(egui::Color32::from_rgb(46, 125, 50))
+                                .min_size(egui::vec2(120.0, 40.0));
+
+                                if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
+                                {
+                                    let platforms = self
+                                        .runtime
+                                        .block_on(self.client.get_available_platforms(game.app_id))
+                                        .unwrap_or_default();
+                                    if platforms.len() > 1 {
+                                        self.platform_selection = Some(PlatformSelectionState {
+                                            app_id: game.app_id,
+                                            game_name: game.name.clone(),
+                                            available: platforms,
+                                        });
+                                    } else {
+                                        let platform =
+                                            platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
+                                        self.start_install(game.app_id, platform);
+                                    }
+                                }
+                            }
+                        });
+                    });
+                });
+
+                ui.add_space(10.0);
 
                 if let Some(progress) = &self.live_download_progress {
                     let denom = if progress.total_bytes == 0 {
@@ -1296,123 +1534,27 @@ impl eframe::App for SteamLauncher {
                                 progress.total_bytes
                             )),
                     );
-                } else if let Some(progress) = &self.current_download_progress {
-                    if progress.total_bytes > 0 {
-                        let fraction =
-                            progress.bytes_downloaded as f32 / progress.total_bytes as f32;
-                        ui.add(
-                            egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                                .show_percentage()
-                                .text(format!(
-                                    "{} ({} / {} bytes)",
-                                    progress.file_name,
-                                    progress.bytes_downloaded,
-                                    progress.total_bytes
-                                )),
-                        );
-                    }
                 }
 
-                ui.add_space(12.0);
-                if game.is_installed {
-                    ui.horizontal(|ui| {
-                        let button = egui::Button::new(
-                            egui::RichText::new("PLAY")
-                                .color(egui::Color32::WHITE)
-                                .strong(),
-                        )
-                        .fill(egui::Color32::from_rgb(46, 125, 50))
-                        .min_size(egui::vec2(160.0, 42.0));
+                ui.separator();
 
-                        if ui.add(button).clicked() {
-                            self.handle_play_click(&game);
-                        }
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.current_tab, GameTab::Options, "Options");
+                    ui.selectable_value(&mut self.current_tab, GameTab::Mods, "Mods");
+                    ui.selectable_value(&mut self.current_tab, GameTab::Info, "Info");
+                    ui.selectable_value(&mut self.current_tab, GameTab::Misc, "Misc");
+                });
 
-                        ui.menu_button("⚙", |ui| {
-                            if ui.button("Verify Integrity").clicked() {
-                                match self.client.verify_game(game.app_id) {
-                                    Ok(rx) => {
-                                        self.download_receiver = Some(rx);
-                                        self.active_download_appid = Some(game.app_id);
-                                        self.status = format!("Started verify for app {}", game.app_id);
-                                    }
-                                    Err(err) => {
-                                        self.status = format!("Failed to verify {}: {err}", game.app_id);
-                                    }
-                                }
-                                ui.close();
-                            }
+                ui.add_space(8.0);
 
-                            if ui.button("Properties").clicked() {
-                                self.open_properties_modal(&game);
-                                ui.close();
-                            }
-
-                            if ui.button("Uninstall").clicked() {
-                                self.open_uninstall_modal(&game);
-                                ui.close();
-                            }
-
-                            if ui.button("Depot Browser").clicked() {
-                                self.open_depot_browser(&game);
-                                ui.close();
-                            }
-                        });
-
-                        if game.update_available {
-                            let update_button = egui::Button::new(
-                                egui::RichText::new("⬇ Update")
-                                    .color(egui::Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(egui::Color32::from_rgb(33, 150, 243))
-                            .min_size(egui::vec2(100.0, 42.0));
-
-                            if ui
-                                .add_enabled(!self.client.is_offline(), update_button)
-                                .clicked()
-                            {
-                                match self.client.update_game(game.app_id) {
-                                    Ok(rx) => {
-                                        self.download_receiver = Some(rx);
-                                        self.active_download_appid = Some(game.app_id);
-                                        self.status =
-                                            format!("Started update for app {}", game.app_id);
-                                    }
-                                    Err(err) => {
-                                        self.status = format!(
-                                            "Failed to start update for {}: {err}",
-                                            game.app_id
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    let button = egui::Button::new(
-                        egui::RichText::new("INSTALL")
-                            .color(egui::Color32::WHITE)
-                            .strong(),
-                    )
-                    .fill(egui::Color32::from_rgb(33, 150, 243))
-                    .min_size(egui::vec2(160.0, 42.0));
-
-                    if self.client.is_offline() {
-                        ui.label("Downloads disabled in offline mode.");
+                match self.current_tab {
+                    GameTab::Options => self.draw_options_tab(&game, ui),
+                    GameTab::Mods => {
+                        ui.label("Coming Soon");
                     }
-                    if ui.add_enabled(!self.client.is_offline(), button).clicked() {
-                        let platforms = self.runtime.block_on(self.client.get_available_platforms(game.app_id)).unwrap_or_default();
-                        if platforms.len() > 1 {
-                            self.platform_selection = Some(PlatformSelectionState {
-                                app_id: game.app_id,
-                                game_name: game.name.clone(),
-                                available: platforms,
-                            });
-                        } else {
-                            let platform = platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
-                            self.start_install(game.app_id, platform);
-                        }
+                    GameTab::Info => self.draw_info_tab(&game, ui),
+                    GameTab::Misc => {
+                        ui.label("Coming Soon");
                     }
                 }
             } else {

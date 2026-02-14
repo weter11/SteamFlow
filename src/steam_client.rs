@@ -65,6 +65,20 @@ pub struct LaunchInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct RawLaunchOption {
+    pub executable: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtendedAppInfo {
+    pub dlcs: Vec<u32>,
+    pub depots: Vec<(u32, String)>,
+    pub launch_options: Vec<RawLaunchOption>,
+    pub active_branch: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ConfirmationPrompt {
     pub requirement: SteamGuardReq,
     pub details: String,
@@ -871,6 +885,100 @@ impl SteamClient {
         })
     }
 
+    pub async fn get_extended_app_info(&self, appid: u32) -> Result<ExtendedAppInfo> {
+        let connection = self
+            .connection
+            .as_ref()
+            .context("steam connection not initialized")?;
+
+        let mut request = CMsgClientPICSProductInfoRequest::new();
+        request
+            .apps
+            .push(cmsg_client_picsproduct_info_request::AppInfo {
+                appid: Some(appid),
+                ..Default::default()
+            });
+
+        let response: CMsgClientPICSProductInfoResponse = connection
+            .job(request)
+            .await
+            .context("failed requesting appinfo product info for extended metadata")?;
+
+        let app = response
+            .apps
+            .iter()
+            .find(|entry| entry.appid() == appid)
+            .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
+
+        let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let parsed: AppInfoRoot =
+            keyvalues_serde::from_str(&raw_vdf).context("failed to parse product info VDF")?;
+
+        let common = parsed
+            .appinfo
+            .as_ref()
+            .and_then(|a| a.common.as_ref())
+            .or(parsed.common.as_ref());
+        let dlcs = common
+            .map(|c| {
+                c.dlc
+                    .keys()
+                    .filter_map(|k| k.parse::<u32>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let depots_map = parsed
+            .appinfo
+            .as_ref()
+            .map(|a| &a.depots)
+            .unwrap_or(&parsed.depots);
+        let mut depots = Vec::new();
+        for (id_str, node) in depots_map {
+            if id_str.chars().all(|c| c.is_ascii_digit()) {
+                let id = id_str.parse::<u32>().unwrap_or(0);
+                let name = node
+                    ._other
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown Depot")
+                    .to_string();
+                depots.push((id, name));
+            }
+        }
+
+        let config = parsed
+            .appinfo
+            .as_ref()
+            .and_then(|a| a.config.as_ref())
+            .or(parsed.config.as_ref());
+
+        let mut launch_options = Vec::new();
+        if let Some(config) = config {
+            for entry in config.launch.values() {
+                launch_options.push(RawLaunchOption {
+                    executable: entry.executable.clone().unwrap_or_default(),
+                    arguments: entry.arguments.clone().unwrap_or_default(),
+                });
+            }
+        }
+
+        let manifest_path = self.appmanifest_path(appid)?;
+        let active_branch = if manifest_path.exists() {
+            let raw = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+            parse_active_branch_from_acf(&raw)
+        } else {
+            "public".to_string()
+        };
+
+        Ok(ExtendedAppInfo {
+            dlcs,
+            depots,
+            launch_options,
+            active_branch,
+        })
+    }
+
     pub async fn get_product_info(&mut self, appid: u32, prefer_proton: bool) -> Result<Vec<LaunchInfo>> {
         let connection = self
             .connection
@@ -1252,13 +1360,21 @@ impl SteamClient {
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
-                let proton = proton_path
-                    .filter(|p| !p.is_empty())
-                    .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?;
-
                 let launcher_config = match tokio::runtime::Handle::try_current() {
                     Ok(handle) => handle.block_on(load_launcher_config()).unwrap_or_default(),
                     Err(_) => crate::config::LauncherConfig::default(),
+                };
+
+                let proton = if let Some(forced) = launcher_config
+                    .game_configs
+                    .get(&app.app_id)
+                    .and_then(|c| c.forced_proton_version.as_ref())
+                {
+                    forced
+                } else {
+                    proton_path
+                        .filter(|p| !p.is_empty())
+                        .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
                 };
 
                 let compat_data_path = if launcher_config.use_shared_compat_data {
