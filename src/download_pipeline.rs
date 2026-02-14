@@ -537,20 +537,20 @@ pub async fn phase4_download_chunks_async(
     state.download_all_files().await
 }
 
-pub fn phase4_download_chunks(
+pub async fn phase4_download_chunks(
     manifest: &ContentManifestPayload,
     security: &SecurityInfo,
     install_root: &Path,
     smart_verify_existing: bool,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(phase4_download_chunks_async(
+    phase4_download_chunks_async(
         manifest.clone(),
         security.clone(),
         install_root.to_path_buf(),
         smart_verify_existing,
         None,
-    ))
+    )
+    .await
 }
 
 pub async fn execute_multi_depot_download_async(
@@ -576,34 +576,31 @@ pub async fn execute_multi_depot_download_async(
     Ok(())
 }
 
-pub fn execute_four_step_download(
+pub async fn execute_four_step_download(
     connection: &Connection,
     plan: &DepotDownloadPlan,
     install_root: &Path,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let selection = phase1_get_manifest_id(
-            connection,
-            plan.app_id,
-            plan.platform,
-            &plan.language,
-        )
-        .await?;
+    let selection = phase1_get_manifest_id(
+        connection,
+        plan.app_id,
+        plan.platform,
+        &plan.language,
+    )
+    .await?;
 
-        execute_multi_depot_download_async(
-            connection,
-            plan.app_id,
-            vec![selection],
-            install_root.to_path_buf(),
-            false,
-            None,
-        )
-        .await
-    })
+    execute_multi_depot_download_async(
+        connection,
+        plan.app_id,
+        vec![selection],
+        install_root.to_path_buf(),
+        false,
+        None,
+    )
+    .await
 }
 
-pub fn execute_download_with_manifest_id(
+pub async fn execute_download_with_manifest_id(
     connection: &Connection,
     app_id: u32,
     depot_id: u32,
@@ -611,17 +608,15 @@ pub fn execute_download_with_manifest_id(
     install_root: &Path,
     smart_verify_existing: bool,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
-
-    let security = runtime.block_on(phase2_get_security_info(connection, app_id, depot_id))?;
+    let security = phase2_get_security_info(connection, app_id, depot_id).await?;
     let selection = ManifestSelection {
         app_id,
         depot_id,
         manifest_id,
         appinfo_vdf: String::new(),
     };
-    let manifest = runtime.block_on(phase3_download_manifest(&selection, &security))?;
-    phase4_download_chunks(&manifest, &security, install_root, smart_verify_existing)?;
+    let manifest = phase3_download_manifest(&selection, &security).await?;
+    phase4_download_chunks(&manifest, &security, install_root, smart_verify_existing).await?;
     Ok(())
 }
 

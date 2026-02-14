@@ -135,7 +135,7 @@ pub async fn fetch_manifest_files(
     Ok(files)
 }
 
-pub fn download_single_file(
+pub async fn download_single_file(
     connection: &Connection,
     appid: u32,
     depot_id: u32,
@@ -143,21 +143,15 @@ pub fn download_single_file(
     file_path: &str,
     output_dir: &Path,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    let manifest_id = runtime.block_on(resolve_manifest_id(
-        connection,
-        appid,
-        depot_id,
-        manifest_ref,
-    ))?;
-    let security = runtime.block_on(phase2_get_security_info(connection, appid, depot_id))?;
+    let manifest_id = resolve_manifest_id(connection, appid, depot_id, manifest_ref).await?;
+    let security = phase2_get_security_info(connection, appid, depot_id).await?;
     let selection = ManifestSelection {
         app_id: appid,
         depot_id,
         manifest_id,
         appinfo_vdf: String::new(),
     };
-    let manifest = runtime.block_on(phase3_download_manifest(&selection, &security))?;
+    let manifest = phase3_download_manifest(&selection, &security).await?;
 
     let file_entry = manifest
         .mappings
@@ -176,7 +170,7 @@ pub fn download_single_file(
         None,
         false,
     );
-    runtime.block_on(state.download_file(file_entry))
+    state.download_file(file_entry).await
 }
 
 async fn resolve_manifest_id(
