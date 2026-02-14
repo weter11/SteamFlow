@@ -2,6 +2,7 @@ use crate::config::{
     load_launcher_config, opensteam_image_cache_dir, save_launcher_config, LauncherConfig,
 };
 use crate::depot_browser::{DepotInfo, ManifestFileEntry};
+use crate::download_pipeline::DepotPlatform;
 use crate::install::{InstallPipeline, InstallStage, ProgressEvent};
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
@@ -40,6 +41,13 @@ struct DepotBrowserState {
     files: Vec<ManifestFileEntry>,
 }
 
+#[derive(Debug, Clone)]
+struct PlatformSelectionState {
+    app_id: u32,
+    game_name: String,
+    available: Vec<DepotPlatform>,
+}
+
 pub struct SteamLauncher {
     runtime: Runtime,
     pub client: SteamClient,
@@ -72,6 +80,7 @@ pub struct SteamLauncher {
     user_profile: Option<UserProfile>,
     uninstall_modal: Option<UninstallModalState>,
     depot_browser: Option<DepotBrowserState>,
+    platform_selection: Option<PlatformSelectionState>,
 }
 
 impl SteamLauncher {
@@ -119,6 +128,7 @@ impl SteamLauncher {
             user_profile,
             uninstall_modal: None,
             depot_browser: None,
+            platform_selection: None,
         }
     }
 
@@ -298,6 +308,20 @@ impl SteamLauncher {
                     self.play_result_rx = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    fn start_install(&mut self, app_id: u32, platform: DepotPlatform) {
+        self.install_pipeline.enqueue(app_id);
+        match self.client.install_game(app_id, platform) {
+            Ok(rx) => {
+                self.download_receiver = Some(rx);
+                self.active_download_appid = Some(app_id);
+                self.status = format!("Started install for app {}", app_id);
+            }
+            Err(err) => {
+                self.status = format!("Failed to start install for {}: {err}", app_id);
             }
         }
     }
@@ -483,6 +507,42 @@ impl SteamLauncher {
             Err(err) => {
                 self.status = format!("Failed to load depots for {}: {err}", game.name);
             }
+        }
+    }
+
+    fn draw_platform_selection_modal(&mut self, ctx: &egui::Context) {
+        let mut selection = None;
+        let mut close = false;
+
+        if let Some(state) = &self.platform_selection {
+            egui::Window::new("Select Version to Install")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Select version of {} to install:", state.game_name));
+                    ui.add_space(8.0);
+
+                    for platform in &state.available {
+                        let label = match platform {
+                            DepotPlatform::Windows => "Windows (Proton)",
+                            DepotPlatform::Linux => "Linux (Native)",
+                        };
+                        if ui.button(label).clicked() {
+                            selection = Some((state.app_id, *platform));
+                        }
+                    }
+
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+        }
+
+        if let Some((app_id, platform)) = selection {
+            self.start_install(app_id, platform);
+            self.platform_selection = None;
+        } else if close {
+            self.platform_selection = None;
         }
     }
 
@@ -1081,17 +1141,16 @@ impl eframe::App for SteamLauncher {
                         ui.label("Downloads disabled in offline mode.");
                     }
                     if ui.add_enabled(!self.client.is_offline(), button).clicked() {
-                        self.install_pipeline.enqueue(game.app_id);
-                        match self.client.install_game(game.app_id) {
-                            Ok(rx) => {
-                                self.download_receiver = Some(rx);
-                                self.active_download_appid = Some(game.app_id);
-                                self.status = format!("Started install for app {}", game.app_id);
-                            }
-                            Err(err) => {
-                                self.status =
-                                    format!("Failed to start install for {}: {err}", game.app_id);
-                            }
+                        let platforms = self.runtime.block_on(self.client.get_available_platforms(game.app_id)).unwrap_or_default();
+                        if platforms.len() > 1 {
+                            self.platform_selection = Some(PlatformSelectionState {
+                                app_id: game.app_id,
+                                game_name: game.name.clone(),
+                                available: platforms,
+                            });
+                        } else {
+                            let platform = platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
+                            self.start_install(game.app_id, platform);
                         }
                     }
                 }
@@ -1103,6 +1162,7 @@ impl eframe::App for SteamLauncher {
 
         self.draw_uninstall_modal(ctx);
         self.draw_depot_browser_window(ctx);
+        self.draw_platform_selection_modal(ctx);
         ctx.request_repaint();
     }
 }

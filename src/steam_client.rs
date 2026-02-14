@@ -5,7 +5,9 @@ use crate::config::{
     save_session,
 };
 use crate::depot_browser::{self, DepotInfo, ManifestFileEntry};
-use crate::download_pipeline::{self, DepotDownloadPlan, DepotPlatform};
+use crate::download_pipeline::{
+    self, should_keep_depot, AppInfoRoot, DepotPlatform, ManifestSelection,
+};
 use crate::models::{
     DownloadProgress, DownloadProgressState, LibraryGame, OwnedGame, SessionState, SteamGuardReq,
     UserProfile,
@@ -296,7 +298,76 @@ impl SteamClient {
         })
     }
 
-    pub fn install_game(&self, appid: u32) -> Result<Receiver<DownloadProgress>> {
+    pub async fn get_available_platforms(&mut self, appid: u32) -> Result<Vec<DepotPlatform>> {
+        let connection = self
+            .connection
+            .as_ref()
+            .context("steam connection not initialized")?;
+
+        let mut request = CMsgClientPICSProductInfoRequest::new();
+        request
+            .apps
+            .push(cmsg_client_picsproduct_info_request::AppInfo {
+                appid: Some(appid),
+                ..Default::default()
+            });
+
+        let response: CMsgClientPICSProductInfoResponse = connection
+            .job(request)
+            .await
+            .context("failed requesting appinfo product info")?;
+
+        let app = response
+            .apps
+            .iter()
+            .find(|entry| entry.appid() == appid)
+            .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
+
+        let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let parsed: AppInfoRoot =
+            keyvalues_serde::from_str(&appinfo_vdf).context("failed parsing appinfo VDF")?;
+        let depots = parsed
+            .appinfo
+            .map(|node| node.depots)
+            .unwrap_or(parsed.depots);
+
+        let mut has_linux = false;
+        let mut has_windows = false;
+
+        for node in depots.values() {
+            if let Some(config) = &node.config {
+                if let Some(oslist) = &config.oslist {
+                    let oslist = oslist.to_lowercase();
+                    if oslist.contains("linux") {
+                        has_linux = true;
+                    }
+                    if oslist.contains("windows") {
+                        has_windows = true;
+                    }
+                }
+            }
+        }
+
+        let mut platforms = Vec::new();
+        if has_windows {
+            platforms.push(DepotPlatform::Windows);
+        }
+        if has_linux {
+            platforms.push(DepotPlatform::Linux);
+        }
+
+        if platforms.is_empty() {
+            platforms.push(DepotPlatform::Windows);
+        }
+
+        Ok(platforms)
+    }
+
+    pub fn install_game(
+        &self,
+        appid: u32,
+        platform: DepotPlatform,
+    ) -> Result<Receiver<DownloadProgress>> {
         let connection = self
             .connection
             .as_ref()
@@ -328,30 +399,120 @@ impl SteamClient {
                 })
                 .await;
 
-            let plan = DepotDownloadPlan {
-                app_id: appid,
-                depot_id: 0,
-                manifest_id: 0,
-                platform: DepotPlatform::Linux,
-                language: "english".to_string(),
+            let mut request = CMsgClientPICSProductInfoRequest::new();
+            request
+                .apps
+                .push(cmsg_client_picsproduct_info_request::AppInfo {
+                    appid: Some(appid),
+                    ..Default::default()
+                });
+
+            let response: CMsgClientPICSProductInfoResponse = match connection.job(request).await {
+                Ok(res) => res,
+                Err(e) => {
+                    let _ = tx
+                        .send(DownloadProgress {
+                            state: DownloadProgressState::Failed,
+                            bytes_downloaded: 0,
+                            total_bytes: 0,
+                            current_file: format!("failed requesting appinfo: {e}"),
+                        })
+                        .await;
+                    return;
+                }
             };
+
+            let app = response.apps.iter().find(|entry| entry.appid() == appid);
+            let Some(app) = app else {
+                let _ = tx
+                    .send(DownloadProgress {
+                        state: DownloadProgressState::Failed,
+                        bytes_downloaded: 0,
+                        total_bytes: 0,
+                        current_file: "missing appinfo payload".to_string(),
+                    })
+                    .await;
+                return;
+            };
+
+            let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+            let parsed: AppInfoRoot = match keyvalues_serde::from_str(&appinfo_vdf) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx
+                        .send(DownloadProgress {
+                            state: DownloadProgressState::Failed,
+                            bytes_downloaded: 0,
+                            total_bytes: 0,
+                            current_file: format!("failed parsing appinfo: {e}"),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            let depots = parsed
+                .appinfo
+                .map(|node| node.depots)
+                .unwrap_or(parsed.depots);
+
+            let mut selections = Vec::new();
+            for (depot_id_str, node) in depots {
+                if !depot_id_str.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+
+                let oslist = node.config.as_ref().and_then(|c| c.oslist.as_deref());
+                if !should_keep_depot(oslist, platform) {
+                    continue;
+                }
+
+                if let Some(manifests) = node.manifests {
+                    if let Some(gid_text) = manifests.public {
+                        if let (Ok(d_id), Ok(m_id)) = (depot_id_str.parse::<u32>(), gid_text.parse::<u64>()) {
+                            selections.push(ManifestSelection {
+                                app_id: appid,
+                                depot_id: d_id,
+                                manifest_id: m_id,
+                                appinfo_vdf: appinfo_vdf.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+
+            if selections.is_empty() {
+                let _ = tx
+                    .send(DownloadProgress {
+                        state: DownloadProgressState::Failed,
+                        bytes_downloaded: 0,
+                        total_bytes: 0,
+                        current_file: "no matching depots found for platform".to_string(),
+                    })
+                    .await;
+                return;
+            }
 
             let _ = tx
                 .send(DownloadProgress {
                     state: DownloadProgressState::Downloading,
                     bytes_downloaded: 0,
                     total_bytes: 0,
-                    current_file: "resolving manifest".to_string(),
+                    current_file: format!("starting download of {} depots", selections.len()),
                 })
                 .await;
 
-            let result = tokio::task::spawn_blocking(move || {
-                download_pipeline::execute_four_step_download(&connection, &plan, &install_dir)
-            })
+            let result = download_pipeline::execute_multi_depot_download_async(
+                &connection,
+                appid,
+                selections,
+                install_dir,
+                None,
+            )
             .await;
 
             match result {
-                Ok(Ok(())) => {
+                Ok(()) => {
                     if let Err(err) =
                         SteamClient::write_basic_appmanifest(&manifest_path, appid, &game_name)
                     {
@@ -366,23 +527,13 @@ impl SteamClient {
                         })
                         .await;
                 }
-                Ok(Err(err)) => {
-                    let _ = tx
-                        .send(DownloadProgress {
-                            state: DownloadProgressState::Failed,
-                            bytes_downloaded: 0,
-                            total_bytes: 0,
-                            current_file: err.to_string(),
-                        })
-                        .await;
-                }
                 Err(err) => {
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
                             bytes_downloaded: 0,
                             total_bytes: 0,
-                            current_file: format!("download task join failure: {err}"),
+                            current_file: err.to_string(),
                         })
                         .await;
                 }

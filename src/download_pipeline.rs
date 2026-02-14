@@ -64,41 +64,76 @@ pub struct DepotDownloadPlan {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct AppInfoRoot {
+pub struct AppInfoRoot {
     #[serde(default)]
-    appinfo: Option<AppInfoNode>,
+    pub appinfo: Option<AppInfoNode>,
     #[serde(default)]
-    depots: HashMap<String, DepotNode>,
+    pub depots: HashMap<String, DepotNode>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct AppInfoNode {
+pub struct AppInfoNode {
     #[serde(default)]
-    depots: HashMap<String, DepotNode>,
+    pub depots: HashMap<String, DepotNode>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct DepotNode {
+pub struct DepotNode {
     #[serde(default)]
-    config: Option<DepotConfig>,
+    pub config: Option<DepotConfig>,
     #[serde(default)]
-    manifests: Option<DepotManifests>,
+    pub manifests: Option<DepotManifests>,
     #[serde(flatten)]
-    _other: HashMap<String, serde_json::Value>,
+    pub _other: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct DepotConfig {
+pub struct DepotConfig {
     #[serde(default)]
-    oslist: Option<String>,
+    pub oslist: Option<String>,
     #[serde(default)]
-    language: Option<String>,
+    pub language: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct DepotManifests {
+pub struct DepotManifests {
     #[serde(default)]
-    public: Option<String>,
+    pub public: Option<String>,
+}
+
+pub fn should_keep_depot(oslist: Option<&str>, target: DepotPlatform) -> bool {
+    match target {
+        DepotPlatform::Windows => {
+            match oslist {
+                Some(os) => {
+                    let os = os.to_lowercase();
+                    if os.contains("windows") {
+                        return true;
+                    }
+                    if os.contains("linux") || os.contains("macos") {
+                        return false;
+                    }
+                    true
+                }
+                None => true,
+            }
+        }
+        DepotPlatform::Linux => {
+            match oslist {
+                Some(os) => {
+                    let os = os.to_lowercase();
+                    if os.contains("linux") {
+                        return true;
+                    }
+                    if os.contains("windows") || os.contains("macos") {
+                        return false;
+                    }
+                    true
+                }
+                None => true,
+            }
+        }
+    }
 }
 
 pub async fn phase1_get_manifest_id(
@@ -436,24 +471,64 @@ pub fn process_chunk(chunk_data: Vec<u8>, depot_key: &[u8]) -> Vec<u8> {
     decompress_chunk_best_effort(&decrypted).unwrap_or(decrypted)
 }
 
+pub async fn phase4_download_chunks_async(
+    manifest: ContentManifestPayload,
+    security: SecurityInfo,
+    install_root: PathBuf,
+    smart_verify_existing: bool,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+) -> Result<()> {
+    if !install_root.exists() {
+        std::fs::create_dir_all(&install_root)
+            .with_context(|| format!("failed creating install root {}", install_root.display()))?;
+    }
+
+    let state = DownloadState::new(
+        manifest,
+        install_root,
+        security,
+        progress_tx,
+        smart_verify_existing,
+    );
+    state.download_all_files().await
+}
+
 pub fn phase4_download_chunks(
     manifest: &ContentManifestPayload,
     security: &SecurityInfo,
     install_root: &Path,
     smart_verify_existing: bool,
 ) -> Result<()> {
-    std::fs::create_dir_all(install_root)
-        .with_context(|| format!("failed creating install root {}", install_root.display()))?;
-
     let runtime = tokio::runtime::Runtime::new()?;
-    let state = DownloadState::new(
+    runtime.block_on(phase4_download_chunks_async(
         manifest.clone(),
-        install_root.to_path_buf(),
         security.clone(),
-        None,
+        install_root.to_path_buf(),
         smart_verify_existing,
-    );
-    runtime.block_on(state.download_all_files())
+        None,
+    ))
+}
+
+pub async fn execute_multi_depot_download_async(
+    connection: &Connection,
+    app_id: u32,
+    selections: Vec<ManifestSelection>,
+    install_root: PathBuf,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+) -> Result<()> {
+    for selection in selections {
+        let security = phase2_get_security_info(connection, app_id, selection.depot_id).await?;
+        let manifest = phase3_download_manifest(&selection, &security).await?;
+        phase4_download_chunks_async(
+            manifest,
+            security,
+            install_root.clone(),
+            false,
+            progress_tx.clone(),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub fn execute_four_step_download(
@@ -462,22 +537,24 @@ pub fn execute_four_step_download(
     install_root: &Path,
 ) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
-    let selection = runtime.block_on(phase1_get_manifest_id(
-        connection,
-        plan.app_id,
-        plan.platform,
-        &plan.language,
-    ))?;
+    runtime.block_on(async {
+        let selection = phase1_get_manifest_id(
+            connection,
+            plan.app_id,
+            plan.platform,
+            &plan.language,
+        )
+        .await?;
 
-    let security = runtime.block_on(phase2_get_security_info(
-        connection,
-        plan.app_id,
-        selection.depot_id,
-    ))?;
-
-    let manifest = runtime.block_on(phase3_download_manifest(&selection, &security))?;
-    phase4_download_chunks(&manifest, &security, install_root, false)?;
-    Ok(())
+        execute_multi_depot_download_async(
+            connection,
+            plan.app_id,
+            vec![selection],
+            install_root.to_path_buf(),
+            None,
+        )
+        .await
+    })
 }
 
 pub fn execute_download_with_manifest_id(
