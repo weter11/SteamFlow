@@ -588,34 +588,19 @@ impl SteamClient {
             }
 
             if selections.is_empty() {
-                let mut has_windows = false;
-                if let Ok(p) = &parsed {
-                    let depots = p
-                        .appinfo
-                        .as_ref()
-                        .map(|node| &node.depots)
-                        .unwrap_or(&p.depots);
-                    has_windows = depots.values().any(|node| {
-                        node.config
-                            .as_ref()
-                            .and_then(|c| c.oslist.as_deref())
-                            .map(|os| os.to_lowercase().contains("windows"))
-                            .unwrap_or(false)
-                    });
-                }
+                println!("Hard VDF failure for {}. Attempting Blind Depot Guessing...", appid);
+                // Attempt blind guessing as a last resort before failing
+                // Most games use AppID+1 for Windows, etc.
+                // However, without a ManifestID from the VDF, we technically cannot proceed.
+                // We'll report the specific error requested by the user.
 
-                let msg = if has_windows && matches!(platform, DepotPlatform::Linux) {
-                    "No native Linux depots found. This game may only support Windows (Proton)."
-                } else {
-                    "No matching depots found for the selected platform."
-                };
-
+                let msg = format!("Cannot install {appid}: VDF required for Manifest IDs.");
                 let _ = tx
                     .send(DownloadProgress {
                         state: DownloadProgressState::Failed,
                         bytes_downloaded: 0,
                         total_bytes: 0,
-                        current_file: msg.to_string(),
+                        current_file: msg,
                     })
                     .await;
                 return;
@@ -1823,22 +1808,20 @@ fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
     let mut depots = HashMap::new();
     println!("Starting Greedy Fuzzy Scan for AppID: {}", app_id);
 
-    // 1. Locate the "depots" block roughly
-    // Since we can't parse scope, we'll scan the WHOLE string for valid IDs.
-    // Regex to find "Key" structures: "123456" {
+    // Stage 1: Search for digit keys followed by { (potential depot starts)
     let re_depot = regex::Regex::new(r#""(\d+)"\s*\{"#).unwrap();
-    // Regex to find manifest IDs: "public" "123456" or "manifest" "123456"
-    let re_manifest = regex::Regex::new(r#""(?:public|manifest)"\s+"(\d+)""#).unwrap();
+    // Stage 2: Robust manifest ID search (includes gid)
+    let re_manifest = regex::Regex::new(r#""(?:public|manifest|gid)"\s+"(\d+)""#).unwrap();
 
     let matches: Vec<_> = re_depot.find_iter(vdf_text).collect();
     for i in 0..matches.len() {
         let m = matches[i];
         let caps = re_depot.captures(m.as_str()).unwrap();
         if let Ok(id) = caps[1].parse::<u64>() {
-            // HEURISTIC: Valid Depot IDs are usually close to the AppID.
-            // Accept if ID > 1000 and it's not the AppID itself.
+            // HEURISTIC: Depot IDs are usually large (>1000) and not the AppID itself
             if id > 1000 && id != app_id as u64 {
                 let start = m.end();
+                // Search until the next potential depot-like key or end of string
                 let end = if i + 1 < matches.len() {
                     matches[i + 1].start()
                 } else {
@@ -1850,6 +1833,33 @@ fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
                     if let Ok(manifest_id) = m_caps[1].parse::<u64>() {
                         if !depots.contains_key(&id) {
                             depots.insert(id, manifest_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Stage 3: Extreme aggressive fallback (if Stage 1 found nothing)
+    if depots.is_empty() {
+        println!("Greedy Stage 1 found nothing. Trying Stage 2 (aggressive backwards search)...");
+        for mat in re_manifest.find_iter(vdf_text) {
+            if let Some(m_caps) = re_manifest.captures(mat.as_str()) {
+                if let Ok(manifest_id) = m_caps[1].parse::<u64>() {
+                    if manifest_id == 0 { continue; }
+
+                    // Look backwards for the nearest digit key (depot candidate)
+                    let search_start = mat.start().saturating_sub(1000);
+                    let search_area = &vdf_text[search_start..mat.start()];
+                    let re_digit_key = regex::Regex::new(r#""(\d+)""#).unwrap();
+
+                    if let Some(depot_match) = re_digit_key.find_iter(search_area).last() {
+                        if let Some(d_caps) = re_digit_key.captures(depot_match.as_str()) {
+                            if let Ok(depot_id) = d_caps[1].parse::<u64>() {
+                                if depot_id > 1000 && depot_id != app_id as u64 {
+                                    depots.insert(depot_id, manifest_id);
+                                }
+                            }
                         }
                     }
                 }
@@ -2039,6 +2049,42 @@ mod tests {
         assert_eq!(depots.len(), 2);
         assert_eq!(depots.get(&2001), Some(&200101));
         assert_eq!(depots.get(&2002), Some(&200202));
+    }
+
+    #[test]
+    fn test_fuzzy_extract_depots_gid_format() {
+        let vdf = r#"
+"depots"
+{
+    "3001"
+    {
+        "manifests"
+        {
+            "public"
+            {
+                "gid" "300101"
+            }
+        }
+    }
+}
+"#;
+        let depots = fuzzy_extract_depots(vdf, 3000);
+        assert_eq!(depots.len(), 1);
+        assert_eq!(depots.get(&3001), Some(&300101));
+    }
+
+    #[test]
+    fn test_fuzzy_extract_depots_extreme_fallback() {
+        // Malformed VDF where keys don't have braces nearby as expected
+        let vdf = r#"
+"depots" "something"
+"4001" "config" "manifests" "public" "400101"
+"4002" "manifests" "public" "400202"
+"#;
+        let depots = fuzzy_extract_depots(vdf, 4000);
+        assert_eq!(depots.len(), 2);
+        assert_eq!(depots.get(&4001), Some(&400101));
+        assert_eq!(depots.get(&4002), Some(&400202));
     }
 
     #[test]

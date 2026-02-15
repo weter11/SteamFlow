@@ -1016,8 +1016,8 @@ impl SteamLauncher {
                 let tx = self.operation_tx.clone();
                 self.runtime.spawn(async move {
                     match client.get_available_platforms(app_id).await {
-                            Ok((platforms, vdf)) => {
-                                let _ = tx.send(AsyncOp::PlatformsFetched(app_id, platforms, vdf));
+                        Ok((platforms, vdf)) => {
+                            let _ = tx.send(AsyncOp::PlatformsFetched(app_id, platforms, vdf));
                         }
                         Err(err) => {
                             let _ = tx.send(AsyncOp::Error(format!(
