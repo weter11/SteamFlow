@@ -1375,6 +1375,9 @@ impl SteamClient {
         let executable = install_dir.join(&launch_info.executable);
         let args = split_args(&launch_info.arguments);
 
+        // Standard Steam identity fallback: steam_appid.txt
+        let _ = std::fs::write(install_dir.join("steam_appid.txt"), app.app_id.to_string());
+
         match launch_info.target {
             LaunchTarget::NativeLinux => {
                 #[cfg(unix)]
@@ -1397,6 +1400,7 @@ impl SteamClient {
 
                 cmd.env("LD_LIBRARY_PATH", format!("{}:{}", bin_dir.display(), existing_ld));
                 cmd.env("PATH", format!("{}:{}", bin_dir.display(), existing_path));
+                cmd.env("SteamAppId", app.app_id.to_string());
 
                 println!("EXECUTING COMMAND: {:?}", cmd);
                 println!("Working Dir: {:?}", install_dir);
