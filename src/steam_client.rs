@@ -550,8 +550,12 @@ impl SteamClient {
                     }
                 }
                 Err(e) => {
-                    println!("VDF Parse failed, using fallback: {}", e);
-                    let fallback_map = parse_remote_depot_manifests_from_vdf(&appinfo_vdf, "public");
+                    println!("VDF Parse failed, using fuzzy fallback: {}", e);
+                    let target_os = match platform {
+                        DepotPlatform::Windows => "windows",
+                        DepotPlatform::Linux => "linux",
+                    };
+                    let fallback_map = fuzzy_extract_depots(&appinfo_vdf, target_os);
                     for (d_id, m_id) in fallback_map {
                         selections.push(ManifestSelection {
                             app_id: appid,
@@ -1750,6 +1754,54 @@ fn parse_active_branch_from_acf(raw: &str) -> String {
         }
     }
     "public".to_string()
+}
+
+fn fuzzy_extract_depots(vdf_text: &str, target_os: &str) -> HashMap<u64, u64> {
+    let mut depots = HashMap::new();
+
+    // 1. Find the "depots" section
+    if let Some(depots_start) = vdf_text.find("\"depots\"") {
+        let depots_str = &vdf_text[depots_start..];
+
+        // 2. Iterate over potential IDs (numeric keys)
+        let re = regex::Regex::new(r#""(\d+)"\s*\{([^}]*)\}"#).unwrap();
+        let manifest_re = regex::Regex::new(r#""public"\s+"(\d+)""#).unwrap();
+
+        for cap in re.captures_iter(depots_str) {
+            let depot_id_str = &cap[1];
+            let content = &cap[2]; // The body of the depot config
+
+            if let Ok(depot_id) = depot_id_str.parse::<u64>() {
+                let matches_windows = content.contains("\"windows\"");
+                let matches_linux = content.contains("\"linux\"");
+                let matches_mac = content.contains("\"macos\"");
+
+                let mut keep = false;
+
+                if target_os == "windows" {
+                    // Keep if Windows explicitly, or if NO OS specified (Common)
+                    if matches_windows || (!matches_linux && !matches_mac) {
+                        keep = true;
+                    }
+                } else {
+                    // Linux
+                    // Keep if Linux explicitly, or if NO OS specified
+                    if matches_linux || (!matches_windows && !matches_mac) {
+                        keep = true;
+                    }
+                }
+
+                if keep {
+                    if let Some(m_cap) = manifest_re.captures(content) {
+                        if let Ok(manifest_id) = m_cap[1].parse::<u64>() {
+                            depots.insert(depot_id, manifest_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    depots
 }
 
 fn parse_remote_depot_manifests_from_vdf(raw: &str, branch: &str) -> HashMap<u64, u64> {
