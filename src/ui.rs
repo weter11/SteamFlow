@@ -2,11 +2,10 @@ use crate::config::{
     load_launcher_config, opensteam_image_cache_dir, save_launcher_config, LauncherConfig,
 };
 use crate::depot_browser::{DepotInfo, ManifestFileEntry};
-use crate::download_pipeline::DepotPlatform;
 use crate::install::{InstallPipeline, ProgressEvent};
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
-    DownloadProgress, DownloadProgressState, LibraryGame, SteamGuardReq, UserProfile,
+    DepotPlatform, DownloadProgress, DownloadProgressState, LibraryGame, SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
 use anyhow::anyhow;
@@ -728,6 +727,17 @@ impl SteamLauncher {
         }
 
         if let Some((app_id, platform)) = selection {
+            self.launcher_config
+                .game_configs
+                .entry(app_id)
+                .or_default()
+                .platform_preference = Some(platform);
+            let _ = self.runtime.block_on(self.launcher_config.save());
+
+            // Invalidate cache
+            self.extended_info.remove(&app_id);
+            ctx.request_repaint();
+
             self.start_install(app_id, platform);
             self.platform_selection = None;
         } else if close {

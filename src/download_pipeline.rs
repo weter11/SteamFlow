@@ -29,6 +29,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::install::ProgressEvent;
+use crate::models::DepotPlatform;
 use xz2::read::XzDecoder;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
@@ -46,12 +47,6 @@ pub struct SecurityInfo {
     pub depot_key: Vec<u8>,
     pub cdn_host: String,
     pub cdn_auth_token: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum DepotPlatform {
-    Linux,
-    Windows,
 }
 
 #[derive(Debug, Clone)]

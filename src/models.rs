@@ -94,6 +94,12 @@ pub enum SteamGuardReq {
     DeviceConfirmation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DepotPlatform {
+    Linux,
+    Windows,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadProgressState {
     Queued,

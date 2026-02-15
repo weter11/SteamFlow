@@ -1,4 +1,4 @@
-use crate::models::{OwnedGame, SessionState};
+use crate::models::{DepotPlatform, OwnedGame, SessionState};
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use tokio::fs;
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct GameConfig {
     pub forced_proton_version: Option<String>,
+    pub platform_preference: Option<DepotPlatform>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
