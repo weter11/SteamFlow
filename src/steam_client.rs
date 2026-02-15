@@ -642,6 +642,7 @@ impl SteamClient {
             match connection.job::<CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse>(license_req).await {
                 Ok(res) => {
                     println!("License Request Result: {:?}", res);
+                    println!("License granted! If download fails, please RESTART the application to refresh permissions.");
                 }
                 Err(e) => {
                     println!("Warning: Failed to request free license (might already own it): {}", e);
@@ -676,12 +677,16 @@ impl SteamClient {
                         .await;
                 }
                 Err(err) => {
+                    let mut msg = err.to_string();
+                    if msg.contains("CDN auth token") {
+                        msg = format!("{}. TIP: Try RESTARTING the application to refresh your authentication ticket.", msg);
+                    }
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
                             bytes_downloaded: 0,
                             total_bytes: 0,
-                            current_file: err.to_string(),
+                            current_file: msg,
                         })
                         .await;
                 }
@@ -1812,10 +1817,8 @@ fn parse_active_branch_from_acf(raw: &str) -> String {
             continue;
         }
 
-        if parts.len() >= 2 && in_user_config && parts[0].eq_ignore_ascii_case("betakey") {
-            if !parts[1].trim().is_empty() {
-                return parts[1].to_string();
-            }
+        if parts.len() >= 2 && in_user_config && parts[0].eq_ignore_ascii_case("betakey") && !parts[1].trim().is_empty() {
+            return parts[1].to_string();
         }
     }
     "public".to_string()
@@ -1853,11 +1856,9 @@ fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
                     None
                 };
 
-                if let Some(m_id) = manifest_id {
-                    if m_id != 0 {
-                        depots.insert(id, m_id);
-                        println!("Found Depot (Stage 1): {} -> Manifest: {}", id, m_id);
-                    }
+                if let Some(m_id) = manifest_id.filter(|&id| id != 0) {
+                    depots.insert(id, m_id);
+                    println!("Found Depot (Stage 1): {} -> Manifest: {}", id, m_id);
                 }
             }
         }
@@ -1880,8 +1881,8 @@ fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
                          if let Some(d_caps) = digit_key_re.captures(depot_match.as_str()) {
                              if let Ok(depot_id) = d_caps[1].parse::<u64>() {
                                  if depot_id > 1000 && depot_id != app_id as u64 {
-                                     if !depots.contains_key(&depot_id) {
-                                         depots.insert(depot_id, manifest_id);
+                                     if let std::collections::hash_map::Entry::Vacant(e) = depots.entry(depot_id) {
+                                         e.insert(manifest_id);
                                          println!("Found Depot (Stage 2): {} -> Manifest: {}", depot_id, manifest_id);
                                      }
                                  }
@@ -1927,15 +1928,13 @@ fn parse_remote_depot_manifests_from_vdf(raw: &str, branch: &str) -> HashMap<u64
             if let Ok(depot_id) = u64::from_str(&quoted[0]) {
                 current_depot = Some(depot_id);
             }
-        } else if quoted.len() >= 2 && current_depot.is_some() {
-            if quoted[0] == branch || (branch != "public" && quoted[0] == "public") || quoted[0] == "manifest" {
-                if let Ok(manifest) = u64::from_str(&quoted[1]) {
-                    // If we already have a manifest for this depot, only overwrite if this is the requested branch
-                    // (prevents 'public' fallback from overwriting a previously found 'beta' manifest if it appeared first,
-                    // though usually branch manifests are inside a 'manifests' sub-section which we are not fully parsing yet)
-                    if !manifests.contains_key(&current_depot.unwrap()) || quoted[0] == branch {
-                         manifests.insert(current_depot.unwrap_or_default(), manifest);
-                    }
+        } else if quoted.len() >= 2 && current_depot.is_some() && (quoted[0] == branch || (branch != "public" && quoted[0] == "public") || quoted[0] == "manifest") {
+            if let Ok(manifest) = u64::from_str(&quoted[1]) {
+                // If we already have a manifest for this depot, only overwrite if this is the requested branch
+                // (prevents 'public' fallback from overwriting a previously found 'beta' manifest if it appeared first,
+                // though usually branch manifests are inside a 'manifests' sub-section which we are not fully parsing yet)
+                if !manifests.contains_key(&current_depot.unwrap()) || quoted[0] == branch {
+                     manifests.insert(current_depot.unwrap_or_default(), manifest);
                 }
             }
         }

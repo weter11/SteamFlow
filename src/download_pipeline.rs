@@ -443,6 +443,7 @@ impl DownloadState {
 
         let mut output = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&file_path)

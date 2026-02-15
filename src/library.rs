@@ -229,10 +229,8 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
                 } else if key == "installdir" {
                     install_dir_name = Some(value.to_string());
                 }
-            } else if key == "betakey" {
-                if !value.trim().is_empty() {
-                    active_branch = value.to_string();
-                }
+            } else if key == "betakey" && !value.trim().is_empty() {
+                active_branch = value.to_string();
             }
         }
     }
