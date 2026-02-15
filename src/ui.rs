@@ -892,6 +892,7 @@ impl SteamLauncher {
                 let _ = config_to_save.save().await;
             });
 
+            self.extended_info.remove(&app_id);
             self.start_install(app_id, platform);
             self.platform_selection = None;
         } else if close {

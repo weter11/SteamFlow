@@ -518,50 +518,47 @@ impl SteamClient {
             let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
             let parsed: Result<AppInfoRoot, _> = keyvalues_serde::from_str(&appinfo_vdf);
 
-            let parsed = match parsed {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("CRITICAL VDF ERROR for {}: {:?}", appid, e);
-                    println!("RAW DATA: {}", appinfo_vdf);
-
-                    let _ = tx
-                        .send(DownloadProgress {
-                            state: DownloadProgressState::Failed,
-                            bytes_downloaded: 0,
-                            total_bytes: 0,
-                            current_file: format!("failed parsing appinfo: {e}. Check logs for raw data."),
-                        })
-                        .await;
-                    return;
-                }
-            };
-
-            let depots = parsed
-                .appinfo
-                .map(|node| node.depots)
-                .unwrap_or(parsed.depots);
-
             let mut selections = Vec::new();
-            for (depot_id_str, node) in depots {
-                if !depot_id_str.chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
+            match parsed {
+                Ok(p) => {
+                    let depots = p.appinfo.map(|node| node.depots).unwrap_or(p.depots);
 
-                let oslist = node.config.as_ref().and_then(|c| c.oslist.as_deref());
-                if !should_keep_depot(oslist, platform) {
-                    continue;
-                }
-
-                if let Some(manifests) = node.manifests {
-                    if let Some(gid_text) = manifests.public {
-                        if let (Ok(d_id), Ok(m_id)) = (depot_id_str.parse::<u32>(), gid_text.parse::<u64>()) {
-                            selections.push(ManifestSelection {
-                                app_id: appid,
-                                depot_id: d_id,
-                                manifest_id: m_id,
-                                appinfo_vdf: appinfo_vdf.clone(),
-                            });
+                    for (depot_id_str, node) in depots {
+                        if !depot_id_str.chars().all(|c| c.is_ascii_digit()) {
+                            continue;
                         }
+
+                        let oslist = node.config.as_ref().and_then(|c| c.oslist.as_deref());
+                        if !should_keep_depot(oslist, platform) {
+                            continue;
+                        }
+
+                        if let Some(manifests) = node.manifests {
+                            if let Some(gid_text) = manifests.public {
+                                if let (Ok(d_id), Ok(m_id)) =
+                                    (depot_id_str.parse::<u32>(), gid_text.parse::<u64>())
+                                {
+                                    selections.push(ManifestSelection {
+                                        app_id: appid,
+                                        depot_id: d_id,
+                                        manifest_id: m_id,
+                                        appinfo_vdf: appinfo_vdf.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("VDF Parse failed, using fallback: {}", e);
+                    let fallback_map = parse_remote_depot_manifests_from_vdf(&appinfo_vdf, "public");
+                    for (d_id, m_id) in fallback_map {
+                        selections.push(ManifestSelection {
+                            app_id: appid,
+                            depot_id: d_id as u32,
+                            manifest_id: m_id,
+                            appinfo_vdf: appinfo_vdf.clone(),
+                        });
                     }
                 }
             }
@@ -1494,7 +1491,11 @@ fn map_confirmation(method: &ConfirmationMethod) -> ConfirmationPrompt {
     }
 }
 
-fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, _prefer_proton: bool) -> Result<Vec<LaunchInfo>> {
+fn parse_launch_info_from_vdf(
+    appid: u32,
+    raw_vdf: &str,
+    _prefer_proton: bool,
+) -> Result<Vec<LaunchInfo>> {
     let parsed: ProductInfoEnvelope =
         keyvalues_serde::from_str(raw_vdf).context("failed to parse product info VDF")?;
 
@@ -1517,46 +1518,53 @@ fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, _prefer_proton: bool) -
         let os_list = entry.config.as_ref().and_then(|c| c.oslist.as_deref());
         let description = entry.description.as_deref().unwrap_or("Game");
 
+        // HEURISTIC: DETERMINE TARGET
         let target = if let Some(os) = os_list {
             if os.contains("linux") {
-                Some(LaunchTarget::NativeLinux)
+                LaunchTarget::NativeLinux
             } else if os.contains("windows") {
-                Some(LaunchTarget::WindowsProton)
+                LaunchTarget::WindowsProton
             } else if os.contains("macos") {
-                None // Hide Mac on Linux/Windows
-            } else {
-                Some(LaunchTarget::WindowsProton)
-            }
+                continue;
+            } // Skip Mac on non-Mac
+            else {
+                LaunchTarget::WindowsProton
+            } // Default to Windows
         } else {
-            // Heuristics for "None"
-            if exe.ends_with(".sh") || exe.contains("linux") {
-                Some(LaunchTarget::NativeLinux)
-            } else if exe.ends_with(".exe") || exe.ends_with(".bat") {
-                Some(LaunchTarget::WindowsProton)
+            // No OS specified? Check Extension.
+            if exe.ends_with(".exe") || exe.ends_with(".bat") {
+                LaunchTarget::WindowsProton
+            } else if exe.contains("linux") || exe.ends_with(".sh") {
+                LaunchTarget::NativeLinux
             } else {
+                // Default behavior
                 #[cfg(target_os = "linux")]
-                { Some(LaunchTarget::NativeLinux) }
+                {
+                    LaunchTarget::NativeLinux
+                }
                 #[cfg(target_os = "windows")]
-                { Some(LaunchTarget::WindowsProton) }
+                {
+                    LaunchTarget::WindowsProton
+                }
                 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-                { Some(LaunchTarget::WindowsProton) }
+                {
+                    LaunchTarget::WindowsProton
+                }
             }
         };
 
-        if let Some(t) = target {
-            options.push(LaunchInfo {
-                app_id: appid,
-                id: id.clone(),
-                description: if description == "Game" && !exe.is_empty() {
-                    exe.to_string()
-                } else {
-                    description.to_string()
-                },
-                executable: exe.to_string(),
-                arguments: entry.arguments.clone().unwrap_or_default(),
-                target: t,
-            });
-        }
+        options.push(LaunchInfo {
+            app_id: appid,
+            id: id.clone(),
+            description: if description == "Game" && !exe.is_empty() {
+                exe.to_string()
+            } else {
+                description.to_string()
+            },
+            executable: exe.to_string(),
+            arguments: entry.arguments.clone().unwrap_or_default(),
+            target,
+        });
     }
 
     if options.is_empty() {
