@@ -3,7 +3,6 @@ use crate::config::{
 };
 use crate::depot_browser::{DepotInfo, ManifestFileEntry};
 use crate::download_pipeline::DepotPlatform;
-use crate::install::{InstallPipeline, ProgressEvent};
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
     DownloadProgress, DownloadProgressState, LibraryGame, SteamGuardReq, UserProfile,
@@ -110,9 +109,7 @@ pub struct SteamLauncher {
     auth_password: String,
     auth_guard_code: String,
     needs_reauth: bool,
-    install_pipeline: InstallPipeline,
     install_log: Vec<String>,
-    current_download_progress: Option<ProgressEvent>,
     download_receiver: Option<tokio::sync::mpsc::Receiver<DownloadProgress>>,
     active_download_appid: Option<u32>,
     live_download_progress: Option<DownloadProgress>,
@@ -165,9 +162,7 @@ impl SteamLauncher {
             auth_password: String::new(),
             auth_guard_code: String::new(),
             needs_reauth: !authenticated,
-            install_pipeline: InstallPipeline::default(),
             install_log: Vec::new(),
-            current_download_progress: None,
             download_receiver: None,
             active_download_appid: None,
             live_download_progress: None,
@@ -307,6 +302,16 @@ impl SteamLauncher {
                         self.status = "Install queued".to_string();
                     }
                     DownloadProgressState::Downloading => {
+                        self.install_log.push(format!(
+                            "App {} — downloading {}: {} / {} bytes",
+                            self.active_download_appid.unwrap_or(0),
+                            progress.current_file,
+                            progress.bytes_downloaded,
+                            progress.total_bytes
+                        ));
+                        if self.install_log.len() > 8 {
+                            self.install_log.drain(0..self.install_log.len() - 8);
+                        }
                         self.status = format!(
                             "Downloading {}: {} / {} bytes",
                             progress.current_file, progress.bytes_downloaded, progress.total_bytes
@@ -323,7 +328,8 @@ impl SteamLauncher {
                         if let Some(appid) = self.active_download_appid {
                             let tx = self.operation_tx.clone();
                             self.runtime.spawn(async move {
-                                let installed_paths = scan_installed_app_paths().await.unwrap_or_default();
+                                let installed_paths =
+                                    scan_installed_app_paths().await.unwrap_or_default();
                                 let _ = tx.send(AsyncOp::ScanCompleted(appid, installed_paths));
                             });
                         }
@@ -343,28 +349,6 @@ impl SteamLauncher {
         }
     }
 
-    fn process_install_pipeline(&mut self) {
-        for event in self.install_pipeline.tick() {
-            self.install_log.push(format!(
-                "App {} -> {:?}: {}",
-                event.app_id, event.stage, event.message
-            ));
-            self.status = format!("Install pipeline: App {} {:?}", event.app_id, event.stage);
-        }
-
-        for progress in self.install_pipeline.take_progress_events() {
-            self.current_download_progress = Some(progress.clone());
-            self.status = format!(
-                "Downloading {}: {} / {} bytes",
-                progress.file_name, progress.bytes_downloaded, progress.total_bytes
-            );
-        }
-
-        if self.install_log.len() > 8 {
-            let drop_count = self.install_log.len() - 8;
-            self.install_log.drain(0..drop_count);
-        }
-    }
 
     fn poll_play_result(&mut self) {
         if let Some(rx) = &self.play_result_rx {
@@ -383,7 +367,6 @@ impl SteamLauncher {
     }
 
     fn start_install(&mut self, app_id: u32, platform: DepotPlatform) {
-        self.install_pipeline.enqueue(app_id);
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
         self.runtime.spawn(async move {
@@ -1413,7 +1396,6 @@ impl eframe::App for SteamLauncher {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_image_results(ctx);
         self.poll_download_progress();
-        self.process_install_pipeline();
         self.poll_play_result();
         self.poll_async_ops();
 

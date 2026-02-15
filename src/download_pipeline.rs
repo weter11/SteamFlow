@@ -63,6 +63,31 @@ pub struct DepotDownloadPlan {
     pub language: String,
 }
 
+/// Steam wraps the entire VDF in a top-level key that is the numeric app ID.
+/// This wrapper accepts that outer key transparently.
+#[derive(Debug, serde::Deserialize)]
+pub struct AppInfoEnvelope(pub HashMap<String, AppInfoRoot>);
+
+impl AppInfoEnvelope {
+    /// Extract the inner AppInfoRoot regardless of the outer key name.
+    pub fn into_inner(self) -> Option<AppInfoRoot> {
+        self.0.into_values().next()
+    }
+}
+
+pub fn parse_appinfo(vdf: &str) -> Result<AppInfoRoot> {
+    // Try direct parse first (in case steam-vent already strips the wrapper)
+    if let Ok(parsed) = keyvalues_serde::from_str::<AppInfoRoot>(vdf) {
+        return Ok(parsed);
+    }
+    // Fall back to envelope parse
+    let envelope: AppInfoEnvelope = keyvalues_serde::from_str(vdf)
+        .context("failed parsing appinfo VDF (envelope)")?;
+    envelope
+        .into_inner()
+        .context("appinfo envelope was empty")
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct AppInfoRoot {
     #[serde(default)]
@@ -212,8 +237,7 @@ pub async fn phase1_get_manifest_id(
         bail!("appinfo buffer was empty for app {app_id}")
     }
 
-    let parsed: AppInfoRoot =
-        keyvalues_serde::from_str(&appinfo_vdf).context("failed parsing appinfo VDF")?;
+    let parsed: AppInfoRoot = parse_appinfo(&appinfo_vdf).context("failed parsing appinfo VDF")?;
     let depots = parsed
         .appinfo
         .map(|node| node.depots)

@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::depot_browser::{self, DepotInfo, ManifestFileEntry};
 use crate::download_pipeline::{
-    self, should_keep_depot, AppInfoRoot, DepotPlatform, ManifestSelection,
+    self, parse_appinfo, should_keep_depot, AppInfoRoot, DepotPlatform, ManifestSelection,
 };
 use crate::models::{
     DownloadProgress, DownloadProgressState, LibraryGame, OwnedGame, SessionState, SteamGuardReq,
@@ -345,7 +345,7 @@ impl SteamClient {
 
         let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
         let parsed: AppInfoRoot =
-            keyvalues_serde::from_str(&appinfo_vdf).context("failed parsing appinfo VDF")?;
+            parse_appinfo(&appinfo_vdf).context("failed parsing appinfo VDF")?;
 
         let branches = parsed
             .appinfo
@@ -392,7 +392,7 @@ impl SteamClient {
             .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
 
         let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        let parsed: Result<AppInfoRoot, _> = keyvalues_serde::from_str(&appinfo_vdf);
+        let parsed: Result<AppInfoRoot> = parse_appinfo(&appinfo_vdf);
 
         let parsed = match parsed {
             Ok(p) => p,
@@ -516,12 +516,16 @@ impl SteamClient {
             };
 
             let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-            let parsed: Result<AppInfoRoot, _> = keyvalues_serde::from_str(&appinfo_vdf);
+            let parsed: Result<AppInfoRoot> = parse_appinfo(&appinfo_vdf);
 
             let mut selections = Vec::new();
-            match parsed {
+            match &parsed {
                 Ok(p) => {
-                    let depots = p.appinfo.map(|node| node.depots).unwrap_or(p.depots);
+                    let depots = p
+                        .appinfo
+                        .as_ref()
+                        .map(|node| &node.depots)
+                        .unwrap_or(&p.depots);
 
                     for (depot_id_str, node) in depots {
                         if !depot_id_str.chars().all(|c| c.is_ascii_digit()) {
@@ -533,8 +537,8 @@ impl SteamClient {
                             continue;
                         }
 
-                        if let Some(manifests) = node.manifests {
-                            if let Some(gid_text) = manifests.public {
+                        if let Some(manifests) = &node.manifests {
+                            if let Some(gid_text) = &manifests.public {
                                 if let (Ok(d_id), Ok(m_id)) =
                                     (depot_id_str.parse::<u32>(), gid_text.parse::<u64>())
                                 {
@@ -568,12 +572,34 @@ impl SteamClient {
             }
 
             if selections.is_empty() {
+                let mut has_windows = false;
+                if let Ok(p) = &parsed {
+                    let depots = p
+                        .appinfo
+                        .as_ref()
+                        .map(|node| &node.depots)
+                        .unwrap_or(&p.depots);
+                    has_windows = depots.values().any(|node| {
+                        node.config
+                            .as_ref()
+                            .and_then(|c| c.oslist.as_deref())
+                            .map(|os| os.to_lowercase().contains("windows"))
+                            .unwrap_or(false)
+                    });
+                }
+
+                let msg = if has_windows && matches!(platform, DepotPlatform::Linux) {
+                    "No native Linux depots found. This game may only support Windows (Proton)."
+                } else {
+                    "No matching depots found for the selected platform."
+                };
+
                 let _ = tx
                     .send(DownloadProgress {
                         state: DownloadProgressState::Failed,
                         bytes_downloaded: 0,
                         total_bytes: 0,
-                        current_file: "no matching depots found for platform".to_string(),
+                        current_file: msg.to_string(),
                     })
                     .await;
                 return;
@@ -869,6 +895,7 @@ impl SteamClient {
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
         let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        // Still uses manual scanner for remote_manifest_ids, which should be okay as it scans lines
         Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf, branch))
     }
 
@@ -930,7 +957,7 @@ impl SteamClient {
 
         let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
         let parsed: AppInfoRoot =
-            keyvalues_serde::from_str(&raw_vdf).context("failed to parse product info VDF")?;
+            parse_appinfo(&raw_vdf).context("failed to parse product info VDF")?;
 
         let common = parsed
             .appinfo
@@ -1495,13 +1522,33 @@ fn map_confirmation(method: &ConfirmationMethod) -> ConfirmationPrompt {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ProductInfoEnvelopeWrapper(pub HashMap<String, ProductInfoEnvelope>);
+
+impl ProductInfoEnvelopeWrapper {
+    pub fn into_inner(self) -> Option<ProductInfoEnvelope> {
+        self.0.into_values().next()
+    }
+}
+
+fn parse_product_info_envelope(vdf: &str) -> Result<ProductInfoEnvelope> {
+    if let Ok(parsed) = keyvalues_serde::from_str::<ProductInfoEnvelope>(vdf) {
+        return Ok(parsed);
+    }
+    let wrapper: ProductInfoEnvelopeWrapper = keyvalues_serde::from_str(vdf)
+        .context("failed parsing product info VDF (wrapper)")?;
+    wrapper
+        .into_inner()
+        .context("product info envelope was empty")
+}
+
 fn parse_launch_info_from_vdf(
     appid: u32,
     raw_vdf: &str,
     _prefer_proton: bool,
 ) -> Result<Vec<LaunchInfo>> {
     let parsed: ProductInfoEnvelope =
-        keyvalues_serde::from_str(raw_vdf).context("failed to parse product info VDF")?;
+        parse_product_info_envelope(raw_vdf).context("failed to parse product info VDF")?;
 
     let config = parsed
         .appinfo
