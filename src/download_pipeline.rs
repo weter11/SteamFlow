@@ -76,16 +76,68 @@ impl AppInfoEnvelope {
 }
 
 pub fn parse_appinfo(vdf: &str) -> Result<AppInfoRoot> {
-    // Try direct parse first (in case steam-vent already strips the wrapper)
-    if let Ok(parsed) = keyvalues_serde::from_str::<AppInfoRoot>(vdf) {
-        return Ok(parsed);
+    let mut last_error = None;
+
+    for candidate in appinfo_candidates(vdf) {
+        // Try direct parse first (in case steam-vent already strips the wrapper)
+        if let Ok(parsed) = keyvalues_serde::from_str::<AppInfoRoot>(&candidate) {
+            return Ok(parsed);
+        }
+
+        match keyvalues_serde::from_str::<AppInfoEnvelope>(&candidate) {
+            Ok(envelope) => {
+                return envelope.into_inner().context("appinfo envelope was empty");
+            }
+            Err(err) => last_error = Some(err),
+        }
     }
-    // Fall back to envelope parse
-    let envelope: AppInfoEnvelope = keyvalues_serde::from_str(vdf)
-        .context("failed parsing appinfo VDF (envelope)")?;
-    envelope
-        .into_inner()
-        .context("appinfo envelope was empty")
+
+    Err(last_error
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow!("failed parsing appinfo VDF")))
+    .context("failed parsing appinfo VDF (envelope)")
+}
+
+pub fn appinfo_buffer_to_vdf(buffer: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(buffer).to_string();
+    let without_nul = raw.replace('\0', "");
+    match without_nul.rfind('}') {
+        Some(end) => without_nul[..=end].to_string(),
+        None => without_nul,
+    }
+}
+
+fn appinfo_candidates(vdf: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    let trimmed = vdf.trim();
+    if !trimmed.is_empty() {
+        candidates.push(trimmed.to_string());
+    }
+
+    let stripped_nul = trimmed.replace('\0', "");
+    if !stripped_nul.is_empty() && !candidates.contains(&stripped_nul) {
+        candidates.push(stripped_nul.clone());
+    }
+
+    if let Some(start) = stripped_nul.find(|c: char| c == '"' || c == '{') {
+        let sliced = stripped_nul[start..].trim().to_string();
+        if !sliced.is_empty() && !candidates.contains(&sliced) {
+            candidates.push(sliced);
+        }
+    }
+
+    if let Some(captures) = regex::Regex::new(r#"^\s*(\d+)\s*(\{[\s\S]*)$"#)
+        .unwrap()
+        .captures(&stripped_nul)
+    {
+        let normalized = format!("\"{}\"{}", &captures[1], &captures[2]);
+        if !candidates.contains(&normalized) {
+            candidates.push(normalized);
+        }
+    }
+
+    candidates
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -174,36 +226,32 @@ pub struct DepotManifests {
 
 pub fn should_keep_depot(oslist: Option<&str>, target: DepotPlatform) -> bool {
     match target {
-        DepotPlatform::Windows => {
-            match oslist {
-                Some(os) => {
-                    let os = os.to_lowercase();
-                    if os.contains("windows") {
-                        return true;
-                    }
-                    if os.contains("linux") || os.contains("macos") {
-                        return false;
-                    }
-                    true
+        DepotPlatform::Windows => match oslist {
+            Some(os) => {
+                let os = os.to_lowercase();
+                if os.contains("windows") {
+                    return true;
                 }
-                None => true,
-            }
-        }
-        DepotPlatform::Linux => {
-            match oslist {
-                Some(os) => {
-                    let os = os.to_lowercase();
-                    if os.contains("linux") {
-                        return true;
-                    }
-                    if os.contains("windows") || os.contains("macos") {
-                        return false;
-                    }
-                    true
+                if os.contains("linux") || os.contains("macos") {
+                    return false;
                 }
-                None => true,
+                true
             }
-        }
+            None => true,
+        },
+        DepotPlatform::Linux => match oslist {
+            Some(os) => {
+                let os = os.to_lowercase();
+                if os.contains("linux") {
+                    return true;
+                }
+                if os.contains("windows") || os.contains("macos") {
+                    return false;
+                }
+                true
+            }
+            None => true,
+        },
     }
 }
 
@@ -232,7 +280,7 @@ pub async fn phase1_get_manifest_id(
         .find(|entry| entry.appid() == app_id)
         .ok_or_else(|| anyhow!("missing app info payload for app {app_id}"))?;
 
-    let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+    let appinfo_vdf = appinfo_buffer_to_vdf(app.buffer());
     if appinfo_vdf.trim().is_empty() {
         bail!("appinfo buffer was empty for app {app_id}")
     }
@@ -607,13 +655,8 @@ pub fn execute_four_step_download(
 ) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let selection = phase1_get_manifest_id(
-            connection,
-            plan.app_id,
-            plan.platform,
-            &plan.language,
-        )
-        .await?;
+        let selection =
+            phase1_get_manifest_id(connection, plan.app_id, plan.platform, &plan.language).await?;
 
         execute_multi_depot_download_async(
             connection,

@@ -6,7 +6,8 @@ use crate::config::{
 };
 use crate::depot_browser::{self, DepotInfo, ManifestFileEntry};
 use crate::download_pipeline::{
-    self, parse_appinfo, should_keep_depot, AppInfoRoot, DepotPlatform, ManifestSelection,
+    self, appinfo_buffer_to_vdf, parse_appinfo, should_keep_depot, AppInfoRoot, DepotPlatform,
+    ManifestSelection,
 };
 use crate::models::{
     DownloadProgress, DownloadProgressState, LibraryGame, OwnedGame, SessionState, SteamGuardReq,
@@ -343,7 +344,7 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
 
-        let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let appinfo_vdf = appinfo_buffer_to_vdf(app.buffer());
         let parsed: AppInfoRoot =
             parse_appinfo(&appinfo_vdf).context("failed parsing appinfo VDF")?;
 
@@ -391,7 +392,7 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
 
-        let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let appinfo_vdf = appinfo_buffer_to_vdf(app.buffer());
         let parsed: Result<AppInfoRoot> = parse_appinfo(&appinfo_vdf);
 
         let parsed = match parsed {
@@ -515,7 +516,7 @@ impl SteamClient {
                 return;
             };
 
-            let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+            let appinfo_vdf = appinfo_buffer_to_vdf(app.buffer());
             let parsed: Result<AppInfoRoot> = parse_appinfo(&appinfo_vdf);
 
             let mut selections = Vec::new();
@@ -894,7 +895,7 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
-        let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let raw_vdf = appinfo_buffer_to_vdf(app.buffer());
         // Still uses manual scanner for remote_manifest_ids, which should be okay as it scans lines
         Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf, branch))
     }
@@ -955,7 +956,7 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
-        let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let raw_vdf = appinfo_buffer_to_vdf(app.buffer());
         let parsed: AppInfoRoot =
             parse_appinfo(&raw_vdf).context("failed to parse product info VDF")?;
 
@@ -965,12 +966,7 @@ impl SteamClient {
             .and_then(|a| a.common.as_ref())
             .or(parsed.common.as_ref());
         let dlcs = common
-            .map(|c| {
-                c.dlc
-                    .keys()
-                    .filter_map(|k| k.parse::<u32>().ok())
-                    .collect()
-            })
+            .map(|c| c.dlc.keys().filter_map(|k| k.parse::<u32>().ok()).collect())
             .unwrap_or_default();
 
         let depots_map = parsed
@@ -1024,7 +1020,11 @@ impl SteamClient {
         })
     }
 
-    pub async fn get_product_info(&mut self, appid: u32, prefer_proton: bool) -> Result<Vec<LaunchInfo>> {
+    pub async fn get_product_info(
+        &mut self,
+        appid: u32,
+        prefer_proton: bool,
+    ) -> Result<Vec<LaunchInfo>> {
         let connection = self
             .connection
             .as_ref()
@@ -1049,7 +1049,7 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
-        let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let raw_vdf = appinfo_buffer_to_vdf(app.buffer());
         if raw_vdf.trim().is_empty() {
             bail!("empty appinfo payload returned for app {appid}")
         }
@@ -1271,7 +1271,10 @@ impl SteamClient {
             .join(format!("appmanifest_{appid}.acf")))
     }
 
-    async fn local_manifest_info_for_appid(&self, appid: u32) -> Result<(HashMap<u64, u64>, String)> {
+    async fn local_manifest_info_for_appid(
+        &self,
+        appid: u32,
+    ) -> Result<(HashMap<u64, u64>, String)> {
         let manifest_path = self.appmanifest_path(appid).await?;
         if !manifest_path.exists() {
             return Ok((HashMap::new(), "public".to_string()));
@@ -1298,13 +1301,12 @@ impl SteamClient {
             }
         }
 
-        Ok(PathBuf::from(
-            load_launcher_config().await?
-                .steam_library_path,
+        Ok(
+            PathBuf::from(load_launcher_config().await?.steam_library_path)
+                .join("steamapps")
+                .join("common")
+                .join(appid.to_string()),
         )
-        .join("steamapps")
-        .join("common")
-        .join(appid.to_string()))
     }
 
     async fn remote_manifest_ids_static(
@@ -1331,7 +1333,7 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
-        let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let raw_vdf = appinfo_buffer_to_vdf(app.buffer());
         Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf, branch))
     }
 
@@ -1348,7 +1350,8 @@ impl SteamClient {
     }
 
     async fn resolve_install_game_name(&self, appid: u32) -> String {
-        load_library_cache().await
+        load_library_cache()
+            .await
             .ok()
             .and_then(|games| {
                 games
@@ -1443,7 +1446,10 @@ impl SteamClient {
                 let existing_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
                 let existing_path = std::env::var("PATH").unwrap_or_default();
 
-                cmd.env("LD_LIBRARY_PATH", format!("{}:{}", bin_dir.display(), existing_ld));
+                cmd.env(
+                    "LD_LIBRARY_PATH",
+                    format!("{}:{}", bin_dir.display(), existing_ld),
+                );
                 cmd.env("PATH", format!("{}:{}", bin_dir.display(), existing_path));
                 cmd.env("SteamAppId", app.app_id.to_string());
 
@@ -1535,8 +1541,8 @@ fn parse_product_info_envelope(vdf: &str) -> Result<ProductInfoEnvelope> {
     if let Ok(parsed) = keyvalues_serde::from_str::<ProductInfoEnvelope>(vdf) {
         return Ok(parsed);
     }
-    let wrapper: ProductInfoEnvelopeWrapper = keyvalues_serde::from_str(vdf)
-        .context("failed parsing product info VDF (wrapper)")?;
+    let wrapper: ProductInfoEnvelopeWrapper =
+        keyvalues_serde::from_str(vdf).context("failed parsing product info VDF (wrapper)")?;
     wrapper
         .into_inner()
         .context("product info envelope was empty")
@@ -1577,7 +1583,8 @@ fn parse_launch_info_from_vdf(
                 LaunchTarget::WindowsProton
             } else if os.contains("macos") {
                 continue;
-            } // Skip Mac on non-Mac
+            }
+            // Skip Mac on non-Mac
             else {
                 LaunchTarget::WindowsProton
             } // Default to Windows
@@ -1882,13 +1889,16 @@ fn parse_remote_depot_manifests_from_vdf(raw: &str, branch: &str) -> HashMap<u64
                 current_depot = Some(depot_id);
             }
         } else if quoted.len() >= 2 && current_depot.is_some() {
-            if quoted[0] == branch || (branch != "public" && quoted[0] == "public") || quoted[0] == "manifest" {
+            if quoted[0] == branch
+                || (branch != "public" && quoted[0] == "public")
+                || quoted[0] == "manifest"
+            {
                 if let Ok(manifest) = u64::from_str(&quoted[1]) {
                     // If we already have a manifest for this depot, only overwrite if this is the requested branch
                     // (prevents 'public' fallback from overwriting a previously found 'beta' manifest if it appeared first,
                     // though usually branch manifests are inside a 'manifests' sub-section which we are not fully parsing yet)
                     if !manifests.contains_key(&current_depot.unwrap()) || quoted[0] == branch {
-                         manifests.insert(current_depot.unwrap_or_default(), manifest);
+                        manifests.insert(current_depot.unwrap_or_default(), manifest);
                     }
                 }
             }

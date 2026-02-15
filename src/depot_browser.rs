@@ -13,7 +13,8 @@ use steam_vent::proto::steammessages_clientserver_appinfo::{
 use steam_vent::ConnectionTrait;
 
 use crate::download_pipeline::{
-    phase2_get_security_info, phase3_download_manifest, DownloadState, ManifestSelection,
+    appinfo_buffer_to_vdf, phase2_get_security_info, phase3_download_manifest, DownloadState,
+    ManifestSelection,
 };
 
 #[derive(Debug, Clone)]
@@ -221,6 +222,6 @@ async fn fetch_appinfo(connection: &Connection, appid: u32) -> Result<AppInfoRoo
         .find(|entry| entry.appid() == appid)
         .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
-    let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+    let raw_vdf = appinfo_buffer_to_vdf(app.buffer());
     keyvalues_serde::from_str(&raw_vdf).context("failed parsing appinfo VDF")
 }
