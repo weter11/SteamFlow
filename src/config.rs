@@ -9,6 +9,7 @@ use tokio::fs;
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct GameConfig {
     pub forced_proton_version: Option<String>,
+    pub platform_preference: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
