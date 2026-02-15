@@ -1806,68 +1806,77 @@ fn parse_active_branch_from_acf(raw: &str) -> String {
 
 fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
     let mut depots = HashMap::new();
-    println!("Starting Greedy Fuzzy Scan for AppID: {}", app_id);
+    println!("Starting Super-Greedy Fuzzy Scan for AppID: {}", app_id);
 
-    // Stage 1: Search for digit keys followed by { (potential depot starts)
-    let re_depot = regex::Regex::new(r#""(\d+)"\s*\{"#).unwrap();
-    // Stage 2: Robust manifest ID search (includes gid)
-    let re_manifest = regex::Regex::new(r#""(?:public|manifest|gid)"\s+"(\d+)""#).unwrap();
+    // Stage 1: Structured scan (look for depot ID keys and then manifest IDs in their block)
+    let depot_re = regex::Regex::new(r#""(\d+)"\s*\{"#).unwrap();
+    let gid_re = regex::Regex::new(r#""gid"\s*"(\d+)""#).unwrap();
+    let fallback_re = regex::Regex::new(r#""(?:public|manifest)"\s+"(\d+)""#).unwrap();
 
-    let matches: Vec<_> = re_depot.find_iter(vdf_text).collect();
+    let matches: Vec<_> = depot_re.find_iter(vdf_text).collect();
     for i in 0..matches.len() {
         let m = matches[i];
-        let caps = re_depot.captures(m.as_str()).unwrap();
+        let caps = depot_re.captures(m.as_str()).unwrap();
         if let Ok(id) = caps[1].parse::<u64>() {
-            // HEURISTIC: Depot IDs are usually large (>1000) and not the AppID itself
             if id > 1000 && id != app_id as u64 {
                 let start = m.end();
-                // Search until the next potential depot-like key or end of string
                 let end = if i + 1 < matches.len() {
                     matches[i + 1].start()
                 } else {
                     vdf_text.len()
                 };
+                // Search within a 2000 char window from the depot ID start
+                let search_range = &vdf_text[start..std::cmp::min(end, start + 2000)];
 
-                let search_range = &vdf_text[start..end];
-                if let Some(m_caps) = re_manifest.captures(search_range) {
-                    if let Ok(manifest_id) = m_caps[1].parse::<u64>() {
-                        if !depots.contains_key(&id) {
-                            depots.insert(id, manifest_id);
-                        }
+                let manifest_id = if let Some(g_caps) = gid_re.captures(search_range) {
+                    g_caps[1].parse::<u64>().ok()
+                } else if let Some(f_caps) = fallback_re.captures(search_range) {
+                    f_caps[1].parse::<u64>().ok()
+                } else {
+                    None
+                };
+
+                if let Some(m_id) = manifest_id {
+                    if m_id != 0 {
+                        depots.insert(id, m_id);
+                        println!("Found Depot (Stage 1): {} -> Manifest: {}", id, m_id);
                     }
                 }
             }
         }
     }
 
-    // Stage 3: Extreme aggressive fallback (if Stage 1 found nothing)
+    // Stage 2: Flat scan (for malformed VDFs or extreme cases)
     if depots.is_empty() {
-        println!("Greedy Stage 1 found nothing. Trying Stage 2 (aggressive backwards search)...");
-        for mat in re_manifest.find_iter(vdf_text) {
-            if let Some(m_caps) = re_manifest.captures(mat.as_str()) {
-                if let Ok(manifest_id) = m_caps[1].parse::<u64>() {
-                    if manifest_id == 0 { continue; }
+        println!("Stage 1 found nothing. Trying Stage 2 (flat scan)...");
+        let all_manifest_re = regex::Regex::new(r#""(?:gid|public|manifest)"\s+"?(\d+)"?"#).unwrap();
+        for mat in all_manifest_re.find_iter(vdf_text) {
+             if let Some(m_caps) = all_manifest_re.captures(mat.as_str()) {
+                 if let Ok(manifest_id) = m_caps[1].parse::<u64>() {
+                     if manifest_id == 0 { continue; }
 
-                    // Look backwards for the nearest digit key (depot candidate)
-                    let search_start = mat.start().saturating_sub(1000);
-                    let search_area = &vdf_text[search_start..mat.start()];
-                    let re_digit_key = regex::Regex::new(r#""(\d+)""#).unwrap();
+                     let search_start = mat.start().saturating_sub(500);
+                     let search_area = &vdf_text[search_start..mat.start()];
+                     let digit_key_re = regex::Regex::new(r#""(\d+)""#).unwrap();
 
-                    if let Some(depot_match) = re_digit_key.find_iter(search_area).last() {
-                        if let Some(d_caps) = re_digit_key.captures(depot_match.as_str()) {
-                            if let Ok(depot_id) = d_caps[1].parse::<u64>() {
-                                if depot_id > 1000 && depot_id != app_id as u64 {
-                                    depots.insert(depot_id, manifest_id);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+                     if let Some(depot_match) = digit_key_re.find_iter(search_area).last() {
+                         if let Some(d_caps) = digit_key_re.captures(depot_match.as_str()) {
+                             if let Ok(depot_id) = d_caps[1].parse::<u64>() {
+                                 if depot_id > 1000 && depot_id != app_id as u64 {
+                                     if !depots.contains_key(&depot_id) {
+                                         depots.insert(depot_id, manifest_id);
+                                         println!("Found Depot (Stage 2): {} -> Manifest: {}", depot_id, manifest_id);
+                                     }
+                                 }
+                             }
+                         }
+                     }
+                 }
+             }
         }
     }
 
-    println!("Greedy Scan found candidates: {:?}", depots.keys().collect::<Vec<_>>());
+    println!("Super-Greedy Scan associations: {:?}", depots);
     depots
 }
 
