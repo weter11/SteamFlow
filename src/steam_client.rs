@@ -366,7 +366,7 @@ impl SteamClient {
         Ok(names)
     }
 
-    pub async fn get_available_platforms(&mut self, appid: u32) -> Result<Vec<DepotPlatform>> {
+    pub async fn get_available_platforms(&mut self, appid: u32) -> Result<(Vec<DepotPlatform>, Vec<u8>)> {
         let connection = self
             .connection
             .as_ref()
@@ -391,7 +391,8 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
 
-        let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+        let raw_buffer = app.buffer().to_vec();
+        let appinfo_vdf = String::from_utf8_lossy(&raw_buffer).to_string();
         let parsed: Result<AppInfoRoot> = parse_appinfo(&appinfo_vdf);
 
         let parsed = match parsed {
@@ -402,7 +403,7 @@ impl SteamClient {
                 println!("RAW DATA: {}", appinfo_vdf);
 
                 // Fallback: assume both for now if we can't parse it
-                return Ok(vec![DepotPlatform::Windows, DepotPlatform::Linux]);
+                return Ok((vec![DepotPlatform::Windows, DepotPlatform::Linux], raw_buffer));
             }
         };
 
@@ -440,13 +441,14 @@ impl SteamClient {
             platforms.push(DepotPlatform::Windows);
         }
 
-        Ok(platforms)
+        Ok((platforms, raw_buffer))
     }
 
     pub async fn install_game(
         &self,
         appid: u32,
         platform: DepotPlatform,
+        cached_vdf: Option<Vec<u8>>,
     ) -> Result<Receiver<DownloadProgress>> {
         let connection = self
             .connection
@@ -479,43 +481,48 @@ impl SteamClient {
                 })
                 .await;
 
-            let mut request = CMsgClientPICSProductInfoRequest::new();
-            request
-                .apps
-                .push(cmsg_client_picsproduct_info_request::AppInfo {
-                    appid: Some(appid),
-                    ..Default::default()
-                });
+            let appinfo_vdf = if let Some(buffer) = cached_vdf {
+                String::from_utf8_lossy(&buffer).to_string()
+            } else {
+                let mut request = CMsgClientPICSProductInfoRequest::new();
+                request
+                    .apps
+                    .push(cmsg_client_picsproduct_info_request::AppInfo {
+                        appid: Some(appid),
+                        ..Default::default()
+                    });
 
-            let response: CMsgClientPICSProductInfoResponse = match connection.job(request).await {
-                Ok(res) => res,
-                Err(e) => {
-                    let _ = tx
-                        .send(DownloadProgress {
-                            state: DownloadProgressState::Failed,
-                            bytes_downloaded: 0,
-                            total_bytes: 0,
-                            current_file: format!("failed requesting appinfo: {e}"),
-                        })
-                        .await;
-                    return;
+                let response: CMsgClientPICSProductInfoResponse = match connection.job(request).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        let _ = tx
+                            .send(DownloadProgress {
+                                state: DownloadProgressState::Failed,
+                                bytes_downloaded: 0,
+                                total_bytes: 0,
+                                current_file: format!("failed requesting appinfo: {e}"),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+
+                let app = response.apps.iter().find(|entry| entry.appid() == appid);
+                match app {
+                    Some(app) => String::from_utf8_lossy(app.buffer()).to_string(),
+                    None => {
+                        let _ = tx
+                            .send(DownloadProgress {
+                                state: DownloadProgressState::Failed,
+                                bytes_downloaded: 0,
+                                total_bytes: 0,
+                                current_file: "missing appinfo payload".to_string(),
+                            })
+                            .await;
+                        return;
+                    }
                 }
             };
-
-            let app = response.apps.iter().find(|entry| entry.appid() == appid);
-            let Some(app) = app else {
-                let _ = tx
-                    .send(DownloadProgress {
-                        state: DownloadProgressState::Failed,
-                        bytes_downloaded: 0,
-                        total_bytes: 0,
-                        current_file: "missing appinfo payload".to_string(),
-                    })
-                    .await;
-                return;
-            };
-
-            let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
             let parsed: Result<AppInfoRoot> = parse_appinfo(&appinfo_vdf);
 
             let mut selections = Vec::new();

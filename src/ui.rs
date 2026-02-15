@@ -54,6 +54,7 @@ struct PlatformSelectionState {
     app_id: u32,
     game_name: String,
     available: Vec<DepotPlatform>,
+    cached_vdf: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +78,7 @@ pub enum AsyncOp {
     DownloadStarted(u32, tokio::sync::mpsc::Receiver<DownloadProgress>),
     BranchUpdated(u32, String),
     Uninstalled(u32, String),
-    PlatformsFetched(u32, Vec<DepotPlatform>),
+    PlatformsFetched(u32, Vec<DepotPlatform>, Vec<u8>),
     ExtendedInfoFetched(u32, crate::steam_client::ExtendedAppInfo),
     LibraryFetched(Vec<LibraryGame>),
     Authenticated(crate::models::SessionState),
@@ -366,11 +367,11 @@ impl SteamLauncher {
         }
     }
 
-    fn start_install(&mut self, app_id: u32, platform: DepotPlatform) {
+    fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>) {
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
         self.runtime.spawn(async move {
-            match client.install_game(app_id, platform).await {
+            match client.install_game(app_id, platform, cached_vdf).await {
                 Ok(rx) => {
                     let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
                 }
@@ -408,7 +409,7 @@ impl SteamLauncher {
                     }
                     self.status = format!("Uninstalled {name}");
                 }
-                AsyncOp::PlatformsFetched(appid, platforms) => {
+                AsyncOp::PlatformsFetched(appid, platforms, vdf) => {
                     if platforms.len() > 1 {
                         let game_name = self
                             .library
@@ -420,11 +421,12 @@ impl SteamLauncher {
                             app_id: appid,
                             game_name,
                             available: platforms,
+                            cached_vdf: vdf,
                         });
                     } else {
                         let platform =
                             platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
-                        self.start_install(appid, platform);
+                        self.start_install(appid, platform, Some(vdf));
                     }
                 }
                 AsyncOp::ExtendedInfoFetched(appid, info) => {
@@ -875,8 +877,9 @@ impl SteamLauncher {
                 let _ = config_to_save.save().await;
             });
 
+            let vdf = self.platform_selection.as_ref().map(|s| s.cached_vdf.clone());
             self.extended_info.remove(&app_id);
-            self.start_install(app_id, platform);
+            self.start_install(app_id, platform, vdf);
             self.platform_selection = None;
         } else if close {
             self.platform_selection = None;
@@ -1013,8 +1016,8 @@ impl SteamLauncher {
                 let tx = self.operation_tx.clone();
                 self.runtime.spawn(async move {
                     match client.get_available_platforms(app_id).await {
-                        Ok(platforms) => {
-                            let _ = tx.send(AsyncOp::PlatformsFetched(app_id, platforms));
+                            Ok((platforms, vdf)) => {
+                                let _ = tx.send(AsyncOp::PlatformsFetched(app_id, platforms, vdf));
                         }
                         Err(err) => {
                             let _ = tx.send(AsyncOp::Error(format!(
@@ -1680,9 +1683,9 @@ impl eframe::App for SteamLauncher {
                                     let tx = self.operation_tx.clone();
                                     self.runtime.spawn(async move {
                                         match client.get_available_platforms(app_id).await {
-                                            Ok(platforms) => {
+                                            Ok((platforms, vdf)) => {
                                                 let _ = tx.send(AsyncOp::PlatformsFetched(
-                                                    app_id, platforms,
+                                                    app_id, platforms, vdf
                                                 ));
                                             }
                                             Err(err) => {
