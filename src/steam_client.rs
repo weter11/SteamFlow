@@ -474,6 +474,28 @@ impl SteamClient {
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
 
+        println!("Attempting to request free license for AppID: {}", appid);
+        let mut license_req = CMsgClientRequestFreeLicense::new();
+        license_req.appids.push(appid);
+
+        match connection
+            .job::<CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse>(license_req)
+            .await
+        {
+            Ok(res) => {
+                println!("License Request Result: {:?}", res);
+                if !res.granted_appids.is_empty() || !res.granted_packageids.is_empty() {
+                    bail!("License granted for AppID {appid}! Please RESTART the application to refresh your authentication ticket.");
+                }
+            }
+            Err(e) => {
+                println!(
+                    "Warning: Failed to request free license (might already own it): {}",
+                    e
+                );
+            }
+        }
+
         tokio::task::spawn(async move {
             let _ = tx
                 .send(DownloadProgress {
@@ -635,19 +657,6 @@ impl SteamClient {
                 }
             });
 
-            println!("Attempting to request free license for AppID: {}", appid);
-            let mut license_req = CMsgClientRequestFreeLicense::new();
-            license_req.appids.push(appid);
-
-            match connection.job::<CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse>(license_req).await {
-                Ok(res) => {
-                    println!("License Request Result: {:?}", res);
-                    println!("License granted! If download fails, please RESTART the application to refresh permissions.");
-                }
-                Err(e) => {
-                    println!("Warning: Failed to request free license (might already own it): {}", e);
-                }
-            }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
             let result = download_pipeline::execute_multi_depot_download_async(
