@@ -675,7 +675,13 @@ impl SteamLauncher {
             Some(self.proton_path_for_windows.trim().to_string())
         };
 
-        let prefer_proton = proton_path.is_some();
+        let mut prefer_proton = proton_path.is_some();
+        if let Some(config) = self.launcher_config.game_configs.get(&game.app_id) {
+            if let Some(pref) = &config.platform_preference {
+                prefer_proton = pref == "windows";
+            }
+        }
+
         let mut client = self.client.clone();
         let tx = self.operation_tx.clone();
         let app_id = game.app_id;
@@ -870,6 +876,22 @@ impl SteamLauncher {
         }
 
         if let Some((app_id, platform)) = selection {
+            let mut config = self
+                .launcher_config
+                .game_configs
+                .get(&app_id)
+                .cloned()
+                .unwrap_or_default();
+            config.platform_preference = Some(match platform {
+                DepotPlatform::Windows => "windows".to_string(),
+                DepotPlatform::Linux => "linux".to_string(),
+            });
+            self.launcher_config.game_configs.insert(app_id, config);
+            let config_to_save = self.launcher_config.clone();
+            self.runtime.spawn(async move {
+                let _ = config_to_save.save().await;
+            });
+
             self.start_install(app_id, platform);
             self.platform_selection = None;
         } else if close {
@@ -979,13 +1001,20 @@ impl SteamLauncher {
             ui.add_space(16.0);
             ui.heading("Platform Preference");
             let current_platform = if game.is_installed {
-                if game.active_branch.contains("experimental")
+                let mut is_proton = game.active_branch.contains("experimental")
                     || game
                         .install_path
                         .as_ref()
                         .map(|p| p.contains("compatdata"))
-                        .unwrap_or(false)
-                {
+                        .unwrap_or(false);
+
+                if let Some(config) = self.launcher_config.game_configs.get(&game.app_id) {
+                    if let Some(pref) = &config.platform_preference {
+                        is_proton = pref == "windows";
+                    }
+                }
+
+                if is_proton {
                     "Windows (Proton)"
                 } else {
                     "Linux Native"

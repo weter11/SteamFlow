@@ -392,8 +392,20 @@ impl SteamClient {
             .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
 
         let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        let parsed: AppInfoRoot =
-            keyvalues_serde::from_str(&appinfo_vdf).context("failed parsing appinfo VDF")?;
+        let parsed: Result<AppInfoRoot, _> = keyvalues_serde::from_str(&appinfo_vdf);
+
+        let parsed = match parsed {
+            Ok(p) => p,
+            Err(e) => {
+                println!("CRITICAL VDF ERROR for {}: {:?}", appid, e);
+                // Print the raw AppInfo buffer as string to see what's wrong if possible
+                println!("RAW DATA: {}", appinfo_vdf);
+
+                // Fallback: assume both for now if we can't parse it
+                return Ok(vec![DepotPlatform::Windows, DepotPlatform::Linux]);
+            }
+        };
+
         let depots = parsed
             .appinfo
             .map(|node| node.depots)
@@ -504,15 +516,20 @@ impl SteamClient {
             };
 
             let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-            let parsed: AppInfoRoot = match keyvalues_serde::from_str(&appinfo_vdf) {
+            let parsed: Result<AppInfoRoot, _> = keyvalues_serde::from_str(&appinfo_vdf);
+
+            let parsed = match parsed {
                 Ok(p) => p,
                 Err(e) => {
+                    println!("CRITICAL VDF ERROR for {}: {:?}", appid, e);
+                    println!("RAW DATA: {}", appinfo_vdf);
+
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
                             bytes_downloaded: 0,
                             total_bytes: 0,
-                            current_file: format!("failed parsing appinfo: {e}"),
+                            current_file: format!("failed parsing appinfo: {e}. Check logs for raw data."),
                         })
                         .await;
                     return;
@@ -1477,45 +1494,7 @@ fn map_confirmation(method: &ConfirmationMethod) -> ConfirmationPrompt {
     }
 }
 
-fn score_launch_option(exe: &str, prefer_proton: bool) -> i32 {
-    let mut score = 0;
-    let exe_low = exe.to_lowercase();
-
-    if prefer_proton {
-        if exe_low.ends_with(".exe") {
-            score = 100;
-        } else if exe_low.ends_with(".bat") {
-            score = 90;
-        } else if exe_low.ends_with(".app") || exe_low.contains("x86") {
-            score = 0;
-        } else if !exe_low.is_empty() {
-            score = 10;
-        }
-    } else {
-        // Linux Preference
-        if exe_low.contains("x86_64") {
-            score = 100;
-        } else if exe_low.contains("x86") {
-            score = 80;
-        } else if exe_low.ends_with(".sh") {
-            score = 70;
-        } else if !exe_low.contains(".") && !exe_low.is_empty() {
-            score = 50;
-        } else if exe_low.ends_with(".exe") || exe_low.ends_with(".app") {
-            score = 0;
-        } else if !exe_low.is_empty() {
-            score = 10;
-        }
-    }
-
-    if score > 0 && exe_low.contains("launcher") {
-        score -= 40;
-    }
-
-    score.max(0)
-}
-
-fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, prefer_proton: bool) -> Result<Vec<LaunchInfo>> {
+fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, _prefer_proton: bool) -> Result<Vec<LaunchInfo>> {
     let parsed: ProductInfoEnvelope =
         keyvalues_serde::from_str(raw_vdf).context("failed to parse product info VDF")?;
 
@@ -1532,78 +1511,60 @@ fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, prefer_proton: bool) ->
         bail!("no launch entries found for app {appid}")
     }
 
-    let mut options_with_scores = Vec::new();
+    let mut options = Vec::new();
     for (id, entry) in &config.launch {
         let exe = entry.executable.as_deref().unwrap_or("");
-        let score = score_launch_option(exe, prefer_proton);
+        let os_list = entry.config.as_ref().and_then(|c| c.oslist.as_deref());
+        let description = entry.description.as_deref().unwrap_or("Game");
 
-        if score > 0 {
-            options_with_scores.push((
-                score,
-                LaunchInfo {
-                    app_id: appid,
-                    id: id.clone(),
-                    description: entry.description.clone().unwrap_or_else(|| {
-                        if exe.is_empty() {
-                            format!("Launch Option {id}")
-                        } else {
-                            exe.to_string()
-                        }
-                    }),
-                    executable: exe.to_string(),
-                    arguments: entry.arguments.clone().unwrap_or_default(),
-                    target: if prefer_proton {
-                        LaunchTarget::WindowsProton
-                    } else {
-                        LaunchTarget::NativeLinux
-                    },
-                },
-            ));
-        }
-    }
-
-    if options_with_scores.is_empty() {
-        // Fallback: if preferred OS found nothing, try the other preference
-        for (id, entry) in &config.launch {
-            let exe = entry.executable.as_deref().unwrap_or("");
-            let score = score_launch_option(exe, !prefer_proton);
-
-            if score > 0 {
-                options_with_scores.push((
-                    score,
-                    LaunchInfo {
-                        app_id: appid,
-                        id: id.clone(),
-                        description: entry.description.clone().unwrap_or_else(|| {
-                            if exe.is_empty() {
-                                format!("Launch Option {id}")
-                            } else {
-                                exe.to_string()
-                            }
-                        }),
-                        executable: exe.to_string(),
-                        arguments: entry.arguments.clone().unwrap_or_default(),
-                        target: if !prefer_proton {
-                            LaunchTarget::WindowsProton
-                        } else {
-                            LaunchTarget::NativeLinux
-                        },
-                    },
-                ));
+        let target = if let Some(os) = os_list {
+            if os.contains("linux") {
+                Some(LaunchTarget::NativeLinux)
+            } else if os.contains("windows") {
+                Some(LaunchTarget::WindowsProton)
+            } else if os.contains("macos") {
+                None // Hide Mac on Linux/Windows
+            } else {
+                Some(LaunchTarget::WindowsProton)
             }
+        } else {
+            // Heuristics for "None"
+            if exe.ends_with(".sh") || exe.contains("linux") {
+                Some(LaunchTarget::NativeLinux)
+            } else if exe.ends_with(".exe") || exe.ends_with(".bat") {
+                Some(LaunchTarget::WindowsProton)
+            } else {
+                #[cfg(target_os = "linux")]
+                { Some(LaunchTarget::NativeLinux) }
+                #[cfg(target_os = "windows")]
+                { Some(LaunchTarget::WindowsProton) }
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                { Some(LaunchTarget::WindowsProton) }
+            }
+        };
+
+        if let Some(t) = target {
+            options.push(LaunchInfo {
+                app_id: appid,
+                id: id.clone(),
+                description: if description == "Game" && !exe.is_empty() {
+                    exe.to_string()
+                } else {
+                    description.to_string()
+                },
+                executable: exe.to_string(),
+                arguments: entry.arguments.clone().unwrap_or_default(),
+                target: t,
+            });
         }
     }
 
-    if options_with_scores.is_empty() {
+    if options.is_empty() {
         bail!("no suitable launch option found for app {appid}");
     }
 
-    // Sort options: prefer higher score, then key "0", then by id
-    options_with_scores.sort_by(|(score_a, a), (score_b, b)| {
-        if score_a != score_b {
-            return score_b.cmp(score_a);
-        }
-
+    // Sort options: prefer key "0", then by id
+    options.sort_by(|a, b| {
         if a.id == "0" {
             return std::cmp::Ordering::Less;
         }
@@ -1613,7 +1574,7 @@ fn parse_launch_info_from_vdf(appid: u32, raw_vdf: &str, prefer_proton: bool) ->
         a.id.cmp(&b.id)
     });
 
-    Ok(options_with_scores.into_iter().map(|(_, info)| info).collect())
+    Ok(options)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1644,7 +1605,12 @@ struct ProductLaunchEntry {
     arguments: Option<String>,
     #[serde(default)]
     description: Option<String>,
-    #[allow(dead_code)]
+    #[serde(default)]
+    config: Option<ProductLaunchConfigInner>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProductLaunchConfigInner {
     #[serde(default)]
     oslist: Option<String>,
 }
