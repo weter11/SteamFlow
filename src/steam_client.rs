@@ -554,12 +554,21 @@ impl SteamClient {
                     }
                 }
                 Err(e) => {
-                    println!("VDF Parse failed, using fuzzy fallback: {}", e);
-                    let target_os = match platform {
-                        DepotPlatform::Windows => "windows",
-                        DepotPlatform::Linux => "linux",
-                    };
-                    let fallback_map = fuzzy_extract_depots(&appinfo_vdf, target_os);
+                    println!("VDF Parse failed, using greedy fallback: {}", e);
+                    let fallback_map = fuzzy_extract_depots(&appinfo_vdf, appid);
+
+                    if fallback_map.is_empty() {
+                        let _ = tx
+                            .send(DownloadProgress {
+                                state: DownloadProgressState::Failed,
+                                bytes_downloaded: 0,
+                                total_bytes: 0,
+                                current_file: "No depots found in greedy fallback".to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+
                     for (d_id, m_id) in fallback_map {
                         selections.push(ManifestSelection {
                             app_id: appid,
@@ -1803,51 +1812,45 @@ fn parse_active_branch_from_acf(raw: &str) -> String {
     "public".to_string()
 }
 
-fn fuzzy_extract_depots(vdf_text: &str, target_os: &str) -> HashMap<u64, u64> {
+fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
     let mut depots = HashMap::new();
+    println!("Starting Greedy Fuzzy Scan for AppID: {}", app_id);
 
-    // 1. Find the "depots" section
-    if let Some(depots_start) = vdf_text.find("\"depots\"") {
-        let depots_str = &vdf_text[depots_start..];
+    // 1. Locate the "depots" block roughly
+    // Since we can't parse scope, we'll scan the WHOLE string for valid IDs.
+    // Regex to find "Key" structures: "123456" {
+    let re_depot = regex::Regex::new(r#""(\d+)"\s*\{"#).unwrap();
+    // Regex to find manifest IDs: "public" "123456" or "manifest" "123456"
+    let re_manifest = regex::Regex::new(r#""(?:public|manifest)"\s+"(\d+)""#).unwrap();
 
-        // 2. Iterate over potential IDs (numeric keys)
-        let re = regex::Regex::new(r#""(\d+)"\s*\{([^}]*)\}"#).unwrap();
-        let manifest_re = regex::Regex::new(r#""public"\s+"(\d+)""#).unwrap();
-
-        for cap in re.captures_iter(depots_str) {
-            let depot_id_str = &cap[1];
-            let content = &cap[2]; // The body of the depot config
-
-            if let Ok(depot_id) = depot_id_str.parse::<u64>() {
-                let matches_windows = content.contains("\"windows\"");
-                let matches_linux = content.contains("\"linux\"");
-                let matches_mac = content.contains("\"macos\"");
-
-                let mut keep = false;
-
-                if target_os == "windows" {
-                    // Keep if Windows explicitly, or if NO OS specified (Common)
-                    if matches_windows || (!matches_linux && !matches_mac) {
-                        keep = true;
-                    }
+    let matches: Vec<_> = re_depot.find_iter(vdf_text).collect();
+    for i in 0..matches.len() {
+        let m = matches[i];
+        let caps = re_depot.captures(m.as_str()).unwrap();
+        if let Ok(id) = caps[1].parse::<u64>() {
+            // HEURISTIC: Valid Depot IDs are usually close to the AppID.
+            // Accept if ID > 1000 and it's not the AppID itself.
+            if id > 1000 && id != app_id as u64 {
+                let start = m.end();
+                let end = if i + 1 < matches.len() {
+                    matches[i + 1].start()
                 } else {
-                    // Linux
-                    // Keep if Linux explicitly, or if NO OS specified
-                    if matches_linux || (!matches_windows && !matches_mac) {
-                        keep = true;
-                    }
-                }
+                    vdf_text.len()
+                };
 
-                if keep {
-                    if let Some(m_cap) = manifest_re.captures(content) {
-                        if let Ok(manifest_id) = m_cap[1].parse::<u64>() {
-                            depots.insert(depot_id, manifest_id);
+                let search_range = &vdf_text[start..end];
+                if let Some(m_caps) = re_manifest.captures(search_range) {
+                    if let Ok(manifest_id) = m_caps[1].parse::<u64>() {
+                        if !depots.contains_key(&id) {
+                            depots.insert(id, manifest_id);
                         }
                     }
                 }
             }
         }
     }
+
+    println!("Greedy Scan found candidates: {:?}", depots.keys().collect::<Vec<_>>());
     depots
 }
 
@@ -1971,6 +1974,65 @@ fn extract_quoted_values(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fuzzy_extract_depots_greedy() {
+        let vdf = r#"
+"appinfo"
+{
+    "appid" "2368470"
+    "depots"
+    {
+        "2368471"
+        {
+            "manifests"
+            {
+                "public" "1111111111111111111"
+            }
+        }
+        "2368472"
+        {
+            "manifests"
+            {
+                "public" "2222222222222222222"
+            }
+        }
+    }
+}
+"#;
+        let app_id = 2368470;
+        let depots = fuzzy_extract_depots(vdf, app_id);
+        assert_eq!(depots.len(), 2);
+        assert_eq!(depots.get(&2368471), Some(&1111111111111111111));
+        assert_eq!(depots.get(&2368472), Some(&2222222222222222222));
+    }
+
+    #[test]
+    fn test_fuzzy_extract_depots_nested_braces() {
+        // Simulating the "nested braces" issue where a simple regex would fail
+        let vdf = r#"
+"appinfo"
+{
+    "appid" "2000"
+    "depots"
+    {
+        "2001"
+        {
+            "config" { "foo" { "bar" "baz" } }
+            "manifests" { "public" "200101" }
+        }
+        "2002"
+        {
+            "manifests" { "public" "200202" }
+        }
+    }
+}
+"#;
+        let depots = fuzzy_extract_depots(vdf, 2000);
+        assert_eq!(depots.len(), 2);
+        assert_eq!(depots.get(&2001), Some(&200101));
+        assert_eq!(depots.get(&2002), Some(&200202));
+    }
 
     #[test]
     fn parses_linux_launch_section_from_vdf() {

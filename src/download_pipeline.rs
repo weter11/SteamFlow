@@ -585,6 +585,10 @@ pub async fn execute_multi_depot_download_async(
     smart_verify_existing: bool,
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<()> {
+    if selections.is_empty() {
+        bail!("No depots selected for download");
+    }
+
     for selection in selections {
         let security = phase2_get_security_info(connection, app_id, selection.depot_id).await?;
         let manifest = phase3_download_manifest(&selection, &security).await?;
