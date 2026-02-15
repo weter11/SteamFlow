@@ -32,6 +32,7 @@ use xz2::read::XzDecoder;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
+#[derive(Clone)]
 pub struct ManifestSelection {
     pub app_id: u32,
     pub depot_id: u32,

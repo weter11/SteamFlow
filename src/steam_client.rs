@@ -400,11 +400,8 @@ impl SteamClient {
 
         let parsed = match parsed {
             Ok(p) => p,
-            Err(e) => {
-                println!("CRITICAL VDF ERROR for {}: {:?}", appid, e);
-                // Print the raw AppInfo buffer as string to see what's wrong if possible
-                println!("RAW DATA: {}", appinfo_vdf);
-
+            Err(_e) => {
+                println!("Warning: Standard VDF parsing failed (likely format issue). Using Greedy Fallback.");
                 // Fallback: assume both for now if we can't parse it
                 return Ok((vec![DepotPlatform::Windows, DepotPlatform::Linux], raw_buffer));
             }
@@ -473,28 +470,6 @@ impl SteamClient {
             .join(format!("appmanifest_{appid}.acf"));
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
-
-        println!("Attempting to request free license for AppID: {}", appid);
-        let mut license_req = CMsgClientRequestFreeLicense::new();
-        license_req.appids.push(appid);
-
-        match connection
-            .job::<CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse>(license_req)
-            .await
-        {
-            Ok(res) => {
-                println!("License Request Result: {:?}", res);
-                if !res.granted_appids.is_empty() || !res.granted_packageids.is_empty() {
-                    bail!("License granted for AppID {appid}! Please RESTART the application to refresh your authentication ticket.");
-                }
-            }
-            Err(e) => {
-                println!(
-                    "Warning: Failed to request free license (might already own it): {}",
-                    e
-                );
-            }
-        }
 
         tokio::task::spawn(async move {
             let _ = tx
@@ -612,6 +587,35 @@ impl SteamClient {
                 }
             }
 
+            // --- F2P License Handling ---
+            println!("Attempting to request free license for AppID: {}", appid);
+            let mut license_req = CMsgClientRequestFreeLicense::new();
+            license_req.appids.push(appid);
+
+            match connection
+                .job::<CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse>(license_req)
+                .await
+            {
+                Ok(res) => {
+                    println!("License Request Result: {:?}", res);
+                    if !res.granted_appids.is_empty() || !res.granted_packageids.is_empty() {
+                        println!("New license granted for AppID {}! Waiting for Steam backend to propagate...", appid);
+                        let _ = tx.send(DownloadProgress {
+                            state: DownloadProgressState::Queued,
+                            bytes_downloaded: 0,
+                            total_bytes: 0,
+                            current_file: "License granted. Waiting for propagation...".to_string(),
+                        }).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    } else {
+                        println!("License already owned. Proceeding to download...");
+                    }
+                }
+                Err(e) => {
+                    println!("Warning: License request skipped: {}", e);
+                }
+            }
+
             if selections.is_empty() {
                 println!("Hard VDF failure for {}. Attempting Blind Depot Guessing...", appid);
                 // Attempt blind guessing as a last resort before failing
@@ -659,17 +663,43 @@ impl SteamClient {
 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-            let result = download_pipeline::execute_multi_depot_download_async(
-                &connection,
-                appid,
-                selections,
-                install_dir,
-                false,
-                Some(progress_tx),
-            )
-            .await;
+            let mut final_result = Err(anyhow!("Download not started"));
 
-            match result {
+            for attempt in 1..=3 {
+                println!("Starting Download Attempt {}/3 for AppID {}...", attempt, appid);
+                if attempt > 1 {
+                    let _ = tx.send(DownloadProgress {
+                        state: DownloadProgressState::Queued,
+                        bytes_downloaded: 0,
+                        total_bytes: 0,
+                        current_file: format!("Retrying download (Attempt {}/3)...", attempt),
+                    }).await;
+                }
+
+                let result = download_pipeline::execute_multi_depot_download_async(
+                    &connection,
+                    appid,
+                    selections.clone(),
+                    install_dir.clone(),
+                    false,
+                    Some(progress_tx.clone()),
+                )
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        final_result = Ok(());
+                        break;
+                    }
+                    Err(e) => {
+                        println!("Attempt {} failed: {}. Retrying in 2s...", attempt, e);
+                        final_result = Err(e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+
+            match final_result {
                 Ok(()) => {
                     if let Err(err) =
                         SteamClient::write_basic_appmanifest(&manifest_path, appid, &game_name)

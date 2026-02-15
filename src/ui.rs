@@ -128,7 +128,6 @@ pub struct SteamLauncher {
     launch_selector: Option<LaunchSelectorState>,
     current_tab: GameTab,
     extended_info: HashMap<u32, crate::steam_client::ExtendedAppInfo>,
-    show_restart_modal: bool,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -182,7 +181,6 @@ impl SteamLauncher {
             launch_selector: None,
             current_tab: GameTab::Options,
             extended_info: HashMap::new(),
-            show_restart_modal: false,
             operation_tx,
             operation_rx,
         }
@@ -339,9 +337,6 @@ impl SteamLauncher {
                         should_clear_receiver = true;
                     }
                     DownloadProgressState::Failed => {
-                        if progress.current_file.contains("RESTART") {
-                            self.show_restart_modal = true;
-                        }
                         self.status = format!("Install failed: {}", progress.current_file);
                         should_clear_receiver = true;
                     }
@@ -538,9 +533,6 @@ impl SteamLauncher {
                     }
                 }
                 AsyncOp::Error(err) => {
-                    if err.contains("RESTART") {
-                        self.show_restart_modal = true;
-                    }
                     self.status = err;
                 }
             }
@@ -783,29 +775,6 @@ impl SteamLauncher {
                 }
             }
         });
-    }
-
-    fn draw_restart_required_modal(&mut self, ctx: &egui::Context) {
-        if self.show_restart_modal {
-            egui::Window::new("Restart Required")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-                .show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("A new license has been granted to your account.").strong());
-                        ui.label("Steam requires a fresh authentication ticket to access these files.");
-                        ui.add_space(12.0);
-                        ui.colored_label(egui::Color32::YELLOW, "Please RESTART the application and try again.");
-                        ui.add_space(16.0);
-                        if ui.button("Understood").clicked() {
-                            self.show_restart_modal = false;
-                        }
-                        ui.add_space(8.0);
-                    });
-                });
-        }
     }
 
     fn draw_launch_selector_modal(&mut self, ctx: &egui::Context) {
@@ -1786,7 +1755,6 @@ impl eframe::App for SteamLauncher {
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
         self.draw_launch_selector_modal(ctx);
-        self.draw_restart_required_modal(ctx);
         ctx.request_repaint();
     }
 }
