@@ -30,6 +30,9 @@ use steam_vent::proto::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
 };
+use steam_vent::proto::steammessages_clientserver_2::{
+    CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse,
+};
 use steam_vent::proto::steammessages_player_steamclient::{
     CPlayer_GetOwnedGames_Request, CPlayer_GetOwnedGames_Response,
 };
@@ -631,6 +634,20 @@ impl SteamClient {
                         .await;
                 }
             });
+
+            println!("Attempting to request free license for AppID: {}", appid);
+            let mut license_req = CMsgClientRequestFreeLicense::new();
+            license_req.appids.push(appid);
+
+            match connection.job::<CMsgClientRequestFreeLicense, CMsgClientRequestFreeLicenseResponse>(license_req).await {
+                Ok(res) => {
+                    println!("License Request Result: {:?}", res);
+                }
+                Err(e) => {
+                    println!("Warning: Failed to request free license (might already own it): {}", e);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
             let result = download_pipeline::execute_multi_depot_download_async(
                 &connection,
@@ -1850,6 +1867,7 @@ fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
     if depots.is_empty() {
         println!("Stage 1 found nothing. Trying Stage 2 (flat scan)...");
         let all_manifest_re = regex::Regex::new(r#""(?:gid|public|manifest)"\s+"?(\d+)"?"#).unwrap();
+        let digit_key_re = regex::Regex::new(r#""(\d+)""#).unwrap();
         for mat in all_manifest_re.find_iter(vdf_text) {
              if let Some(m_caps) = all_manifest_re.captures(mat.as_str()) {
                  if let Ok(manifest_id) = m_caps[1].parse::<u64>() {
@@ -1857,7 +1875,6 @@ fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
 
                      let search_start = mat.start().saturating_sub(500);
                      let search_area = &vdf_text[search_start..mat.start()];
-                     let digit_key_re = regex::Regex::new(r#""(\d+)""#).unwrap();
 
                      if let Some(depot_match) = digit_key_re.find_iter(search_area).last() {
                          if let Some(d_caps) = digit_key_re.captures(depot_match.as_str()) {

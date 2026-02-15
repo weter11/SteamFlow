@@ -20,7 +20,6 @@ use steam_vent::proto::steammessages_clientserver_appinfo::{
 };
 use steam_vent::proto::steammessages_contentsystem_steamclient::{
     CContentServerDirectory_GetCDNAuthToken_Request,
-    CContentServerDirectory_GetCDNAuthToken_Response,
     CContentServerDirectory_GetServersForSteamPipe_Request,
     CContentServerDirectory_GetServersForSteamPipe_Response,
 };
@@ -326,15 +325,29 @@ pub async fn phase2_get_security_info(
         .ok_or_else(|| anyhow!("Steam did not return any CDN server"))?;
     let cdn_host = server.host().to_string();
 
-    let token_response: CContentServerDirectory_GetCDNAuthToken_Response = connection
+    let mut token_response_result = connection
         .service_method(CContentServerDirectory_GetCDNAuthToken_Request {
             app_id: Some(app_id),
             depot_id: Some(depot_id),
             host_name: Some(cdn_host.clone()),
             ..Default::default()
         })
-        .await
-        .context("failed requesting CDN auth token")?;
+        .await;
+
+    if token_response_result.is_err() {
+        println!("Warning: CDN auth token request failed, retrying once...");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        token_response_result = connection
+            .service_method(CContentServerDirectory_GetCDNAuthToken_Request {
+                app_id: Some(app_id),
+                depot_id: Some(depot_id),
+                host_name: Some(cdn_host.clone()),
+                ..Default::default()
+            })
+            .await;
+    }
+
+    let token_response = token_response_result.context("failed requesting CDN auth token after retry")?;
 
     Ok(SecurityInfo {
         depot_id,
