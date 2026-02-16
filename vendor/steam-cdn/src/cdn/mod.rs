@@ -55,6 +55,10 @@ impl CDNClient {
         }
     }
 
+    pub fn server_count(&self) -> usize {
+        self.inner.servers.len()
+    }
+
     pub async fn discover(connection: Arc<Connection>) -> Result<Self, Error> {
         let mut inner = InnerClient::new(connection);
         inner.servers =

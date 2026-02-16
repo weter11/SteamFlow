@@ -813,29 +813,6 @@ impl SteamClient {
             }
             tracing::info!("Effective Cell ID: {}", cell_id);
 
-            // 4. Check Server Resolution
-            tracing::info!("Attempting to resolve servers for Cell ID: {} via Web API...", cell_id);
-
-            // Fetch Servers via Web API
-            let server_list = match crate::steam_api::fetch_content_servers(cell_id).await {
-                Ok(s) => {
-                    tracing::info!("Web API returned {} content servers.", s.len());
-                    for (i, server) in s.iter().take(3).enumerate() {
-                        tracing::info!("  Server {}: {}", i, server);
-                    }
-                    s
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to fetch servers: {}. Falling back to internal list.",
-                        e
-                    );
-                    vec![]
-                }
-            };
-            tracing::info!("----------------------------");
-            // --- DEBUG PROBE END ---
-
             // 2. Initialize the CDN Client
             tracing::info!(
                 "Initializing CDN Client for SteamID: {} with CellID: {}",
@@ -850,10 +827,22 @@ impl SteamClient {
                 Some(app_ticket),
             );
 
-            for server in server_list {
-                tracing::info!("Adding CDN Server: {}", server);
-                cdn_client.add_server(server);
+            // 3. FORCE SERVER POPULATION
+            let servers = crate::steam_api::fetch_servers_fallback().await;
+
+            if servers.is_empty() {
+                tracing::error!("CRITICAL: No servers found via Web API or Fallback!");
+            } else {
+                tracing::info!("Injecting {} servers into CDN Client...", servers.len());
+                for server_addr in servers {
+                    tracing::info!("Adding CDN Server: {}", server_addr);
+                    cdn_client.add_server(server_addr);
+                }
             }
+
+            tracing::info!("Client ready with {} servers.", cdn_client.server_count());
+            tracing::info!("----------------------------");
+            // --- DEBUG PROBE END ---
 
             // 3. Download Loop
             let mut success = true;

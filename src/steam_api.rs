@@ -44,8 +44,7 @@ pub async fn fetch_content_servers(cell_id: u32) -> Result<Vec<String>> {
     for server in resp.response.servers {
         // Construct the host string (e.g., "valve404.steamcontent.com")
         if server.server_type == "SteamCache" || server.server_type == "CS" || server.server_type == "CDN" {
-            let host = format!("{}:80", server.host);
-            server_hosts.push(host);
+            server_hosts.push(server.host);
         }
     }
 
@@ -55,4 +54,37 @@ pub async fn fetch_content_servers(cell_id: u32) -> Result<Vec<String>> {
 
     tracing::info!("Found {} servers via Web API.", server_hosts.len());
     Ok(server_hosts)
+}
+
+pub async fn fetch_servers_fallback() -> Vec<String> {
+    tracing::info!("Fallback: Fetching Content Servers via Web API (Force Cell 17)...");
+
+    // Use Cell ID 17 (Germany) to ensure high availability for EU
+    let url = "https://api.steampowered.com/ISteamContentServer/GetServersForSteamPipe/v1/?cell_id=17&max_servers=20";
+    let client = reqwest::Client::new();
+    match client.get(url).send().await {
+        Ok(resp) => match resp.json::<ServerResponse>().await {
+            Ok(data) => {
+                let list: Vec<String> = data
+                    .response
+                    .servers
+                    .into_iter()
+                    .map(|s| s.host)
+                    .collect();
+                tracing::info!("Web API returned {} servers.", list.len());
+                if !list.is_empty() {
+                    return list;
+                }
+            }
+            Err(e) => tracing::error!("Failed to parse Web API JSON: {}", e),
+        },
+        Err(e) => tracing::error!("Web API Request failed: {}", e),
+    }
+
+    // Emergency Fallback: Hardcoded Valve CDN (US/EU)
+    vec![
+        "155.133.248.34".to_string(), // Frankfort
+        "162.254.196.82".to_string(), // CM
+        "162.254.197.72".to_string(), // CM
+    ]
 }
