@@ -48,6 +48,72 @@ pub struct SecurityInfo {
     pub cdn_auth_token: String,
 }
 
+pub struct ContentClient {
+    connection: Connection,
+    pub servers: Vec<String>,
+}
+
+impl ContentClient {
+    pub fn new(connection: Connection) -> Self {
+        Self {
+            connection,
+            servers: Vec::new(),
+        }
+    }
+
+    pub async fn resolve_content_servers(&mut self, cell_id: u32) -> Result<Vec<String>> {
+        let servers_response: CContentServerDirectory_GetServersForSteamPipe_Response = self
+            .connection
+            .service_method(CContentServerDirectory_GetServersForSteamPipe_Request {
+                cell_id: Some(cell_id),
+                max_servers: Some(20),
+                ..Default::default()
+            })
+            .await
+            .context("failed requesting SteamPipe CDN server list")?;
+
+        let servers: Vec<String> = servers_response
+            .servers
+            .iter()
+            .map(|s| s.host().to_string())
+            .collect();
+
+        self.servers = servers.clone();
+        Ok(servers)
+    }
+
+    pub async fn download_depot(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        manifest_id: u64,
+        install_root: PathBuf,
+        smart_verify_existing: bool,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
+    ) -> Result<()> {
+        let preferred_host = self.servers.first().cloned();
+        let security =
+            phase2_get_security_info(&self.connection, app_id, depot_id, preferred_host).await?;
+
+        let selection = ManifestSelection {
+            app_id,
+            depot_id,
+            manifest_id,
+            appinfo_vdf: String::new(),
+        };
+
+        let manifest = phase3_download_manifest(&selection, &security).await?;
+        phase4_download_chunks_async(
+            manifest,
+            security,
+            install_root,
+            smart_verify_existing,
+            progress_tx,
+        )
+        .await
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum DepotPlatform {
     Linux,
@@ -294,6 +360,7 @@ pub async fn phase2_get_security_info(
     connection: &Connection,
     app_id: u32,
     depot_id: u32,
+    preferred_host: Option<String>,
 ) -> Result<SecurityInfo> {
     let depot_request = CMsgClientGetDepotDecryptionKey {
         app_id: Some(app_id),
@@ -311,20 +378,24 @@ pub async fn phase2_get_security_info(
         bail!("Steam returned empty depot decryption key")
     }
 
-    let servers_response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
-        .service_method(CContentServerDirectory_GetServersForSteamPipe_Request {
-            cell_id: Some(connection.cell_id()),
-            max_servers: Some(20),
-            ..Default::default()
-        })
-        .await
-        .context("failed requesting SteamPipe CDN server list")?;
+    let cdn_host = if let Some(host) = preferred_host {
+        host
+    } else {
+        let servers_response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
+            .service_method(CContentServerDirectory_GetServersForSteamPipe_Request {
+                cell_id: Some(connection.cell_id()),
+                max_servers: Some(20),
+                ..Default::default()
+            })
+            .await
+            .context("failed requesting SteamPipe CDN server list")?;
 
-    let server = servers_response
-        .servers
-        .first()
-        .ok_or_else(|| anyhow!("Steam did not return any CDN server"))?;
-    let cdn_host = server.host().to_string();
+        let server = servers_response
+            .servers
+            .first()
+            .ok_or_else(|| anyhow!("Steam did not return any CDN server"))?;
+        server.host().to_string()
+    };
 
     let token_response: CContentServerDirectory_GetCDNAuthToken_Response = connection
         .service_method(CContentServerDirectory_GetCDNAuthToken_Request {
@@ -586,10 +657,10 @@ pub async fn execute_multi_depot_download_async(
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<()> {
     for selection in selections {
-        let security = match phase2_get_security_info(connection, app_id, selection.depot_id).await {
+        let security = match phase2_get_security_info(connection, app_id, selection.depot_id, None).await {
             Ok(s) => s,
             Err(e) => {
-                println!("Warning: Could not get key for Depot {} (User might not own this DLC/Language). Skipping. Error: {}", selection.depot_id, e);
+                tracing::warn!("Could not get key for Depot {} (User might not own this DLC/Language). Skipping. Error: {}", selection.depot_id, e);
                 continue;
             }
         };
@@ -643,7 +714,7 @@ pub fn execute_download_with_manifest_id(
 ) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
 
-    let security = runtime.block_on(phase2_get_security_info(connection, app_id, depot_id))?;
+    let security = runtime.block_on(phase2_get_security_info(connection, app_id, depot_id, None))?;
     let selection = ManifestSelection {
         app_id,
         depot_id,

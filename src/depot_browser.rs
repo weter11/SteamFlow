@@ -101,7 +101,7 @@ pub async fn fetch_manifest_files(
     manifest_ref: &str,
 ) -> Result<Vec<ManifestFileEntry>> {
     let manifest_id = resolve_manifest_id(connection, appid, depot_id, manifest_ref).await?;
-    let security = phase2_get_security_info(connection, appid, depot_id).await?;
+    let security = phase2_get_security_info(connection, appid, depot_id, None).await?;
     let selection = ManifestSelection {
         app_id: appid,
         depot_id,
@@ -150,7 +150,7 @@ pub fn download_single_file(
         depot_id,
         manifest_ref,
     ))?;
-    let security = runtime.block_on(phase2_get_security_info(connection, appid, depot_id))?;
+    let security = runtime.block_on(phase2_get_security_info(connection, appid, depot_id, None))?;
     let selection = ManifestSelection {
         app_id: appid,
         depot_id,

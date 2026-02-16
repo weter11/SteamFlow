@@ -780,42 +780,75 @@ impl SteamClient {
                 }
             });
 
-            let result = download_pipeline::execute_multi_depot_download_async(
-                &connection,
-                appid,
-                selections,
-                install_dir,
-                false,
-                Some(progress_tx),
-            )
-            .await;
+            // 2. Create Fresh Content Client
+            let mut fresh_content = crate::download_pipeline::ContentClient::new(connection.clone());
 
-            match result {
-                Ok(()) => {
-                    if let Err(err) =
-                        SteamClient::write_basic_appmanifest(&manifest_path, appid, &game_name)
-                    {
-                        tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
+            // 3. CRITICAL: Resolve Content Servers
+            tracing::info!("Resolving Content Servers for AppID {}...", appid);
+            let cell_id = connection.cell_id();
+
+            match fresh_content.resolve_content_servers(cell_id).await {
+                Ok(servers) => tracing::info!("Resolved {} content servers.", servers.len()),
+                Err(e) => {
+                    tracing::warn!(
+                        "Warning: Failed to resolve servers (Download might fail): {}",
+                        e
+                    )
+                }
+            }
+
+            // 4. Download Loop
+            let mut success = true;
+            for selection in selections {
+                tracing::info!(
+                    "Starting download for Depot {} (GID: {})...",
+                    selection.depot_id, selection.manifest_id
+                );
+                match fresh_content
+                    .download_depot(
+                        appid,
+                        selection.depot_id,
+                        selection.manifest_id,
+                        install_dir.clone(),
+                        false,
+                        Some(progress_tx.clone()),
+                    )
+                    .await
+                {
+                    Ok(_) => tracing::info!("Depot {} download complete!", selection.depot_id),
+                    Err(e) => {
+                        tracing::error!("Error downloading Depot {}: {}", selection.depot_id, e);
+                        let _ = tx
+                            .send(DownloadProgress {
+                                state: DownloadProgressState::Failed,
+                                bytes_downloaded: 0,
+                                total_bytes: 0,
+                                current_file: format!(
+                                    "Error downloading Depot {}: {}",
+                                    selection.depot_id, e
+                                ),
+                            })
+                            .await;
+                        success = false;
+                        break;
                     }
-                    let _ = tx
-                        .send(DownloadProgress {
-                            state: DownloadProgressState::Completed,
-                            bytes_downloaded: 1,
-                            total_bytes: 1,
-                            current_file: "completed".to_string(),
-                        })
-                        .await;
                 }
-                Err(err) => {
-                    let _ = tx
-                        .send(DownloadProgress {
-                            state: DownloadProgressState::Failed,
-                            bytes_downloaded: 0,
-                            total_bytes: 0,
-                            current_file: err.to_string(),
-                        })
-                        .await;
+            }
+
+            if success {
+                if let Err(err) =
+                    SteamClient::write_basic_appmanifest(&manifest_path, appid, &game_name)
+                {
+                    tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
                 }
+                let _ = tx
+                    .send(DownloadProgress {
+                        state: DownloadProgressState::Completed,
+                        bytes_downloaded: 1,
+                        total_bytes: 1,
+                        current_file: "completed".to_string(),
+                    })
+                    .await;
             }
         });
 
