@@ -16,6 +16,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -152,7 +153,7 @@ impl SteamClient {
         Ok(())
     }
 
-    pub async fn get_app_ticket(&self, appid: u32) -> Result<()> {
+    pub async fn get_app_ticket(&self, appid: u32) -> Result<Vec<u8>> {
         let connection = self
             .connection
             .as_ref()
@@ -161,13 +162,17 @@ impl SteamClient {
         let mut request = CMsgClientGetAppOwnershipTicket::new();
         request.set_app_id(appid);
 
-        // We don't strictly need the response body if we just want to warm up the session
-        let _: steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse = connection
-            .job(request)
-            .await
-            .context("failed requesting app ownership ticket")?;
+        let response: steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse =
+            connection
+                .job(request)
+                .await
+                .context("failed requesting app ownership ticket")?;
 
-        Ok(())
+        let ticket = response.ticket().to_vec();
+        if ticket.is_empty() {
+            bail!("Steam returned an empty app ownership ticket for app {appid}");
+        }
+        Ok(ticket)
     }
 
     pub async fn get_account_data(&self) -> AccountData {
@@ -575,10 +580,21 @@ impl SteamClient {
                 .await;
 
             // TASK 1: Request App Ticket
-            println!("Requesting App Ticket for AppID: {}", appid);
-            if let Err(e) = client_clone.get_app_ticket(appid).await {
-                tracing::warn!("Failed to request app ticket for {}: {}", appid, e);
-            }
+            tracing::info!("Requesting App Ticket for AppID: {}", appid);
+            let app_ticket = match client_clone.get_app_ticket(appid).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx
+                        .send(DownloadProgress {
+                            state: DownloadProgressState::Failed,
+                            bytes_downloaded: 0,
+                            total_bytes: 0,
+                            current_file: format!("Failed to get App Ticket: {}", e),
+                        })
+                        .await;
+                    return;
+                }
+            };
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
             let appinfo_vdf_bytes_owned;
@@ -763,7 +779,7 @@ impl SteamClient {
                 })
                 .await;
 
-            let (progress_tx, mut progress_rx) =
+            let (_progress_tx, mut progress_rx) =
                 tokio::sync::mpsc::unbounded_channel::<crate::install::ProgressEvent>();
             let tx_clone = tx.clone();
             tokio::task::spawn(async move {
@@ -780,53 +796,61 @@ impl SteamClient {
                 }
             });
 
-            // 2. Create Fresh Content Client
-            let mut fresh_content = crate::download_pipeline::ContentClient::new(connection.clone());
-
-            // 3. CRITICAL: Resolve Content Servers
-            tracing::info!("Resolving Content Servers for AppID {}...", appid);
+            // 2. Initialize the CDN Client
+            let steam_id = u64::from(connection.steam_id());
             let cell_id = connection.cell_id();
+            tracing::info!(
+                "Initializing CDN Client for SteamID: {} with CellID: {}",
+                steam_id,
+                cell_id
+            );
 
-            match fresh_content.resolve_content_servers(cell_id).await {
-                Ok(servers) => tracing::info!("Resolved {} content servers.", servers.len()),
-                Err(e) => {
-                    tracing::warn!(
-                        "Warning: Failed to resolve servers (Download might fail): {}",
-                        e
-                    )
-                }
-            }
+            let cdn_client = steam_cdn::CDNClient::new(
+                steam_id,
+                cell_id,
+                Arc::new(connection.clone()),
+                Some(app_ticket),
+            );
 
-            // 4. Download Loop
+            // 3. Download Loop
             let mut success = true;
             for selection in selections {
                 tracing::info!(
                     "Starting download for Depot {} (GID: {})...",
                     selection.depot_id, selection.manifest_id
                 );
-                match fresh_content
+
+                let key = match client_clone.get_depot_key(appid, selection.depot_id).await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping Depot {} (No Key/Not Owned): {}",
+                            selection.depot_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                match cdn_client
                     .download_depot(
                         appid,
                         selection.depot_id,
                         selection.manifest_id,
-                        install_dir.clone(),
-                        false,
-                        Some(progress_tx.clone()),
+                        &key,
+                        &install_dir,
                     )
                     .await
                 {
                     Ok(_) => tracing::info!("Depot {} download complete!", selection.depot_id),
                     Err(e) => {
-                        tracing::error!("Error downloading Depot {}: {}", selection.depot_id, e);
+                        tracing::error!("CDN Error for Depot {}: {}", selection.depot_id, e);
                         let _ = tx
                             .send(DownloadProgress {
                                 state: DownloadProgressState::Failed,
                                 bytes_downloaded: 0,
                                 total_bytes: 0,
-                                current_file: format!(
-                                    "Error downloading Depot {}: {}",
-                                    selection.depot_id, e
-                                ),
+                                current_file: format!("CDN Error for Depot {}: {}", selection.depot_id, e),
                             })
                             .await;
                         success = false;
@@ -990,8 +1014,21 @@ impl SteamClient {
         Ok(out)
     }
 
+    pub async fn get_depot_key(&self, app_id: u32, depot_id: u32) -> Result<Vec<u8>> {
+        let connection = self.connection.as_ref().context("steam connection not initialized")?;
+        let mut request = CMsgClientGetDepotDecryptionKey::new();
+        request.set_depot_id(depot_id);
+        request.set_app_id(app_id);
+
+        let response: CMsgClientGetDepotDecryptionKeyResponse = connection.job(request).await?;
+        if response.eresult() != 1 {
+            bail!("failed to get depot key for depot {depot_id}: eresult {}", response.eresult());
+        }
+        Ok(response.depot_encryption_key().to_vec())
+    }
+
     pub async fn verify_depot_ownership(&self, app_id: u32, depot_ids: Vec<u64>) -> HashMap<u64, bool> {
-        println!("Verifying ownership for {} depots...", depot_ids.len());
+        tracing::info!("Verifying ownership for {} depots...", depot_ids.len());
         let mut results = HashMap::new();
 
         let connection = match self.connection.as_ref() {
