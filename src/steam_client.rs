@@ -589,53 +589,54 @@ impl SteamClient {
             let mut selections = Vec::new();
 
             let mut has_windows = false;
-            let vdf_res = steam_vdf_parser::parse_binary(appinfo_vdf_bytes)
-                .or_else(|_| steam_vdf_parser::parse_text(&appinfo_vdf_text).map(|v| v.into_owned()));
+            if let Ok(map) = parse_pics_product_info(appinfo_vdf_bytes) {
+                // To keep filtering, we re-parse or re-use the find_vdf logic.
+                // We'll re-parse here to stay strictly compliant with Task 2's request to call parse_pics_product_info.
+                if let Ok(vdf) = find_vdf_in_pics(appinfo_vdf_bytes) {
+                    let root_obj = vdf.as_obj().unwrap();
+                    let depots_val = if vdf.key() == "appinfo" || vdf.key() == appid.to_string() {
+                        root_obj.get("depots")
+                    } else {
+                        root_obj.get("depots").or_else(|| {
+                            root_obj
+                                .get("appinfo")
+                                .and_then(|v| v.as_obj())
+                                .and_then(|o| o.get("depots"))
+                        })
+                    };
 
-            if let Ok(vdf) = vdf_res {
-                let root_obj = vdf.as_obj().unwrap();
-                let depots_val = if vdf.key() == "appinfo" || vdf.key() == appid.to_string() {
-                    root_obj.get("depots")
-                } else {
-                    root_obj.get("depots").or_else(|| {
-                        root_obj
-                            .values()
-                            .next()
-                            .and_then(|v| v.as_obj())
-                            .and_then(|o| o.get("depots"))
-                    })
-                };
+                    if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
+                        for (key, value) in depots.iter() {
+                            if let Ok(d_id) = key.parse::<u32>() {
+                                let oslist = value
+                                    .get_obj(&["config"])
+                                    .and_then(|c| c.get("oslist"))
+                                    .and_then(|o| o.as_str());
 
-                if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
-                    for (key, value) in depots.iter() {
-                        if let Ok(d_id) = key.parse::<u32>() {
-                            let oslist = value
-                                .get_obj(&["config"])
-                                .and_then(|c| c.get("oslist"))
-                                .and_then(|o| o.as_str());
+                                if oslist
+                                    .map(|os| os.to_lowercase().contains("windows"))
+                                    .unwrap_or(false)
+                                {
+                                    has_windows = true;
+                                }
 
-                            if oslist
-                                .map(|os| os.to_lowercase().contains("windows"))
-                                .unwrap_or(false)
-                            {
-                                has_windows = true;
-                            }
-
-                            if should_keep_depot(oslist, platform) {
-                                if let Some(m_id) = extract_manifest_id(value, "public") {
-                                    selections.push(ManifestSelection {
-                                        app_id: appid,
-                                        depot_id: d_id,
-                                        manifest_id: m_id,
-                                        appinfo_vdf: appinfo_vdf_text.clone(),
-                                    });
+                                if should_keep_depot(oslist, platform) {
+                                    if let Some(m_id) = map.get(&(d_id as u64)) {
+                                        selections.push(ManifestSelection {
+                                            app_id: appid,
+                                            depot_id: d_id,
+                                            manifest_id: *m_id,
+                                            appinfo_vdf: appinfo_vdf_text.clone(),
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                println!("Resolved {} Depots via Binary VDF.", selections.len());
             } else {
-                println!("CRITICAL: VDF parse failed even with robust parser for {appid}");
+                println!("CRITICAL: VDF parse failed for {appid}");
             }
 
             if selections.is_empty() {
@@ -1362,29 +1363,26 @@ impl SteamClient {
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
         let mut manifests = HashMap::new();
-        let buffer = app.buffer();
-        let vdf_res = steam_vdf_parser::parse_binary(buffer).or_else(|_| {
-            let text = String::from_utf8_lossy(buffer);
-            steam_vdf_parser::parse_text(&text).map(|v| v.into_owned())
-        });
-
-        if let Ok(vdf) = vdf_res {
+        if let Ok(vdf) = find_vdf_in_pics(app.buffer()) {
             let root_obj = vdf.as_obj().unwrap();
-            let depots_val = root_obj.get("depots").or_else(|| {
-                root_obj
-                    .values()
-                    .next()
-                    .and_then(|v| v.as_obj())
-                    .and_then(|o| o.get("depots"))
-            });
+            let depots_val = if vdf.key() == "appinfo" || vdf.key() == appid.to_string() {
+                root_obj.get("depots")
+            } else {
+                root_obj.get("depots").or_else(|| {
+                    root_obj
+                        .get("appinfo")
+                        .and_then(|v| v.as_obj())
+                        .and_then(|o| o.get("depots"))
+                })
+            };
 
             if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
                 for (key, value) in depots.iter() {
                     if let Ok(d_id) = key.parse::<u64>() {
-                        if let Some(m_id) = extract_manifest_id(value, branch) {
+                        if let Some(m_id) = extract_manifest_id_robust(value, branch) {
                             manifests.insert(d_id, m_id);
                         } else if branch != "public" {
-                            if let Some(m_id) = extract_manifest_id(value, "public") {
+                            if let Some(m_id) = extract_manifest_id_robust(value, "public") {
                                 manifests.insert(d_id, m_id);
                             }
                         }
@@ -1696,20 +1694,29 @@ fn parse_launch_info_from_vdf(
     Ok(options)
 }
 
-pub fn parse_depots_robust(data: &[u8]) -> Result<HashMap<u64, u64>> {
-    let vdf = steam_vdf_parser::parse_binary(data)
-        .or_else(|_| {
-            let text = String::from_utf8_lossy(data);
-            steam_vdf_parser::parse_text(&text).map(|v| v.into_owned())
-        })
-        .map_err(|e| anyhow!("VDF parse error: {}", e))?;
+pub fn find_vdf_in_pics(buffer: &[u8]) -> Result<steam_vdf_parser::Vdf<'static>> {
+    if let Ok(vdf) = steam_vdf_parser::parse_binary(buffer) {
+        return Ok(vdf.into_owned());
+    }
 
+    for offset in 1..std::cmp::min(128, buffer.len()) {
+        if let Ok(vdf) = steam_vdf_parser::parse_binary(&buffer[offset..]) {
+            tracing::info!("Success! Found VDF at offset {}", offset);
+            return Ok(vdf.into_owned());
+        }
+    }
+
+    bail!("Failed to locate valid Binary VDF in PICS buffer")
+}
+
+pub fn parse_pics_product_info(buffer: &[u8]) -> Result<HashMap<u64, u64>> {
+    let vdf = find_vdf_in_pics(buffer)?;
     let mut depot_map = HashMap::new();
-    let root_obj = vdf.as_obj().unwrap();
+
+    let root_obj = vdf.as_obj().context("root is not an object")?;
     let depots_val = root_obj.get("depots").or_else(|| {
         root_obj
-            .values()
-            .next()
+            .get("appinfo")
             .and_then(|v| v.as_obj())
             .and_then(|o| o.get("depots"))
     });
@@ -1717,28 +1724,79 @@ pub fn parse_depots_robust(data: &[u8]) -> Result<HashMap<u64, u64>> {
     if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
         for (key, value) in depots.iter() {
             if let Ok(depot_id) = key.parse::<u64>() {
-                if let Some(m_id) = extract_manifest_id(value, "public") {
+                if let Some(m_id) = extract_manifest_id_robust(value, "public") {
                     depot_map.insert(depot_id, m_id);
                 }
             }
         }
     }
+
+    if depot_map.is_empty() {
+        bail!("parsed structure but found no depots");
+    }
+
+    println!("Resolved {} Depots via Binary VDF.", depot_map.len());
     Ok(depot_map)
 }
 
-fn extract_manifest_id(value: &steam_vdf_parser::Value, branch: &str) -> Option<u64> {
+pub fn parse_depots_robust(data: &[u8]) -> Result<HashMap<u64, u64>> {
+    parse_pics_product_info(data).or_else(|_| {
+        let vdf = steam_vdf_parser::parse_binary(data)
+            .or_else(|_| {
+                let text = String::from_utf8_lossy(data);
+                steam_vdf_parser::parse_text(&text).map(|v| v.into_owned())
+            })
+            .map_err(|e| anyhow!("VDF parse error: {}", e))?;
+
+        let mut depot_map = HashMap::new();
+        let root_obj = vdf.as_obj().unwrap();
+        let depots_val = root_obj.get("depots").or_else(|| {
+            root_obj
+                .values()
+                .next()
+                .and_then(|v| v.as_obj())
+                .and_then(|o| o.get("depots"))
+        });
+
+        if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
+            for (key, value) in depots.iter() {
+                if let Ok(depot_id) = key.parse::<u64>() {
+                    if let Some(m_id) = extract_manifest_id_robust(value, "public") {
+                        depot_map.insert(depot_id, m_id);
+                    }
+                }
+            }
+        }
+        Ok(depot_map)
+    })
+}
+
+fn extract_manifest_id_robust(value: &steam_vdf_parser::Value, branch: &str) -> Option<u64> {
     if let Some(obj) = value.as_obj() {
+        // Deep search for branch manifest
         if let Some(manifests) = obj.get("manifests").and_then(|v| v.as_obj()) {
             if let Some(branch_entry) = manifests.get(branch) {
+                // It can be a direct string or a gid object
                 if let Some(gid_str) = branch_entry.as_str() {
-                    return gid_str.parse::<u64>().ok();
+                    if let Ok(gid) = gid_str.parse::<u64>() {
+                        return Some(gid);
+                    }
                 }
                 if let Some(gid_val) = branch_entry.as_u64() {
                     return Some(gid_val);
                 }
+                if let Some(branch_obj) = branch_entry.as_obj() {
+                    if let Some(gid) = branch_obj.get("gid") {
+                        if let Some(s) = gid.as_str() {
+                            return s.parse().ok();
+                        }
+                        return gid.as_u64();
+                    }
+                }
             }
         }
 
+        // Direct gid
         if let Some(gid_entry) = obj.get("gid") {
             if let Some(gid_str) = gid_entry.as_str() {
                 return gid_str.parse::<u64>().ok();
