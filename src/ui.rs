@@ -7,7 +7,7 @@ use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
     DownloadProgress, DownloadProgressState, LibraryGame, SteamGuardReq, UserProfile,
 };
-use crate::steam_client::SteamClient;
+use crate::steam_client::{SteamClient, AccountData};
 use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
@@ -67,6 +67,12 @@ struct LaunchSelectorState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainTab {
+    Library,
+    Account,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameTab {
     Options,
     Mods,
@@ -88,6 +94,8 @@ pub enum AsyncOp {
     LaunchOptionsFetched(u32, Vec<crate::steam_client::LaunchInfo>, Option<String>),
     AuthFailed(String),
     UserProfileFetched(crate::models::UserProfile),
+    AccountDataFetched(AccountData),
+    LoggedOut,
     SettingsSaved(bool),
     ScanCompleted(u32, HashMap<u32, String>),
     Error(String),
@@ -127,6 +135,8 @@ pub struct SteamLauncher {
     platform_selection: Option<PlatformSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
     current_tab: GameTab,
+    main_tab: MainTab,
+    account_data: Option<AccountData>,
     extended_info: HashMap<u32, crate::steam_client::ExtendedAppInfo>,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
@@ -180,6 +190,8 @@ impl SteamLauncher {
             platform_selection: None,
             launch_selector: None,
             current_tab: GameTab::Options,
+            main_tab: MainTab::Library,
+            account_data: None,
             extended_info: HashMap::new(),
             operation_tx,
             operation_rx,
@@ -367,6 +379,36 @@ impl SteamLauncher {
         }
     }
 
+    fn fetch_account_data(&mut self) {
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        self.runtime.spawn(async move {
+            match client.get_account_data().await {
+                Ok(data) => {
+                    let _ = tx.send(AsyncOp::AccountDataFetched(data));
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!("Failed to fetch account data: {err}")));
+                }
+            }
+        });
+    }
+
+    fn handle_logout(&mut self) {
+        let mut client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        self.runtime.spawn(async move {
+            match client.logout().await {
+                Ok(()) => {
+                    let _ = tx.send(AsyncOp::LoggedOut);
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!("Logout failed: {err}")));
+                }
+            }
+        });
+    }
+
     fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>) {
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
@@ -460,6 +502,17 @@ impl SteamLauncher {
                 }
                 AsyncOp::UserProfileFetched(profile) => {
                     self.user_profile = Some(profile);
+                }
+                AsyncOp::AccountDataFetched(data) => {
+                    self.account_data = Some(data);
+                }
+                AsyncOp::LoggedOut => {
+                    self.client.invalidate_session();
+                    self.needs_reauth = true;
+                    self.library.clear();
+                    self.user_profile = None;
+                    self.account_data = None;
+                    self.status = "Logged out".to_string();
                 }
                 AsyncOp::SettingsSaved(success) => {
                     self.status = if success {
@@ -1064,6 +1117,101 @@ impl SteamLauncher {
         });
     }
 
+    fn draw_account_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(data) = self.account_data.clone() else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.add(egui::Spinner::new());
+                ui.label("Loading account data...");
+            });
+            return;
+        };
+
+        ui.columns(2, |columns| {
+            // Left Column: Profile Overview
+            columns[0].vertical_centered(|ui| {
+                ui.add_space(20.0);
+                // Placeholder for Avatar (circle with initials)
+                let (rect, _response) = ui.allocate_at_least(egui::vec2(128.0, 128.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 64.0, egui::Color32::from_rgb(60, 60, 60));
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &data.persona_name.chars().next().unwrap_or('?').to_string().to_uppercase(),
+                    egui::FontId::proportional(48.0),
+                    egui::Color32::WHITE,
+                );
+                ui.add_space(10.0);
+                ui.heading(egui::RichText::new(&data.persona_name).size(24.0).strong());
+                ui.label(format!("@{}", data.account_name));
+                ui.add_space(20.0);
+
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("Logout").color(egui::Color32::WHITE))
+                            .fill(egui::Color32::from_rgb(200, 45, 45))
+                            .min_size(egui::vec2(120.0, 32.0)),
+                    )
+                    .clicked()
+                {
+                    self.handle_logout();
+                }
+            });
+
+            // Right Column: Details Grid
+            columns[1].vertical(|ui| {
+                ui.add_space(20.0);
+                ui.heading("Account Details");
+                ui.add_space(10.0);
+
+                egui::Grid::new("account_details_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 10.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Steam ID:");
+                        ui.label(data.steam_id.to_string());
+                        ui.end_row();
+
+                        ui.label("Country:");
+                        ui.label(&data.country);
+                        ui.end_row();
+
+                        ui.label("Email Status:");
+                        if data.email_validated {
+                            ui.colored_label(egui::Color32::GREEN, "Verified");
+                        } else {
+                            ui.colored_label(egui::Color32::YELLOW, "Unverified");
+                        }
+                        ui.end_row();
+
+                        ui.label("VAC Status:");
+                        if data.vac_bans > 0 {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("{} bans on record", data.vac_bans),
+                            );
+                        } else {
+                            ui.colored_label(egui::Color32::GREEN, "In Good Standing");
+                        }
+                        ui.end_row();
+
+                        ui.label("Owned Licenses:");
+                        ui.label(data.total_licenses.to_string());
+                        ui.end_row();
+
+                        ui.label("Authorized Machines:");
+                        ui.label(data.authed_machines.to_string());
+                        ui.end_row();
+
+                        ui.label("Wallet Balance:");
+                        ui.label(&data.wallet_balance);
+                        ui.end_row();
+                    });
+            });
+        });
+    }
+
     fn draw_info_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
         if !self.extended_info.contains_key(&game.app_id) {
             ui.vertical_centered(|ui| {
@@ -1360,6 +1508,157 @@ impl SteamLauncher {
             self.handle_auth_submit();
         }
     }
+
+    fn draw_library_view(&mut self, ui: &mut egui::Ui) {
+        if let Some(game) = self.selected_game().cloned() {
+            self.ensure_image_requested(game.app_id);
+
+            ui.horizontal(|ui| {
+                if let Some(texture) = self.image_cache.get(&game.app_id) {
+                    ui.add(egui::Image::new(texture).max_width(250.0));
+                } else {
+                    ui.allocate_ui(egui::vec2(250.0, 375.0), |ui| {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Loading...");
+                        });
+                    });
+                }
+
+                ui.vertical(|ui| {
+                    ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
+                    ui.label(format!("AppID: {}", game.app_id));
+
+                    ui.add_space(20.0);
+
+                    ui.horizontal(|ui| {
+                        if game.is_installed {
+                            let play_btn = egui::Button::new(
+                                egui::RichText::new("PLAY")
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(46, 125, 50))
+                            .min_size(egui::vec2(120.0, 40.0));
+
+                            if ui.add(play_btn).clicked() {
+                                self.handle_play_click(&game);
+                            }
+
+                            if game.update_available {
+                                ui.add_space(50.0);
+                                let update_btn = egui::Button::new(
+                                    egui::RichText::new("UPDATE AVAILABLE")
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(egui::Color32::from_rgb(33, 150, 243))
+                                .min_size(egui::vec2(120.0, 40.0));
+
+                                if ui
+                                    .add_enabled(!self.client.is_offline(), update_btn)
+                                    .clicked()
+                                {
+                                    let app_id = game.app_id;
+                                    let client = self.client.clone();
+                                    let tx = self.operation_tx.clone();
+                                    self.runtime.spawn(async move {
+                                        match client.update_game(app_id).await {
+                                            Ok(rx) => {
+                                                let _ = tx.send(AsyncOp::DownloadStarted(
+                                                    app_id, rx,
+                                                ));
+                                            }
+                                            Err(err) => {
+                                                let _ = tx.send(AsyncOp::Error(format!(
+                                                    "Failed to update {app_id}: {err}"
+                                                )));
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        } else {
+                            let install_btn = egui::Button::new(
+                                egui::RichText::new("INSTALL")
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(46, 125, 50))
+                            .min_size(egui::vec2(120.0, 40.0));
+
+                            if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
+                            {
+                                let app_id = game.app_id;
+                                let mut client = self.client.clone();
+                                let tx = self.operation_tx.clone();
+                                self.runtime.spawn(async move {
+                                    match client.get_available_platforms(app_id).await {
+                                        Ok((platforms, vdf)) => {
+                                            let _ = tx.send(AsyncOp::PlatformsFetched(
+                                                app_id, platforms, vdf
+                                            ));
+                                        }
+                                        Err(err) => {
+                                            let _ = tx.send(AsyncOp::Error(format!(
+                                                "Failed to fetch platforms for {app_id}: {err}"
+                                            )));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                });
+            });
+
+            ui.add_space(10.0);
+
+            if let Some(progress) = &self.live_download_progress {
+                let denom = if progress.total_bytes == 0 {
+                    1.0
+                } else {
+                    progress.total_bytes as f32
+                };
+                let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .show_percentage()
+                        .text(format!(
+                            "Live operation: {:?} - {} ({} / {} bytes)",
+                            progress.state,
+                            progress.current_file,
+                            progress.bytes_downloaded,
+                            progress.total_bytes
+                        )),
+                );
+            }
+
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.current_tab, GameTab::Options, "Options");
+                ui.selectable_value(&mut self.current_tab, GameTab::Mods, "Mods");
+                ui.selectable_value(&mut self.current_tab, GameTab::Info, "Info");
+                ui.selectable_value(&mut self.current_tab, GameTab::Misc, "Misc");
+            });
+
+            ui.add_space(8.0);
+
+            match self.current_tab {
+                GameTab::Options => self.draw_options_tab(&game.clone(), ui),
+                GameTab::Mods => {
+                    ui.label("Coming Soon");
+                }
+                GameTab::Info => self.draw_info_tab(&game.clone(), ui),
+                GameTab::Misc => {
+                    ui.label("Coming Soon");
+                }
+            }
+        } else {
+            ui.heading("SteamFlow");
+            ui.label("Select a game from the sidebar.");
+        }
+    }
 }
 
 fn scan_proton_runtimes() -> (Vec<String>, Vec<String>) {
@@ -1434,7 +1733,7 @@ impl eframe::App for SteamLauncher {
                     return;
                 }
 
-                if let Some(profile) = &self.user_profile {
+                if let Some(profile) = self.user_profile.clone() {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             let status_color = if profile.is_online {
@@ -1447,6 +1746,17 @@ impl eframe::App for SteamLauncher {
                         });
                         ui.small(format!("Steam ID: {}", profile.steam_id));
                         ui.label(format!("{} Games Owned", profile.game_count));
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(self.main_tab == MainTab::Library, "Library").clicked() {
+                                self.main_tab = MainTab::Library;
+                            }
+                            if ui.selectable_label(self.main_tab == MainTab::Account, "Account").clicked() {
+                                self.main_tab = MainTab::Account;
+                                self.fetch_account_data();
+                            }
+                        });
                     });
                     ui.separator();
                 }
@@ -1561,6 +1871,7 @@ impl eframe::App for SteamLauncher {
                         let response = ui.selectable_label(selected, job);
                         if response.clicked() {
                             self.selected_app = Some(app_id);
+                            self.main_tab = MainTab::Library;
                         }
 
                         response.context_menu(|ui| {
@@ -1600,153 +1911,13 @@ impl eframe::App for SteamLauncher {
                 return;
             }
 
-            if let Some(game) = self.selected_game().cloned() {
-                self.ensure_image_requested(game.app_id);
-
-                ui.horizontal(|ui| {
-                    if let Some(texture) = self.image_cache.get(&game.app_id) {
-                        ui.add(egui::Image::new(texture).max_width(250.0));
-                    } else {
-                        ui.allocate_ui(egui::vec2(250.0, 375.0), |ui| {
-                            ui.centered_and_justified(|ui| {
-                                ui.label("Loading...");
-                            });
-                        });
-                    }
-
-                    ui.vertical(|ui| {
-                        ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
-                        ui.label(format!("AppID: {}", game.app_id));
-
-                        ui.add_space(20.0);
-
-                        ui.horizontal(|ui| {
-                            if game.is_installed {
-                                let play_btn = egui::Button::new(
-                                    egui::RichText::new("PLAY")
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(egui::Color32::from_rgb(46, 125, 50))
-                                .min_size(egui::vec2(120.0, 40.0));
-
-                                if ui.add(play_btn).clicked() {
-                                    self.handle_play_click(&game);
-                                }
-
-                                if game.update_available {
-                                    ui.add_space(50.0);
-                                    let update_btn = egui::Button::new(
-                                        egui::RichText::new("UPDATE AVAILABLE")
-                                            .color(egui::Color32::WHITE)
-                                            .strong(),
-                                    )
-                                    .fill(egui::Color32::from_rgb(33, 150, 243))
-                                    .min_size(egui::vec2(120.0, 40.0));
-
-                                    if ui
-                                        .add_enabled(!self.client.is_offline(), update_btn)
-                                        .clicked()
-                                    {
-                                        let app_id = game.app_id;
-                                        let client = self.client.clone();
-                                        let tx = self.operation_tx.clone();
-                                        self.runtime.spawn(async move {
-                                            match client.update_game(app_id).await {
-                                                Ok(rx) => {
-                                                    let _ = tx.send(AsyncOp::DownloadStarted(
-                                                        app_id, rx,
-                                                    ));
-                                                }
-                                                Err(err) => {
-                                                    let _ = tx.send(AsyncOp::Error(format!(
-                                                        "Failed to update {app_id}: {err}"
-                                                    )));
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
-                            } else {
-                                let install_btn = egui::Button::new(
-                                    egui::RichText::new("INSTALL")
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(egui::Color32::from_rgb(46, 125, 50))
-                                .min_size(egui::vec2(120.0, 40.0));
-
-                                if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
-                                {
-                                    let app_id = game.app_id;
-                                    let mut client = self.client.clone();
-                                    let tx = self.operation_tx.clone();
-                                    self.runtime.spawn(async move {
-                                        match client.get_available_platforms(app_id).await {
-                                            Ok((platforms, vdf)) => {
-                                                let _ = tx.send(AsyncOp::PlatformsFetched(
-                                                    app_id, platforms, vdf
-                                                ));
-                                            }
-                                            Err(err) => {
-                                                let _ = tx.send(AsyncOp::Error(format!(
-                                                    "Failed to fetch platforms for {app_id}: {err}"
-                                                )));
-                                            }
-                                        }
-                                    });
-                                }
-                            }
-                        });
-                    });
-                });
-
-                ui.add_space(10.0);
-
-                if let Some(progress) = &self.live_download_progress {
-                    let denom = if progress.total_bytes == 0 {
-                        1.0
-                    } else {
-                        progress.total_bytes as f32
-                    };
-                    let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .show_percentage()
-                            .text(format!(
-                                "Live operation: {:?} - {} ({} / {} bytes)",
-                                progress.state,
-                                progress.current_file,
-                                progress.bytes_downloaded,
-                                progress.total_bytes
-                            )),
-                    );
+            match self.main_tab {
+                MainTab::Library => {
+                    self.draw_library_view(ui);
                 }
-
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.current_tab, GameTab::Options, "Options");
-                    ui.selectable_value(&mut self.current_tab, GameTab::Mods, "Mods");
-                    ui.selectable_value(&mut self.current_tab, GameTab::Info, "Info");
-                    ui.selectable_value(&mut self.current_tab, GameTab::Misc, "Misc");
-                });
-
-                ui.add_space(8.0);
-
-                match self.current_tab {
-                    GameTab::Options => self.draw_options_tab(&game, ui),
-                    GameTab::Mods => {
-                        ui.label("Coming Soon");
-                    }
-                    GameTab::Info => self.draw_info_tab(&game, ui),
-                    GameTab::Misc => {
-                        ui.label("Coming Soon");
-                    }
+                MainTab::Account => {
+                    self.draw_account_tab(ui);
                 }
-            } else {
-                ui.heading("SteamFlow");
-                ui.label("Select a game from the sidebar.");
             }
         });
 

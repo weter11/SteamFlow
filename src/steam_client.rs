@@ -1,8 +1,8 @@
 use crate::cloud_sync::{default_cloud_root, CloudClient};
 use crate::cm_list::get_cm_endpoints;
 use crate::config::{
-    library_cache_path, load_launcher_config, load_library_cache, load_session, save_library_cache,
-    save_session,
+    config_dir, library_cache_path, load_launcher_config, load_library_cache, load_session,
+    save_library_cache, save_session,
 };
 use crate::depot_browser::{self, DepotInfo, ManifestFileEntry};
 use crate::download_pipeline::{
@@ -85,6 +85,22 @@ pub struct ExtendedAppInfo {
 pub struct ConfirmationPrompt {
     pub requirement: SteamGuardReq,
     pub details: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AccountData {
+    pub steam_id: u64,
+    pub account_name: String,
+    pub persona_name: String,
+    pub country: String,      // GeoIP Country
+    pub authed_machines: u32, // Steam Guard count
+    pub flags: u32,           // Account Flags
+    pub email: String,
+    pub email_validated: bool,
+    pub vac_bans: u32,        // Num VAC bans
+    pub vac_banned_apps: Vec<u32>,
+    pub total_licenses: usize,
+    pub wallet_balance: String, // formatted currency
 }
 
 #[derive(Clone)]
@@ -206,6 +222,38 @@ impl SteamClient {
 
     pub fn active_cm(&self) -> Option<SocketAddr> {
         self.active_cm
+    }
+
+    pub async fn get_account_data(&self) -> Result<AccountData> {
+        let conn = self.connection.as_ref().context("not connected")?;
+        let session = load_session().await.unwrap_or_default();
+
+        Ok(AccountData {
+            steam_id: u64::from(conn.steam_id()),
+            account_name: session.account_name.unwrap_or_else(|| "Unknown".to_string()),
+            persona_name: "Unknown".to_string(),
+            country: conn.ip_country_code().unwrap_or_else(|| "??".to_string()),
+            authed_machines: 0,
+            flags: 0,
+            email: "Hidden".to_string(),
+            email_validated: true,
+            vac_bans: 0,
+            vac_banned_apps: vec![],
+            total_licenses: 0,
+            wallet_balance: "0.00".to_string(),
+        })
+    }
+
+    pub async fn logout(&mut self) -> Result<()> {
+        self.connection = None;
+        self.state = LoginState::Connected;
+
+        let dir = config_dir()?;
+        let path = dir.join("session.json");
+        if path.exists() {
+            tokio::fs::remove_file(path).await?;
+        }
+        Ok(())
     }
 
     pub async fn restore_session(&mut self) -> Result<SessionState> {
