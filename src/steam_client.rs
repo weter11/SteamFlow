@@ -586,6 +586,21 @@ impl SteamClient {
             };
 
             let appinfo_vdf_text = String::from_utf8_lossy(appinfo_vdf_bytes).to_string();
+
+            // HEX DUMP: Print the first 128 bytes of the received buffer
+            let preview_len = std::cmp::min(appinfo_vdf_bytes.len(), 128);
+            println!("--- VDF BUFFER DEBUG ---");
+            println!("Buffer Size: {} bytes", appinfo_vdf_bytes.len());
+            println!("Header (Hex): {:02X?}", &appinfo_vdf_bytes[..preview_len]);
+            // Try to print as string (replace non-utf8 with dot)
+            let text_preview: String = appinfo_vdf_bytes
+                .iter()
+                .take(preview_len)
+                .map(|&b| if (32..=126).contains(&b) { b as char } else { '.' })
+                .collect();
+            println!("Header (ASCII): {}", text_preview);
+            println!("------------------------");
+
             let mut selections = Vec::new();
 
             let mut has_windows = false;
@@ -613,6 +628,17 @@ impl SteamClient {
                                     .and_then(|c| c.get("oslist"))
                                     .and_then(|o| o.as_str());
 
+                                println!("Evaluating Depot ID: {}", d_id);
+                                if let Some(config) = value.get_obj(&["config"]) {
+                                    let os_arch =
+                                        config.get("osarch").and_then(|v| v.as_str()).unwrap_or("ANY");
+                                    println!("  - OS List: {:?}", oslist.unwrap_or("ALL (Common)"));
+                                    println!("  - Architecture: {:?}", os_arch);
+                                } else {
+                                    println!("  - No 'config' section found (Assuming Shared/Common depot)");
+                                }
+                                println!("  - Target Platform: {:?}", platform);
+
                                 if oslist
                                     .map(|os| os.to_lowercase().contains("windows"))
                                     .unwrap_or(false)
@@ -620,7 +646,10 @@ impl SteamClient {
                                     has_windows = true;
                                 }
 
-                                if should_keep_depot(oslist, platform) {
+                                let match_os = should_keep_depot(oslist, platform);
+                                println!("  -> Match Result: {}", match_os);
+
+                                if match_os {
                                     if let Some(m_id) = map.get(&(d_id as u64)) {
                                         selections.push(ManifestSelection {
                                             app_id: appid,

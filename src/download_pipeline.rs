@@ -765,4 +765,19 @@ mod tests {
         let out = process_chunk(data.clone(), &[]);
         assert_eq!(out, data);
     }
+
+    #[test]
+    fn should_keep_common_depots() {
+        // None means common/all
+        assert!(should_keep_depot(None, DepotPlatform::Windows));
+        assert!(should_keep_depot(None, DepotPlatform::Linux));
+
+        // Explicitly including target OS
+        assert!(should_keep_depot(Some("windows"), DepotPlatform::Windows));
+        assert!(should_keep_depot(Some("linux"), DepotPlatform::Linux));
+
+        // Excluding other OS
+        assert!(!should_keep_depot(Some("windows"), DepotPlatform::Linux));
+        assert!(!should_keep_depot(Some("linux"), DepotPlatform::Windows));
+    }
 }
