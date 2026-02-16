@@ -26,6 +26,7 @@ use steam_vent::auth::{
     UserProvidedAuthConfirmationHandler,
 };
 use steam_vent::connection::Connection;
+use steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicket;
 use steam_vent::proto::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
@@ -135,6 +136,24 @@ impl SteamClient {
         self.connection = None;
         self.state = LoginState::Connected;
         delete_session().await?;
+        Ok(())
+    }
+
+    pub async fn get_app_ticket(&self, appid: u32) -> Result<()> {
+        let connection = self
+            .connection
+            .as_ref()
+            .context("steam connection not initialized")?;
+
+        let mut request = CMsgClientGetAppOwnershipTicket::new();
+        request.set_app_id(appid);
+
+        // We don't strictly need the response body if we just want to warm up the session
+        let _: steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse = connection
+            .job(request)
+            .await
+            .context("failed requesting app ownership ticket")?;
+
         Ok(())
     }
 
@@ -529,6 +548,7 @@ impl SteamClient {
             .join(format!("appmanifest_{appid}.acf"));
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let client_clone = self.clone();
 
         tokio::task::spawn(async move {
             let _ = tx
@@ -539,6 +559,13 @@ impl SteamClient {
                     current_file: String::new(),
                 })
                 .await;
+
+            // TASK 1: Request App Ticket
+            println!("Requesting App Ticket for AppID: {}", appid);
+            if let Err(e) = client_clone.get_app_ticket(appid).await {
+                tracing::warn!("Failed to request app ticket for {}: {}", appid, e);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
             let appinfo_vdf_bytes_owned;
             let appinfo_vdf_bytes = if let Some(cached) = cached_vdf {
@@ -667,6 +694,7 @@ impl SteamClient {
 
                                 if match_os {
                                     if let Some(m_id) = map.get(&(d_id as u64)) {
+                                        println!("Using GID {} for Depot {}", m_id, d_id);
                                         selections.push(ManifestSelection {
                                             app_id: appid,
                                             depot_id: d_id,
@@ -1825,6 +1853,8 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
     if depot_map.is_empty() {
         let mut current_depot = 0;
         let mut inside_depots = false;
+        let mut inside_manifests = false;
+        let mut inside_public = false;
         let mut depot_langs = HashMap::new();
 
         for line in text.lines() {
@@ -1837,21 +1867,49 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
                 continue;
             }
 
+            if trimmed == "}" {
+                if inside_public {
+                    inside_public = false;
+                } else if inside_manifests {
+                    inside_manifests = false;
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("\"manifests\"") {
+                inside_manifests = true;
+                continue;
+            }
+            if inside_manifests && trimmed.starts_with("\"public\"") {
+                inside_public = true;
+                continue;
+            }
+
             let parts = extract_quoted_values(trimmed);
             if parts.len() == 1 {
                 if let Ok(id) = parts[0].parse::<u64>() {
                     current_depot = id;
+                    inside_manifests = false;
+                    inside_public = false;
                 }
             } else if parts.len() >= 2 && current_depot > 0 {
                 let key = parts[0].to_lowercase();
-                if key == "public" || key == "manifest" || key == "gid" {
+                if inside_public && key == "gid" {
                     if let Ok(gid) = parts[1].parse::<u64>() {
                         if gid > 0 {
+                            println!("Found Public GID for Depot {}: {}", current_depot, gid);
                             depot_map.insert(current_depot, gid);
                         }
                     }
                 } else if key == "language" {
                     depot_langs.insert(current_depot, parts[1].to_lowercase());
+                } else if !inside_manifests && (key == "manifest" || key == "gid") {
+                    // Fallback for flat structure
+                    if let Ok(gid) = parts[1].parse::<u64>() {
+                        if gid > 0 {
+                            depot_map.insert(current_depot, gid);
+                        }
+                    }
                 }
             }
         }
