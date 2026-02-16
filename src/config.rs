@@ -118,6 +118,14 @@ pub async fn save_session(session: &SessionState) -> Result<()> {
     Ok(())
 }
 
+pub async fn delete_session() -> Result<()> {
+    let session_path = config_dir()?.join("session.json");
+    if session_path.exists() {
+        fs::remove_file(session_path).await?;
+    }
+    Ok(())
+}
+
 pub async fn load_launcher_config() -> Result<LauncherConfig> {
     let path = config_dir()?.join("config.json");
     if !path.exists() {

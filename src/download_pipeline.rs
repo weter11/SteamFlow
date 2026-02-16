@@ -586,7 +586,13 @@ pub async fn execute_multi_depot_download_async(
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<()> {
     for selection in selections {
-        let security = phase2_get_security_info(connection, app_id, selection.depot_id).await?;
+        let security = match phase2_get_security_info(connection, app_id, selection.depot_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Warning: Could not get key for Depot {} (User might not own this DLC/Language). Skipping. Error: {}", selection.depot_id, e);
+                continue;
+            }
+        };
         let manifest = phase3_download_manifest(&selection, &security).await?;
         phase4_download_chunks_async(
             manifest,
@@ -764,5 +770,20 @@ mod tests {
         let data = b"hello-chunk".to_vec();
         let out = process_chunk(data.clone(), &[]);
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn should_keep_common_depots() {
+        // None means common/all
+        assert!(should_keep_depot(None, DepotPlatform::Windows));
+        assert!(should_keep_depot(None, DepotPlatform::Linux));
+
+        // Explicitly including target OS
+        assert!(should_keep_depot(Some("windows"), DepotPlatform::Windows));
+        assert!(should_keep_depot(Some("linux"), DepotPlatform::Linux));
+
+        // Excluding other OS
+        assert!(!should_keep_depot(Some("windows"), DepotPlatform::Linux));
+        assert!(!should_keep_depot(Some("linux"), DepotPlatform::Windows));
     }
 }
