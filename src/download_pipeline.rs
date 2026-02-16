@@ -586,7 +586,13 @@ pub async fn execute_multi_depot_download_async(
     progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
 ) -> Result<()> {
     for selection in selections {
-        let security = phase2_get_security_info(connection, app_id, selection.depot_id).await?;
+        let security = match phase2_get_security_info(connection, app_id, selection.depot_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Warning: Could not get key for Depot {} (User might not own this DLC/Language). Skipping. Error: {}", selection.depot_id, e);
+                continue;
+            }
+        };
         let manifest = phase3_download_manifest(&selection, &security).await?;
         phase4_download_chunks_async(
             manifest,

@@ -646,8 +646,24 @@ impl SteamClient {
                                     has_windows = true;
                                 }
 
-                                let match_os = should_keep_depot(oslist, platform);
-                                println!("  -> Match Result: {}", match_os);
+                                let mut match_os = should_keep_depot(oslist, platform);
+                                println!("  -> Match Result (OS): {}", match_os);
+
+                                if match_os {
+                                    // 1. LANGUAGE CHECK
+                                    let lang = value
+                                        .get_obj(&["config"])
+                                        .and_then(|c| c.get("language"))
+                                        .and_then(|l| l.as_str());
+                                    if let Some(lang) = lang {
+                                        if lang != "english" && !lang.is_empty() {
+                                            println!("  - Language: {} (Skipping)", lang);
+                                            match_os = false;
+                                        } else {
+                                            println!("  - Language: {} (Matched)", lang);
+                                        }
+                                    }
+                                }
 
                                 if match_os {
                                     if let Some(m_id) = map.get(&(d_id as u64)) {
@@ -1783,6 +1799,17 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
             if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
                 for (key, value) in depots.iter() {
                     if let Ok(depot_id) = key.parse::<u64>() {
+                        // Language check for library-parsed VDF
+                        let lang = value
+                            .get_obj(&["config"])
+                            .and_then(|c| c.get("language"))
+                            .and_then(|l| l.as_str());
+                        if let Some(lang) = lang {
+                            if lang != "english" && !lang.is_empty() {
+                                continue;
+                            }
+                        }
+
                         if let Some(m_id) = extract_manifest_id_robust(value, "public") {
                             depot_map.insert(depot_id, m_id);
                         }
@@ -1798,6 +1825,8 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
     if depot_map.is_empty() {
         let mut current_depot = 0;
         let mut inside_depots = false;
+        let mut depot_langs = HashMap::new();
+
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.contains("\"depots\"") {
@@ -1814,15 +1843,29 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
                     current_depot = id;
                 }
             } else if parts.len() >= 2 && current_depot > 0 {
-                if parts[0] == "public" || parts[0] == "manifest" || parts[0] == "gid" {
+                let key = parts[0].to_lowercase();
+                if key == "public" || key == "manifest" || key == "gid" {
                     if let Ok(gid) = parts[1].parse::<u64>() {
                         if gid > 0 {
                             depot_map.insert(current_depot, gid);
                         }
                     }
+                } else if key == "language" {
+                    depot_langs.insert(current_depot, parts[1].to_lowercase());
                 }
             }
         }
+
+        // Apply Language Filter to manual scan results
+        depot_map.retain(|id, _| {
+            if let Some(lang) = depot_langs.get(id) {
+                if lang != "english" && !lang.is_empty() {
+                    println!("Skipping Depot {} (Language: {}) during manual scan", id, lang);
+                    return false;
+                }
+            }
+            true
+        });
     }
 
     if depot_map.is_empty() {
@@ -1847,6 +1890,17 @@ fn parse_binary_vdf_with_offset(data: &[u8]) -> Result<HashMap<u64, u64>> {
         if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
             for (key, value) in depots.iter() {
                 if let Ok(depot_id) = key.parse::<u64>() {
+                    // Language check for binary-parsed VDF
+                    let lang = value
+                        .get_obj(&["config"])
+                        .and_then(|c| c.get("language"))
+                        .and_then(|l| l.as_str());
+                    if let Some(lang) = lang {
+                        if lang != "english" && !lang.is_empty() {
+                            continue;
+                        }
+                    }
+
                     if let Some(m_id) = extract_manifest_id_robust(value, "public") {
                         depot_map.insert(depot_id, m_id);
                     }
