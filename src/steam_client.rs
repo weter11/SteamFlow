@@ -663,7 +663,6 @@ impl SteamClient {
                         }
                     }
                 }
-                println!("Resolved {} Depots via Binary VDF.", selections.len());
             } else {
                 println!("CRITICAL: VDF parse failed for {appid}");
             }
@@ -1724,6 +1723,18 @@ fn parse_launch_info_from_vdf(
 }
 
 pub fn find_vdf_in_pics(buffer: &[u8]) -> Result<steam_vdf_parser::Vdf<'static>> {
+    let is_text = buffer
+        .first()
+        .map(|&b| b == 0x22 || b == 0x7B)
+        .unwrap_or(false);
+
+    if is_text {
+        let text = String::from_utf8_lossy(buffer);
+        return steam_vdf_parser::parse_text(&text)
+            .map(|v| v.into_owned())
+            .map_err(|e| anyhow!("Text VDF parse error: {}", e));
+    }
+
     if let Ok(vdf) = steam_vdf_parser::parse_binary(buffer) {
         return Ok(vdf.into_owned());
     }
@@ -1735,54 +1746,100 @@ pub fn find_vdf_in_pics(buffer: &[u8]) -> Result<steam_vdf_parser::Vdf<'static>>
         }
     }
 
-    bail!("Failed to locate valid Binary VDF in PICS buffer")
+    bail!("Failed to locate valid VDF (Text or Binary) in PICS buffer")
 }
 
 pub fn parse_pics_product_info(buffer: &[u8]) -> Result<HashMap<u64, u64>> {
-    let vdf = find_vdf_in_pics(buffer)?;
+    println!("Detecting VDF Format...");
+
+    let is_text = buffer
+        .first()
+        .map(|&b| b == 0x22 || b == 0x7B)
+        .unwrap_or(false);
+
+    if is_text {
+        println!("Format: TEXT VDF detected.");
+        parse_text_vdf(buffer)
+    } else {
+        println!("Format: BINARY VDF (or Header) detected.");
+        parse_binary_vdf_with_offset(buffer)
+    }
+}
+
+fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
+    let text = String::from_utf8_lossy(data);
     let mut depot_map = HashMap::new();
 
-    let root_obj = vdf.as_obj().context("root is not an object")?;
-    let depots_val = root_obj.get("depots").or_else(|| {
-        root_obj
-            .get("appinfo")
-            .and_then(|v| v.as_obj())
-            .and_then(|o| o.get("depots"))
-    });
+    match steam_vdf_parser::parse_text(&text) {
+        Ok(vdf) => {
+            let root_obj = vdf.as_obj().unwrap();
+            let depots_val = root_obj.get("depots").or_else(|| {
+                root_obj
+                    .get("appinfo")
+                    .and_then(|v| v.as_obj())
+                    .and_then(|o| o.get("depots"))
+            });
 
-    if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
-        for (key, value) in depots.iter() {
-            if let Ok(depot_id) = key.parse::<u64>() {
-                if let Some(m_id) = extract_manifest_id_robust(value, "public") {
-                    depot_map.insert(depot_id, m_id);
+            if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
+                for (key, value) in depots.iter() {
+                    if let Ok(depot_id) = key.parse::<u64>() {
+                        if let Some(m_id) = extract_manifest_id_robust(value, "public") {
+                            depot_map.insert(depot_id, m_id);
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            println!("Text VDF parser failed: {e}. Falling back to manual scan.");
+        }
+    }
+
+    if depot_map.is_empty() {
+        let mut current_depot = 0;
+        let mut inside_depots = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("\"depots\"") {
+                inside_depots = true;
+                continue;
+            }
+            if !inside_depots {
+                continue;
+            }
+
+            let parts = extract_quoted_values(trimmed);
+            if parts.len() == 1 {
+                if let Ok(id) = parts[0].parse::<u64>() {
+                    current_depot = id;
+                }
+            } else if parts.len() >= 2 && current_depot > 0 {
+                if parts[0] == "public" || parts[0] == "manifest" || parts[0] == "gid" {
+                    if let Ok(gid) = parts[1].parse::<u64>() {
+                        if gid > 0 {
+                            depot_map.insert(current_depot, gid);
+                        }
+                    }
                 }
             }
         }
     }
 
     if depot_map.is_empty() {
-        bail!("parsed structure but found no depots");
+        bail!("Text scan found no depots");
     }
 
-    println!("Resolved {} Depots via Binary VDF.", depot_map.len());
+    println!("Resolved {} Depots via Text VDF.", depot_map.len());
     Ok(depot_map)
 }
 
-pub fn parse_depots_robust(data: &[u8]) -> Result<HashMap<u64, u64>> {
-    parse_pics_product_info(data).or_else(|_| {
-        let vdf = steam_vdf_parser::parse_binary(data)
-            .or_else(|_| {
-                let text = String::from_utf8_lossy(data);
-                steam_vdf_parser::parse_text(&text).map(|v| v.into_owned())
-            })
-            .map_err(|e| anyhow!("VDF parse error: {}", e))?;
-
+fn parse_binary_vdf_with_offset(data: &[u8]) -> Result<HashMap<u64, u64>> {
+    if let Ok(vdf) = find_vdf_in_pics(data) {
         let mut depot_map = HashMap::new();
-        let root_obj = vdf.as_obj().unwrap();
+        let root_obj = vdf.as_obj().context("root is not an object")?;
         let depots_val = root_obj.get("depots").or_else(|| {
             root_obj
-                .values()
-                .next()
+                .get("appinfo")
                 .and_then(|v| v.as_obj())
                 .and_then(|o| o.get("depots"))
         });
@@ -1796,8 +1853,17 @@ pub fn parse_depots_robust(data: &[u8]) -> Result<HashMap<u64, u64>> {
                 }
             }
         }
-        Ok(depot_map)
-    })
+
+        if !depot_map.is_empty() {
+            println!("Resolved {} Depots via Binary VDF.", depot_map.len());
+            return Ok(depot_map);
+        }
+    }
+    bail!("Failed to locate valid Binary VDF in PICS buffer")
+}
+
+pub fn parse_depots_robust(data: &[u8]) -> Result<HashMap<u64, u64>> {
+    parse_pics_product_info(data)
 }
 
 fn extract_manifest_id_robust(value: &steam_vdf_parser::Value, branch: &str) -> Option<u64> {
