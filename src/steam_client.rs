@@ -796,28 +796,52 @@ impl SteamClient {
                 }
             });
 
-            // 2. Initialize the CDN Client
+            // --- DEBUG PROBE START ---
+            tracing::info!("--- CDN CONNECTION DEBUG ---");
+            // 1. Check Identity
             let steam_id = u64::from(connection.steam_id());
-            let mut cell_id = connection.cell_id();
+            tracing::info!("SteamID: {}", steam_id);
+
+            // 2. Check Cell ID (Crucial)
+            let config_cell = connection.cell_id();
+            tracing::info!("Client Config Cell ID: {}", config_cell);
+
+            let mut cell_id = config_cell;
             if cell_id == 0 {
                 tracing::info!("Warning: Cell ID is 0. Defaulting to US East (12).");
                 cell_id = 12;
             }
+            tracing::info!("Effective Cell ID: {}", cell_id);
 
+            // 4. Check Server Resolution
+            tracing::info!("Attempting to resolve servers for Cell ID: {} via Web API...", cell_id);
+
+            // Fetch Servers via Web API
+            let server_list = match crate::steam_api::fetch_content_servers(cell_id).await {
+                Ok(s) => {
+                    tracing::info!("Web API returned {} content servers.", s.len());
+                    for (i, server) in s.iter().take(3).enumerate() {
+                        tracing::info!("  Server {}: {}", i, server);
+                    }
+                    s
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to fetch servers: {}. Falling back to internal list.",
+                        e
+                    );
+                    vec![]
+                }
+            };
+            tracing::info!("----------------------------");
+            // --- DEBUG PROBE END ---
+
+            // 2. Initialize the CDN Client
             tracing::info!(
                 "Initializing CDN Client for SteamID: {} with CellID: {}",
                 steam_id,
                 cell_id
             );
-
-            // Fetch Servers via Web API
-            let server_list = match crate::steam_api::fetch_content_servers(cell_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Failed to fetch servers: {}. Falling back to internal list.", e);
-                    vec![]
-                }
-            };
 
             let mut cdn_client = steam_cdn::CDNClient::new(
                 steam_id,
