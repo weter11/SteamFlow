@@ -54,6 +54,7 @@ struct PlatformSelectionState {
     app_id: u32,
     game_name: String,
     available: Vec<DepotPlatform>,
+    cached_vdf: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,11 +74,18 @@ enum GameTab {
     Misc,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainTab {
+    Library,
+    Account,
+}
+
 pub enum AsyncOp {
     DownloadStarted(u32, tokio::sync::mpsc::Receiver<DownloadProgress>),
     BranchUpdated(u32, String),
+    AccountDataFetched(crate::steam_client::AccountData),
     Uninstalled(u32, String),
-    PlatformsFetched(u32, Vec<DepotPlatform>),
+    PlatformsFetched(u32, Vec<DepotPlatform>, Vec<u8>),
     ExtendedInfoFetched(u32, crate::steam_client::ExtendedAppInfo),
     LibraryFetched(Vec<LibraryGame>),
     Authenticated(crate::models::SessionState),
@@ -120,12 +128,15 @@ pub struct SteamLauncher {
     steam_protons: Vec<String>,
     custom_protons: Vec<String>,
     user_profile: Option<UserProfile>,
+    refreshing_account_data: bool,
     uninstall_modal: Option<UninstallModalState>,
     properties_modal: Option<PropertiesModalState>,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
     current_tab: GameTab,
+    main_tab: MainTab,
+    account_data: Option<crate::steam_client::AccountData>,
     extended_info: HashMap<u32, crate::steam_client::ExtendedAppInfo>,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
@@ -173,12 +184,15 @@ impl SteamLauncher {
             steam_protons,
             custom_protons,
             user_profile,
+            refreshing_account_data: false,
             uninstall_modal: None,
             properties_modal: None,
             depot_browser: None,
             platform_selection: None,
             launch_selector: None,
             current_tab: GameTab::Options,
+            main_tab: MainTab::Library,
+            account_data: None,
             extended_info: HashMap::new(),
             operation_tx,
             operation_rx,
@@ -291,6 +305,30 @@ impl SteamLauncher {
         });
     }
 
+    fn refresh_account_data(&mut self) {
+        if self.refreshing_account_data {
+            return;
+        }
+        self.refreshing_account_data = true;
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        self.runtime.spawn(async move {
+            let data = client.get_account_data().await;
+            let _ = tx.send(AsyncOp::AccountDataFetched(data));
+        });
+    }
+
+    fn logout(&mut self) {
+        let mut client = self.client.clone();
+        let _ = self.runtime.block_on(client.logout());
+        self.client = client;
+        self.needs_reauth = true;
+        self.user_profile = None;
+        self.account_data = None;
+        self.library.clear();
+        self.status = "Logged out".to_string();
+    }
+
     fn poll_download_progress(&mut self) {
         let mut should_clear_receiver = false;
 
@@ -366,11 +404,11 @@ impl SteamLauncher {
         }
     }
 
-    fn start_install(&mut self, app_id: u32, platform: DepotPlatform) {
+    fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>) {
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
         self.runtime.spawn(async move {
-            match client.install_game(app_id, platform).await {
+            match client.install_game(app_id, platform, cached_vdf).await {
                 Ok(rx) => {
                     let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
                 }
@@ -408,7 +446,7 @@ impl SteamLauncher {
                     }
                     self.status = format!("Uninstalled {name}");
                 }
-                AsyncOp::PlatformsFetched(appid, platforms) => {
+                AsyncOp::PlatformsFetched(appid, platforms, buffer) => {
                     if platforms.len() > 1 {
                         let game_name = self
                             .library
@@ -420,11 +458,11 @@ impl SteamLauncher {
                             app_id: appid,
                             game_name,
                             available: platforms,
+                            cached_vdf: buffer,
                         });
                     } else {
-                        let platform =
-                            platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
-                        self.start_install(appid, platform);
+                        let platform = platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
+                        self.start_install(appid, platform, Some(buffer));
                     }
                 }
                 AsyncOp::ExtendedInfoFetched(appid, info) => {
@@ -458,6 +496,10 @@ impl SteamLauncher {
                 }
                 AsyncOp::UserProfileFetched(profile) => {
                     self.user_profile = Some(profile);
+                }
+                AsyncOp::AccountDataFetched(data) => {
+                    self.account_data = Some(data);
+                    self.refreshing_account_data = false;
                 }
                 AsyncOp::SettingsSaved(success) => {
                     self.status = if success {
@@ -848,7 +890,7 @@ impl SteamLauncher {
                             DepotPlatform::Linux => "Linux (Native)",
                         };
                         if ui.button(label).clicked() {
-                            selection = Some((state.app_id, *platform));
+                            selection = Some((state.app_id, *platform, state.cached_vdf.clone()));
                         }
                     }
 
@@ -858,7 +900,7 @@ impl SteamLauncher {
                 });
         }
 
-        if let Some((app_id, platform)) = selection {
+        if let Some((app_id, platform, cached_vdf)) = selection {
             let mut config = self
                 .launcher_config
                 .game_configs
@@ -876,7 +918,7 @@ impl SteamLauncher {
             });
 
             self.extended_info.remove(&app_id);
-            self.start_install(app_id, platform);
+            self.start_install(app_id, platform, Some(cached_vdf));
             self.platform_selection = None;
         } else if close {
             self.platform_selection = None;
@@ -1013,8 +1055,8 @@ impl SteamLauncher {
                 let tx = self.operation_tx.clone();
                 self.runtime.spawn(async move {
                     match client.get_available_platforms(app_id).await {
-                        Ok(platforms) => {
-                            let _ = tx.send(AsyncOp::PlatformsFetched(app_id, platforms));
+                        Ok((platforms, buffer)) => {
+                            let _ = tx.send(AsyncOp::PlatformsFetched(app_id, platforms, buffer));
                         }
                         Err(err) => {
                             let _ = tx.send(AsyncOp::Error(format!(
@@ -1059,6 +1101,101 @@ impl SteamLauncher {
                 }
             });
         });
+    }
+
+    fn draw_account_tab(&mut self, ui: &mut egui::Ui) {
+        if self.account_data.is_none() {
+            self.refresh_account_data();
+            ui.vertical_centered(|ui| {
+                ui.add_space(20.0);
+                ui.add(egui::Spinner::new());
+                ui.label("Loading account data...");
+            });
+            return;
+        }
+
+        let data = self.account_data.clone().unwrap();
+        let mut should_logout = false;
+
+        ui.columns(2, |columns| {
+            // Left Column
+            columns[0].vertical_centered(|ui| {
+                ui.add_space(20.0);
+                // Persona placeholder
+                let initials: String = data.account_name.chars().take(2).collect();
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(100.0, 100.0));
+                    ui.heading(egui::RichText::new(initials.to_uppercase()).size(40.0));
+                });
+
+                ui.add_space(10.0);
+                ui.heading(&data.account_name);
+
+                ui.add_space(20.0);
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("Logout").color(egui::Color32::WHITE))
+                            .fill(egui::Color32::from_rgb(200, 45, 45))
+                            .min_size(egui::vec2(120.0, 30.0)),
+                    )
+                    .clicked()
+                {
+                    should_logout = true;
+                }
+            });
+
+            // Right Column
+            columns[1].vertical(|ui| {
+                ui.add_space(20.0);
+                ui.heading("Account Details");
+                ui.add_space(10.0);
+
+                egui::Grid::new("account_details_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 10.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Steam ID:");
+                        ui.label(data.steam_id.to_string());
+                        ui.end_row();
+
+                        ui.label("Country:");
+                        ui.label(&data.country);
+                        ui.end_row();
+
+                        ui.label("Email Status:");
+                        if data.email_validated {
+                            ui.colored_label(egui::Color32::GREEN, "Verified");
+                        } else {
+                            ui.label("Unverified");
+                        }
+                        ui.end_row();
+
+                        ui.label("VAC Status:");
+                        if data.vac_bans > 0 {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!("{} VAC bans on record", data.vac_bans),
+                            );
+                        } else {
+                            ui.colored_label(egui::Color32::GREEN, "In Good Standing");
+                        }
+                        ui.end_row();
+
+                        ui.label("Steam Guard:");
+                        ui.label(format!("{} authorized machines", data.authed_machines));
+                        ui.end_row();
+
+                        ui.label("Account Flags:");
+                        ui.label(format!("{:#X}", data.flags));
+                        ui.end_row();
+                    });
+            });
+        });
+
+        if should_logout {
+            self.logout();
+        }
     }
 
     fn draw_info_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
@@ -1426,6 +1563,12 @@ impl eframe::App for SteamLauncher {
             .resizable(true)
             .default_width(280.0)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.main_tab, MainTab::Library, "Library");
+                    ui.selectable_value(&mut self.main_tab, MainTab::Account, "Account");
+                });
+                ui.separator();
+
                 if self.needs_reauth {
                     self.auth_ui(ui);
                     return;
@@ -1597,6 +1740,11 @@ impl eframe::App for SteamLauncher {
                 return;
             }
 
+            if self.main_tab == MainTab::Account {
+                self.draw_account_tab(ui);
+                return;
+            }
+
             if let Some(game) = self.selected_game().cloned() {
                 self.ensure_image_requested(game.app_id);
 
@@ -1680,9 +1828,9 @@ impl eframe::App for SteamLauncher {
                                     let tx = self.operation_tx.clone();
                                     self.runtime.spawn(async move {
                                         match client.get_available_platforms(app_id).await {
-                                            Ok(platforms) => {
+                                            Ok((platforms, buffer)) => {
                                                 let _ = tx.send(AsyncOp::PlatformsFetched(
-                                                    app_id, platforms,
+                                                    app_id, platforms, buffer,
                                                 ));
                                             }
                                             Err(err) => {

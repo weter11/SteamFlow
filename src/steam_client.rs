@@ -1,8 +1,8 @@
 use crate::cloud_sync::{default_cloud_root, CloudClient};
 use crate::cm_list::get_cm_endpoints;
 use crate::config::{
-    library_cache_path, load_launcher_config, load_library_cache, load_session, save_library_cache,
-    save_session,
+    delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
+    save_library_cache, save_session,
 };
 use crate::depot_browser::{self, DepotInfo, ManifestFileEntry};
 use crate::download_pipeline::{
@@ -84,6 +84,19 @@ pub struct ConfirmationPrompt {
     pub details: String,
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AccountData {
+    pub steam_id: u64,
+    pub account_name: String,
+    pub country: String,      // GeoIP Country
+    pub authed_machines: u32, // Steam Guard count
+    pub flags: u32,           // Account Flags
+    pub email: String,
+    pub email_validated: bool,
+    pub vac_bans: u32,        // Num VAC bans
+    pub vac_banned_apps: Vec<u32>,
+}
+
 #[derive(Clone)]
 pub struct SteamClient {
     connection: Option<Connection>,
@@ -116,6 +129,41 @@ impl SteamClient {
 
     pub fn connection(&self) -> Option<&Connection> {
         self.connection.as_ref()
+    }
+
+    pub async fn logout(&mut self) -> Result<()> {
+        self.connection = None;
+        self.state = LoginState::Connected;
+        delete_session().await?;
+        Ok(())
+    }
+
+    pub async fn get_account_data(&self) -> AccountData {
+        let Some(connection) = self.connection.as_ref() else {
+            return AccountData::default();
+        };
+
+        let mut data = AccountData {
+            steam_id: u64::from(connection.steam_id()),
+            country: connection.ip_country_code().unwrap_or_default(),
+            ..Default::default()
+        };
+
+        // Attempt to populate from persistent session info
+        if let Ok(session) = load_session().await {
+            if let Some(name) = session.account_name {
+                data.account_name = name;
+            }
+        }
+
+        if data.account_name.is_empty() {
+            data.account_name = "Steam User".to_string();
+        }
+
+        data.email = "Hidden".to_string();
+        data.email_validated = true;
+
+        data
     }
 
     pub fn pending_confirmations(&self) -> &[ConfirmationPrompt] {
@@ -366,7 +414,10 @@ impl SteamClient {
         Ok(names)
     }
 
-    pub async fn get_available_platforms(&mut self, appid: u32) -> Result<Vec<DepotPlatform>> {
+    pub async fn get_available_platforms(
+        &mut self,
+        appid: u32,
+    ) -> Result<(Vec<DepotPlatform>, Vec<u8>)> {
         let connection = self
             .connection
             .as_ref()
@@ -391,41 +442,50 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
 
-        let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        let parsed: Result<AppInfoRoot> = parse_appinfo(&appinfo_vdf);
-
-        let parsed = match parsed {
-            Ok(p) => p,
-            Err(e) => {
-                println!("CRITICAL VDF ERROR for {}: {:?}", appid, e);
-                // Print the raw AppInfo buffer as string to see what's wrong if possible
-                println!("RAW DATA: {}", appinfo_vdf);
-
-                // Fallback: assume both for now if we can't parse it
-                return Ok(vec![DepotPlatform::Windows, DepotPlatform::Linux]);
-            }
-        };
-
-        let depots = parsed
-            .appinfo
-            .map(|node| node.depots)
-            .unwrap_or(parsed.depots);
+        let buffer = app.buffer().to_vec();
+        let appinfo_vdf_text = String::from_utf8_lossy(&buffer);
 
         let mut has_linux = false;
         let mut has_windows = false;
 
-        for node in depots.values() {
-            if let Some(config) = &node.config {
-                if let Some(oslist) = &config.oslist {
-                    let oslist = oslist.to_lowercase();
-                    if oslist.contains("linux") {
-                        has_linux = true;
-                    }
-                    if oslist.contains("windows") {
-                        has_windows = true;
+        let vdf_res = steam_vdf_parser::parse_binary(&buffer)
+            .or_else(|_| steam_vdf_parser::parse_text(&appinfo_vdf_text).map(|v| v.into_owned()));
+
+        if let Ok(vdf) = vdf_res {
+            let root_obj = vdf.as_obj().unwrap();
+            let depots_val = if vdf.key() == "appinfo" || vdf.key() == appid.to_string() {
+                root_obj.get("depots")
+            } else {
+                root_obj.get("depots").or_else(|| {
+                    root_obj
+                        .values()
+                        .next()
+                        .and_then(|v| v.as_obj())
+                        .and_then(|o| o.get("depots"))
+                })
+            };
+
+            if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
+                for value in depots.values() {
+                    let oslist = value
+                        .get_obj(&["config"])
+                        .and_then(|c| c.get("oslist"))
+                        .and_then(|o| o.as_str());
+
+                    if let Some(os) = oslist {
+                        let os = os.to_lowercase();
+                        if os.contains("linux") {
+                            has_linux = true;
+                        }
+                        if os.contains("windows") {
+                            has_windows = true;
+                        }
                     }
                 }
             }
+        } else {
+            tracing::warn!("get_available_platforms: VDF parse failed for {appid}, using fallback discovery");
+            return Ok((vec![DepotPlatform::Windows, DepotPlatform::Linux], buffer));
         }
 
         let mut platforms = Vec::new();
@@ -440,13 +500,14 @@ impl SteamClient {
             platforms.push(DepotPlatform::Windows);
         }
 
-        Ok(platforms)
+        Ok((platforms, buffer))
     }
 
     pub async fn install_game(
         &self,
         appid: u32,
         platform: DepotPlatform,
+        cached_vdf: Option<Vec<u8>>,
     ) -> Result<Receiver<DownloadProgress>> {
         let connection = self
             .connection
@@ -479,114 +540,105 @@ impl SteamClient {
                 })
                 .await;
 
-            let mut request = CMsgClientPICSProductInfoRequest::new();
-            request
-                .apps
-                .push(cmsg_client_picsproduct_info_request::AppInfo {
-                    appid: Some(appid),
-                    ..Default::default()
-                });
+            let appinfo_vdf_bytes_owned;
+            let appinfo_vdf_bytes = if let Some(cached) = cached_vdf {
+                appinfo_vdf_bytes_owned = cached;
+                &appinfo_vdf_bytes_owned
+            } else {
+                let mut request = CMsgClientPICSProductInfoRequest::new();
+                request
+                    .apps
+                    .push(cmsg_client_picsproduct_info_request::AppInfo {
+                        appid: Some(appid),
+                        ..Default::default()
+                    });
 
-            let response: CMsgClientPICSProductInfoResponse = match connection.job(request).await {
-                Ok(res) => res,
-                Err(e) => {
+                let response: CMsgClientPICSProductInfoResponse = match connection.job(request).await
+                {
+                    Ok(res) => res,
+                    Err(e) => {
+                        let _ = tx
+                            .send(DownloadProgress {
+                                state: DownloadProgressState::Failed,
+                                bytes_downloaded: 0,
+                                total_bytes: 0,
+                                current_file: format!("failed requesting appinfo: {e}"),
+                            })
+                            .await;
+                        return;
+                    }
+                };
+
+                let app = response.apps.iter().find(|entry| entry.appid() == appid);
+                let Some(app) = app else {
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
                             bytes_downloaded: 0,
                             total_bytes: 0,
-                            current_file: format!("failed requesting appinfo: {e}"),
+                            current_file: "missing appinfo payload".to_string(),
                         })
                         .await;
                     return;
-                }
+                };
+                appinfo_vdf_bytes_owned = app.buffer().to_vec();
+                &appinfo_vdf_bytes_owned
             };
 
-            let app = response.apps.iter().find(|entry| entry.appid() == appid);
-            let Some(app) = app else {
-                let _ = tx
-                    .send(DownloadProgress {
-                        state: DownloadProgressState::Failed,
-                        bytes_downloaded: 0,
-                        total_bytes: 0,
-                        current_file: "missing appinfo payload".to_string(),
-                    })
-                    .await;
-                return;
-            };
-
-            let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-            let parsed: Result<AppInfoRoot> = parse_appinfo(&appinfo_vdf);
-
+            let appinfo_vdf_text = String::from_utf8_lossy(appinfo_vdf_bytes).to_string();
             let mut selections = Vec::new();
-            match &parsed {
-                Ok(p) => {
-                    let depots = p
-                        .appinfo
-                        .as_ref()
-                        .map(|node| &node.depots)
-                        .unwrap_or(&p.depots);
 
-                    for (depot_id_str, node) in depots {
-                        if !depot_id_str.chars().all(|c| c.is_ascii_digit()) {
-                            continue;
-                        }
+            let mut has_windows = false;
+            let vdf_res = steam_vdf_parser::parse_binary(appinfo_vdf_bytes)
+                .or_else(|_| steam_vdf_parser::parse_text(&appinfo_vdf_text).map(|v| v.into_owned()));
 
-                        let oslist = node.config.as_ref().and_then(|c| c.oslist.as_deref());
-                        if !should_keep_depot(oslist, platform) {
-                            continue;
-                        }
+            if let Ok(vdf) = vdf_res {
+                let root_obj = vdf.as_obj().unwrap();
+                let depots_val = if vdf.key() == "appinfo" || vdf.key() == appid.to_string() {
+                    root_obj.get("depots")
+                } else {
+                    root_obj.get("depots").or_else(|| {
+                        root_obj
+                            .values()
+                            .next()
+                            .and_then(|v| v.as_obj())
+                            .and_then(|o| o.get("depots"))
+                    })
+                };
 
-                        if let Some(manifests) = &node.manifests {
-                            if let Some(gid_text) = &manifests.public {
-                                if let (Ok(d_id), Ok(m_id)) =
-                                    (depot_id_str.parse::<u32>(), gid_text.parse::<u64>())
-                                {
+                if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
+                    for (key, value) in depots.iter() {
+                        if let Ok(d_id) = key.parse::<u32>() {
+                            let oslist = value
+                                .get_obj(&["config"])
+                                .and_then(|c| c.get("oslist"))
+                                .and_then(|o| o.as_str());
+
+                            if oslist
+                                .map(|os| os.to_lowercase().contains("windows"))
+                                .unwrap_or(false)
+                            {
+                                has_windows = true;
+                            }
+
+                            if should_keep_depot(oslist, platform) {
+                                if let Some(m_id) = extract_manifest_id(value, "public") {
                                     selections.push(ManifestSelection {
                                         app_id: appid,
                                         depot_id: d_id,
                                         manifest_id: m_id,
-                                        appinfo_vdf: appinfo_vdf.clone(),
+                                        appinfo_vdf: appinfo_vdf_text.clone(),
                                     });
                                 }
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    println!("VDF Parse failed, using fuzzy fallback: {}", e);
-                    let target_os = match platform {
-                        DepotPlatform::Windows => "windows",
-                        DepotPlatform::Linux => "linux",
-                    };
-                    let fallback_map = fuzzy_extract_depots(&appinfo_vdf, target_os);
-                    for (d_id, m_id) in fallback_map {
-                        selections.push(ManifestSelection {
-                            app_id: appid,
-                            depot_id: d_id as u32,
-                            manifest_id: m_id,
-                            appinfo_vdf: appinfo_vdf.clone(),
-                        });
-                    }
-                }
+            } else {
+                println!("CRITICAL: VDF parse failed even with robust parser for {appid}");
             }
 
             if selections.is_empty() {
-                let mut has_windows = false;
-                if let Ok(p) = &parsed {
-                    let depots = p
-                        .appinfo
-                        .as_ref()
-                        .map(|node| &node.depots)
-                        .unwrap_or(&p.depots);
-                    has_windows = depots.values().any(|node| {
-                        node.config
-                            .as_ref()
-                            .and_then(|c| c.oslist.as_deref())
-                            .map(|os| os.to_lowercase().contains("windows"))
-                            .unwrap_or(false)
-                    });
-                }
 
                 let msg = if has_windows && matches!(platform, DepotPlatform::Linux) {
                     "No native Linux depots found. This game may only support Windows (Proton)."
@@ -874,29 +926,7 @@ impl SteamClient {
             .connection
             .as_ref()
             .context("steam connection not initialized")?;
-
-        let mut request = CMsgClientPICSProductInfoRequest::new();
-        request
-            .apps
-            .push(cmsg_client_picsproduct_info_request::AppInfo {
-                appid: Some(appid),
-                ..Default::default()
-            });
-
-        let response: CMsgClientPICSProductInfoResponse = connection
-            .job(request)
-            .await
-            .context("failed requesting appinfo product info for update metadata")?;
-
-        let app = response
-            .apps
-            .iter()
-            .find(|entry| entry.appid() == appid)
-            .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
-
-        let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        // Still uses manual scanner for remote_manifest_ids, which should be okay as it scans lines
-        Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf, branch))
+        SteamClient::remote_manifest_ids_static(connection, appid, branch).await
     }
 
     pub async fn get_user_profile(&self, current_library_len: usize) -> Result<UserProfile> {
@@ -1331,8 +1361,38 @@ impl SteamClient {
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
 
-        let raw_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        Ok(parse_remote_depot_manifests_from_vdf(&raw_vdf, branch))
+        let mut manifests = HashMap::new();
+        let buffer = app.buffer();
+        let vdf_res = steam_vdf_parser::parse_binary(buffer).or_else(|_| {
+            let text = String::from_utf8_lossy(buffer);
+            steam_vdf_parser::parse_text(&text).map(|v| v.into_owned())
+        });
+
+        if let Ok(vdf) = vdf_res {
+            let root_obj = vdf.as_obj().unwrap();
+            let depots_val = root_obj.get("depots").or_else(|| {
+                root_obj
+                    .values()
+                    .next()
+                    .and_then(|v| v.as_obj())
+                    .and_then(|o| o.get("depots"))
+            });
+
+            if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
+                for (key, value) in depots.iter() {
+                    if let Ok(d_id) = key.parse::<u64>() {
+                        if let Some(m_id) = extract_manifest_id(value, branch) {
+                            manifests.insert(d_id, m_id);
+                        } else if branch != "public" {
+                            if let Some(m_id) = extract_manifest_id(value, "public") {
+                                manifests.insert(d_id, m_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(manifests)
     }
 
     fn write_manifest_ids_at_path(path: &Path, new_manifest_ids: &HashMap<u64, u64>) -> Result<()> {
@@ -1636,6 +1696,62 @@ fn parse_launch_info_from_vdf(
     Ok(options)
 }
 
+pub fn parse_depots_robust(data: &[u8]) -> Result<HashMap<u64, u64>> {
+    let vdf = steam_vdf_parser::parse_binary(data)
+        .or_else(|_| {
+            let text = String::from_utf8_lossy(data);
+            steam_vdf_parser::parse_text(&text).map(|v| v.into_owned())
+        })
+        .map_err(|e| anyhow!("VDF parse error: {}", e))?;
+
+    let mut depot_map = HashMap::new();
+    let root_obj = vdf.as_obj().unwrap();
+    let depots_val = root_obj.get("depots").or_else(|| {
+        root_obj
+            .values()
+            .next()
+            .and_then(|v| v.as_obj())
+            .and_then(|o| o.get("depots"))
+    });
+
+    if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
+        for (key, value) in depots.iter() {
+            if let Ok(depot_id) = key.parse::<u64>() {
+                if let Some(m_id) = extract_manifest_id(value, "public") {
+                    depot_map.insert(depot_id, m_id);
+                }
+            }
+        }
+    }
+    Ok(depot_map)
+}
+
+fn extract_manifest_id(value: &steam_vdf_parser::Value, branch: &str) -> Option<u64> {
+    if let Some(obj) = value.as_obj() {
+        if let Some(manifests) = obj.get("manifests").and_then(|v| v.as_obj()) {
+            if let Some(branch_entry) = manifests.get(branch) {
+                if let Some(gid_str) = branch_entry.as_str() {
+                    return gid_str.parse::<u64>().ok();
+                }
+                if let Some(gid_val) = branch_entry.as_u64() {
+                    return Some(gid_val);
+                }
+            }
+        }
+
+        if let Some(gid_entry) = obj.get("gid") {
+            if let Some(gid_str) = gid_entry.as_str() {
+                return gid_str.parse::<u64>().ok();
+            }
+            if let Some(gid_val) = gid_entry.as_u64() {
+                return Some(gid_val);
+            }
+        }
+    }
+
+    None
+}
+
 #[derive(Debug, Deserialize)]
 struct ProductInfoEnvelope {
     #[serde(default)]
@@ -1803,100 +1919,6 @@ fn parse_active_branch_from_acf(raw: &str) -> String {
     "public".to_string()
 }
 
-fn fuzzy_extract_depots(vdf_text: &str, target_os: &str) -> HashMap<u64, u64> {
-    let mut depots = HashMap::new();
-
-    // 1. Find the "depots" section
-    if let Some(depots_start) = vdf_text.find("\"depots\"") {
-        let depots_str = &vdf_text[depots_start..];
-
-        // 2. Iterate over potential IDs (numeric keys)
-        let re = regex::Regex::new(r#""(\d+)"\s*\{([^}]*)\}"#).unwrap();
-        let manifest_re = regex::Regex::new(r#""public"\s+"(\d+)""#).unwrap();
-
-        for cap in re.captures_iter(depots_str) {
-            let depot_id_str = &cap[1];
-            let content = &cap[2]; // The body of the depot config
-
-            if let Ok(depot_id) = depot_id_str.parse::<u64>() {
-                let matches_windows = content.contains("\"windows\"");
-                let matches_linux = content.contains("\"linux\"");
-                let matches_mac = content.contains("\"macos\"");
-
-                let mut keep = false;
-
-                if target_os == "windows" {
-                    // Keep if Windows explicitly, or if NO OS specified (Common)
-                    if matches_windows || (!matches_linux && !matches_mac) {
-                        keep = true;
-                    }
-                } else {
-                    // Linux
-                    // Keep if Linux explicitly, or if NO OS specified
-                    if matches_linux || (!matches_windows && !matches_mac) {
-                        keep = true;
-                    }
-                }
-
-                if keep {
-                    if let Some(m_cap) = manifest_re.captures(content) {
-                        if let Ok(manifest_id) = m_cap[1].parse::<u64>() {
-                            depots.insert(depot_id, manifest_id);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    depots
-}
-
-fn parse_remote_depot_manifests_from_vdf(raw: &str, branch: &str) -> HashMap<u64, u64> {
-    let mut manifests = HashMap::new();
-    let mut in_depots = false;
-    let mut current_depot: Option<u64> = None;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("\"depots\"") {
-            in_depots = true;
-            continue;
-        }
-
-        if !in_depots {
-            continue;
-        }
-
-        if trimmed == "}" {
-            current_depot = None;
-            continue;
-        }
-
-        let quoted = extract_quoted_values(trimmed);
-        if quoted.is_empty() {
-            continue;
-        }
-
-        if quoted.len() == 1 {
-            if let Ok(depot_id) = u64::from_str(&quoted[0]) {
-                current_depot = Some(depot_id);
-            }
-        } else if quoted.len() >= 2 && current_depot.is_some() {
-            if quoted[0] == branch || (branch != "public" && quoted[0] == "public") || quoted[0] == "manifest" {
-                if let Ok(manifest) = u64::from_str(&quoted[1]) {
-                    // If we already have a manifest for this depot, only overwrite if this is the requested branch
-                    // (prevents 'public' fallback from overwriting a previously found 'beta' manifest if it appeared first,
-                    // though usually branch manifests are inside a 'manifests' sub-section which we are not fully parsing yet)
-                    if !manifests.contains_key(&current_depot.unwrap()) || quoted[0] == branch {
-                         manifests.insert(current_depot.unwrap_or_default(), manifest);
-                    }
-                }
-            }
-        }
-    }
-
-    manifests
-}
 
 fn rewrite_app_branch(raw: &str, branch: &str) -> String {
     let mut out = Vec::new();

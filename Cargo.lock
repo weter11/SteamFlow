@@ -3270,18 +3270,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "regex"
-version = "1.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
-dependencies = [
- "aho-corasick",
- "memchr",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "regex-automata"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3776,6 +3764,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "steam-vdf-parser"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b432ac0178530ed6dd5fe22ea452e5e9a8d068c6e5687fa7e63547ed90c6dd34"
+dependencies = [
+ "foldhash 0.2.0",
+ "hex",
+ "indexmap",
+ "winnow",
+]
+
+[[package]]
 name = "steam-vent"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3875,11 +3875,11 @@ dependencies = [
  "image",
  "keyvalues-serde",
  "prost",
- "regex",
  "reqwest",
  "serde",
  "serde_json",
  "sha1",
+ "steam-vdf-parser",
  "steam-vent",
  "steam-vent-proto",
  "tokio",
