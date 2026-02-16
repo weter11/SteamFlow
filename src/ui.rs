@@ -1,7 +1,7 @@
 use crate::config::{
     load_launcher_config, opensteam_image_cache_dir, save_launcher_config, LauncherConfig,
 };
-use crate::depot_browser::{DepotInfo, ManifestFileEntry};
+use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::download_pipeline::DepotPlatform;
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
@@ -43,7 +43,7 @@ struct PropertiesModalState {
 struct DepotBrowserState {
     app_id: u32,
     game_name: String,
-    depots: Vec<DepotInfo>,
+    depots: Vec<BrowserDepotInfo>,
     selected_depot: Option<u32>,
     manifest_input: String,
     files: Vec<ManifestFileEntry>,
@@ -90,7 +90,9 @@ pub enum AsyncOp {
     LibraryFetched(Vec<LibraryGame>),
     Authenticated(crate::models::SessionState),
     BranchesFetched(u32, Vec<String>),
-    DepotsFetched(u32, Vec<DepotInfo>),
+    DepotsFetched(u32, Vec<BrowserDepotInfo>),
+    DepotListFetched(u32, Vec<crate::steam_client::DepotInfo>),
+    DepotOwnershipVerified(HashMap<u64, bool>),
     ManifestFilesFetched(Vec<ManifestFileEntry>),
     LaunchOptionsFetched(u32, Vec<crate::steam_client::LaunchInfo>, Option<String>),
     AuthFailed(String),
@@ -138,6 +140,9 @@ pub struct SteamLauncher {
     main_tab: MainTab,
     account_data: Option<crate::steam_client::AccountData>,
     extended_info: HashMap<u32, crate::steam_client::ExtendedAppInfo>,
+    depot_list: Vec<crate::steam_client::DepotInfo>,
+    depot_selection: HashSet<u64>,
+    is_verifying: bool,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -194,6 +199,9 @@ impl SteamLauncher {
             main_tab: MainTab::Library,
             account_data: None,
             extended_info: HashMap::new(),
+            depot_list: Vec::new(),
+            depot_selection: HashSet::new(),
+            is_verifying: false,
             operation_tx,
             operation_rx,
         }
@@ -404,11 +412,11 @@ impl SteamLauncher {
         }
     }
 
-    fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>) {
+    fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>, filter_depots: Option<Vec<u64>>) {
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
         self.runtime.spawn(async move {
-            match client.install_game(app_id, platform, cached_vdf).await {
+            match client.install_game(app_id, platform, cached_vdf, filter_depots).await {
                 Ok(rx) => {
                     let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
                 }
@@ -462,7 +470,7 @@ impl SteamLauncher {
                         });
                     } else {
                         let platform = platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
-                        self.start_install(appid, platform, Some(buffer));
+                        self.start_install(appid, platform, Some(buffer), None);
                     }
                 }
                 AsyncOp::ExtendedInfoFetched(appid, info) => {
@@ -525,6 +533,18 @@ impl SteamLauncher {
                             active_branch: game.active_branch.clone(),
                         });
                     }
+                }
+                AsyncOp::DepotListFetched(_appid, list) => {
+                    self.depot_list = list;
+                    self.depot_selection = self.depot_list.iter().map(|d| d.id).collect();
+                }
+                AsyncOp::DepotOwnershipVerified(results) => {
+                    for depot in &mut self.depot_list {
+                        if let Some(owned) = results.get(&depot.id) {
+                            depot.is_owned = Some(*owned);
+                        }
+                    }
+                    self.is_verifying = false;
                 }
                 AsyncOp::DepotsFetched(appid, depots) => {
                     if let Some(game) = self.library.iter().find(|g| g.app_id == appid) {
@@ -918,7 +938,7 @@ impl SteamLauncher {
             });
 
             self.extended_info.remove(&app_id);
-            self.start_install(app_id, platform, Some(cached_vdf));
+            self.start_install(app_id, platform, Some(cached_vdf), None);
             self.platform_selection = None;
         } else if close {
             self.platform_selection = None;
@@ -1100,6 +1120,110 @@ impl SteamLauncher {
                     self.open_uninstall_modal(game);
                 }
             });
+        });
+    }
+
+    fn draw_misc_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
+        ui.vertical(|ui| {
+            ui.heading("Depot Manager");
+            ui.horizontal(|ui| {
+                if ui.button("Load Depots").clicked() {
+                    let client = self.client.clone();
+                    let tx = self.operation_tx.clone();
+                    let app_id = game.app_id;
+                    self.runtime.spawn(async move {
+                        match client.get_depot_list(app_id).await {
+                            Ok(list) => {
+                                let _ = tx.send(AsyncOp::DepotListFetched(app_id, list));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AsyncOp::Error(format!("Failed to load depots: {e}")));
+                            }
+                        }
+                    });
+                }
+
+                if !self.depot_list.is_empty() {
+                    if ui
+                        .add_enabled(!self.is_verifying, egui::Button::new("Verify Ownership"))
+                        .clicked()
+                    {
+                        self.is_verifying = true;
+                        let client = self.client.clone();
+                        let tx = self.operation_tx.clone();
+                        let app_id = game.app_id;
+                        let depot_ids: Vec<u64> = self.depot_list.iter().map(|d| d.id).collect();
+                        self.runtime.spawn(async move {
+                            let results = client.verify_depot_ownership(app_id, depot_ids).await;
+                            let _ = tx.send(AsyncOp::DepotOwnershipVerified(results));
+                        });
+                    }
+                }
+            });
+
+            if !self.depot_list.is_empty() {
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    egui::Grid::new("depot_list_grid")
+                        .num_columns(5)
+                        .spacing([10.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("Sel");
+                            ui.label("ID");
+                            ui.label("Name");
+                            ui.label("Config");
+                            ui.label("Status");
+                            ui.end_row();
+
+                            for depot in &self.depot_list {
+                                let mut selected = self.depot_selection.contains(&depot.id);
+                                if ui.checkbox(&mut selected, "").changed() {
+                                    if selected {
+                                        self.depot_selection.insert(depot.id);
+                                    } else {
+                                        self.depot_selection.remove(&depot.id);
+                                    }
+                                }
+                                ui.label(depot.id.to_string());
+                                ui.label(&depot.name);
+                                ui.label(&depot.config);
+
+                                match depot.is_owned {
+                                    None => {
+                                        ui.label(egui::RichText::new("?").color(egui::Color32::GRAY));
+                                    }
+                                    Some(true) => {
+                                        ui.label(
+                                            egui::RichText::new("Owned").color(egui::Color32::GREEN),
+                                        );
+                                    }
+                                    Some(false) => {
+                                        ui.label(
+                                            egui::RichText::new("Locked").color(egui::Color32::RED),
+                                        );
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+
+                ui.add_space(10.0);
+                if ui.button("Install Selected").clicked() {
+                    let selected_ids: Vec<u64> = self.depot_selection.iter().cloned().collect();
+                    if selected_ids.is_empty() {
+                        self.status = "No depots selected".to_string();
+                    } else {
+                        let platform = if cfg!(target_os = "linux") {
+                            DepotPlatform::Linux
+                        } else {
+                            DepotPlatform::Windows
+                        };
+                        self.start_install(game.app_id, platform, None, Some(selected_ids));
+                    }
+                }
+            }
         });
     }
 
@@ -1885,9 +2009,7 @@ impl eframe::App for SteamLauncher {
                         ui.label("Coming Soon");
                     }
                     GameTab::Info => self.draw_info_tab(&game, ui),
-                    GameTab::Misc => {
-                        ui.label("Coming Soon");
-                    }
+                    GameTab::Misc => self.draw_misc_tab(&game, ui),
                 }
             } else {
                 ui.heading("SteamFlow");

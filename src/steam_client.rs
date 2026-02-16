@@ -4,7 +4,7 @@ use crate::config::{
     delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
     save_library_cache, save_session,
 };
-use crate::depot_browser::{self, DepotInfo, ManifestFileEntry};
+use crate::depot_browser::{self, DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::download_pipeline::{
     self, parse_appinfo, should_keep_depot, AppInfoRoot, DepotPlatform, ManifestSelection,
 };
@@ -27,6 +27,9 @@ use steam_vent::auth::{
 };
 use steam_vent::connection::Connection;
 use steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicket;
+use steam_vent::proto::steammessages_clientserver_2::{
+    CMsgClientGetDepotDecryptionKey, CMsgClientGetDepotDecryptionKeyResponse,
+};
 use steam_vent::proto::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
@@ -77,6 +80,16 @@ pub struct ExtendedAppInfo {
     pub depots: Vec<(u32, String)>,
     pub launch_options: Vec<RawLaunchOption>,
     pub active_branch: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DepotInfo {
+    pub id: u64,
+    pub name: String,
+    pub size: u64,
+    pub file_count: u64,
+    pub config: String,
+    pub is_owned: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +540,7 @@ impl SteamClient {
         appid: u32,
         platform: DepotPlatform,
         cached_vdf: Option<Vec<u8>>,
+        filter_depots: Option<Vec<u64>>,
     ) -> Result<Receiver<DownloadProgress>> {
         let connection = self
             .connection
@@ -693,14 +707,24 @@ impl SteamClient {
                                 }
 
                                 if match_os {
-                                    if let Some(m_id) = map.get(&(d_id as u64)) {
-                                        println!("Using GID {} for Depot {}", m_id, d_id);
-                                        selections.push(ManifestSelection {
-                                            app_id: appid,
-                                            depot_id: d_id,
-                                            manifest_id: *m_id,
-                                            appinfo_vdf: appinfo_vdf_text.clone(),
-                                        });
+                                    let depot_id_u64 = d_id as u64;
+                                    let is_allowed = match &filter_depots {
+                                        Some(list) => list.contains(&depot_id_u64),
+                                        None => true,
+                                    };
+
+                                    if is_allowed {
+                                        if let Some(m_id) = map.get(&depot_id_u64) {
+                                            println!("Using GID {} for Depot {}", m_id, d_id);
+                                            selections.push(ManifestSelection {
+                                                app_id: appid,
+                                                depot_id: d_id,
+                                                manifest_id: *m_id,
+                                                appinfo_vdf: appinfo_vdf_text.clone(),
+                                            });
+                                        }
+                                    } else {
+                                        println!("Skipping Depot {} (Not in filter list)", d_id);
                                     }
                                 }
                             }
@@ -850,7 +874,130 @@ impl SteamClient {
         Ok(())
     }
 
-    pub async fn fetch_depots(&self, appid: u32) -> Result<Vec<DepotInfo>> {
+    pub async fn get_depot_list(&self, app_id: u32) -> Result<Vec<DepotInfo>> {
+        let connection = self
+            .connection
+            .as_ref()
+            .context("steam connection not initialized")?;
+
+        let mut request = CMsgClientPICSProductInfoRequest::new();
+        request
+            .apps
+            .push(cmsg_client_picsproduct_info_request::AppInfo {
+                appid: Some(app_id),
+                ..Default::default()
+            });
+
+        let response: CMsgClientPICSProductInfoResponse = connection
+            .job(request)
+            .await
+            .context("failed requesting appinfo product info for depot list")?;
+
+        let app = response
+            .apps
+            .iter()
+            .find(|entry| entry.appid() == app_id)
+            .ok_or_else(|| anyhow!("missing appinfo payload for app {app_id}"))?;
+
+        let mut out = Vec::new();
+        if let Ok(vdf) = find_vdf_in_pics(app.buffer()) {
+            let root_obj = vdf.as_obj().context("root is not an object")?;
+            let depots_val = if vdf.key() == "appinfo" || vdf.key() == app_id.to_string() {
+                root_obj.get("depots")
+            } else {
+                root_obj.get("depots").or_else(|| {
+                    root_obj
+                        .get("appinfo")
+                        .and_then(|v| v.as_obj())
+                        .and_then(|o| o.get("depots"))
+                })
+            };
+
+            if let Some(depots) = depots_val.and_then(|v| v.as_obj()) {
+                for (key, value) in depots.iter() {
+                    if let Ok(d_id) = key.parse::<u64>() {
+                        let name = value
+                            .as_obj()
+                            .and_then(|o| o.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(&format!("Depot {d_id}"))
+                            .to_string();
+
+                        let size = value
+                            .as_obj()
+                            .and_then(|o| o.get("maxsize"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+
+                        let mut config_parts = Vec::new();
+                        if let Some(config) = value.as_obj().and_then(|o| o.get("config")).and_then(|v| v.as_obj()) {
+                            if let Some(os) = config.get("oslist").and_then(|v| v.as_str()) {
+                                config_parts.push(format!("os: {}", os));
+                            }
+                            if let Some(lang) = config.get("language").and_then(|v| v.as_str()) {
+                                config_parts.push(format!("lang: {}", lang));
+                            }
+                        }
+
+                        out.push(DepotInfo {
+                            id: d_id,
+                            name,
+                            size,
+                            file_count: 0, // Not easily available in PICS VDF without manifest
+                            config: config_parts.join(", "),
+                            is_owned: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        out.sort_by_key(|d| d.id);
+        Ok(out)
+    }
+
+    pub async fn verify_depot_ownership(&self, app_id: u32, depot_ids: Vec<u64>) -> HashMap<u64, bool> {
+        println!("Verifying ownership for {} depots...", depot_ids.len());
+        let mut results = HashMap::new();
+
+        let connection = match self.connection.as_ref() {
+            Some(c) => c,
+            None => {
+                for id in depot_ids { results.insert(id, false); }
+                return results;
+            }
+        };
+
+        // 1. Ensure we have an App Ticket (Warm up session)
+        let _ = self.get_app_ticket(app_id).await;
+
+        for depot_id in depot_ids {
+            let mut request = CMsgClientGetDepotDecryptionKey::new();
+            request.set_depot_id(depot_id as u32);
+            request.set_app_id(app_id);
+
+            match connection.job(request).await {
+                Ok(response) => {
+                    let response: CMsgClientGetDepotDecryptionKeyResponse = response;
+                    if response.eresult() == 1 { // EResult::OK
+                        println!("Depot {}: OWNED", depot_id);
+                        results.insert(depot_id, true);
+                    } else {
+                        println!("Depot {}: NOT OWNED (EResult {})", depot_id, response.eresult());
+                        results.insert(depot_id, false);
+                    }
+                }
+                Err(_) => {
+                    println!("Depot {}: NOT OWNED (Request failed)", depot_id);
+                    results.insert(depot_id, false);
+                }
+            }
+        }
+        results
+    }
+
+    pub async fn fetch_depots(&self, appid: u32) -> Result<Vec<BrowserDepotInfo>> {
         let connection = self
             .connection
             .as_ref()
