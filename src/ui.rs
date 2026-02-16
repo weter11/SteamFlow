@@ -1137,7 +1137,7 @@ impl SteamLauncher {
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    &data.persona_name.chars().next().unwrap_or('?').to_string().to_uppercase(),
+                    data.persona_name.chars().next().unwrap_or('?').to_string().to_uppercase(),
                     egui::FontId::proportional(48.0),
                     egui::Color32::WHITE,
                 );

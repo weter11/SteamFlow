@@ -529,8 +529,8 @@ impl SteamClient {
                 })
                 .await;
 
-            let appinfo_vdf = if let Some(buffer) = cached_vdf {
-                String::from_utf8_lossy(&buffer).to_string()
+            let appinfo_vdf = if let Some(ref buffer) = cached_vdf {
+                String::from_utf8_lossy(buffer).to_string()
             } else {
                 let mut request = CMsgClientPICSProductInfoRequest::new();
                 request
@@ -609,28 +609,35 @@ impl SteamClient {
                     }
                 }
                 Err(e) => {
-                    println!("VDF Parse failed, using greedy fallback: {}", e);
-                    let fallback_map = fuzzy_extract_depots(&appinfo_vdf, appid);
+                    println!("VDF Parse failed, using robust fallback: {}", e);
+                    let robust_bytes = if let Some(ref buffer) = cached_vdf {
+                        buffer.as_slice()
+                    } else {
+                        appinfo_vdf.as_bytes()
+                    };
 
-                    if fallback_map.is_empty() {
-                        let _ = tx
-                            .send(DownloadProgress {
-                                state: DownloadProgressState::Failed,
-                                bytes_downloaded: 0,
-                                total_bytes: 0,
-                                current_file: "No depots found in greedy fallback".to_string(),
-                            })
-                            .await;
-                        return;
-                    }
-
-                    for (d_id, m_id) in fallback_map {
-                        selections.push(ManifestSelection {
-                            app_id: appid,
-                            depot_id: d_id as u32,
-                            manifest_id: m_id,
-                            appinfo_vdf: appinfo_vdf.clone(),
-                        });
+                    match parse_depots_robust(robust_bytes) {
+                        Ok(fallback_map) if !fallback_map.is_empty() => {
+                            for (d_id, m_id) in fallback_map {
+                                selections.push(ManifestSelection {
+                                    app_id: appid,
+                                    depot_id: d_id as u32,
+                                    manifest_id: m_id,
+                                    appinfo_vdf: appinfo_vdf.clone(),
+                                });
+                            }
+                        }
+                        _ => {
+                            let _ = tx
+                                .send(DownloadProgress {
+                                    state: DownloadProgressState::Failed,
+                                    bytes_downloaded: 0,
+                                    total_bytes: 0,
+                                    current_file: "No depots found in robust fallback".to_string(),
+                                })
+                                .await;
+                            return;
+                        }
                     }
                 }
             }
@@ -1911,78 +1918,41 @@ fn parse_active_branch_from_acf(raw: &str) -> String {
     "public".to_string()
 }
 
-fn fuzzy_extract_depots(vdf_text: &str, app_id: u32) -> HashMap<u64, u64> {
-    let mut depots = HashMap::new();
-    println!("Starting Super-Greedy Fuzzy Scan for AppID: {}", app_id);
+pub fn parse_depots_robust(data: &[u8]) -> Result<HashMap<u64, u64>> {
+    let is_text = data.iter().find(|&&b| !b.is_ascii_whitespace()) == Some(&b'\"');
+    let vdf = if is_text {
+        let text = std::str::from_utf8(data).map_err(|e| anyhow!("VDF utf8 error: {}", e))?;
+        steam_vdf_parser::parse_text(text).map_err(|e| anyhow!("VDF text parse error: {:?}", e))?
+    } else {
+        steam_vdf_parser::parse_binary(data).map_err(|e| anyhow!("VDF binary parse error: {:?}", e))?
+    };
 
-    // Stage 1: Structured scan (look for depot ID keys and then manifest IDs in their block)
-    let depot_re = regex::Regex::new(r#""(\d+)"\s*\{"#).unwrap();
-    let gid_re = regex::Regex::new(r#""gid"\s*"(\d+)""#).unwrap();
-    let fallback_re = regex::Regex::new(r#""(?:public|manifest)"\s+"(\d+)""#).unwrap();
+    let mut depot_map = HashMap::new();
 
-    let matches: Vec<_> = depot_re.find_iter(vdf_text).collect();
-    for i in 0..matches.len() {
-        let m = matches[i];
-        let caps = depot_re.captures(m.as_str()).unwrap();
-        if let Ok(id) = caps[1].parse::<u64>() {
-            if id > 1000 && id != app_id as u64 {
-                let start = m.end();
-                let end = if i + 1 < matches.len() {
-                    matches[i + 1].start()
-                } else {
-                    vdf_text.len()
-                };
-                // Search within a 2000 char window from the depot ID start
-                let search_range = &vdf_text[start..std::cmp::min(end, start + 2000)];
-
-                let manifest_id = if let Some(g_caps) = gid_re.captures(search_range) {
-                    g_caps[1].parse::<u64>().ok()
-                } else if let Some(f_caps) = fallback_re.captures(search_range) {
-                    f_caps[1].parse::<u64>().ok()
-                } else {
-                    None
-                };
-
-                if let Some(m_id) = manifest_id.filter(|&id| id != 0) {
-                    depots.insert(id, m_id);
-                    println!("Found Depot (Stage 1): {} -> Manifest: {}", id, m_id);
+    if let Some(depots) = vdf.get("depots").and_then(|v| v.as_obj()) {
+        for (key, value) in depots.iter() {
+            if let Ok(depot_id) = key.parse::<u64>() {
+                if let Some(manifests) = value.get("manifests").and_then(|v| v.as_obj()) {
+                    if let Some(public) = manifests.get("public") {
+                        if let Some(gid_str) = public.as_str() {
+                            if let Ok(gid) = gid_str.parse::<u64>() {
+                                depot_map.insert(depot_id, gid);
+                            }
+                        } else if let Some(gid_val) = public.get("gid").and_then(|v| v.as_str()) {
+                            if let Ok(gid) = gid_val.parse::<u64>() {
+                                depot_map.insert(depot_id, gid);
+                            }
+                        }
+                    }
+                } else if let Some(gid_entry) = value.get("gid").and_then(|v| v.as_str()) {
+                    if let Ok(gid) = gid_entry.parse::<u64>() {
+                        depot_map.insert(depot_id, gid);
+                    }
                 }
             }
         }
     }
-
-    // Stage 2: Flat scan (for malformed VDFs or extreme cases)
-    if depots.is_empty() {
-        println!("Stage 1 found nothing. Trying Stage 2 (flat scan)...");
-        let all_manifest_re = regex::Regex::new(r#""(?:gid|public|manifest)"\s+"?(\d+)"?"#).unwrap();
-        let digit_key_re = regex::Regex::new(r#""(\d+)""#).unwrap();
-        for mat in all_manifest_re.find_iter(vdf_text) {
-             if let Some(m_caps) = all_manifest_re.captures(mat.as_str()) {
-                 if let Ok(manifest_id) = m_caps[1].parse::<u64>() {
-                     if manifest_id == 0 { continue; }
-
-                     let search_start = mat.start().saturating_sub(500);
-                     let search_area = &vdf_text[search_start..mat.start()];
-
-                     if let Some(depot_match) = digit_key_re.find_iter(search_area).last() {
-                         if let Some(d_caps) = digit_key_re.captures(depot_match.as_str()) {
-                             if let Ok(depot_id) = d_caps[1].parse::<u64>() {
-                                 if depot_id > 1000 && depot_id != app_id as u64 {
-                                     if let std::collections::hash_map::Entry::Vacant(e) = depots.entry(depot_id) {
-                                         e.insert(manifest_id);
-                                         println!("Found Depot (Stage 2): {} -> Manifest: {}", depot_id, manifest_id);
-                                     }
-                                 }
-                             }
-                         }
-                     }
-                 }
-             }
-        }
-    }
-
-    println!("Super-Greedy Scan associations: {:?}", depots);
-    depots
+    Ok(depot_map)
 }
 
 fn parse_remote_depot_manifests_from_vdf(raw: &str, branch: &str) -> HashMap<u64, u64> {
@@ -2105,7 +2075,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fuzzy_extract_depots_greedy() {
+    fn test_parse_depots_robust_text() {
         let vdf = r#"
 "appinfo"
 {
@@ -2123,22 +2093,23 @@ mod tests {
         {
             "manifests"
             {
-                "public" "2222222222222222222"
+                "public"
+                {
+                    "gid" "2222222222222222222"
+                }
             }
         }
     }
 }
 "#;
-        let app_id = 2368470;
-        let depots = fuzzy_extract_depots(vdf, app_id);
+        let depots = parse_depots_robust(vdf.as_bytes()).expect("parse robust");
         assert_eq!(depots.len(), 2);
         assert_eq!(depots.get(&2368471), Some(&1111111111111111111));
         assert_eq!(depots.get(&2368472), Some(&2222222222222222222));
     }
 
     #[test]
-    fn test_fuzzy_extract_depots_nested_braces() {
-        // Simulating the "nested braces" issue where a simple regex would fail
+    fn test_parse_depots_robust_nested_braces() {
         let vdf = r#"
 "appinfo"
 {
@@ -2157,46 +2128,10 @@ mod tests {
     }
 }
 "#;
-        let depots = fuzzy_extract_depots(vdf, 2000);
+        let depots = parse_depots_robust(vdf.as_bytes()).expect("parse robust");
         assert_eq!(depots.len(), 2);
         assert_eq!(depots.get(&2001), Some(&200101));
         assert_eq!(depots.get(&2002), Some(&200202));
-    }
-
-    #[test]
-    fn test_fuzzy_extract_depots_gid_format() {
-        let vdf = r#"
-"depots"
-{
-    "3001"
-    {
-        "manifests"
-        {
-            "public"
-            {
-                "gid" "300101"
-            }
-        }
-    }
-}
-"#;
-        let depots = fuzzy_extract_depots(vdf, 3000);
-        assert_eq!(depots.len(), 1);
-        assert_eq!(depots.get(&3001), Some(&300101));
-    }
-
-    #[test]
-    fn test_fuzzy_extract_depots_extreme_fallback() {
-        // Malformed VDF where keys don't have braces nearby as expected
-        let vdf = r#"
-"depots" "something"
-"4001" "config" "manifests" "public" "400101"
-"4002" "manifests" "public" "400202"
-"#;
-        let depots = fuzzy_extract_depots(vdf, 4000);
-        assert_eq!(depots.len(), 2);
-        assert_eq!(depots.get(&4001), Some(&400101));
-        assert_eq!(depots.get(&4002), Some(&400202));
     }
 
     #[test]
