@@ -40,6 +40,21 @@ impl CDNClient {
         }
     }
 
+    pub fn add_server(&mut self, host: String) {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.servers.push(web_api::content_service::CDNServer {
+                r#type: "CDN".to_string(),
+                https: false,
+                host,
+                vhost: String::new(),
+                port: 80,
+                cell_id: 0,
+                load: 0,
+                weighted_load: 0,
+            });
+        }
+    }
+
     pub async fn discover(connection: Arc<Connection>) -> Result<Self, Error> {
         let mut inner = InnerClient::new(connection);
         inner.servers =
@@ -121,6 +136,7 @@ impl CDNClient {
         manifest_id: u64,
         depot_key: &[u8],
         target_dir: impl AsRef<std::path::Path>,
+        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, u64, u64)>>,
     ) -> Result<(), Error> {
         let request_code = self
             .get_manifest_request_code(app_id, depot_id, manifest_id)
@@ -144,7 +160,8 @@ impl CDNClient {
                 let mut out = tokio::fs::File::create(&full_path)
                     .await
                     .map_err(|e| Error::Unexpected(e.to_string()))?;
-                file.download(key_arr, &mut out, None).await?;
+
+                file.download(key_arr, &mut out, None, progress_tx.clone()).await?;
             }
         }
         Ok(())

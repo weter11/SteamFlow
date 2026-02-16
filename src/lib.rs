@@ -6,5 +6,6 @@ pub mod download_pipeline;
 pub mod install;
 pub mod library;
 pub mod models;
+pub mod steam_api;
 pub mod steam_client;
 pub mod ui;

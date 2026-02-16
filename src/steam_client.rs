@@ -779,18 +779,18 @@ impl SteamClient {
                 })
                 .await;
 
-            let (_progress_tx, mut progress_rx) =
-                tokio::sync::mpsc::unbounded_channel::<crate::install::ProgressEvent>();
+            let (cdn_progress_tx, mut cdn_progress_rx) =
+                tokio::sync::mpsc::unbounded_channel::<(String, u64, u64)>();
             let tx_clone = tx.clone();
             tokio::task::spawn(async move {
-                while let Some(event) = progress_rx.recv().await {
+                while let Some((file_name, bytes_downloaded, total_bytes)) = cdn_progress_rx.recv().await {
                     let state = DownloadProgressState::Downloading;
                     let _ = tx_clone
                         .send(DownloadProgress {
                             state,
-                            bytes_downloaded: event.bytes_downloaded,
-                            total_bytes: event.total_bytes,
-                            current_file: event.file_name,
+                            bytes_downloaded,
+                            total_bytes,
+                            current_file: file_name,
                         })
                         .await;
                 }
@@ -798,19 +798,38 @@ impl SteamClient {
 
             // 2. Initialize the CDN Client
             let steam_id = u64::from(connection.steam_id());
-            let cell_id = connection.cell_id();
+            let mut cell_id = connection.cell_id();
+            if cell_id == 0 {
+                tracing::info!("Warning: Cell ID is 0. Defaulting to US East (12).");
+                cell_id = 12;
+            }
+
             tracing::info!(
                 "Initializing CDN Client for SteamID: {} with CellID: {}",
                 steam_id,
                 cell_id
             );
 
-            let cdn_client = steam_cdn::CDNClient::new(
+            // Fetch Servers via Web API
+            let server_list = match crate::steam_api::fetch_content_servers(cell_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to fetch servers: {}. Falling back to internal list.", e);
+                    vec![]
+                }
+            };
+
+            let mut cdn_client = steam_cdn::CDNClient::new(
                 steam_id,
                 cell_id,
                 Arc::new(connection.clone()),
                 Some(app_ticket),
             );
+
+            for server in server_list {
+                tracing::info!("Adding CDN Server: {}", server);
+                cdn_client.add_server(server);
+            }
 
             // 3. Download Loop
             let mut success = true;
@@ -839,6 +858,7 @@ impl SteamClient {
                         selection.manifest_id,
                         &key,
                         &install_dir,
+                        Some(cdn_progress_tx.clone()),
                     )
                     .await
                 {
