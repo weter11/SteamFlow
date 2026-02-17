@@ -111,12 +111,17 @@ impl InnerClient {
             url.push_str(manifest_request_code.to_string().as_str());
         }
 
+        let mut request = self.web_client.get(&url);
+
         if let Some(token) = &server.auth_token {
+            println!("DEBUG: Using Auth Token: {:.20}...", token);
             url.push_str("?token=");
             url.push_str(token);
+            request = self.web_client.get(&url).header("x-cdn-auth-token", token);
         }
 
-        let response = self.web_client.get(&url).send().await?;
+        println!("DEBUG: Fetching from: {}", url);
+        let response = request.send().await?;
         let status = response.status();
         println!("DEBUG: CDN Response Status: {}", status);
         if !status.is_success() {
