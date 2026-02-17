@@ -59,7 +59,3 @@ For long running, oneshot tasks (for example logging in or updating appinfo), us
 
 ### Tests
 We don't currently have tests, as the project is still rapidly taking shape.
-
-## Footnote by Rosentti
-This is my first open-source project that I've led.
-I may make some mistakes or bad decisions every now and then and if that's the case feel free to suggest and assist :)
