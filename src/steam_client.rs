@@ -579,23 +579,6 @@ impl SteamClient {
                 })
                 .await;
 
-            // TASK 1: Request App Ticket
-            tracing::info!("Requesting App Ticket for AppID: {}", appid);
-            let app_ticket = match client_clone.get_app_ticket(appid).await {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = tx
-                        .send(DownloadProgress {
-                            state: DownloadProgressState::Failed,
-                            bytes_downloaded: 0,
-                            total_bytes: 0,
-                            current_file: format!("Failed to get App Ticket: {}", e),
-                        })
-                        .await;
-                    return;
-                }
-            };
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
             let appinfo_vdf_bytes_owned;
             let appinfo_vdf_bytes = if let Some(cached) = cached_vdf {
@@ -779,80 +762,22 @@ impl SteamClient {
                 })
                 .await;
 
-            let (cdn_progress_tx, mut cdn_progress_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(String, u64, u64)>();
-            let tx_clone = tx.clone();
-            tokio::task::spawn(async move {
-                while let Some((file_name, bytes_downloaded, total_bytes)) = cdn_progress_rx.recv().await {
-                    let state = DownloadProgressState::Downloading;
-                    let _ = tx_clone
+            // 2. Initialize the CDN Client using internal discovery
+            tracing::info!("Initializing CDN Client for AppID: {}...", appid);
+            let cdn_client = match steam_cdn::CDNClient::discover(Arc::new(connection.clone())).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx
                         .send(DownloadProgress {
-                            state,
-                            bytes_downloaded,
-                            total_bytes,
-                            current_file: file_name,
+                            state: DownloadProgressState::Failed,
+                            bytes_downloaded: 0,
+                            total_bytes: 0,
+                            current_file: format!("Failed to discover CDN servers: {}", e),
                         })
                         .await;
-                }
-            });
-
-            // --- DEBUG PROBE START ---
-            tracing::info!("--- CDN CONNECTION DEBUG ---");
-            // 1. Check Identity
-            let steam_id = u64::from(connection.steam_id());
-            tracing::info!("SteamID: {}", steam_id);
-
-            // 2. Check Cell ID (Crucial)
-            let config_cell = connection.cell_id();
-            tracing::info!("Client Config Cell ID: {}", config_cell);
-
-            let mut cell_id = config_cell;
-            if cell_id == 0 {
-                tracing::info!("Warning: Cell ID is 0. Defaulting to US East (12).");
-                cell_id = 12;
-            }
-            tracing::info!("Effective Cell ID: {}", cell_id);
-
-            // 2. Initialize the CDN Client
-            tracing::info!(
-                "Initializing CDN Client for SteamID: {} with CellID: {}",
-                steam_id,
-                cell_id
-            );
-
-            let mut cdn_client = steam_cdn::CDNClient::new(
-                steam_id,
-                cell_id,
-                Arc::new(connection.clone()),
-                Some(app_ticket),
-            );
-
-            // 3. FORCE SERVER POPULATION (Strict Filter)
-            let servers = match crate::steam_api::fetch_content_servers(cell_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("Primary server fetch failed: {}. Using fallback.", e);
-                    crate::steam_api::fetch_servers_fallback().await
+                    return;
                 }
             };
-
-            if servers.is_empty() {
-                tracing::error!("CRITICAL: No servers found via Web API or Fallback!");
-            } else {
-                tracing::info!("Resolved {} servers.", servers.len());
-                if let Some(first) = servers.first() {
-                    tracing::info!("VERIFICATION: First Server is {}", first);
-                }
-
-                tracing::info!("Injecting servers into CDN Client...");
-                for server_addr in servers {
-                    cdn_client.add_server(server_addr);
-                }
-            }
-
-            tracing::info!("Client ready with {} servers.", cdn_client.server_count());
-            tracing::info!("----------------------------");
-            // --- DEBUG PROBE END ---
 
             // 3. Download Loop
             let mut success = true;
@@ -881,7 +806,6 @@ impl SteamClient {
                         selection.manifest_id,
                         &key,
                         &install_dir,
-                        Some(cdn_progress_tx.clone()),
                     )
                     .await
                 {

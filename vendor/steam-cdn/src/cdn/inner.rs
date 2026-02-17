@@ -18,7 +18,6 @@ pub(crate) struct InnerClient {
     pub connection: Arc<Connection>,
     web_client: Client,
     pub servers: Vec<CDNServer>,
-    pub app_ticket: Option<Vec<u8>>,
 }
 
 impl InnerClient {
@@ -27,7 +26,6 @@ impl InnerClient {
             connection,
             web_client: Client::new(),
             servers: Vec::new(),
-            app_ticket: None,
         }
     }
 
@@ -96,8 +94,8 @@ impl InnerClient {
         command: C,
         args: A,
         manifest_request_code: Option<u64>,
-        app_id: Option<u32>,
-        depot_id: Option<u32>,
+        _app_id: Option<u32>,
+        _depot_id: Option<u32>,
     ) -> Result<Response, Error> {
         let server = self.get_server()?;
         let mut url = format!(
@@ -113,31 +111,7 @@ impl InnerClient {
             url.push_str(manifest_request_code.to_string().as_str());
         }
 
-        let mut request = self.web_client.get(url);
-
-        if let (Some(app_id), Some(depot_id)) = (app_id, depot_id) {
-            use steam_vent::proto::steammessages_contentsystem_steamclient::{
-                CContentServerDirectory_GetCDNAuthToken_Request,
-                CContentServerDirectory_GetCDNAuthToken_Response,
-            };
-
-            let mut auth_req = CContentServerDirectory_GetCDNAuthToken_Request::new();
-            auth_req.set_app_id(app_id);
-            auth_req.set_depot_id(depot_id);
-            auth_req.set_host_name(server.host.clone());
-            // if let Some(ticket) = &self.app_ticket {
-            //     auth_req.set_app_ticket(ticket.clone());
-            // }
-
-            let response: CContentServerDirectory_GetCDNAuthToken_Response =
-                self.connection.service_method(auth_req).await?;
-
-            if let Some(token) = response.token {
-                request = request.header("x-steam-auth", token);
-            }
-        }
-
-        Ok(request.send().await?)
+        Ok(self.web_client.get(url).send().await?)
     }
 
     pub async fn get_chunk(

@@ -110,13 +110,9 @@ impl ManifestFile {
         depot_key: [u8; 32],
         stream: &mut S,
         max_tasks: Option<usize>,
-        progress_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, u64, u64)>>,
     ) -> Result<(), Error> {
         let max_tasks = max_tasks.unwrap_or(4);
         let semaphore = Arc::new(Semaphore::new(max_tasks));
-        let mut bytes_downloaded = 0u64;
-        let total_bytes = self.size;
-        let filename = self.full_path();
 
         let mut tasks = self
             .chunks()
@@ -137,10 +133,6 @@ impl ManifestFile {
             .collect::<FuturesOrdered<_>>();
         while let Some(result) = tasks.next().await {
             let data = result?;
-            bytes_downloaded += data.len() as u64;
-            if let Some(tx) = &progress_tx {
-                let _ = tx.send((filename.clone(), bytes_downloaded, total_bytes));
-            }
             stream.write_all(&data).await?;
         }
         stream.flush().await?;
