@@ -87,6 +87,19 @@ pub enum LibraryFilter {
     Installed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DepotPlatform {
+    Linux,
+    Windows,
+}
+
+pub struct ManifestSelection {
+    pub app_id: u32,
+    pub depot_id: u32,
+    pub manifest_id: u64,
+    pub appinfo_vdf: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SteamGuardReq {
     EmailCode { domain_hint: String },
@@ -119,4 +132,90 @@ pub struct DownloadState {
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
     pub status_text: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AppInfoRoot {
+    #[serde(default)]
+    pub appinfo: Option<AppInfoNode>,
+    #[serde(default)]
+    pub common: Option<CommonNode>,
+    #[serde(default)]
+    pub depots: HashMap<String, DepotNode>,
+    #[serde(default)]
+    pub branches: HashMap<String, BranchNode>,
+    #[serde(default)]
+    pub config: Option<ConfigNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AppInfoNode {
+    #[serde(default)]
+    pub common: Option<CommonNode>,
+    #[serde(default)]
+    pub depots: HashMap<String, DepotNode>,
+    #[serde(default)]
+    pub branches: HashMap<String, BranchNode>,
+    #[serde(default)]
+    pub config: Option<ConfigNode>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ConfigNode {
+    #[serde(default)]
+    pub launch: HashMap<String, ProductLaunchEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ProductLaunchEntry {
+    #[serde(default)]
+    pub executable: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub oslist: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CommonNode {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub dlc: HashMap<String, String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DepotNode {
+    #[serde(default)]
+    pub config: Option<DepotConfig>,
+    #[serde(default)]
+    pub manifests: Option<DepotManifests>,
+    #[serde(flatten)]
+    pub _other: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BranchNode {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub pwdrequired: Option<String>,
+    #[serde(default)]
+    pub buildid: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DepotConfig {
+    #[serde(default)]
+    pub oslist: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DepotManifests {
+    #[serde(default)]
+    pub public: Option<String>,
 }

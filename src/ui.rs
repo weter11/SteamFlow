@@ -2,10 +2,10 @@ use crate::config::{
     load_launcher_config, opensteam_image_cache_dir, save_launcher_config, LauncherConfig,
 };
 use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
-use crate::download_pipeline::DepotPlatform;
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
-    DownloadProgress, DownloadProgressState, DownloadState, LibraryGame, SteamGuardReq, UserProfile,
+    DepotPlatform, DownloadProgress, DownloadProgressState, DownloadState, LibraryGame,
+    SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
 use anyhow::anyhow;
