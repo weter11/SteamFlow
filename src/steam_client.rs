@@ -92,6 +92,12 @@ pub struct ExtendedAppInfo {
     pub active_branch: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AppMetadata {
+    pub name: String,
+    pub header_image: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DepotInfo {
     pub id: u64,
@@ -1825,15 +1831,19 @@ impl SteamClient {
         Ok(())
     }
 
-    pub async fn fetch_app_name_from_web(&self, appid: u32) -> Option<String> {
+    pub async fn fetch_app_metadata(&self, appid: u32) -> Option<AppMetadata> {
         let url = format!("https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic");
         let resp = reqwest::get(url).await.ok()?;
         let json: serde_json::Value = resp.json().await.ok()?;
-        json.get(appid.to_string())?
-            .get("data")?
-            .get("name")?
-            .as_str()
-            .map(|s| s.to_string())
+        let data = json.get(appid.to_string())?.get("data")?;
+
+        let name = data.get("name")?.as_str()?.to_string();
+        let header_image = data
+            .get("header_image")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Some(AppMetadata { name, header_image })
     }
 
     async fn resolve_install_game_name(&self, appid: u32) -> String {
@@ -1845,8 +1855,15 @@ impl SteamClient {
             }
         }
 
-        if let Some(web_name) = self.fetch_app_name_from_web(appid).await {
-            return web_name;
+        if let Some(metadata) = self.fetch_app_metadata(appid).await {
+            // Update cache with new name if we have it
+            if let Ok(mut games) = load_library_cache().await {
+                if let Some(game) = games.iter_mut().find(|g| g.app_id == appid) {
+                    game.name = metadata.name.clone();
+                    let _ = save_library_cache(&games).await;
+                }
+            }
+            return metadata.name;
         }
 
         format!("App {appid}")

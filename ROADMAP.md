@@ -26,3 +26,4 @@
 
 10. ✅ Add Depot Browser developer tooling (depot list, manifest tree, single-file download).
 11. ✅ Harden library scanning fallback and appmanifest parse diagnostics.
+12. ✅ Robust metadata and image lazy-fetching via Steam Web API.

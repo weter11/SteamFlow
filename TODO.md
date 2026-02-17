@@ -15,6 +15,7 @@
   - [ ] Environment variable support for games.
 - [x] **UI/UX Polish**
   - [x] Context menus for games (Install, Uninstall, Properties).
+  - [x] Lazy fetch for game metadata and images.
   - [ ] Better error reporting in the UI.
   - [ ] Responsive layout improvements.
 
