@@ -85,6 +85,7 @@ pub struct RawLaunchOption {
 
 #[derive(Debug, Clone)]
 pub struct ExtendedAppInfo {
+    pub name: Option<String>,
     pub dlcs: Vec<u32>,
     pub depots: Vec<(u32, String)>,
     pub launch_options: Vec<RawLaunchOption>,
@@ -554,6 +555,7 @@ impl SteamClient {
         platform: DepotPlatform,
         cached_vdf: Option<Vec<u8>>,
         filter_depots: Option<Vec<u64>>,
+        shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
     ) -> Result<Receiver<DownloadProgress>> {
         let connection = self
             .connection
@@ -576,6 +578,7 @@ impl SteamClient {
 
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let client_clone = self.clone();
+        let shared_state_clone = shared_state.clone();
 
         tokio::task::spawn(async move {
             let _ = tx
@@ -739,6 +742,16 @@ impl SteamClient {
                 })
                 .await;
 
+            // Update shared state for the start of the download
+            if let Ok(mut state) = shared_state_clone.write() {
+                state.is_downloading = true;
+                state.app_id = appid;
+                state.app_name = game_name.clone();
+                state.downloaded_bytes = 0;
+                state.total_bytes = 0; // We'll update this once we have manifests
+                state.status_text = format!("Initializing download for {}...", game_name);
+            }
+
             // 2. Fetch Content Servers via Service
             tracing::info!("Fetching Content Servers for AppID: {}...", appid);
             let hosts = match client_clone.get_content_servers(connection.cell_id()).await {
@@ -831,6 +844,20 @@ impl SteamClient {
                         cdn_server,
                     );
 
+                let state_for_closure = shared_state_clone.clone();
+                let on_progress = Arc::new(move |bytes: u64| {
+                    if let Ok(mut state) = state_for_closure.write() {
+                        state.downloaded_bytes += bytes;
+                    }
+                });
+
+                let state_for_manifest = shared_state_clone.clone();
+                let on_manifest = Arc::new(move |total_bytes: u64| {
+                    if let Ok(mut state) = state_for_manifest.write() {
+                        state.total_bytes += total_bytes;
+                    }
+                });
+
                     match cdn_client
                         .download_depot(
                             appid,
@@ -839,6 +866,8 @@ impl SteamClient {
                             &key,
                             &install_dir,
                             manifest_code,
+                        Some(on_progress),
+                        Some(on_manifest),
                         )
                         .await
                     {
@@ -875,6 +904,11 @@ impl SteamClient {
             }
 
             if success {
+                if let Ok(mut state) = shared_state_clone.write() {
+                    state.is_downloading = false;
+                    state.status_text = "Download complete".to_string();
+                }
+
                 if let Err(err) =
                     SteamClient::write_basic_appmanifest(&manifest_path, appid, &game_name)
                 {
@@ -888,6 +922,11 @@ impl SteamClient {
                         current_file: "completed".to_string(),
                     })
                     .await;
+            } else {
+                if let Ok(mut state) = shared_state_clone.write() {
+                    state.is_downloading = false;
+                    state.status_text = "Download failed".to_string();
+                }
             }
         });
 
@@ -1373,6 +1412,9 @@ impl SteamClient {
             .as_ref()
             .and_then(|a| a.common.as_ref())
             .or(parsed.common.as_ref());
+
+        let name = common.and_then(|c| c.name.clone());
+
         let dlcs = common
             .map(|c| {
                 c.dlc
@@ -1426,6 +1468,7 @@ impl SteamClient {
         };
 
         Ok(ExtendedAppInfo {
+            name,
             dlcs,
             depots,
             launch_options,
@@ -1782,17 +1825,31 @@ impl SteamClient {
         Ok(())
     }
 
+    pub async fn fetch_app_name_from_web(&self, appid: u32) -> Option<String> {
+        let url = format!("https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic");
+        let resp = reqwest::get(url).await.ok()?;
+        let json: serde_json::Value = resp.json().await.ok()?;
+        json.get(appid.to_string())?
+            .get("data")?
+            .get("name")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
     async fn resolve_install_game_name(&self, appid: u32) -> String {
-        load_library_cache().await
-            .ok()
-            .and_then(|games| {
-                games
-                    .into_iter()
-                    .find(|g| g.app_id == appid)
-                    .map(|g| g.name)
-            })
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| format!("App {appid}"))
+        if let Ok(games) = load_library_cache().await {
+            if let Some(game) = games.iter().find(|g| g.app_id == appid) {
+                if !game.name.is_empty() && !game.name.starts_with("App ") {
+                    return game.name.clone();
+                }
+            }
+        }
+
+        if let Some(web_name) = self.fetch_app_name_from_web(appid).await {
+            return web_name;
+        }
+
+        format!("App {appid}")
     }
 
     fn write_basic_appmanifest(path: &Path, appid: u32, game_name: &str) -> Result<()> {

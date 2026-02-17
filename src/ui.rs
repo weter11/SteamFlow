@@ -5,7 +5,7 @@ use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::download_pipeline::DepotPlatform;
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
-    DownloadProgress, DownloadProgressState, LibraryGame, SteamGuardReq, UserProfile,
+    DownloadProgress, DownloadProgressState, DownloadState, LibraryGame, SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
 use anyhow::anyhow;
@@ -13,6 +13,8 @@ use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::mpsc::{self, Receiver, Sender};
 use tokio::runtime::Runtime;
 
@@ -123,6 +125,7 @@ pub struct SteamLauncher {
     download_receiver: Option<tokio::sync::mpsc::Receiver<DownloadProgress>>,
     active_download_appid: Option<u32>,
     live_download_progress: Option<DownloadProgress>,
+    pub download_state: Arc<RwLock<DownloadState>>,
     play_result_rx: Option<Receiver<String>>,
     show_settings: bool,
     launcher_config: LauncherConfig,
@@ -182,6 +185,7 @@ impl SteamLauncher {
             download_receiver: None,
             active_download_appid: None,
             live_download_progress: None,
+            download_state: Arc::new(RwLock::new(DownloadState::default())),
             play_result_rx: None,
             show_settings: false,
             launcher_config,
@@ -415,8 +419,9 @@ impl SteamLauncher {
     fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>, filter_depots: Option<Vec<u64>>) {
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
+        let download_state = self.download_state.clone();
         self.runtime.spawn(async move {
-            match client.install_game(app_id, platform, cached_vdf, filter_depots).await {
+            match client.install_game(app_id, platform, cached_vdf, filter_depots, download_state).await {
                 Ok(rx) => {
                     let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
                 }
@@ -474,6 +479,13 @@ impl SteamLauncher {
                     }
                 }
                 AsyncOp::ExtendedInfoFetched(appid, info) => {
+                    if let Some(new_name) = &info.name {
+                        if let Some(game) = self.library.iter_mut().find(|g| g.app_id == appid) {
+                            if game.name.starts_with("App ") {
+                                game.name = new_name.clone();
+                            }
+                        }
+                    }
                     self.extended_info.insert(appid, info);
                 }
                 AsyncOp::LibraryFetched(library) => {
@@ -1659,6 +1671,31 @@ impl eframe::App for SteamLauncher {
         self.poll_download_progress();
         self.poll_play_result();
         self.poll_async_ops();
+
+        let is_downloading = self.download_state.read().unwrap().is_downloading;
+        if is_downloading {
+            egui::TopBottomPanel::bottom("download_bar").show(ctx, |ui| {
+                let state = self.download_state.read().unwrap();
+                let percent = if state.total_bytes > 0 {
+                    state.downloaded_bytes as f32 / state.total_bytes as f32
+                } else {
+                    0.0
+                };
+                ui.horizontal(|ui| {
+                    ui.label(format!("Downloading {}: ", state.app_name));
+                    ui.add(
+                        egui::ProgressBar::new(percent)
+                            .show_percentage()
+                            .text(format!("{:.1}%", percent * 100.0)),
+                    );
+                    ui.label(format!(
+                        "({} / {} MB)",
+                        state.downloaded_bytes / 1024 / 1024,
+                        state.total_bytes / 1024 / 1024
+                    ));
+                });
+            });
+        }
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {

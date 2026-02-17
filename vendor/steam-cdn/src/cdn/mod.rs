@@ -127,6 +127,8 @@ impl CDNClient {
         depot_key: &[u8],
         target_dir: impl AsRef<std::path::Path>,
         manifest_request_code: Option<u64>,
+        on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
+        on_manifest: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
         let request_code = if manifest_request_code.is_some() {
             manifest_request_code
@@ -143,6 +145,10 @@ impl CDNClient {
             .get_manifest(app_id, depot_id, manifest_id, request_code, Some(key_arr))
             .await?;
 
+        if let Some(ref cb) = on_manifest {
+            cb(manifest.original_size());
+        }
+
         for file in manifest.files() {
             let full_path = target_dir.as_ref().join(file.full_path());
             if let Some(parent) = full_path.parent() {
@@ -154,7 +160,7 @@ impl CDNClient {
                     .await
                     .map_err(|e| Error::Unexpected(e.to_string()))?;
 
-                file.download(key_arr, &mut out, None).await?;
+                file.download(key_arr, &mut out, None, on_progress.clone()).await?;
             }
         }
         Ok(())

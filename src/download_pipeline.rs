@@ -136,6 +136,8 @@ pub struct ProductLaunchEntry {
 #[derive(Debug, serde::Deserialize)]
 pub struct CommonNode {
     #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub dlc: HashMap<String, String>,
 }
 
@@ -378,7 +380,7 @@ pub async fn phase3_download_manifest(
     decode_manifest_payload(&body)
 }
 
-pub struct DownloadState {
+pub struct LocalDownloadState {
     pub manifest: ContentManifestPayload,
     pub install_dir: PathBuf,
     pub client: reqwest::Client,
@@ -387,7 +389,7 @@ pub struct DownloadState {
     pub smart_verify_existing: bool,
 }
 
-impl DownloadState {
+impl LocalDownloadState {
     pub fn new(
         manifest: ContentManifestPayload,
         install_dir: PathBuf,
@@ -561,7 +563,7 @@ pub async fn phase4_download_chunks_async(
             .with_context(|| format!("failed creating install root {}", install_root.display()))?;
     }
 
-    let state = DownloadState::new(
+    let state = LocalDownloadState::new(
         manifest,
         install_root,
         security,
