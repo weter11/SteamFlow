@@ -17,7 +17,7 @@ SteamFlow now follows the full auth sequence used by steam-vent's login pipeline
 3. Surface Steam Guard confirmation methods in the UI, then submit code/device confirmation through the login flow.
 4. Poll `Authentication.PollAuthSessionStatus` until tokens are issued.
 5. Perform client logon using the returned refresh token (steam-vent access-token login step).
-6. Persist `account_name` and refresh token (`access_token()` from session) to `~/.config/SteamFlow/session.json`.
+6. Persist `account_name` and refresh token (`access_token()` from session) to `./config/SteamFlow/session.json`.
 7. On next launch, call `Connection::access` with the persisted refresh token to restore the session.
 
 Guard data is persisted through `FileGuardDataStore::user_cache()` so repeated Steam Guard prompts are reduced when Steam allows it.

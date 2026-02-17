@@ -6,7 +6,7 @@
   - [x] Filter by installed/uninstalled.
   - [ ] Filter by genre/tags.
 - [ ] **Download Manager Improvements**
-  - [ ] Better visualization of download progress (speed, time remaining).
+  - [x] Better visualization of download progress (speed, size).
   - [ ] Queue management (pause, resume, reorder).
   - [x] Proper handling of multiple depots.
 - [ ] **Game Launching Polish**
@@ -54,3 +54,5 @@
 - [x] **Steam Cloud**
   - Sync game saves on launch/exit.
   - [ ] Conflict resolution UI.
+- [x] **Portability**
+  - Use relative path structure for config and data.

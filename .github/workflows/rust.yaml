@@ -8,7 +8,6 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust.yaml"
-  pull_request:
 
 jobs:
   steamflow-deb:
@@ -56,3 +55,21 @@ jobs:
         with:
           name: steamflow-deb
           path: target/debian/*.deb
+
+  steamflow-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build SteamFlow (release)
+        run: cargo build --release
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamflow-windows
+          path: target/release/steamflow.exe
