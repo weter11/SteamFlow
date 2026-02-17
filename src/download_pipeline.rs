@@ -662,6 +662,25 @@ pub fn execute_download_with_manifest_id(
 }
 
 fn decode_manifest_payload(bytes: &[u8]) -> Result<ContentManifestPayload> {
+    // 1. Check for standard PKZip Header (0x50 0x4B)
+    if bytes.len() > 2 && bytes[0] == 0x50 && bytes[1] == 0x4B {
+        println!("DEBUG: Detected PKZip format. Extracting...");
+        if let Ok(mut archive) = zip::read::ZipArchive::new(std::io::Cursor::new(bytes)) {
+            if archive.len() > 0 {
+                if let Ok(mut file) = archive.by_index(0) {
+                    let mut unzipped_data = Vec::with_capacity(file.size() as usize);
+                    if std::io::copy(&mut file, &mut unzipped_data).is_ok() {
+                        println!("DEBUG: Successfully unzipped {} bytes.", unzipped_data.len());
+                        if let Ok(payload) = ContentManifestPayload::parse_from_bytes(&unzipped_data)
+                        {
+                            return Ok(payload);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Ok(payload) = ContentManifestPayload::parse_from_bytes(bytes) {
         return Ok(payload);
     }

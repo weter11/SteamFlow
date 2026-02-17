@@ -86,13 +86,32 @@ impl DepotManifest {
         app_id: u32,
         data: &[u8],
     ) -> Result<Self, ManifestError> {
-        let cursor = Cursor::new(data);
         let mut buffer = Vec::new();
-        ZipArchive::new(cursor)?
-            .by_index(0)?
-            .read_to_end(&mut buffer)?;
+        let is_zip = data.len() > 2 && data[0] == 0x50 && data[1] == 0x4B;
 
-        let mut bytes = Bytes::from(buffer);
+        let raw_data = if is_zip {
+            println!("DEBUG: Detected PKZip format in Manifest. Extracting...");
+            let cursor = Cursor::new(data);
+            match ZipArchive::new(cursor) {
+                Ok(mut archive) if archive.len() > 0 => {
+                    if let Ok(mut file) = archive.by_index(0) {
+                        if file.read_to_end(&mut buffer).is_ok() {
+                            println!("DEBUG: Successfully unzipped {} bytes.", buffer.len());
+                            &buffer[..]
+                        } else {
+                            data
+                        }
+                    } else {
+                        data
+                    }
+                }
+                _ => data,
+            }
+        } else {
+            data
+        };
+
+        let mut bytes = Bytes::from(raw_data.to_vec());
         if bytes.try_get_u32()? != PROTOBUF_PAYLOAD_MAGIC {
             return Err(ManifestError::MagicMismatch(
                 "expecting protobuf payload".to_string(),

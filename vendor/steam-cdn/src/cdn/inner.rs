@@ -147,8 +147,9 @@ impl InnerClient {
                 Some(depot_id),
             )
             .await?;
-        if !response.status().is_success() {
-            return Err(Error::HttpStatus(response.status()));
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::HttpStatus(status));
         }
 
         let mut bytes = response.bytes().await?.to_vec();
