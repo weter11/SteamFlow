@@ -294,7 +294,7 @@ impl SteamLauncher {
             let target_path = cache_dir.join(format!("{appid}_library.jpg"));
             if tokio::fs::metadata(&target_path).await.is_err() {
                 let candidates = [
-                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"),
+                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900_2x.jpg"),
                     format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"),
                     format!("https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.jpg"),
                 ];

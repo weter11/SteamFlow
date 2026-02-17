@@ -777,6 +777,7 @@ impl SteamClient {
 
             // 3. Download Loop
             let mut success = true;
+            let mut successful_depots = Vec::new();
             for selection in selections {
                 tracing::info!(
                     "Starting download for Depot {} (GID: {})...",
@@ -858,7 +859,10 @@ impl SteamClient {
                 });
 
                 let state_for_manifest = shared_state_clone.clone();
+                let depot_size = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let size_clone = depot_size.clone();
                 let on_manifest = Arc::new(move |total_bytes: u64| {
+                    size_clone.store(total_bytes, std::sync::atomic::Ordering::SeqCst);
                     if let Ok(mut state) = state_for_manifest.write() {
                         state.total_bytes += total_bytes;
                     }
@@ -873,7 +877,7 @@ impl SteamClient {
                             &install_dir,
                             manifest_code,
                         Some(on_progress),
-                        Some(on_manifest),
+                        Some(on_manifest.clone()),
                         )
                         .await
                     {
@@ -884,6 +888,11 @@ impl SteamClient {
                                 host
                             );
                             depot_success = true;
+                            successful_depots.push((
+                                selection.depot_id,
+                                selection.manifest_id,
+                                depot_size.load(std::sync::atomic::Ordering::SeqCst),
+                            ));
                             break;
                         }
                         Err(e) => {
@@ -915,9 +924,12 @@ impl SteamClient {
                     state.status_text = "Download complete".to_string();
                 }
 
-                if let Err(err) =
-                    SteamClient::write_basic_appmanifest(&manifest_path, appid, &game_name)
-                {
+                if let Err(err) = SteamClient::write_appmanifest(
+                    &manifest_path,
+                    appid,
+                    &game_name,
+                    successful_depots,
+                ) {
                     tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
                 }
                 let _ = tx
@@ -1869,7 +1881,12 @@ impl SteamClient {
         format!("App {appid}")
     }
 
-    fn write_basic_appmanifest(path: &Path, appid: u32, game_name: &str) -> Result<()> {
+    pub fn write_appmanifest(
+        path: &Path,
+        appid: u32,
+        game_name: &str,
+        installed_depots: Vec<(u32, u64, u64)>,
+    ) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed creating {}", parent.display()))?;
@@ -1877,9 +1894,22 @@ impl SteamClient {
 
         let installdir = sanitize_install_dir(game_name);
         let game_name = game_name.replace('"', "");
-        let content = format!(
-            "\"AppState\"\n{{\n\t\"appid\"\t\"{appid}\"\n\t\"name\"\t\"{game_name}\"\n\t\"StateFlags\"\t\"4\"\n\t\"installdir\"\t\"{installdir}\"\n}}\n"
+
+        let mut content = format!(
+            "\"AppState\"\n{{\n\t\"appid\"\t\"{appid}\"\n\t\"name\"\t\"{game_name}\"\n\t\"StateFlags\"\t\"4\"\n\t\"installdir\"\t\"{installdir}\"\n"
         );
+
+        if !installed_depots.is_empty() {
+            content.push_str("\t\"InstalledDepots\"\n\t{\n");
+            for (depot_id, manifest_id, size) in installed_depots {
+                content.push_str(&format!(
+                    "\t\t\"{depot_id}\"\n\t\t{{\n\t\t\t\"manifest\"\t\t\"{manifest_id}\"\n\t\t\t\"size\"\t\t\"{size}\"\n\t\t}}\n"
+                ));
+            }
+            content.push_str("\t}\n");
+        }
+
+        content.push_str("}\n");
 
         std::fs::write(path, content)
             .with_context(|| format!("failed writing {}", path.display()))?;
