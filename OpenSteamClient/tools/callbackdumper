@@ -1,3 +1,0 @@
-#!/bin/sh
-SCRIPT_PATH=$(dirname "$0")
-dotnet run --project $SCRIPT_PATH/callbackdumper_src -- $@

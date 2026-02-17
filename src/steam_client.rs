@@ -635,19 +635,6 @@ impl SteamClient {
 
             let appinfo_vdf_text = String::from_utf8_lossy(appinfo_vdf_bytes).to_string();
 
-            // HEX DUMP: Print the first 128 bytes of the received buffer
-            let preview_len = std::cmp::min(appinfo_vdf_bytes.len(), 128);
-            println!("--- VDF BUFFER DEBUG ---");
-            println!("Buffer Size: {} bytes", appinfo_vdf_bytes.len());
-            println!("Header (Hex): {:02X?}", &appinfo_vdf_bytes[..preview_len]);
-            // Try to print as string (replace non-utf8 with dot)
-            let text_preview: String = appinfo_vdf_bytes
-                .iter()
-                .take(preview_len)
-                .map(|&b| if (32..=126).contains(&b) { b as char } else { '.' })
-                .collect();
-            println!("Header (ASCII): {}", text_preview);
-            println!("------------------------");
 
             let mut selections = Vec::new();
 
@@ -676,17 +663,6 @@ impl SteamClient {
                                     .and_then(|c| c.get("oslist"))
                                     .and_then(|o| o.as_str());
 
-                                println!("Evaluating Depot ID: {}", d_id);
-                                if let Some(config) = value.get_obj(&["config"]) {
-                                    let os_arch =
-                                        config.get("osarch").and_then(|v| v.as_str()).unwrap_or("ANY");
-                                    println!("  - OS List: {:?}", oslist.unwrap_or("ALL (Common)"));
-                                    println!("  - Architecture: {:?}", os_arch);
-                                } else {
-                                    println!("  - No 'config' section found (Assuming Shared/Common depot)");
-                                }
-                                println!("  - Target Platform: {:?}", platform);
-
                                 if oslist
                                     .map(|os| os.to_lowercase().contains("windows"))
                                     .unwrap_or(false)
@@ -695,7 +671,6 @@ impl SteamClient {
                                 }
 
                                 let mut match_os = should_keep_depot(oslist, platform);
-                                println!("  -> Match Result (OS): {}", match_os);
 
                                 if match_os {
                                     // 1. LANGUAGE CHECK
@@ -705,10 +680,7 @@ impl SteamClient {
                                         .and_then(|l| l.as_str());
                                     if let Some(lang) = lang {
                                         if lang != "english" && !lang.is_empty() {
-                                            println!("  - Language: {} (Skipping)", lang);
                                             match_os = false;
-                                        } else {
-                                            println!("  - Language: {} (Matched)", lang);
                                         }
                                     }
                                 }
@@ -722,7 +694,6 @@ impl SteamClient {
 
                                     if is_allowed {
                                         if let Some(m_id) = map.get(&depot_id_u64) {
-                                            println!("Using GID {} for Depot {}", m_id, d_id);
                                             selections.push(ManifestSelection {
                                                 app_id: appid,
                                                 depot_id: d_id,
@@ -730,8 +701,6 @@ impl SteamClient {
                                                 appinfo_vdf: appinfo_vdf_text.clone(),
                                             });
                                         }
-                                    } else {
-                                        println!("Skipping Depot {} (Not in filter list)", d_id);
                                     }
                                 }
                             }
@@ -978,11 +947,6 @@ impl SteamClient {
     }
 
     pub async fn get_content_servers(&self, cell_id: u32) -> Result<Vec<String>> {
-        println!(
-            "DEBUG: Requesting Content Servers for Cell ID {} via Service...",
-            cell_id
-        );
-
         let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
         let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
         request.set_cell_id(cell_id);
@@ -994,10 +958,6 @@ impl SteamClient {
             .context("failed calling ContentServerDirectory.GetServersForSteamPipe")?;
 
         let mut hosts = Vec::new();
-        println!(
-            "DEBUG: Service returned {} servers.",
-            response.servers.len()
-        );
         for server in &response.servers {
             if server.type_() == "SteamCache" || server.type_() == "CDN" {
                 let host = server.host().to_string();
@@ -1018,11 +978,6 @@ impl SteamClient {
         depot_id: u32,
         manifest_id: u64,
     ) -> Result<u64> {
-        println!(
-            "DEBUG: Requesting Manifest Code for Depot {} / Manifest {}...",
-            depot_id, manifest_id
-        );
-
         let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
         let mut request = CContentServerDirectory_GetManifestRequestCode_Request::new();
         request.set_app_id(app_id);
@@ -1034,10 +989,6 @@ impl SteamClient {
             .await
             .context("failed calling ContentServerDirectory.GetManifestRequestCode")?;
 
-        println!(
-            "DEBUG: Manifest Request Code received: {}",
-            response.manifest_request_code()
-        );
         Ok(response.manifest_request_code())
     }
 
@@ -1047,11 +998,6 @@ impl SteamClient {
         depot_id: u32,
         host_name: &str,
     ) -> Result<String> {
-        println!(
-            "DEBUG: Requesting CDN Auth Token for Depot {} on Host {}...",
-            depot_id, host_name
-        );
-
         let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
         let mut request = CContentServerDirectory_GetCDNAuthToken_Request::new();
         request.set_app_id(app_id);
@@ -1064,11 +1010,9 @@ impl SteamClient {
             .context("failed calling ContentServerDirectory.GetCDNAuthToken")?;
 
         if response.token().is_empty() {
-            println!("ERROR: Steam returned empty Auth Token!");
             return Err(anyhow!("Empty Auth Token returned"));
         }
 
-        println!("DEBUG: Auth Token received successfully.");
         Ok(response.token().to_string())
     }
 
@@ -1156,8 +1100,6 @@ impl SteamClient {
     }
 
     pub async fn get_depot_key(&self, app_id: u32, depot_id: u32) -> Result<Vec<u8>> {
-        println!("DEBUG: Fetching Decryption Key for Depot {}...", depot_id);
-
         let connection = self
             .connection
             .as_ref()
@@ -1168,17 +1110,12 @@ impl SteamClient {
 
         let response: CMsgClientGetDepotDecryptionKeyResponse = connection.job(request).await?;
         if response.eresult() != 1 {
-            println!("ERROR: Key Fetch Failed. EResult: {}", response.eresult());
             bail!(
                 "failed to get depot key for depot {depot_id}: eresult {}",
                 response.eresult()
             );
         }
 
-        println!(
-            "DEBUG: Key Found! (Length: {} bytes)",
-            response.depot_encryption_key().len()
-        );
         Ok(response.depot_encryption_key().to_vec())
     }
 
@@ -1206,15 +1143,12 @@ impl SteamClient {
                 Ok(response) => {
                     let response: CMsgClientGetDepotDecryptionKeyResponse = response;
                     if response.eresult() == 1 { // EResult::OK
-                        println!("Depot {}: OWNED", depot_id);
                         results.insert(depot_id, true);
                     } else {
-                        println!("Depot {}: NOT OWNED (EResult {})", depot_id, response.eresult());
                         results.insert(depot_id, false);
                     }
                 }
                 Err(_) => {
-                    println!("Depot {}: NOT OWNED (Request failed)", depot_id);
                     results.insert(depot_id, false);
                 }
             }
@@ -1532,7 +1466,6 @@ impl SteamClient {
         let launch_infos = parse_launch_info_from_vdf(appid, &raw_vdf, prefer_proton)
             .context("failed to parse launch metadata from PICS appinfo")?;
 
-        println!("DEBUG PICS: {:#?}", launch_infos);
         Ok(launch_infos)
     }
 
@@ -1949,10 +1882,6 @@ impl SteamClient {
                 cmd.env("PATH", format!("{}:{}", bin_dir.display(), existing_path));
                 cmd.env("SteamAppId", app.app_id.to_string());
 
-                println!("EXECUTING COMMAND: {:?}", cmd);
-                println!("Working Dir: {:?}", install_dir);
-                println!("Environment: {:?}", cmd.get_envs());
-
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
@@ -1985,10 +1914,6 @@ impl SteamClient {
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
-
-                println!("EXECUTING COMMAND: {:?}", cmd);
-                println!("Working Dir: {:?}", install_dir);
-                println!("Environment: {:?}", cmd.get_envs());
 
                 cmd.spawn().context("failed to spawn proton game")
             }
@@ -2058,8 +1983,6 @@ fn parse_launch_info_from_vdf(
         .and_then(|appinfo| appinfo.config.as_ref())
         .or(parsed.config.as_ref())
         .ok_or_else(|| anyhow!("missing config section in product info for app {appid}"))?;
-
-    println!("AppInfo Config: {:?}", config);
 
     if config.launch.is_empty() {
         bail!("no launch entries found for app {appid}")
@@ -2166,18 +2089,14 @@ pub fn find_vdf_in_pics(buffer: &[u8]) -> Result<steam_vdf_parser::Vdf<'static>>
 }
 
 pub fn parse_pics_product_info(buffer: &[u8]) -> Result<HashMap<u64, u64>> {
-    println!("Detecting VDF Format...");
-
     let is_text = buffer
         .first()
         .map(|&b| b == 0x22 || b == 0x7B)
         .unwrap_or(false);
 
     if is_text {
-        println!("Format: TEXT VDF detected.");
         parse_text_vdf(buffer)
     } else {
-        println!("Format: BINARY VDF (or Header) detected.");
         parse_binary_vdf_with_offset(buffer)
     }
 }
@@ -2217,9 +2136,7 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
                 }
             }
         }
-        Err(e) => {
-            println!("Text VDF parser failed: {e}. Falling back to manual scan.");
-        }
+        Err(_) => {}
     }
 
     if depot_map.is_empty() {
@@ -2269,7 +2186,6 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
                 if inside_public && key == "gid" {
                     if let Ok(gid) = parts[1].parse::<u64>() {
                         if gid > 0 {
-                            println!("Found Public GID for Depot {}: {}", current_depot, gid);
                             depot_map.insert(current_depot, gid);
                         }
                     }
@@ -2290,7 +2206,6 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
         depot_map.retain(|id, _| {
             if let Some(lang) = depot_langs.get(id) {
                 if lang != "english" && !lang.is_empty() {
-                    println!("Skipping Depot {} (Language: {}) during manual scan", id, lang);
                     return false;
                 }
             }
@@ -2302,7 +2217,6 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
         bail!("Text scan found no depots");
     }
 
-    println!("Resolved {} Depots via Text VDF.", depot_map.len());
     Ok(depot_map)
 }
 
@@ -2339,7 +2253,6 @@ fn parse_binary_vdf_with_offset(data: &[u8]) -> Result<HashMap<u64, u64>> {
         }
 
         if !depot_map.is_empty() {
-            println!("Resolved {} Depots via Binary VDF.", depot_map.len());
             return Ok(depot_map);
         }
     }

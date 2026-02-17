@@ -1,4 +1,3 @@
-use buf::TryBuf;
 use bytes::{Buf, Bytes};
 use error::ManifestError;
 use file::{ChunkData, ManifestFile};
@@ -8,7 +7,7 @@ use std::{
     str,
 };
 use steam_vent::proto::{
-    content_manifest::{ContentManifestMetadata, ContentManifestPayload, ContentManifestSignature},
+    content_manifest::{ContentManifestMetadata, ContentManifestPayload},
     protobuf::Message,
 };
 use zip::ZipArchive;
@@ -92,29 +91,11 @@ impl DepotManifest {
         let is_zip = data.len() > 2 && data[0] == 0x50 && data[1] == 0x4B;
 
         let raw_data = if is_zip {
-            println!("DEBUG: Detected PKZip format in Manifest. Extracting...");
             let cursor = Cursor::new(data);
             match ZipArchive::new(cursor) {
                 Ok(mut archive) if archive.len() > 0 => {
                     if let Ok(mut file) = archive.by_index(0) {
-                        println!("DEBUG: Zip Entry Name: {}", file.name());
                         if file.read_to_end(&mut buffer).is_ok() {
-                            println!("DEBUG: Successfully unzipped {} bytes.", buffer.len());
-
-                            if buffer.len() >= 16 {
-                                println!("DEBUG: Unzipped Header (Hex): {:02X?}", &buffer[..16]);
-                            }
-
-                            if buffer.starts_with(b"VBKV") {
-                                println!(
-                                    "DEBUG: Warning: Found VBKV header! This is not raw Protobuf."
-                                );
-                            }
-
-                            if !buffer.is_empty() && buffer[0] == 0x0A {
-                                println!("DEBUG: Looks like valid ContentManifestPayload (starts with 0x0A).");
-                            }
-
                             &buffer[..]
                         } else {
                             data
@@ -134,26 +115,22 @@ impl DepotManifest {
         let mut metadata = None;
 
         // Try parsing using the magic-wrapped sequence first
-        if raw_data.len() > 8 && u32::from_le_bytes(raw_data[0..4].try_into().unwrap()) == PROTOBUF_PAYLOAD_MAGIC {
-            println!("DEBUG: Found magic-wrapped manifest sequence.");
+        if raw_data.len() > 8
+            && u32::from_le_bytes(raw_data[0..4].try_into().unwrap()) == PROTOBUF_PAYLOAD_MAGIC
+        {
             while bytes.remaining() >= 8 {
                 let magic = bytes.get_u32_le();
                 let len = bytes.get_u32_le() as usize;
 
                 if bytes.remaining() < len {
-                    println!("DEBUG: Segment claims length {}, but only {} bytes remain.", len, bytes.remaining());
                     break;
                 }
 
                 let body = bytes.copy_to_bytes(len);
                 if magic == PROTOBUF_PAYLOAD_MAGIC {
-                    println!("DEBUG: Found Payload Segment ({} bytes)", len);
                     payload = ContentManifestPayload::parse_from_bytes(&body).ok();
                 } else if magic == PROTOBUF_METADATA_MAGIC {
-                    println!("DEBUG: Found Metadata Segment ({} bytes)", len);
                     metadata = ContentManifestMetadata::parse_from_bytes(&body).ok();
-                } else {
-                    println!("DEBUG: Skipping Unknown Segment (Magic: {:08X}, {} bytes)", magic, len);
                 }
             }
         }
@@ -167,10 +144,6 @@ impl DepotManifest {
             } else {
                 0
             };
-
-            if offset > 0 {
-                println!("DEBUG: Skipping {} bytes to Protobuf start (fallback).", offset);
-            }
 
             payload = Some(ContentManifestPayload::parse_from_bytes(&raw_data[offset..])?);
         }

@@ -668,29 +668,11 @@ pub fn execute_download_with_manifest_id(
 fn decode_manifest_payload(bytes: &[u8]) -> Result<ContentManifestPayload> {
     // 1. Check for standard PKZip Header (0x50 0x4B)
     if bytes.len() > 2 && bytes[0] == 0x50 && bytes[1] == 0x4B {
-        println!("DEBUG: Detected PKZip format. Extracting...");
         if let Ok(mut archive) = zip::read::ZipArchive::new(std::io::Cursor::new(bytes)) {
             if archive.len() > 0 {
                 if let Ok(mut file) = archive.by_index(0) {
-                    println!("DEBUG: Zip Entry Name: {}", file.name());
                     let mut unzipped_data = Vec::with_capacity(file.size() as usize);
                     if std::io::copy(&mut file, &mut unzipped_data).is_ok() {
-                        println!("DEBUG: Successfully unzipped {} bytes.", unzipped_data.len());
-
-                        if unzipped_data.len() >= 16 {
-                            println!("DEBUG: Unzipped Header (Hex): {:02X?}", &unzipped_data[..16]);
-                        }
-
-                        if unzipped_data.starts_with(b"VBKV") {
-                            println!("DEBUG: Warning: Found VBKV header! This is not raw Protobuf.");
-                        }
-
-                        if !unzipped_data.is_empty() && unzipped_data[0] == 0x0A {
-                            println!(
-                                "DEBUG: Looks like valid ContentManifestPayload (starts with 0x0A)."
-                            );
-                        }
-
                         let (offset, len) = if unzipped_data.len() > 8
                             && unzipped_data[0] == 0xD0
                             && unzipped_data[1] == 0x17
@@ -701,28 +683,20 @@ fn decode_manifest_payload(bytes: &[u8]) -> Result<ContentManifestPayload> {
                                 unzipped_data[6],
                                 unzipped_data[7],
                             ]) as usize;
-                            println!(
-                                "DEBUG: Magic Header detected. Payload Size: {}, Total: {}",
-                                payload_len,
-                                unzipped_data.len()
-                            );
                             (8, payload_len)
                         } else if unzipped_data.len() > 8 && unzipped_data[8] == 0x0A {
-                            println!("DEBUG: Found custom header (8 bytes). Skipping to Protobuf start...");
                             (8, unzipped_data.len() - 8)
                         } else if unzipped_data.len() > 4 && unzipped_data[4] == 0x0A {
-                            println!("DEBUG: Found custom header (4 bytes). Skipping...");
                             (4, unzipped_data.len() - 4)
                         } else {
                             (0, unzipped_data.len())
                         };
 
                         let end = (offset + len).min(unzipped_data.len());
-                        match ContentManifestPayload::parse_from_bytes(&unzipped_data[offset..end]) {
-                            Ok(payload) => return Ok(payload),
-                            Err(e) => {
-                                println!("ERROR: parse_from_bytes failed on unzipped data: {}", e)
-                            }
+                        if let Ok(payload) =
+                            ContentManifestPayload::parse_from_bytes(&unzipped_data[offset..end])
+                        {
+                            return Ok(payload);
                         }
                     }
                 }

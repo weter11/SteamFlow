@@ -61,6 +61,11 @@ The original C# implementation of OpenSteamClient has been moved to the `OpenSte
 # Contributing
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
+# Acknowledgments
+Special thanks to the developers of **OpenSteamClient** and **steam-vent** for their invaluable reverse-engineering documentation.
+
+Powered by `steam-cdn` (Vendored & Modified) and `zip` crate.
+
 # Credits
 - [steam-vent](https://github.com/n00b67/steam-vent) - Steam protocol implementation
 - [egui](https://github.com/emilk/egui) - Immediate mode GUI library

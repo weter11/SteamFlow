@@ -8,7 +8,7 @@
 - [ ] **Download Manager Improvements**
   - [ ] Better visualization of download progress (speed, time remaining).
   - [ ] Queue management (pause, resume, reorder).
-  - [ ] Proper handling of multiple depots.
+  - [x] Proper handling of multiple depots.
 - [ ] **Game Launching Polish**
   - [x] Better Proton detection and selection.
   - [ ] Support for custom launch options/arguments.
