@@ -29,6 +29,7 @@ enum LibraryFolderRecord {
 pub struct InstalledAppInfo {
     pub install_path: PathBuf,
     pub active_branch: String,
+    pub name: Option<String>,
 }
 
 pub async fn find_local_games() -> Result<Vec<LocalGame>> {
@@ -38,7 +39,7 @@ pub async fn find_local_games() -> Result<Vec<LocalGame>> {
     for (app_id, info) in installed_info {
         all_games.push(LocalGame {
             app_id,
-            name: format!("App {app_id}"),
+            name: info.name.unwrap_or_else(|| format!("App {app_id}")),
             install_dir: info.install_path,
             proton_version: None,
             active_branch: info.active_branch,
@@ -199,6 +200,7 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
 
     let mut app_id = None;
     let mut install_dir_name = None;
+    let mut name = None;
     let mut active_branch = "public".to_string();
 
     let mut in_user_config = false;
@@ -228,6 +230,8 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
                     app_id = value.parse::<u32>().ok();
                 } else if key == "installdir" {
                     install_dir_name = Some(value.to_string());
+                } else if key == "name" {
+                    name = Some(value.to_string());
                 }
             } else if key == "betakey" {
                 if !value.trim().is_empty() {
@@ -248,6 +252,7 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
                 InstalledAppInfo {
                     install_path,
                     active_branch,
+                    name,
                 },
             )))
         }
@@ -308,7 +313,7 @@ pub fn build_game_library(
 
         games.push(LibraryGame {
             app_id,
-            name: format!("App {app_id}"),
+            name: info.name.unwrap_or_else(|| format!("App {app_id}")),
             playtime_forever_minutes: None,
             is_installed: true,
             install_path: Some(info.install_path.to_string_lossy().to_string()),

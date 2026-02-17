@@ -1,4 +1,4 @@
-<img src="Assets/opensteam-logo.svg" alt="SteamFlow logo" title="SteamFlow" align="left" height="65" />
+<img src="https://lh3.googleusercontent.com/gg/AMW1TPr5-3If5nhYyvCYFdwZP-PSBKtW8M1hHDROiSgf-L6tvWyoIR6RieuKDfnkpL88OabVnv8GixMr8Er5xBAbzQ5uBKeu3u5fmVRt0X-vQ99dCGNSxSqXsFoLT_4fKyKOQ0fvdkv_7_02fUMOAv20rQN50qCaKdh0-tKDgfEWLDkXbkIR3Z8K9SpVKyBU8DqHPiMhnVLZJWXbADIdT1CZeZfvMc6aSs03gzRdEaN57fG9qZbtYJ_WWziTfVI7u02xsgQED05XH2M_iFrSgn6HGUAgePxoYp2S7Jiy5-F5-iD1ukHQbfPjusMEXlMwQZmXKpTtrv3qeNW-T75nvYKjwIGp=s1024-rj" alt="SteamFlow logo" title="SteamFlow" align="left" height="65" />
 
 # SteamFlow
 A custom, lightweight Steam launcher and client written in Rust.
@@ -37,13 +37,18 @@ SteamFlow is in active development and serves as the primary project. It has rea
 ## Prerequisites (Linux)
 Ensure you have the following system dependencies installed (Ubuntu 24.04 example):
 ```bash
-sudo apt-get install build-essential pkg-config libssl-dev libx11-dev libxi-dev libxrandr-dev libxinerama-dev libxcursor-dev libxkbcommon-dev libasound2-dev libudev-dev libwayland-dev libgtk-3-dev libpulse-dev libdbus-1-dev libegl1-mesa-dev libgles2-mesa-dev
+sudo apt-get update
+sudo apt-get install build-essential pkg-config libssl-dev libx11-dev libxi-dev libxrandr-dev libxinerama-dev libxcursor-dev libxkbcommon-dev libasound2-dev libudev-dev libwayland-dev libgtk-3-dev libpulse-dev libdbus-1-dev libegl1-mesa-dev libgles2-mesa-dev liblzma-dev
 ```
 
 ## Build and Run
+1. Clone the repository:
 ```bash
-git clone https://github.com/OpenSteamClient/OpenSteamClient.git --recursive
+git clone https://github.com/OpenSteamClient/OpenSteamClient.git
 cd OpenSteamClient
+```
+2. Build and run:
+```bash
 cargo run --release
 ```
 
@@ -55,9 +60,6 @@ cargo run --release
 
 ---
 
-# Legacy: OpenSteamClient (C#)
-The original C# implementation of OpenSteamClient has been moved to the `OpenSteamClient/` directory. It is maintained for reference and legacy purposes but is no longer in active development.
-
 # Contributing
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
@@ -67,6 +69,7 @@ Special thanks to the developers of **OpenSteamClient** and **steam-vent** for t
 Powered by `steam-cdn` (Vendored & Modified) and `zip` crate.
 
 # Credits
+- [OpenSteamClient](https://github.com/OpenSteamClient/OpenSteamClient) - Original project and resource base
 - [steam-vent](https://github.com/n00b67/steam-vent) - Steam protocol implementation
 - [egui](https://github.com/emilk/egui) - Immediate mode GUI library
 - [open-steamworks](https://github.com/SteamRE/open-steamworks) - Research resources

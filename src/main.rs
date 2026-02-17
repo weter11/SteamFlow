@@ -9,6 +9,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let runtime = Runtime::new()?;
+    runtime.block_on(steamflow::config::ensure_config_dirs())?;
     let mut client = SteamClient::new()?;
 
     let library = runtime.block_on(async {

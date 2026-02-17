@@ -1,6 +1,5 @@
 use crate::models::{OwnedGame, SessionState};
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -75,14 +74,19 @@ pub fn detect_steam_path() -> Option<PathBuf> {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("io", "SteamFlow", "SteamFlow")
-        .context("failed to resolve config directory")?;
-    Ok(dirs.config_dir().to_path_buf())
+    Ok(PathBuf::from("./config/SteamFlow"))
 }
 
 pub fn data_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/share/SteamFlow"))
+    Ok(PathBuf::from("./config/SteamFlow"))
+}
+
+pub async fn ensure_config_dirs() -> Result<()> {
+    let config = config_dir()?;
+    fs::create_dir_all(&config).await?;
+    let images = opensteam_image_cache_dir()?;
+    fs::create_dir_all(&images).await?;
+    Ok(())
 }
 
 pub fn opensteam_image_cache_dir() -> Result<PathBuf> {

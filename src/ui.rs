@@ -5,7 +5,7 @@ use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::download_pipeline::DepotPlatform;
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
-    DownloadProgress, DownloadProgressState, LibraryGame, SteamGuardReq, UserProfile,
+    DownloadProgress, DownloadProgressState, DownloadState, LibraryGame, SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
 use anyhow::anyhow;
@@ -13,6 +13,8 @@ use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::mpsc::{self, Receiver, Sender};
 use tokio::runtime::Runtime;
 
@@ -99,6 +101,7 @@ pub enum AsyncOp {
     UserProfileFetched(crate::models::UserProfile),
     SettingsSaved(bool),
     ScanCompleted(u32, HashMap<u32, String>),
+    MetadataFetched(u32, crate::steam_client::AppMetadata),
     Error(String),
 }
 
@@ -108,6 +111,7 @@ pub struct SteamLauncher {
     pub library: Vec<LibraryGame>,
     pub image_cache: HashMap<AppId, TextureHandle>,
     pending_images: HashSet<AppId>,
+    pending_metadata: HashSet<AppId>,
     image_tx: Sender<(AppId, String)>,
     image_rx: Receiver<(AppId, String)>,
     selected_app: Option<AppId>,
@@ -123,6 +127,7 @@ pub struct SteamLauncher {
     download_receiver: Option<tokio::sync::mpsc::Receiver<DownloadProgress>>,
     active_download_appid: Option<u32>,
     live_download_progress: Option<DownloadProgress>,
+    pub download_state: Arc<RwLock<DownloadState>>,
     play_result_rx: Option<Receiver<String>>,
     show_settings: bool,
     launcher_config: LauncherConfig,
@@ -163,6 +168,7 @@ impl SteamLauncher {
             library,
             image_cache: HashMap::new(),
             pending_images: HashSet::new(),
+            pending_metadata: HashSet::new(),
             image_tx,
             image_rx,
             selected_app: None,
@@ -182,6 +188,7 @@ impl SteamLauncher {
             download_receiver: None,
             active_download_appid: None,
             live_download_progress: None,
+            download_state: Arc::new(RwLock::new(DownloadState::default())),
             play_result_rx: None,
             show_settings: false,
             launcher_config,
@@ -244,6 +251,29 @@ impl SteamLauncher {
         }
     }
 
+    fn ensure_metadata_requested(&mut self, appid: AppId) {
+        if let Some(game) = self.library.iter().find(|g| g.app_id == appid) {
+            if !game.name.starts_with("App ") {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        if self.pending_metadata.contains(&appid) {
+            return;
+        }
+
+        self.pending_metadata.insert(appid);
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        self.runtime.spawn(async move {
+            if let Some(metadata) = client.fetch_app_metadata(appid).await {
+                let _ = tx.send(AsyncOp::MetadataFetched(appid, metadata));
+            }
+        });
+    }
+
     fn ensure_image_requested(&mut self, appid: AppId) {
         if self.image_cache.contains_key(&appid) || self.pending_images.contains(&appid) {
             return;
@@ -261,44 +291,20 @@ impl SteamLauncher {
                 return;
             }
 
-            let path = cache_dir.join(format!("{appid}_library_capsule_2x.jpg"));
-            if tokio::fs::metadata(&path).await.is_err() {
+            let target_path = cache_dir.join(format!("{appid}_library.jpg"));
+            if tokio::fs::metadata(&target_path).await.is_err() {
                 let candidates = [
-                    (
-                        format!(
-                            "https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.jpg"
-                        ),
-                        path.clone(),
-                    ),
-                    (
-                        format!(
-                            "https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.png"
-                        ),
-                        path.clone(),
-                    ),
-                    (
-                        format!(
-                            "https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_600x900_2x.jpg"
-                        ),
-                        path.clone(),
-                    ),
-                    (
-                        format!("https://steamcdn-a.akamaihd.net/steam/apps/{appid}/header.jpg"),
-                        cache_dir.join(format!("{appid}_header.jpg")),
-                    ),
-                    (
-                        format!("https://steamcdn-a.akamaihd.net/steam/apps/{appid}/portrait.png"),
-                        cache_dir.join(format!("{appid}_portrait.png")),
-                    ),
+                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"),
+                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"),
+                    format!("https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.jpg"),
                 ];
 
-                for (url, target_path) in candidates {
-                    if let Ok(response) = reqwest::get(url).await {
+                for url in candidates {
+                    if let Ok(response) = reqwest::get(&url).await {
                         if response.status().is_success() {
                             if let Ok(bytes) = response.bytes().await {
                                 if tokio::fs::write(&target_path, bytes).await.is_ok() {
-                                    let _ =
-                                        tx.send((appid, target_path.to_string_lossy().to_string()));
+                                    let _ = tx.send((appid, target_path.to_string_lossy().to_string()));
                                     return;
                                 }
                             }
@@ -307,8 +313,8 @@ impl SteamLauncher {
                 }
             }
 
-            if tokio::fs::metadata(&path).await.is_ok() {
-                let _ = tx.send((appid, path.to_string_lossy().to_string()));
+            if tokio::fs::metadata(&target_path).await.is_ok() {
+                let _ = tx.send((appid, target_path.to_string_lossy().to_string()));
             }
         });
     }
@@ -415,8 +421,9 @@ impl SteamLauncher {
     fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>, filter_depots: Option<Vec<u64>>) {
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
+        let download_state = self.download_state.clone();
         self.runtime.spawn(async move {
-            match client.install_game(app_id, platform, cached_vdf, filter_depots).await {
+            match client.install_game(app_id, platform, cached_vdf, filter_depots, download_state).await {
                 Ok(rx) => {
                     let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
                 }
@@ -523,6 +530,27 @@ impl SteamLauncher {
                             g.is_installed = g.install_path.is_some();
                         }
                     }
+                }
+                AsyncOp::MetadataFetched(appid, metadata) => {
+                    if let Some(game) = self.library.iter_mut().find(|g| g.app_id == appid) {
+                        game.name = metadata.name.clone();
+                    }
+                    let owned: Vec<_> = self
+                        .library
+                        .iter()
+                        .map(|g| crate::models::OwnedGame {
+                            app_id: g.app_id,
+                            name: g.name.clone(),
+                            playtime_forever_minutes: g.playtime_forever_minutes.unwrap_or(0),
+                            local_manifest_ids: g.local_manifest_ids.clone(),
+                            update_available: g.update_available,
+                        })
+                        .collect();
+                    let owned_clone = owned.clone();
+                    self.runtime.spawn(async move {
+                        let _ = crate::config::save_library_cache(&owned_clone).await;
+                    });
+                    self.pending_metadata.remove(&appid);
                 }
                 AsyncOp::BranchesFetched(appid, branches) => {
                     if let Some(game) = self.library.iter().find(|g| g.app_id == appid) {
@@ -1803,6 +1831,7 @@ impl eframe::App for SteamLauncher {
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for game in &visible_games {
+                        self.ensure_metadata_requested(game.app_id);
                         let selected = self.selected_app == Some(game.app_id);
                         let app_id = game.app_id;
 
@@ -1876,11 +1905,18 @@ impl eframe::App for SteamLauncher {
                     if let Some(texture) = self.image_cache.get(&game.app_id) {
                         ui.add(egui::Image::new(texture).max_width(250.0));
                     } else {
-                        ui.allocate_ui(egui::vec2(250.0, 375.0), |ui| {
-                            ui.centered_and_justified(|ui| {
-                                ui.label("Loading...");
-                            });
-                        });
+                        let (rect, _response) = ui.allocate_exact_size(
+                            egui::vec2(250.0, 375.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "STEAM",
+                            egui::FontId::proportional(20.0),
+                            egui::Color32::from_gray(100),
+                        );
                     }
 
                     ui.vertical(|ui| {

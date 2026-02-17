@@ -89,4 +89,4 @@ features = [
 ]
 
 [dependencies.zip]
-version = "2.2"
+version = "2.2.2"

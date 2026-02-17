@@ -13,7 +13,7 @@ use steam_vent::proto::steammessages_clientserver_appinfo::{
 use steam_vent::ConnectionTrait;
 
 use crate::download_pipeline::{
-    phase2_get_security_info, phase3_download_manifest, DownloadState, ManifestSelection,
+    phase2_get_security_info, phase3_download_manifest, LocalDownloadState, ManifestSelection,
 };
 
 #[derive(Debug, Clone)]
@@ -169,7 +169,7 @@ pub fn download_single_file(
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("failed creating {}", output_dir.display()))?;
 
-    let state = DownloadState::new(
+    let state = LocalDownloadState::new(
         ContentManifestPayload::default(),
         output_dir.to_path_buf(),
         security,

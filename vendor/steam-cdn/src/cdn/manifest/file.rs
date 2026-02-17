@@ -110,6 +110,7 @@ impl ManifestFile {
         depot_key: [u8; 32],
         stream: &mut S,
         max_tasks: Option<usize>,
+        on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
         let max_tasks = max_tasks.unwrap_or(4);
         let semaphore = Arc::new(Semaphore::new(max_tasks));
@@ -133,7 +134,11 @@ impl ManifestFile {
             .collect::<FuturesOrdered<_>>();
         while let Some(result) = tasks.next().await {
             let data = result?;
+            let len = data.len() as u64;
             stream.write_all(&data).await?;
+            if let Some(ref cb) = on_progress {
+                cb(len);
+            }
         }
         stream.flush().await?;
         Ok(())
