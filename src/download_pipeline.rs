@@ -668,12 +668,30 @@ fn decode_manifest_payload(bytes: &[u8]) -> Result<ContentManifestPayload> {
         if let Ok(mut archive) = zip::read::ZipArchive::new(std::io::Cursor::new(bytes)) {
             if archive.len() > 0 {
                 if let Ok(mut file) = archive.by_index(0) {
+                    println!("DEBUG: Zip Entry Name: {}", file.name());
                     let mut unzipped_data = Vec::with_capacity(file.size() as usize);
                     if std::io::copy(&mut file, &mut unzipped_data).is_ok() {
                         println!("DEBUG: Successfully unzipped {} bytes.", unzipped_data.len());
-                        if let Ok(payload) = ContentManifestPayload::parse_from_bytes(&unzipped_data)
-                        {
-                            return Ok(payload);
+
+                        if unzipped_data.len() >= 16 {
+                            println!("DEBUG: Unzipped Header (Hex): {:02X?}", &unzipped_data[..16]);
+                        }
+
+                        if unzipped_data.starts_with(b"VBKV") {
+                            println!("DEBUG: Warning: Found VBKV header! This is not raw Protobuf.");
+                        }
+
+                        if !unzipped_data.is_empty() && unzipped_data[0] == 0x0A {
+                            println!(
+                                "DEBUG: Looks like valid ContentManifestPayload (starts with 0x0A)."
+                            );
+                        }
+
+                        match ContentManifestPayload::parse_from_bytes(&unzipped_data) {
+                            Ok(payload) => return Ok(payload),
+                            Err(e) => {
+                                println!("ERROR: parse_from_bytes failed on unzipped data: {}", e)
+                            }
                         }
                     }
                 }

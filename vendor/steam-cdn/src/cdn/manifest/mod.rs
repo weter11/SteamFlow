@@ -95,8 +95,24 @@ impl DepotManifest {
             match ZipArchive::new(cursor) {
                 Ok(mut archive) if archive.len() > 0 => {
                     if let Ok(mut file) = archive.by_index(0) {
+                        println!("DEBUG: Zip Entry Name: {}", file.name());
                         if file.read_to_end(&mut buffer).is_ok() {
                             println!("DEBUG: Successfully unzipped {} bytes.", buffer.len());
+
+                            if buffer.len() >= 16 {
+                                println!("DEBUG: Unzipped Header (Hex): {:02X?}", &buffer[..16]);
+                            }
+
+                            if buffer.starts_with(b"VBKV") {
+                                println!(
+                                    "DEBUG: Warning: Found VBKV header! This is not raw Protobuf."
+                                );
+                            }
+
+                            if !buffer.is_empty() && buffer[0] == 0x0A {
+                                println!("DEBUG: Looks like valid ContentManifestPayload (starts with 0x0A).");
+                            }
+
                             &buffer[..]
                         } else {
                             data
