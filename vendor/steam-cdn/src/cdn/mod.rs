@@ -12,7 +12,7 @@ use steam_vent::{
     Connection, ConnectionTrait,
 };
 
-use crate::{error::Error, web_api};
+use crate::{error::Error, web_api, web_api::content_service::CDNServer};
 
 pub mod depot;
 pub mod depot_chunk;
@@ -31,6 +31,18 @@ impl CDNClient {
         Self {
             inner: Arc::new(InnerClient::new(connection)),
         }
+    }
+
+    pub fn with_servers(connection: Arc<Connection>, servers: Vec<CDNServer>) -> Self {
+        let mut inner = InnerClient::new(connection);
+        inner.servers = servers;
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    pub fn with_server(connection: Arc<Connection>, server: CDNServer) -> Self {
+        Self::with_servers(connection, vec![server])
     }
 
     pub async fn discover(connection: Arc<Connection>) -> Result<Self, Error> {
@@ -114,11 +126,15 @@ impl CDNClient {
         manifest_id: u64,
         depot_key: &[u8],
         target_dir: impl AsRef<std::path::Path>,
+        manifest_request_code: Option<u64>,
     ) -> Result<(), Error> {
-        let request_code = self
-            .get_manifest_request_code(app_id, depot_id, manifest_id)
-            .await
-            .ok();
+        let request_code = if manifest_request_code.is_some() {
+            manifest_request_code
+        } else {
+            self.get_manifest_request_code(app_id, depot_id, manifest_id)
+                .await
+                .ok()
+        };
 
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&depot_key[..32]);
@@ -166,7 +182,7 @@ impl CDNClient {
             .await?;
 
         let mut manifest =
-            DepotManifest::deserialize(self.inner.clone(), app_id, &bytes[..])?;
+            DepotManifest::deserialize(self.inner.clone(), app_id, depot_id, manifest_id, &bytes[..])?;
         if manifest.filenames_encrypted() {
             if let Some(key) = depot_key {
                 manifest.decrypt_filenames(key)?;

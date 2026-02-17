@@ -111,7 +111,17 @@ impl InnerClient {
             url.push_str(manifest_request_code.to_string().as_str());
         }
 
-        Ok(self.web_client.get(url).send().await?)
+        let mut request = self.web_client.get(&url);
+
+        if let Some(token) = &server.auth_token {
+            url.push_str("?token=");
+            url.push_str(token);
+            request = self.web_client.get(&url).header("x-cdn-auth-token", token);
+        }
+
+        let response = request.send().await?;
+
+        Ok(response)
     }
 
     pub async fn get_chunk(
@@ -130,8 +140,9 @@ impl InnerClient {
                 Some(depot_id),
             )
             .await?;
-        if !response.status().is_success() {
-            return Err(Error::HttpStatus(response.status()));
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::HttpStatus(status));
         }
 
         let mut bytes = response.bytes().await?.to_vec();

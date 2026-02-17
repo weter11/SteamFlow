@@ -7,7 +7,7 @@ mod cdn;
 mod crypto;
 mod error;
 mod utils;
-mod web_api;
+pub mod web_api;
 
 pub use cdn::CDNClient;
 pub use error::Error;

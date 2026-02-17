@@ -56,7 +56,7 @@ cargo run
 - App manifests are now written to `<steam_library_path>/steamapps/appmanifest_<appid>.acf` after installs complete so local scan works after restart.
 - Implemented a four-phase pipeline in `src/download_pipeline.rs`:
   1. **Get Manifest ID**: PICS product info request + VDF parsing to find the correct depot and manifest GID for the target platform.
-  2. **Get Security Info**: Request depot decryption keys + CDN server list and auth tokens.
-  3. **Download/Decode Manifest**: Fetch manifest from CDN and decode the proprietary protobuf-based format (supporting raw, Gzip, and Xz).
+  2. **Get Security Info**: Request depot decryption keys + ContentServerDirectory service to resolve CDN servers, auth tokens, and manifest request codes.
+  3. **Download/Decode Manifest**: Fetch manifest from CDN (with PKZip decompression support) and decode the proprietary protobuf-based format (supporting raw, Gzip, and Xz).
   4. **Chunk Download Loop**: Concurrent download of file chunks, followed by AES-256-CBC decryption and decompression.
 - The UI integration drives a staged download into a temporary or configured library directory.

@@ -1,5 +1,4 @@
-use buf::TryBuf;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use error::ManifestError;
 use file::{ChunkData, ManifestFile};
 use std::sync::Arc;
@@ -8,7 +7,7 @@ use std::{
     str,
 };
 use steam_vent::proto::{
-    content_manifest::{ContentManifestMetadata, ContentManifestPayload, ContentManifestSignature},
+    content_manifest::{ContentManifestMetadata, ContentManifestPayload},
     protobuf::Message,
 };
 use zip::ZipArchive;
@@ -84,60 +83,95 @@ impl DepotManifest {
     pub(crate) fn deserialize(
         client: Arc<InnerClient>,
         app_id: u32,
+        depot_id: u32,
+        manifest_gid: u64,
         data: &[u8],
     ) -> Result<Self, ManifestError> {
-        let cursor = Cursor::new(data);
         let mut buffer = Vec::new();
-        ZipArchive::new(cursor)?
-            .by_index(0)?
-            .read_to_end(&mut buffer)?;
+        let is_zip = data.len() > 2 && data[0] == 0x50 && data[1] == 0x4B;
 
-        let mut bytes = Bytes::from(buffer);
-        if bytes.try_get_u32()? != PROTOBUF_PAYLOAD_MAGIC {
-            return Err(ManifestError::MagicMismatch(
-                "expecting protobuf payload".to_string(),
-            ));
+        let raw_data = if is_zip {
+            let cursor = Cursor::new(data);
+            match ZipArchive::new(cursor) {
+                Ok(mut archive) if archive.len() > 0 => {
+                    if let Ok(mut file) = archive.by_index(0) {
+                        if file.read_to_end(&mut buffer).is_ok() {
+                            &buffer[..]
+                        } else {
+                            data
+                        }
+                    } else {
+                        data
+                    }
+                }
+                _ => data,
+            }
+        } else {
+            data
+        };
+
+        let mut bytes = Bytes::from(raw_data.to_vec());
+        let mut payload = None;
+        let mut metadata = None;
+
+        // Try parsing using the magic-wrapped sequence first
+        if raw_data.len() > 8
+            && u32::from_le_bytes(raw_data[0..4].try_into().unwrap()) == PROTOBUF_PAYLOAD_MAGIC
+        {
+            while bytes.remaining() >= 8 {
+                let magic = bytes.get_u32_le();
+                let len = bytes.get_u32_le() as usize;
+
+                if bytes.remaining() < len {
+                    break;
+                }
+
+                let body = bytes.copy_to_bytes(len);
+                if magic == PROTOBUF_PAYLOAD_MAGIC {
+                    payload = ContentManifestPayload::parse_from_bytes(&body).ok();
+                } else if magic == PROTOBUF_METADATA_MAGIC {
+                    metadata = ContentManifestMetadata::parse_from_bytes(&body).ok();
+                }
+            }
         }
 
-        let payload = ContentManifestPayload::parse_from_bytes(&bytes.try_get_bytes()?)?;
+        if payload.is_none() {
+            // Fallback: Check for offset 8 or 4 as suggested by user
+            let offset = if raw_data.len() > 8 && raw_data[8] == 0x0A {
+                8
+            } else if raw_data.len() > 4 && raw_data[4] == 0x0A {
+                4
+            } else {
+                0
+            };
 
-        if bytes.try_get_u32()? != PROTOBUF_METADATA_MAGIC {
-            return Err(ManifestError::MagicMismatch(
-                "expecting protobuf metadata".to_string(),
-            ));
+            payload = Some(ContentManifestPayload::parse_from_bytes(&raw_data[offset..])?);
         }
 
-        let metadata = ContentManifestMetadata::parse_from_bytes(&bytes.try_get_bytes()?)?;
+        let payload = payload.expect("Payload should be present at this point");
 
-        if bytes.try_get_u32()? != PROTOBUF_SIGNATURE_MAGIC {
-            return Err(ManifestError::MagicMismatch(
-                "expecting protobuf signature".to_string(),
-            ));
-        }
-
-        let _signature = ContentManifestSignature::parse_from_bytes(&bytes.try_get_bytes()?)?;
-
-        if bytes.try_get_u32()? != PROTOBUF_ENDOFMANIFEST_MAGIC {
-            return Err(ManifestError::MagicMismatch(
-                "expecting end of manifest".to_string(),
-            ));
-        }
+        let final_depot_id = metadata.as_ref().map(|m| m.depot_id()).unwrap_or(depot_id);
+        let final_manifest_gid = metadata.as_ref().map(|m| m.gid_manifest()).unwrap_or(manifest_gid);
+        let final_creation_time = metadata.as_ref().map(|m| m.creation_time()).unwrap_or(0);
+        let final_filenames_encrypted = metadata.as_ref().map(|m| m.filenames_encrypted()).unwrap_or(false);
+        let final_original_size = metadata.as_ref().map(|m| m.cb_disk_original()).unwrap_or(0);
+        let final_compressed_size = metadata.as_ref().map(|m| m.cb_disk_compressed()).unwrap_or(0);
 
         Ok(Self {
             app_id,
-            depot_id: metadata.depot_id(),
-            manifest_gid: metadata.gid_manifest(),
-            creatime_time: metadata.creation_time(),
-            filenames_encrypted: metadata.filenames_encrypted(),
-            original_size: metadata.cb_disk_original(),
-            compressed_size: metadata.cb_disk_compressed(),
+            depot_id: final_depot_id,
+            manifest_gid: final_manifest_gid,
+            creatime_time: final_creation_time,
+            filenames_encrypted: final_filenames_encrypted,
+            original_size: final_original_size,
+            compressed_size: final_compressed_size,
             files: payload
                 .mappings
                 .into_iter()
                 .map(|map| ManifestFile {
                     inner: client.clone(),
                     app_id,
-                    depot_id: metadata.depot_id(),
+                    depot_id: final_depot_id,
                     filename: map.filename().to_string(),
                     size: map.size(),
                     flags: map.flags(),

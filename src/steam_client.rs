@@ -35,6 +35,14 @@ use steam_vent::proto::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
 };
+use steam_vent::proto::steammessages_contentsystem_steamclient::{
+    CContentServerDirectory_GetCDNAuthToken_Request,
+    CContentServerDirectory_GetCDNAuthToken_Response,
+    CContentServerDirectory_GetManifestRequestCode_Request,
+    CContentServerDirectory_GetManifestRequestCode_Response,
+    CContentServerDirectory_GetServersForSteamPipe_Request,
+    CContentServerDirectory_GetServersForSteamPipe_Response,
+};
 use steam_vent::proto::steammessages_player_steamclient::{
     CPlayer_GetOwnedGames_Request, CPlayer_GetOwnedGames_Response,
 };
@@ -627,19 +635,6 @@ impl SteamClient {
 
             let appinfo_vdf_text = String::from_utf8_lossy(appinfo_vdf_bytes).to_string();
 
-            // HEX DUMP: Print the first 128 bytes of the received buffer
-            let preview_len = std::cmp::min(appinfo_vdf_bytes.len(), 128);
-            println!("--- VDF BUFFER DEBUG ---");
-            println!("Buffer Size: {} bytes", appinfo_vdf_bytes.len());
-            println!("Header (Hex): {:02X?}", &appinfo_vdf_bytes[..preview_len]);
-            // Try to print as string (replace non-utf8 with dot)
-            let text_preview: String = appinfo_vdf_bytes
-                .iter()
-                .take(preview_len)
-                .map(|&b| if (32..=126).contains(&b) { b as char } else { '.' })
-                .collect();
-            println!("Header (ASCII): {}", text_preview);
-            println!("------------------------");
 
             let mut selections = Vec::new();
 
@@ -668,17 +663,6 @@ impl SteamClient {
                                     .and_then(|c| c.get("oslist"))
                                     .and_then(|o| o.as_str());
 
-                                println!("Evaluating Depot ID: {}", d_id);
-                                if let Some(config) = value.get_obj(&["config"]) {
-                                    let os_arch =
-                                        config.get("osarch").and_then(|v| v.as_str()).unwrap_or("ANY");
-                                    println!("  - OS List: {:?}", oslist.unwrap_or("ALL (Common)"));
-                                    println!("  - Architecture: {:?}", os_arch);
-                                } else {
-                                    println!("  - No 'config' section found (Assuming Shared/Common depot)");
-                                }
-                                println!("  - Target Platform: {:?}", platform);
-
                                 if oslist
                                     .map(|os| os.to_lowercase().contains("windows"))
                                     .unwrap_or(false)
@@ -687,7 +671,6 @@ impl SteamClient {
                                 }
 
                                 let mut match_os = should_keep_depot(oslist, platform);
-                                println!("  -> Match Result (OS): {}", match_os);
 
                                 if match_os {
                                     // 1. LANGUAGE CHECK
@@ -697,10 +680,7 @@ impl SteamClient {
                                         .and_then(|l| l.as_str());
                                     if let Some(lang) = lang {
                                         if lang != "english" && !lang.is_empty() {
-                                            println!("  - Language: {} (Skipping)", lang);
                                             match_os = false;
-                                        } else {
-                                            println!("  - Language: {} (Matched)", lang);
                                         }
                                     }
                                 }
@@ -714,7 +694,6 @@ impl SteamClient {
 
                                     if is_allowed {
                                         if let Some(m_id) = map.get(&depot_id_u64) {
-                                            println!("Using GID {} for Depot {}", m_id, d_id);
                                             selections.push(ManifestSelection {
                                                 app_id: appid,
                                                 depot_id: d_id,
@@ -722,8 +701,6 @@ impl SteamClient {
                                                 appinfo_vdf: appinfo_vdf_text.clone(),
                                             });
                                         }
-                                    } else {
-                                        println!("Skipping Depot {} (Not in filter list)", d_id);
                                     }
                                 }
                             }
@@ -762,17 +739,17 @@ impl SteamClient {
                 })
                 .await;
 
-            // 2. Initialize the CDN Client using internal discovery
-            tracing::info!("Initializing CDN Client for AppID: {}...", appid);
-            let cdn_client = match steam_cdn::CDNClient::discover(Arc::new(connection.clone())).await {
-                Ok(c) => c,
+            // 2. Fetch Content Servers via Service
+            tracing::info!("Fetching Content Servers for AppID: {}...", appid);
+            let hosts = match client_clone.get_content_servers(connection.cell_id()).await {
+                Ok(h) => h,
                 Err(e) => {
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
                             bytes_downloaded: 0,
                             total_bytes: 0,
-                            current_file: format!("Failed to discover CDN servers: {}", e),
+                            current_file: format!("Failed to fetch content servers: {}", e),
                         })
                         .await;
                     return;
@@ -784,7 +761,8 @@ impl SteamClient {
             for selection in selections {
                 tracing::info!(
                     "Starting download for Depot {} (GID: {})...",
-                    selection.depot_id, selection.manifest_id
+                    selection.depot_id,
+                    selection.manifest_id
                 );
 
                 let key = match client_clone.get_depot_key(appid, selection.depot_id).await {
@@ -799,30 +777,100 @@ impl SteamClient {
                     }
                 };
 
-                match cdn_client
-                    .download_depot(
-                        appid,
-                        selection.depot_id,
-                        selection.manifest_id,
-                        &key,
-                        &install_dir,
-                    )
+                let manifest_code = match client_clone
+                    .get_manifest_request_code(appid, selection.depot_id, selection.manifest_id)
                     .await
                 {
-                    Ok(_) => tracing::info!("Depot {} download complete!", selection.depot_id),
+                    Ok(code) => Some(code),
                     Err(e) => {
-                        tracing::error!("CDN Error for Depot {}: {}", selection.depot_id, e);
-                        let _ = tx
-                            .send(DownloadProgress {
-                                state: DownloadProgressState::Failed,
-                                bytes_downloaded: 0,
-                                total_bytes: 0,
-                                current_file: format!("CDN Error for Depot {}: {}", selection.depot_id, e),
-                            })
-                            .await;
-                        success = false;
-                        break;
+                        tracing::warn!(
+                            "Failed to get manifest request code for depot {}: {}",
+                            selection.depot_id,
+                            e
+                        );
+                        None
                     }
+                };
+
+                let mut depot_success = false;
+                for host in &hosts {
+                    let token = match client_clone
+                        .get_cdn_auth_token(appid, selection.depot_id, host)
+                        .await
+                    {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            tracing::warn!("Failed to get auth token for host {}: {}", host, e);
+                            None
+                        }
+                    };
+
+                    let (host_name, port) = if let Some(pos) = host.find(':') {
+                        (
+                            &host[..pos],
+                            host[pos + 1..].parse::<u16>().unwrap_or(80),
+                        )
+                    } else {
+                        (host.as_str(), 80)
+                    };
+
+                    let cdn_server = steam_cdn::web_api::content_service::CDNServer {
+                        r#type: "CDN".to_string(),
+                        https: port == 443,
+                        host: host_name.to_string(),
+                        vhost: host_name.to_string(),
+                        port,
+                        cell_id: connection.cell_id(),
+                        load: 0,
+                        weighted_load: 0,
+                        auth_token: token,
+                    };
+
+                    let cdn_client = steam_cdn::CDNClient::with_server(
+                        Arc::new(connection.clone()),
+                        cdn_server,
+                    );
+
+                    match cdn_client
+                        .download_depot(
+                            appid,
+                            selection.depot_id,
+                            selection.manifest_id,
+                            &key,
+                            &install_dir,
+                            manifest_code,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!(
+                                "Depot {} download complete from {}!",
+                                selection.depot_id,
+                                host
+                            );
+                            depot_success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!("CDN Error from {}: {}", host, e);
+                        }
+                    }
+                }
+
+                if !depot_success {
+                    let _ = tx
+                        .send(DownloadProgress {
+                            state: DownloadProgressState::Failed,
+                            bytes_downloaded: 0,
+                            total_bytes: 0,
+                            current_file: format!(
+                                "Failed to download depot {} from all available servers",
+                                selection.depot_id
+                            ),
+                        })
+                        .await;
+                    success = false;
+                    break;
                 }
             }
 
@@ -896,6 +944,76 @@ impl SteamClient {
         }
 
         Ok(())
+    }
+
+    pub async fn get_content_servers(&self, cell_id: u32) -> Result<Vec<String>> {
+        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
+        request.set_cell_id(cell_id);
+        request.set_max_servers(20);
+
+        let response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
+            .service_method(request)
+            .await
+            .context("failed calling ContentServerDirectory.GetServersForSteamPipe")?;
+
+        let mut hosts = Vec::new();
+        for server in &response.servers {
+            if server.type_() == "SteamCache" || server.type_() == "CDN" {
+                let host = server.host().to_string();
+                hosts.push(host);
+            }
+        }
+
+        if hosts.is_empty() {
+            println!("ERROR: Service returned 0 valid CDN servers!");
+        }
+
+        Ok(hosts)
+    }
+
+    pub async fn get_manifest_request_code(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        manifest_id: u64,
+    ) -> Result<u64> {
+        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let mut request = CContentServerDirectory_GetManifestRequestCode_Request::new();
+        request.set_app_id(app_id);
+        request.set_depot_id(depot_id);
+        request.set_manifest_id(manifest_id);
+
+        let response: CContentServerDirectory_GetManifestRequestCode_Response = connection
+            .service_method(request)
+            .await
+            .context("failed calling ContentServerDirectory.GetManifestRequestCode")?;
+
+        Ok(response.manifest_request_code())
+    }
+
+    pub async fn get_cdn_auth_token(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        host_name: &str,
+    ) -> Result<String> {
+        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let mut request = CContentServerDirectory_GetCDNAuthToken_Request::new();
+        request.set_app_id(app_id);
+        request.set_depot_id(depot_id);
+        request.set_host_name(host_name.to_string());
+
+        let response: CContentServerDirectory_GetCDNAuthToken_Response = connection
+            .service_method(request)
+            .await
+            .context("failed calling ContentServerDirectory.GetCDNAuthToken")?;
+
+        if response.token().is_empty() {
+            return Err(anyhow!("Empty Auth Token returned"));
+        }
+
+        Ok(response.token().to_string())
     }
 
     pub async fn get_depot_list(&self, app_id: u32) -> Result<Vec<DepotInfo>> {
@@ -982,15 +1100,22 @@ impl SteamClient {
     }
 
     pub async fn get_depot_key(&self, app_id: u32, depot_id: u32) -> Result<Vec<u8>> {
-        let connection = self.connection.as_ref().context("steam connection not initialized")?;
+        let connection = self
+            .connection
+            .as_ref()
+            .context("steam connection not initialized")?;
         let mut request = CMsgClientGetDepotDecryptionKey::new();
         request.set_depot_id(depot_id);
         request.set_app_id(app_id);
 
         let response: CMsgClientGetDepotDecryptionKeyResponse = connection.job(request).await?;
         if response.eresult() != 1 {
-            bail!("failed to get depot key for depot {depot_id}: eresult {}", response.eresult());
+            bail!(
+                "failed to get depot key for depot {depot_id}: eresult {}",
+                response.eresult()
+            );
         }
+
         Ok(response.depot_encryption_key().to_vec())
     }
 
@@ -1018,15 +1143,12 @@ impl SteamClient {
                 Ok(response) => {
                     let response: CMsgClientGetDepotDecryptionKeyResponse = response;
                     if response.eresult() == 1 { // EResult::OK
-                        println!("Depot {}: OWNED", depot_id);
                         results.insert(depot_id, true);
                     } else {
-                        println!("Depot {}: NOT OWNED (EResult {})", depot_id, response.eresult());
                         results.insert(depot_id, false);
                     }
                 }
                 Err(_) => {
-                    println!("Depot {}: NOT OWNED (Request failed)", depot_id);
                     results.insert(depot_id, false);
                 }
             }
@@ -1344,7 +1466,6 @@ impl SteamClient {
         let launch_infos = parse_launch_info_from_vdf(appid, &raw_vdf, prefer_proton)
             .context("failed to parse launch metadata from PICS appinfo")?;
 
-        println!("DEBUG PICS: {:#?}", launch_infos);
         Ok(launch_infos)
     }
 
@@ -1761,10 +1882,6 @@ impl SteamClient {
                 cmd.env("PATH", format!("{}:{}", bin_dir.display(), existing_path));
                 cmd.env("SteamAppId", app.app_id.to_string());
 
-                println!("EXECUTING COMMAND: {:?}", cmd);
-                println!("Working Dir: {:?}", install_dir);
-                println!("Environment: {:?}", cmd.get_envs());
-
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
@@ -1797,10 +1914,6 @@ impl SteamClient {
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
-
-                println!("EXECUTING COMMAND: {:?}", cmd);
-                println!("Working Dir: {:?}", install_dir);
-                println!("Environment: {:?}", cmd.get_envs());
 
                 cmd.spawn().context("failed to spawn proton game")
             }
@@ -1870,8 +1983,6 @@ fn parse_launch_info_from_vdf(
         .and_then(|appinfo| appinfo.config.as_ref())
         .or(parsed.config.as_ref())
         .ok_or_else(|| anyhow!("missing config section in product info for app {appid}"))?;
-
-    println!("AppInfo Config: {:?}", config);
 
     if config.launch.is_empty() {
         bail!("no launch entries found for app {appid}")
@@ -1978,18 +2089,14 @@ pub fn find_vdf_in_pics(buffer: &[u8]) -> Result<steam_vdf_parser::Vdf<'static>>
 }
 
 pub fn parse_pics_product_info(buffer: &[u8]) -> Result<HashMap<u64, u64>> {
-    println!("Detecting VDF Format...");
-
     let is_text = buffer
         .first()
         .map(|&b| b == 0x22 || b == 0x7B)
         .unwrap_or(false);
 
     if is_text {
-        println!("Format: TEXT VDF detected.");
         parse_text_vdf(buffer)
     } else {
-        println!("Format: BINARY VDF (or Header) detected.");
         parse_binary_vdf_with_offset(buffer)
     }
 }
@@ -2029,9 +2136,7 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
                 }
             }
         }
-        Err(e) => {
-            println!("Text VDF parser failed: {e}. Falling back to manual scan.");
-        }
+        Err(_) => {}
     }
 
     if depot_map.is_empty() {
@@ -2081,7 +2186,6 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
                 if inside_public && key == "gid" {
                     if let Ok(gid) = parts[1].parse::<u64>() {
                         if gid > 0 {
-                            println!("Found Public GID for Depot {}: {}", current_depot, gid);
                             depot_map.insert(current_depot, gid);
                         }
                     }
@@ -2102,7 +2206,6 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
         depot_map.retain(|id, _| {
             if let Some(lang) = depot_langs.get(id) {
                 if lang != "english" && !lang.is_empty() {
-                    println!("Skipping Depot {} (Language: {}) during manual scan", id, lang);
                     return false;
                 }
             }
@@ -2114,7 +2217,6 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
         bail!("Text scan found no depots");
     }
 
-    println!("Resolved {} Depots via Text VDF.", depot_map.len());
     Ok(depot_map)
 }
 
@@ -2151,7 +2253,6 @@ fn parse_binary_vdf_with_offset(data: &[u8]) -> Result<HashMap<u64, u64>> {
         }
 
         if !depot_map.is_empty() {
-            println!("Resolved {} Depots via Binary VDF.", depot_map.len());
             return Ok(depot_map);
         }
     }
