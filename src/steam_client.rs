@@ -38,6 +38,8 @@ use steam_vent::proto::steammessages_clientserver_appinfo::{
 use steam_vent::proto::steammessages_contentsystem_steamclient::{
     CContentServerDirectory_GetCDNAuthToken_Request,
     CContentServerDirectory_GetCDNAuthToken_Response,
+    CContentServerDirectory_GetManifestRequestCode_Request,
+    CContentServerDirectory_GetManifestRequestCode_Response,
     CContentServerDirectory_GetServersForSteamPipe_Request,
     CContentServerDirectory_GetServersForSteamPipe_Response,
 };
@@ -806,6 +808,21 @@ impl SteamClient {
                     }
                 };
 
+                let manifest_code = match client_clone
+                    .get_manifest_request_code(appid, selection.depot_id, selection.manifest_id)
+                    .await
+                {
+                    Ok(code) => Some(code),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to get manifest request code for depot {}: {}",
+                            selection.depot_id,
+                            e
+                        );
+                        None
+                    }
+                };
+
                 let mut depot_success = false;
                 for host in &hosts {
                     let token = match client_clone
@@ -852,6 +869,7 @@ impl SteamClient {
                             selection.manifest_id,
                             &key,
                             &install_dir,
+                            manifest_code,
                         )
                         .await
                     {
@@ -992,6 +1010,35 @@ impl SteamClient {
         }
 
         Ok(hosts)
+    }
+
+    pub async fn get_manifest_request_code(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        manifest_id: u64,
+    ) -> Result<u64> {
+        println!(
+            "DEBUG: Requesting Manifest Code for Depot {} / Manifest {}...",
+            depot_id, manifest_id
+        );
+
+        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let mut request = CContentServerDirectory_GetManifestRequestCode_Request::new();
+        request.set_app_id(app_id);
+        request.set_depot_id(depot_id);
+        request.set_manifest_id(manifest_id);
+
+        let response: CContentServerDirectory_GetManifestRequestCode_Response = connection
+            .service_method(request)
+            .await
+            .context("failed calling ContentServerDirectory.GetManifestRequestCode")?;
+
+        println!(
+            "DEBUG: Manifest Request Code received: {}",
+            response.manifest_request_code()
+        );
+        Ok(response.manifest_request_code())
     }
 
     pub async fn get_cdn_auth_token(

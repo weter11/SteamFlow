@@ -126,11 +126,15 @@ impl CDNClient {
         manifest_id: u64,
         depot_key: &[u8],
         target_dir: impl AsRef<std::path::Path>,
+        manifest_request_code: Option<u64>,
     ) -> Result<(), Error> {
-        let request_code = self
-            .get_manifest_request_code(app_id, depot_id, manifest_id)
-            .await
-            .ok();
+        let request_code = if manifest_request_code.is_some() {
+            manifest_request_code
+        } else {
+            self.get_manifest_request_code(app_id, depot_id, manifest_id)
+                .await
+                .ok()
+        };
 
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&depot_key[..32]);

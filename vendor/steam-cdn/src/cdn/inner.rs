@@ -116,7 +116,14 @@ impl InnerClient {
             url.push_str(token);
         }
 
-        Ok(self.web_client.get(url).send().await?)
+        let response = self.web_client.get(&url).send().await?;
+        let status = response.status();
+        println!("DEBUG: CDN Response Status: {}", status);
+        if !status.is_success() {
+            println!("ERROR: CDN returned failure status. URL was: {}", url);
+        }
+
+        Ok(response)
     }
 
     pub async fn get_chunk(
