@@ -361,7 +361,9 @@ pub async fn phase3_download_manifest(
 
     let mut request = reqwest::Client::new().get(&url);
     if !security.cdn_auth_token.is_empty() {
-        request = request.header("x-steam-auth", &security.cdn_auth_token);
+        request = request
+            .header("x-steam-auth", &security.cdn_auth_token)
+            .header("x-cdn-auth-token", &security.cdn_auth_token);
     }
 
     let response = request
@@ -493,7 +495,9 @@ impl DownloadState {
 
             let mut request = self.client.get(&url);
             if !self.security.cdn_auth_token.is_empty() {
-                request = request.header("x-steam-auth", &self.security.cdn_auth_token);
+                request = request
+                    .header("x-steam-auth", &self.security.cdn_auth_token)
+                    .header("x-cdn-auth-token", &self.security.cdn_auth_token);
             }
 
             let response = request
@@ -687,17 +691,34 @@ fn decode_manifest_payload(bytes: &[u8]) -> Result<ContentManifestPayload> {
                             );
                         }
 
-                        let offset = if unzipped_data.len() > 8 && unzipped_data[8] == 0x0A {
+                        let (offset, len) = if unzipped_data.len() > 8
+                            && unzipped_data[0] == 0xD0
+                            && unzipped_data[1] == 0x17
+                        {
+                            let payload_len = u32::from_le_bytes([
+                                unzipped_data[4],
+                                unzipped_data[5],
+                                unzipped_data[6],
+                                unzipped_data[7],
+                            ]) as usize;
+                            println!(
+                                "DEBUG: Magic Header detected. Payload Size: {}, Total: {}",
+                                payload_len,
+                                unzipped_data.len()
+                            );
+                            (8, payload_len)
+                        } else if unzipped_data.len() > 8 && unzipped_data[8] == 0x0A {
                             println!("DEBUG: Found custom header (8 bytes). Skipping to Protobuf start...");
-                            8
+                            (8, unzipped_data.len() - 8)
                         } else if unzipped_data.len() > 4 && unzipped_data[4] == 0x0A {
                             println!("DEBUG: Found custom header (4 bytes). Skipping...");
-                            4
+                            (4, unzipped_data.len() - 4)
                         } else {
-                            0
+                            (0, unzipped_data.len())
                         };
 
-                        match ContentManifestPayload::parse_from_bytes(&unzipped_data[offset..]) {
+                        let end = (offset + len).min(unzipped_data.len());
+                        match ContentManifestPayload::parse_from_bytes(&unzipped_data[offset..end]) {
                             Ok(payload) => return Ok(payload),
                             Err(e) => {
                                 println!("ERROR: parse_from_bytes failed on unzipped data: {}", e)

@@ -130,20 +130,35 @@ impl DepotManifest {
         };
 
         let mut bytes = Bytes::from(raw_data.to_vec());
+        let mut payload = None;
+        let mut metadata = None;
 
         // Try parsing using the magic-wrapped sequence first
-        let (payload, metadata) = if raw_data.len() > 4 && u32::from_le_bytes(raw_data[0..4].try_into().unwrap()) == PROTOBUF_PAYLOAD_MAGIC {
+        if raw_data.len() > 8 && u32::from_le_bytes(raw_data[0..4].try_into().unwrap()) == PROTOBUF_PAYLOAD_MAGIC {
             println!("DEBUG: Found magic-wrapped manifest sequence.");
-            let _ = TryBuf::try_get_u32(&mut bytes)?; // Skip magic
-            let payload = ContentManifestPayload::parse_from_bytes(&TryBuf::try_get_bytes(&mut bytes)?)?;
+            while bytes.remaining() >= 8 {
+                let magic = bytes.get_u32_le();
+                let len = bytes.get_u32_le() as usize;
 
-            let metadata = if bytes.remaining() >= 4 && TryBuf::try_get_u32(&mut bytes).is_ok() {
-                ContentManifestMetadata::parse_from_bytes(&TryBuf::try_get_bytes(&mut bytes)?).ok()
-            } else {
-                None
-            };
-            (payload, metadata)
-        } else {
+                if bytes.remaining() < len {
+                    println!("DEBUG: Segment claims length {}, but only {} bytes remain.", len, bytes.remaining());
+                    break;
+                }
+
+                let body = bytes.copy_to_bytes(len);
+                if magic == PROTOBUF_PAYLOAD_MAGIC {
+                    println!("DEBUG: Found Payload Segment ({} bytes)", len);
+                    payload = ContentManifestPayload::parse_from_bytes(&body).ok();
+                } else if magic == PROTOBUF_METADATA_MAGIC {
+                    println!("DEBUG: Found Metadata Segment ({} bytes)", len);
+                    metadata = ContentManifestMetadata::parse_from_bytes(&body).ok();
+                } else {
+                    println!("DEBUG: Skipping Unknown Segment (Magic: {:08X}, {} bytes)", magic, len);
+                }
+            }
+        }
+
+        if payload.is_none() {
             // Fallback: Check for offset 8 or 4 as suggested by user
             let offset = if raw_data.len() > 8 && raw_data[8] == 0x0A {
                 8
@@ -154,12 +169,13 @@ impl DepotManifest {
             };
 
             if offset > 0 {
-                println!("DEBUG: Skipping {} bytes to Protobuf start.", offset);
+                println!("DEBUG: Skipping {} bytes to Protobuf start (fallback).", offset);
             }
 
-            let payload = ContentManifestPayload::parse_from_bytes(&raw_data[offset..])?;
-            (payload, None)
-        };
+            payload = Some(ContentManifestPayload::parse_from_bytes(&raw_data[offset..])?);
+        }
+
+        let payload = payload.expect("Payload should be present at this point");
 
         let final_depot_id = metadata.as_ref().map(|m| m.depot_id()).unwrap_or(depot_id);
         let final_manifest_gid = metadata.as_ref().map(|m| m.gid_manifest()).unwrap_or(manifest_gid);
