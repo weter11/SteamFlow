@@ -1,6 +1,7 @@
 use depot::AppDepots;
 use inner::InnerClient;
 use manifest::DepotManifest;
+use sha1::{Digest, Sha1};
 use std::sync::Arc;
 use steam_vent::{
     proto::{
@@ -127,6 +128,7 @@ impl CDNClient {
         depot_key: &[u8],
         target_dir: impl AsRef<std::path::Path>,
         manifest_request_code: Option<u64>,
+        verify: bool,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
         on_manifest: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
@@ -156,6 +158,26 @@ impl CDNClient {
             }
 
             if file.size() > 0 {
+                if let Ok(meta) = tokio::fs::metadata(&full_path).await {
+                    if meta.len() == file.size() {
+                        let mut should_skip = true;
+                        if verify {
+                            let existing = tokio::fs::read(&full_path)
+                                .await
+                                .map_err(|e| Error::Unexpected(e.to_string()))?;
+                            let digest = Sha1::digest(existing.as_slice());
+                            should_skip = digest.as_slice() == file.sha_content().as_slice();
+                        }
+
+                        if should_skip {
+                            if let Some(ref cb) = on_progress {
+                                cb(file.size());
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 let mut out = tokio::fs::File::create(&full_path)
                     .await
                     .map_err(|e| Error::Unexpected(e.to_string()))?;

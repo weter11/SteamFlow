@@ -16,6 +16,7 @@ prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Keep alongside keyvalues-serde: this crate is required for raw/binary appinfo VDF parsing.
 steam-vdf-parser = "0.1.1"
 steam-vent = "0.4.2"
 steam-vent-proto = "=0.5.2"
@@ -23,7 +24,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 walkdir = "2"
-zip = "2.2.2"
+zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 hex = "0.4"
 sha1 = "0.10"
 flate2 = "1"

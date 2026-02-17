@@ -13,9 +13,9 @@ use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::mpsc::{self, Receiver, Sender};
 use tokio::runtime::Runtime;
 
 pub type AppId = u32;
@@ -294,7 +294,7 @@ impl SteamLauncher {
             let target_path = cache_dir.join(format!("{appid}_library.jpg"));
             if tokio::fs::metadata(&target_path).await.is_err() {
                 let candidates = [
-                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"),
+                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900_2x.jpg"),
                     format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"),
                     format!("https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.jpg"),
                 ];
@@ -401,7 +401,6 @@ impl SteamLauncher {
         }
     }
 
-
     fn poll_play_result(&mut self) {
         if let Some(rx) = &self.play_result_rx {
             match rx.try_recv() {
@@ -418,12 +417,21 @@ impl SteamLauncher {
         }
     }
 
-    fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>, filter_depots: Option<Vec<u64>>) {
+    fn start_install(
+        &mut self,
+        app_id: u32,
+        platform: DepotPlatform,
+        cached_vdf: Option<Vec<u8>>,
+        filter_depots: Option<Vec<u64>>,
+    ) {
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
         let download_state = self.download_state.clone();
         self.runtime.spawn(async move {
-            match client.install_game(app_id, platform, cached_vdf, filter_depots, download_state).await {
+            match client
+                .install_game(app_id, platform, cached_vdf, filter_depots, download_state)
+                .await
+            {
                 Ok(rx) => {
                     let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
                 }
@@ -600,7 +608,9 @@ impl SteamLauncher {
                 AsyncOp::LaunchOptionsFetched(appid, options, proton_path) => {
                     let game = self.library.iter().find(|g| g.app_id == appid).cloned();
                     if let Some(game) = game {
-                        if let Some(preferred_id) = self.launcher_config.preferred_launch_options.get(&appid) {
+                        if let Some(preferred_id) =
+                            self.launcher_config.preferred_launch_options.get(&appid)
+                        {
                             if let Some(option) = options.iter().find(|o| &o.id == preferred_id) {
                                 self.start_launch_task(&game, option.clone(), proton_path);
                                 return;
@@ -765,13 +775,20 @@ impl SteamLauncher {
                     let _ = tx.send(AsyncOp::LaunchOptionsFetched(app_id, options, proton_path));
                 }
                 Err(err) => {
-                    let _ = tx.send(AsyncOp::Error(format!("Failed to get launch options: {err}")));
+                    let _ = tx.send(AsyncOp::Error(format!(
+                        "Failed to get launch options: {err}"
+                    )));
                 }
             }
         });
     }
 
-    fn start_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
+    fn start_launch_task(
+        &mut self,
+        game: &LibraryGame,
+        launch_info: crate::steam_client::LaunchInfo,
+        proton_path: Option<String>,
+    ) {
         let game = game.clone();
         let client = self.client.clone();
         let (tx, rx) = mpsc::channel();
@@ -782,9 +799,9 @@ impl SteamLauncher {
             let launcher_config = load_launcher_config().await.unwrap_or_default();
             let chosen_proton_path = match launch_info.target {
                 crate::steam_client::LaunchTarget::NativeLinux => None,
-                crate::steam_client::LaunchTarget::WindowsProton => {
-                    proton_path.as_deref().or(Some(launcher_config.proton_version.as_str()))
-                }
+                crate::steam_client::LaunchTarget::WindowsProton => proton_path
+                    .as_deref()
+                    .or(Some(launcher_config.proton_version.as_str())),
             };
 
             let cloud_enabled = launcher_config.enable_cloud_sync && !client.is_offline();
@@ -793,26 +810,32 @@ impl SteamLauncher {
 
             if cloud_enabled {
                 let c = crate::cloud_sync::CloudClient::new(
-                    client.connection()
+                    client
+                        .connection()
                         .cloned()
                         .ok_or_else(|| anyhow!("steam connection not initialized"))
-                        .unwrap()
+                        .unwrap(),
                 );
-                let root = crate::cloud_sync::default_cloud_root(c.steam_id(), game.app_id).unwrap();
+                let root =
+                    crate::cloud_sync::default_cloud_root(c.steam_id(), game.app_id).unwrap();
                 tracing::info!(appid = game.app_id, path = %root.display(), "Syncing Cloud...");
                 let _ = c.sync_down(game.app_id, &root).await;
                 cloud_client = Some(c);
                 local_root = Some(root);
             }
 
-            let mut child: std::process::Child =
-                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config) {
-                    Ok(child) => child,
-                    Err(e) => {
-                        let _ = tx.send(format!("Launch failed for {}: {e}", game.name));
-                        return;
-                    }
-                };
+            let mut child: std::process::Child = match client.spawn_game_process(
+                &game,
+                &launch_info,
+                chosen_proton_path,
+                &launcher_config,
+            ) {
+                Ok(child) => child,
+                Err(e) => {
+                    let _ = tx.send(format!("Launch failed for {}: {e}", game.name));
+                    return;
+                }
+            };
 
             let _ = child.wait();
 
@@ -878,7 +901,11 @@ impl SteamLauncher {
                     ui.add_space(8.0);
 
                     for option in &state.options {
-                        ui.radio_value(&mut state.selected_id, option.id.clone(), &option.description);
+                        ui.radio_value(
+                            &mut state.selected_id,
+                            option.id.clone(),
+                            &option.description,
+                        );
                     }
 
                     ui.add_space(8.0);
@@ -886,7 +913,9 @@ impl SteamLauncher {
 
                     ui.horizontal(|ui| {
                         if ui.button("Play").clicked() {
-                            if let Some(opt) = state.options.iter().find(|o| o.id == state.selected_id) {
+                            if let Some(opt) =
+                                state.options.iter().find(|o| o.id == state.selected_id)
+                            {
                                 selection = Some((state.app_id, opt.clone(), state.always_use));
                             }
                         }
@@ -899,7 +928,9 @@ impl SteamLauncher {
 
         if let Some((app_id, option, always_use)) = selection {
             if always_use {
-                self.launcher_config.preferred_launch_options.insert(app_id, option.id.clone());
+                self.launcher_config
+                    .preferred_launch_options
+                    .insert(app_id, option.id.clone());
                 let config = self.launcher_config.clone();
                 self.runtime.spawn(async move {
                     let _ = config.save().await;
@@ -990,7 +1021,11 @@ impl SteamLauncher {
                         .show_ui(ui, |ui| {
                             for branch in &state.available_branches {
                                 if ui
-                                    .selectable_value(&mut state.active_branch, branch.clone(), branch)
+                                    .selectable_value(
+                                        &mut state.active_branch,
+                                        branch.clone(),
+                                        branch,
+                                    )
                                     .clicked()
                                 {
                                     new_branch = Some((state.app_id, branch.clone()));
@@ -1042,7 +1077,8 @@ impl SteamLauncher {
                 .changed()
             {
                 if force_proton {
-                    config.forced_proton_version = Some(self.launcher_config.proton_version.clone());
+                    config.forced_proton_version =
+                        Some(self.launcher_config.proton_version.clone());
                 } else {
                     config.forced_proton_version = None;
                 }
@@ -1065,7 +1101,9 @@ impl SteamLauncher {
             }
 
             if self.launcher_config.game_configs.get(&game.app_id) != Some(&config) {
-                self.launcher_config.game_configs.insert(game.app_id, config);
+                self.launcher_config
+                    .game_configs
+                    .insert(game.app_id, config);
                 let config_to_save = self.launcher_config.clone();
                 self.runtime.spawn(async move {
                     let _ = config_to_save.save().await;
@@ -1165,7 +1203,8 @@ impl SteamLauncher {
                                 let _ = tx.send(AsyncOp::DepotListFetched(app_id, list));
                             }
                             Err(e) => {
-                                let _ = tx.send(AsyncOp::Error(format!("Failed to load depots: {e}")));
+                                let _ =
+                                    tx.send(AsyncOp::Error(format!("Failed to load depots: {e}")));
                             }
                         }
                     });
@@ -1191,51 +1230,57 @@ impl SteamLauncher {
 
             if !self.depot_list.is_empty() {
                 ui.add_space(10.0);
-                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                    egui::Grid::new("depot_list_grid")
-                        .num_columns(5)
-                        .spacing([10.0, 4.0])
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("Sel");
-                            ui.label("ID");
-                            ui.label("Name");
-                            ui.label("Config");
-                            ui.label("Status");
-                            ui.end_row();
-
-                            for depot in &self.depot_list {
-                                let mut selected = self.depot_selection.contains(&depot.id);
-                                if ui.checkbox(&mut selected, "").changed() {
-                                    if selected {
-                                        self.depot_selection.insert(depot.id);
-                                    } else {
-                                        self.depot_selection.remove(&depot.id);
-                                    }
-                                }
-                                ui.label(depot.id.to_string());
-                                ui.label(&depot.name);
-                                ui.label(&depot.config);
-
-                                match depot.is_owned {
-                                    None => {
-                                        ui.label(egui::RichText::new("?").color(egui::Color32::GRAY));
-                                    }
-                                    Some(true) => {
-                                        ui.label(
-                                            egui::RichText::new("Owned").color(egui::Color32::GREEN),
-                                        );
-                                    }
-                                    Some(false) => {
-                                        ui.label(
-                                            egui::RichText::new("Locked").color(egui::Color32::RED),
-                                        );
-                                    }
-                                }
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("depot_list_grid")
+                            .num_columns(5)
+                            .spacing([10.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label("Sel");
+                                ui.label("ID");
+                                ui.label("Name");
+                                ui.label("Config");
+                                ui.label("Status");
                                 ui.end_row();
-                            }
-                        });
-                });
+
+                                for depot in &self.depot_list {
+                                    let mut selected = self.depot_selection.contains(&depot.id);
+                                    if ui.checkbox(&mut selected, "").changed() {
+                                        if selected {
+                                            self.depot_selection.insert(depot.id);
+                                        } else {
+                                            self.depot_selection.remove(&depot.id);
+                                        }
+                                    }
+                                    ui.label(depot.id.to_string());
+                                    ui.label(&depot.name);
+                                    ui.label(&depot.config);
+
+                                    match depot.is_owned {
+                                        None => {
+                                            ui.label(
+                                                egui::RichText::new("?").color(egui::Color32::GRAY),
+                                            );
+                                        }
+                                        Some(true) => {
+                                            ui.label(
+                                                egui::RichText::new("Owned")
+                                                    .color(egui::Color32::GREEN),
+                                            );
+                                        }
+                                        Some(false) => {
+                                            ui.label(
+                                                egui::RichText::new("Locked")
+                                                    .color(egui::Color32::RED),
+                                            );
+                                        }
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
 
                 ui.add_space(10.0);
                 if ui.button("Install Selected").clicked() {
@@ -1286,9 +1331,11 @@ impl SteamLauncher {
                 ui.add_space(20.0);
                 if ui
                     .add(
-                        egui::Button::new(egui::RichText::new("Logout").color(egui::Color32::WHITE))
-                            .fill(egui::Color32::from_rgb(200, 45, 45))
-                            .min_size(egui::vec2(120.0, 30.0)),
+                        egui::Button::new(
+                            egui::RichText::new("Logout").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(200, 45, 45))
+                        .min_size(egui::vec2(120.0, 30.0)),
                     )
                     .clicked()
                 {
@@ -1574,12 +1621,17 @@ impl SteamLauncher {
             let client = self.client.clone();
             let tx = self.operation_tx.clone();
             self.runtime.spawn(async move {
-                match client.fetch_manifest_files(appid, depot_id, &manifest).await {
+                match client
+                    .fetch_manifest_files(appid, depot_id, &manifest)
+                    .await
+                {
                     Ok(files) => {
                         let _ = tx.send(AsyncOp::ManifestFilesFetched(files));
                     }
                     Err(err) => {
-                        let _ = tx.send(AsyncOp::Error(format!("Failed to fetch manifest files: {err}")));
+                        let _ = tx.send(AsyncOp::Error(format!(
+                            "Failed to fetch manifest files: {err}"
+                        )));
                     }
                 }
             });
@@ -1905,11 +1957,10 @@ impl eframe::App for SteamLauncher {
                     if let Some(texture) = self.image_cache.get(&game.app_id) {
                         ui.add(egui::Image::new(texture).max_width(250.0));
                     } else {
-                        let (rect, _response) = ui.allocate_exact_size(
-                            egui::vec2(250.0, 375.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                        let (rect, _response) =
+                            ui.allocate_exact_size(egui::vec2(250.0, 375.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(rect, 4.0, egui::Color32::from_gray(30));
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -1959,9 +2010,8 @@ impl eframe::App for SteamLauncher {
                                         self.runtime.spawn(async move {
                                             match client.update_game(app_id).await {
                                                 Ok(rx) => {
-                                                    let _ = tx.send(AsyncOp::DownloadStarted(
-                                                        app_id, rx,
-                                                    ));
+                                                    let _ = tx
+                                                        .send(AsyncOp::DownloadStarted(app_id, rx));
                                                 }
                                                 Err(err) => {
                                                     let _ = tx.send(AsyncOp::Error(format!(
@@ -1981,7 +2031,9 @@ impl eframe::App for SteamLauncher {
                                 .fill(egui::Color32::from_rgb(46, 125, 50))
                                 .min_size(egui::vec2(120.0, 40.0));
 
-                                if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
+                                if ui
+                                    .add_enabled(!self.client.is_offline(), install_btn)
+                                    .clicked()
                                 {
                                     let app_id = game.app_id;
                                     let mut client = self.client.clone();

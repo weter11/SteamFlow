@@ -24,7 +24,6 @@ enum LibraryFolderRecord {
     Ignore(#[allow(dead_code)] HashMap<String, serde_json::Value>),
 }
 
-
 #[derive(Debug, Clone)]
 pub struct InstalledAppInfo {
     pub install_path: PathBuf,

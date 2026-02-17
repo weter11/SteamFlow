@@ -89,4 +89,9 @@ features = [
 ]
 
 [dependencies.zip]
-version = "2.2.2"
+version = "7.2.0"
+default-features = false
+features = ["deflate"]
+
+[dependencies.sha1]
+version = "0.10"

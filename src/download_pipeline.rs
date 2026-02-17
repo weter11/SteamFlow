@@ -48,7 +48,6 @@ pub struct SecurityInfo {
     pub cdn_auth_token: String,
 }
 
-
 #[derive(Debug, Clone, Copy)]
 pub enum DepotPlatform {
     Linux,
@@ -82,11 +81,9 @@ pub fn parse_appinfo(vdf: &str) -> Result<AppInfoRoot> {
         return Ok(parsed);
     }
     // Fall back to envelope parse
-    let envelope: AppInfoEnvelope = keyvalues_serde::from_str(vdf)
-        .context("failed parsing appinfo VDF (envelope)")?;
-    envelope
-        .into_inner()
-        .context("appinfo envelope was empty")
+    let envelope: AppInfoEnvelope =
+        keyvalues_serde::from_str(vdf).context("failed parsing appinfo VDF (envelope)")?;
+    envelope.into_inner().context("appinfo envelope was empty")
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -177,36 +174,32 @@ pub struct DepotManifests {
 
 pub fn should_keep_depot(oslist: Option<&str>, target: DepotPlatform) -> bool {
     match target {
-        DepotPlatform::Windows => {
-            match oslist {
-                Some(os) => {
-                    let os = os.to_lowercase();
-                    if os.contains("windows") {
-                        return true;
-                    }
-                    if os.contains("linux") || os.contains("macos") {
-                        return false;
-                    }
-                    true
+        DepotPlatform::Windows => match oslist {
+            Some(os) => {
+                let os = os.to_lowercase();
+                if os.contains("windows") {
+                    return true;
                 }
-                None => true,
-            }
-        }
-        DepotPlatform::Linux => {
-            match oslist {
-                Some(os) => {
-                    let os = os.to_lowercase();
-                    if os.contains("linux") {
-                        return true;
-                    }
-                    if os.contains("windows") || os.contains("macos") {
-                        return false;
-                    }
-                    true
+                if os.contains("linux") || os.contains("macos") {
+                    return false;
                 }
-                None => true,
+                true
             }
-        }
+            None => true,
+        },
+        DepotPlatform::Linux => match oslist {
+            Some(os) => {
+                let os = os.to_lowercase();
+                if os.contains("linux") {
+                    return true;
+                }
+                if os.contains("windows") || os.contains("macos") {
+                    return false;
+                }
+                true
+            }
+            None => true,
+        },
     }
 }
 
@@ -589,35 +582,6 @@ pub fn phase4_download_chunks(
     ))
 }
 
-pub async fn execute_multi_depot_download_async(
-    connection: &Connection,
-    app_id: u32,
-    selections: Vec<ManifestSelection>,
-    install_root: PathBuf,
-    smart_verify_existing: bool,
-    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<ProgressEvent>>,
-) -> Result<()> {
-    for selection in selections {
-        let security = match phase2_get_security_info(connection, app_id, selection.depot_id, None).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Could not get key for Depot {} (User might not own this DLC/Language). Skipping. Error: {}", selection.depot_id, e);
-                continue;
-            }
-        };
-        let manifest = phase3_download_manifest(&selection, &security).await?;
-        phase4_download_chunks_async(
-            manifest,
-            security,
-            install_root.clone(),
-            smart_verify_existing,
-            progress_tx.clone(),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 pub fn execute_four_step_download(
     connection: &Connection,
     plan: &DepotDownloadPlan,
@@ -625,23 +589,14 @@ pub fn execute_four_step_download(
 ) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let selection = phase1_get_manifest_id(
-            connection,
-            plan.app_id,
-            plan.platform,
-            &plan.language,
-        )
-        .await?;
+        let selection =
+            phase1_get_manifest_id(connection, plan.app_id, plan.platform, &plan.language).await?;
 
-        execute_multi_depot_download_async(
-            connection,
-            plan.app_id,
-            vec![selection],
-            install_root.to_path_buf(),
-            false,
-            None,
-        )
-        .await
+        let security =
+            phase2_get_security_info(connection, plan.app_id, selection.depot_id, None).await?;
+        let manifest = phase3_download_manifest(&selection, &security).await?;
+        phase4_download_chunks_async(manifest, security, install_root.to_path_buf(), false, None)
+            .await
     })
 }
 
@@ -655,7 +610,8 @@ pub fn execute_download_with_manifest_id(
 ) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
 
-    let security = runtime.block_on(phase2_get_security_info(connection, app_id, depot_id, None))?;
+    let security =
+        runtime.block_on(phase2_get_security_info(connection, app_id, depot_id, None))?;
     let selection = ManifestSelection {
         app_id,
         depot_id,
