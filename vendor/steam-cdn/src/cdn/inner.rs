@@ -111,6 +111,11 @@ impl InnerClient {
             url.push_str(manifest_request_code.to_string().as_str());
         }
 
+        if let Some(token) = &server.auth_token {
+            url.push_str("?token=");
+            url.push_str(token);
+        }
+
         Ok(self.web_client.get(url).send().await?)
     }
 

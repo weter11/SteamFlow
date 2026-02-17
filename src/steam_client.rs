@@ -35,6 +35,12 @@ use steam_vent::proto::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
 };
+use steam_vent::proto::steammessages_contentsystem_steamclient::{
+    CContentServerDirectory_GetCDNAuthToken_Request,
+    CContentServerDirectory_GetCDNAuthToken_Response,
+    CContentServerDirectory_GetServersForSteamPipe_Request,
+    CContentServerDirectory_GetServersForSteamPipe_Response,
+};
 use steam_vent::proto::steammessages_player_steamclient::{
     CPlayer_GetOwnedGames_Request, CPlayer_GetOwnedGames_Response,
 };
@@ -762,17 +768,17 @@ impl SteamClient {
                 })
                 .await;
 
-            // 2. Initialize the CDN Client using internal discovery
-            tracing::info!("Initializing CDN Client for AppID: {}...", appid);
-            let cdn_client = match steam_cdn::CDNClient::discover(Arc::new(connection.clone())).await {
-                Ok(c) => c,
+            // 2. Fetch Content Servers via Service
+            tracing::info!("Fetching Content Servers for AppID: {}...", appid);
+            let hosts = match client_clone.get_content_servers(connection.cell_id()).await {
+                Ok(h) => h,
                 Err(e) => {
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
                             bytes_downloaded: 0,
                             total_bytes: 0,
-                            current_file: format!("Failed to discover CDN servers: {}", e),
+                            current_file: format!("Failed to fetch content servers: {}", e),
                         })
                         .await;
                     return;
@@ -784,7 +790,8 @@ impl SteamClient {
             for selection in selections {
                 tracing::info!(
                     "Starting download for Depot {} (GID: {})...",
-                    selection.depot_id, selection.manifest_id
+                    selection.depot_id,
+                    selection.manifest_id
                 );
 
                 let key = match client_clone.get_depot_key(appid, selection.depot_id).await {
@@ -799,30 +806,84 @@ impl SteamClient {
                     }
                 };
 
-                match cdn_client
-                    .download_depot(
-                        appid,
-                        selection.depot_id,
-                        selection.manifest_id,
-                        &key,
-                        &install_dir,
-                    )
-                    .await
-                {
-                    Ok(_) => tracing::info!("Depot {} download complete!", selection.depot_id),
-                    Err(e) => {
-                        tracing::error!("CDN Error for Depot {}: {}", selection.depot_id, e);
-                        let _ = tx
-                            .send(DownloadProgress {
-                                state: DownloadProgressState::Failed,
-                                bytes_downloaded: 0,
-                                total_bytes: 0,
-                                current_file: format!("CDN Error for Depot {}: {}", selection.depot_id, e),
-                            })
-                            .await;
-                        success = false;
-                        break;
+                let mut depot_success = false;
+                for host in &hosts {
+                    let token = match client_clone
+                        .get_cdn_auth_token(appid, selection.depot_id, host)
+                        .await
+                    {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            tracing::warn!("Failed to get auth token for host {}: {}", host, e);
+                            None
+                        }
+                    };
+
+                    let (host_name, port) = if let Some(pos) = host.find(':') {
+                        (
+                            &host[..pos],
+                            host[pos + 1..].parse::<u16>().unwrap_or(80),
+                        )
+                    } else {
+                        (host.as_str(), 80)
+                    };
+
+                    let cdn_server = steam_cdn::web_api::content_service::CDNServer {
+                        r#type: "CDN".to_string(),
+                        https: port == 443,
+                        host: host_name.to_string(),
+                        vhost: host_name.to_string(),
+                        port,
+                        cell_id: connection.cell_id(),
+                        load: 0,
+                        weighted_load: 0,
+                        auth_token: token,
+                    };
+
+                    let cdn_client = steam_cdn::CDNClient::with_server(
+                        Arc::new(connection.clone()),
+                        cdn_server,
+                    );
+
+                    match cdn_client
+                        .download_depot(
+                            appid,
+                            selection.depot_id,
+                            selection.manifest_id,
+                            &key,
+                            &install_dir,
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            tracing::info!(
+                                "Depot {} download complete from {}!",
+                                selection.depot_id,
+                                host
+                            );
+                            depot_success = true;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!("CDN Error from {}: {}", host, e);
+                        }
                     }
+                }
+
+                if !depot_success {
+                    let _ = tx
+                        .send(DownloadProgress {
+                            state: DownloadProgressState::Failed,
+                            bytes_downloaded: 0,
+                            total_bytes: 0,
+                            current_file: format!(
+                                "Failed to download depot {} from all available servers",
+                                selection.depot_id
+                            ),
+                        })
+                        .await;
+                    success = false;
+                    break;
                 }
             }
 
@@ -896,6 +957,72 @@ impl SteamClient {
         }
 
         Ok(())
+    }
+
+    pub async fn get_content_servers(&self, cell_id: u32) -> Result<Vec<String>> {
+        println!(
+            "DEBUG: Requesting Content Servers for Cell ID {} via Service...",
+            cell_id
+        );
+
+        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
+        request.set_cell_id(cell_id);
+        request.set_max_servers(20);
+
+        let response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
+            .service_method(request)
+            .await
+            .context("failed calling ContentServerDirectory.GetServersForSteamPipe")?;
+
+        let mut hosts = Vec::new();
+        println!(
+            "DEBUG: Service returned {} servers.",
+            response.servers.len()
+        );
+        for server in &response.servers {
+            if server.type_() == "SteamCache" || server.type_() == "CDN" {
+                let host = server.host().to_string();
+                hosts.push(host);
+            }
+        }
+
+        if hosts.is_empty() {
+            println!("ERROR: Service returned 0 valid CDN servers!");
+        }
+
+        Ok(hosts)
+    }
+
+    pub async fn get_cdn_auth_token(
+        &self,
+        app_id: u32,
+        depot_id: u32,
+        host_name: &str,
+    ) -> Result<String> {
+        println!(
+            "DEBUG: Requesting CDN Auth Token for Depot {} on Host {}...",
+            depot_id, host_name
+        );
+
+        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let mut request = CContentServerDirectory_GetCDNAuthToken_Request::new();
+        request.set_app_id(app_id);
+        request.set_depot_id(depot_id);
+        request.set_host_name(host_name.to_string());
+
+        let response: CContentServerDirectory_GetCDNAuthToken_Response = connection
+            .service_method(request)
+            .await
+            .context("failed calling ContentServerDirectory.GetCDNAuthToken")?;
+
+        if response.token().is_empty() {
+            println!("ERROR: Steam returned empty Auth Token!");
+            return Err(anyhow!("Empty Auth Token returned"));
+        }
+
+        println!("DEBUG: Auth Token received successfully.");
+        Ok(response.token().to_string())
     }
 
     pub async fn get_depot_list(&self, app_id: u32) -> Result<Vec<DepotInfo>> {
@@ -982,15 +1109,29 @@ impl SteamClient {
     }
 
     pub async fn get_depot_key(&self, app_id: u32, depot_id: u32) -> Result<Vec<u8>> {
-        let connection = self.connection.as_ref().context("steam connection not initialized")?;
+        println!("DEBUG: Fetching Decryption Key for Depot {}...", depot_id);
+
+        let connection = self
+            .connection
+            .as_ref()
+            .context("steam connection not initialized")?;
         let mut request = CMsgClientGetDepotDecryptionKey::new();
         request.set_depot_id(depot_id);
         request.set_app_id(app_id);
 
         let response: CMsgClientGetDepotDecryptionKeyResponse = connection.job(request).await?;
         if response.eresult() != 1 {
-            bail!("failed to get depot key for depot {depot_id}: eresult {}", response.eresult());
+            println!("ERROR: Key Fetch Failed. EResult: {}", response.eresult());
+            bail!(
+                "failed to get depot key for depot {depot_id}: eresult {}",
+                response.eresult()
+            );
         }
+
+        println!(
+            "DEBUG: Key Found! (Length: {} bytes)",
+            response.depot_encryption_key().len()
+        );
         Ok(response.depot_encryption_key().to_vec())
     }
 
