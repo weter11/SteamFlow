@@ -182,7 +182,7 @@ impl CDNClient {
             .await?;
 
         let mut manifest =
-            DepotManifest::deserialize(self.inner.clone(), app_id, &bytes[..])?;
+            DepotManifest::deserialize(self.inner.clone(), app_id, depot_id, manifest_id, &bytes[..])?;
         if manifest.filenames_encrypted() {
             if let Some(key) = depot_key {
                 manifest.decrypt_filenames(key)?;

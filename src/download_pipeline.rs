@@ -687,7 +687,17 @@ fn decode_manifest_payload(bytes: &[u8]) -> Result<ContentManifestPayload> {
                             );
                         }
 
-                        match ContentManifestPayload::parse_from_bytes(&unzipped_data) {
+                        let offset = if unzipped_data.len() > 8 && unzipped_data[8] == 0x0A {
+                            println!("DEBUG: Found custom header (8 bytes). Skipping to Protobuf start...");
+                            8
+                        } else if unzipped_data.len() > 4 && unzipped_data[4] == 0x0A {
+                            println!("DEBUG: Found custom header (4 bytes). Skipping...");
+                            4
+                        } else {
+                            0
+                        };
+
+                        match ContentManifestPayload::parse_from_bytes(&unzipped_data[offset..]) {
                             Ok(payload) => return Ok(payload),
                             Err(e) => {
                                 println!("ERROR: parse_from_bytes failed on unzipped data: {}", e)

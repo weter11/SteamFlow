@@ -1,5 +1,5 @@
 use buf::TryBuf;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use error::ManifestError;
 use file::{ChunkData, ManifestFile};
 use std::sync::Arc;
@@ -84,6 +84,8 @@ impl DepotManifest {
     pub(crate) fn deserialize(
         client: Arc<InnerClient>,
         app_id: u32,
+        depot_id: u32,
+        manifest_gid: u64,
         data: &[u8],
     ) -> Result<Self, ManifestError> {
         let mut buffer = Vec::new();
@@ -128,51 +130,59 @@ impl DepotManifest {
         };
 
         let mut bytes = Bytes::from(raw_data.to_vec());
-        if bytes.try_get_u32()? != PROTOBUF_PAYLOAD_MAGIC {
-            return Err(ManifestError::MagicMismatch(
-                "expecting protobuf payload".to_string(),
-            ));
-        }
 
-        let payload = ContentManifestPayload::parse_from_bytes(&bytes.try_get_bytes()?)?;
+        // Try parsing using the magic-wrapped sequence first
+        let (payload, metadata) = if raw_data.len() > 4 && u32::from_le_bytes(raw_data[0..4].try_into().unwrap()) == PROTOBUF_PAYLOAD_MAGIC {
+            println!("DEBUG: Found magic-wrapped manifest sequence.");
+            let _ = TryBuf::try_get_u32(&mut bytes)?; // Skip magic
+            let payload = ContentManifestPayload::parse_from_bytes(&TryBuf::try_get_bytes(&mut bytes)?)?;
 
-        if bytes.try_get_u32()? != PROTOBUF_METADATA_MAGIC {
-            return Err(ManifestError::MagicMismatch(
-                "expecting protobuf metadata".to_string(),
-            ));
-        }
+            let metadata = if bytes.remaining() >= 4 && TryBuf::try_get_u32(&mut bytes).is_ok() {
+                ContentManifestMetadata::parse_from_bytes(&TryBuf::try_get_bytes(&mut bytes)?).ok()
+            } else {
+                None
+            };
+            (payload, metadata)
+        } else {
+            // Fallback: Check for offset 8 or 4 as suggested by user
+            let offset = if raw_data.len() > 8 && raw_data[8] == 0x0A {
+                8
+            } else if raw_data.len() > 4 && raw_data[4] == 0x0A {
+                4
+            } else {
+                0
+            };
 
-        let metadata = ContentManifestMetadata::parse_from_bytes(&bytes.try_get_bytes()?)?;
+            if offset > 0 {
+                println!("DEBUG: Skipping {} bytes to Protobuf start.", offset);
+            }
 
-        if bytes.try_get_u32()? != PROTOBUF_SIGNATURE_MAGIC {
-            return Err(ManifestError::MagicMismatch(
-                "expecting protobuf signature".to_string(),
-            ));
-        }
+            let payload = ContentManifestPayload::parse_from_bytes(&raw_data[offset..])?;
+            (payload, None)
+        };
 
-        let _signature = ContentManifestSignature::parse_from_bytes(&bytes.try_get_bytes()?)?;
-
-        if bytes.try_get_u32()? != PROTOBUF_ENDOFMANIFEST_MAGIC {
-            return Err(ManifestError::MagicMismatch(
-                "expecting end of manifest".to_string(),
-            ));
-        }
+        let final_depot_id = metadata.as_ref().map(|m| m.depot_id()).unwrap_or(depot_id);
+        let final_manifest_gid = metadata.as_ref().map(|m| m.gid_manifest()).unwrap_or(manifest_gid);
+        let final_creation_time = metadata.as_ref().map(|m| m.creation_time()).unwrap_or(0);
+        let final_filenames_encrypted = metadata.as_ref().map(|m| m.filenames_encrypted()).unwrap_or(false);
+        let final_original_size = metadata.as_ref().map(|m| m.cb_disk_original()).unwrap_or(0);
+        let final_compressed_size = metadata.as_ref().map(|m| m.cb_disk_compressed()).unwrap_or(0);
 
         Ok(Self {
             app_id,
-            depot_id: metadata.depot_id(),
-            manifest_gid: metadata.gid_manifest(),
-            creatime_time: metadata.creation_time(),
-            filenames_encrypted: metadata.filenames_encrypted(),
-            original_size: metadata.cb_disk_original(),
-            compressed_size: metadata.cb_disk_compressed(),
+            depot_id: final_depot_id,
+            manifest_gid: final_manifest_gid,
+            creatime_time: final_creation_time,
+            filenames_encrypted: final_filenames_encrypted,
+            original_size: final_original_size,
+            compressed_size: final_compressed_size,
             files: payload
                 .mappings
                 .into_iter()
                 .map(|map| ManifestFile {
                     inner: client.clone(),
                     app_id,
-                    depot_id: metadata.depot_id(),
+                    depot_id: final_depot_id,
                     filename: map.filename().to_string(),
                     size: map.size(),
                     flags: map.flags(),
