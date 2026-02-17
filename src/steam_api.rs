@@ -15,21 +15,21 @@ struct ServerResponseBody {
 #[derive(Debug, Deserialize)]
 struct ServerEntry {
     #[serde(rename = "type")]
-    server_type: String, // We want "SteamCache" or "CDN" or "CS"
+    server_type: String, // We want "SteamCache" or "CDN"
     host: String,
-    #[serde(default)]
-    _vhost: String,
-    #[serde(default)]
-    _https_support: String, // "mandatory" or "supported"
+    vhost: Option<String>,
+    https_support: Option<String>, // "mandatory", "supported", or null
+    weighted_load: Option<String>,
 }
 
 pub async fn fetch_content_servers(cell_id: u32) -> Result<Vec<String>> {
-    tracing::info!("Fetching Content Servers for Cell ID: {}", cell_id);
+    tracing::info!("Fetching CDN Servers for Cell ID: {}...", cell_id);
 
-    // Use Web API to get the list
+    // Force Cell ID 17 (Germany) if input is 0, to ensure we get results.
+    let effective_cell = if cell_id == 0 { 17 } else { cell_id };
     let url = format!(
         "https://api.steampowered.com/ISteamContentServer/GetServersForSteamPipe/v1/?cell_id={}&max_servers=20",
-        cell_id
+        effective_cell
     );
 
     let client = reqwest::Client::new();
@@ -39,52 +39,43 @@ pub async fn fetch_content_servers(cell_id: u32) -> Result<Vec<String>> {
         .json()
         .await?;
 
-    // Filter for valid CDN servers
-    let mut server_hosts = Vec::new();
+    let mut valid_hosts = Vec::new();
+
     for server in resp.response.servers {
-        // Construct the host string (e.g., "valve404.steamcontent.com")
-        if server.server_type == "SteamCache" || server.server_type == "CS" || server.server_type == "CDN" {
-            server_hosts.push(server.host);
+        // CRITICAL FILTER: Only accept actual Content Servers
+        if server.server_type == "SteamCache" || server.server_type == "CDN" {
+            // Prefer HTTPS if available, but standard host:port is fine
+            if let Some(https) = &server.https_support {
+                if https == "mandatory" || https == "supported" {
+                    valid_hosts.push(server.host.clone());
+                    continue;
+                }
+            }
+            // Fallback to standard host
+            valid_hosts.push(server.host);
         }
     }
 
-    if server_hosts.is_empty() {
-        return Err(anyhow!("Web API returned no valid content servers"));
+    if valid_hosts.is_empty() {
+        return Err(anyhow!("No valid 'SteamCache' servers found in Web API response for Cell {}", effective_cell));
     }
 
-    tracing::info!("Found {} servers via Web API.", server_hosts.len());
-    Ok(server_hosts)
+    tracing::info!("Found {} valid CDN servers (Filtered from total).", valid_hosts.len());
+    Ok(valid_hosts)
 }
 
 pub async fn fetch_servers_fallback() -> Vec<String> {
     tracing::info!("Fallback: Fetching Content Servers via Web API (Force Cell 17)...");
 
-    // Use Cell ID 17 (Germany) to ensure high availability for EU
-    let url = "https://api.steampowered.com/ISteamContentServer/GetServersForSteamPipe/v1/?cell_id=17&max_servers=20";
-    let client = reqwest::Client::new();
-    match client.get(url).send().await {
-        Ok(resp) => match resp.json::<ServerResponse>().await {
-            Ok(data) => {
-                let list: Vec<String> = data
-                    .response
-                    .servers
-                    .into_iter()
-                    .map(|s| s.host)
-                    .collect();
-                tracing::info!("Web API returned {} servers.", list.len());
-                if !list.is_empty() {
-                    return list;
-                }
-            }
-            Err(e) => tracing::error!("Failed to parse Web API JSON: {}", e),
-        },
-        Err(e) => tracing::error!("Web API Request failed: {}", e),
+    match fetch_content_servers(17).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::error!("Fallback Web API Request failed: {}", e);
+            // Emergency Fallback: Hardcoded Valve CDN (EU)
+            vec![
+                "155.133.248.34".to_string(), // Frankfort
+                "155.133.248.35".to_string(), // Frankfort 2
+            ]
+        }
     }
-
-    // Emergency Fallback: Hardcoded Valve CDN (US/EU)
-    vec![
-        "155.133.248.34".to_string(), // Frankfort
-        "162.254.196.82".to_string(), // CM
-        "162.254.197.72".to_string(), // CM
-    ]
 }

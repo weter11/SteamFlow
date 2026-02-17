@@ -827,15 +827,25 @@ impl SteamClient {
                 Some(app_ticket),
             );
 
-            // 3. FORCE SERVER POPULATION
-            let servers = crate::steam_api::fetch_servers_fallback().await;
+            // 3. FORCE SERVER POPULATION (Strict Filter)
+            let servers = match crate::steam_api::fetch_content_servers(cell_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Primary server fetch failed: {}. Using fallback.", e);
+                    crate::steam_api::fetch_servers_fallback().await
+                }
+            };
 
             if servers.is_empty() {
                 tracing::error!("CRITICAL: No servers found via Web API or Fallback!");
             } else {
-                tracing::info!("Injecting {} servers into CDN Client...", servers.len());
+                tracing::info!("Resolved {} servers.", servers.len());
+                if let Some(first) = servers.first() {
+                    tracing::info!("VERIFICATION: First Server is {}", first);
+                }
+
+                tracing::info!("Injecting servers into CDN Client...");
                 for server_addr in servers {
-                    tracing::info!("Adding CDN Server: {}", server_addr);
                     cdn_client.add_server(server_addr);
                 }
             }
