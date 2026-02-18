@@ -1,4 +1,4 @@
-use crate::models::{OwnedGame, SessionState};
+use crate::models::{OwnedGame, SessionState, UserConfigStore};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -192,4 +192,32 @@ pub async fn load_library_cache() -> Result<Vec<OwnedGame>> {
     let cached = serde_json::from_str::<Vec<OwnedGame>>(&raw)
         .with_context(|| format!("failed parsing {}", path.display()))?;
     Ok(cached)
+}
+
+pub async fn load_user_configs() -> Result<UserConfigStore> {
+    let path = config_dir()?.join("user_apps.json");
+    if !path.exists() {
+        return Ok(UserConfigStore::new());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("failed reading {}", path.display()))?;
+    let parsed = serde_json::from_str::<UserConfigStore>(&raw)
+        .with_context(|| format!("failed parsing {}", path.display()))?;
+    Ok(parsed)
+}
+
+pub async fn save_user_configs(configs: &UserConfigStore) -> Result<()> {
+    let dir = config_dir()?;
+    fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("failed creating {}", dir.display()))?;
+
+    let path = dir.join("user_apps.json");
+    let body = serde_json::to_string_pretty(configs)?;
+    fs::write(&path, body)
+        .await
+        .with_context(|| format!("failed writing {}", path.display()))?;
+    Ok(())
 }

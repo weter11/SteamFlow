@@ -1556,6 +1556,7 @@ impl SteamClient {
         &mut self,
         app: &LibraryGame,
         proton_path: Option<&str>,
+        user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<LaunchInfo> {
         let prefer_proton = proton_path.is_some();
         let launch_options = self.get_product_info(app.app_id, prefer_proton).await?;
@@ -1591,7 +1592,7 @@ impl SteamClient {
         }
 
         let mut child =
-            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config)?;
+            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config)?;
         child
             .wait()
             .context("failed waiting for game process exit")?;
@@ -1609,9 +1610,10 @@ impl SteamClient {
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
+        user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<()> {
         let launcher_config = load_launcher_config().await.unwrap_or_default();
-        self.spawn_game_process(app, launch_info, proton_path, &launcher_config)?;
+        self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config)?;
         Ok(())
     }
 
@@ -2108,6 +2110,7 @@ impl SteamClient {
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
         launcher_config: &crate::config::LauncherConfig,
+        user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<std::process::Child> {
         let install_dir = PathBuf::from(
             app.install_path
@@ -2116,7 +2119,14 @@ impl SteamClient {
         );
 
         let executable = install_dir.join(&launch_info.executable);
-        let args = split_args(&launch_info.arguments);
+        let mut args = split_args(&launch_info.arguments);
+
+        if let Some(config) = user_config {
+            if !config.launch_options.trim().is_empty() {
+                let custom_args = split_args(&config.launch_options);
+                args.extend(custom_args);
+            }
+        }
 
         // Standard Steam identity fallback: steam_appid.txt
         let _ = std::fs::write(install_dir.join("steam_appid.txt"), app.app_id.to_string());
@@ -2134,7 +2144,7 @@ impl SteamClient {
                 }
 
                 let mut cmd = Command::new(&executable);
-                cmd.args(args);
+                cmd.args(&args);
                 cmd.current_dir(&install_dir);
 
                 let bin_dir = executable.parent().unwrap_or_else(|| Path::new("."));
@@ -2145,6 +2155,13 @@ impl SteamClient {
                 cmd.env("PATH", format!("{}:{}", bin_dir.display(), existing_path));
                 cmd.env("SteamAppId", app.app_id.to_string());
 
+                if let Some(config) = user_config {
+                    for (key, val) in &config.env_variables {
+                        cmd.env(key, val);
+                    }
+                }
+
+                tracing::info!("Launching game (Native): {:?} with args {:?}", executable, args);
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
@@ -2171,13 +2188,20 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
-                let mut cmd = Command::new(resolved_proton);
-                cmd.arg("run").arg(&executable).args(args);
+                let mut cmd = Command::new(&resolved_proton);
+                cmd.arg("run").arg(&executable).args(&args);
                 cmd.current_dir(&install_dir);
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
 
+                if let Some(config) = user_config {
+                    for (key, val) in &config.env_variables {
+                        cmd.env(key, val);
+                    }
+                }
+
+                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, cmd.get_args());
                 cmd.spawn().context("failed to spawn proton game")
             }
         }

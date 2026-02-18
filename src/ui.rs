@@ -27,6 +27,14 @@ enum ProtonSource {
 }
 
 #[derive(Debug, Clone)]
+struct GamePropertiesModalState {
+    app_id: u32,
+    game_name: String,
+    launch_options: String,
+    env_vars: String, // Key=Value per line
+}
+
+#[derive(Debug, Clone)]
 struct UninstallModalState {
     app_id: u32,
     game_name: String,
@@ -102,6 +110,7 @@ pub enum AsyncOp {
     SettingsSaved(bool),
     ScanCompleted(u32, HashMap<u32, String>),
     MetadataFetched(u32, crate::steam_client::AppMetadata),
+    UserConfigsFetched(crate::models::UserConfigStore),
     Error(String),
 }
 
@@ -138,6 +147,7 @@ pub struct SteamLauncher {
     refreshing_account_data: bool,
     uninstall_modal: Option<UninstallModalState>,
     properties_modal: Option<PropertiesModalState>,
+    game_properties_modal: Option<GamePropertiesModalState>,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
@@ -148,6 +158,7 @@ pub struct SteamLauncher {
     depot_list: Vec<crate::steam_client::DepotInfo>,
     depot_selection: HashSet<u64>,
     is_verifying: bool,
+    user_configs: crate::models::UserConfigStore,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -158,6 +169,7 @@ impl SteamLauncher {
         let (operation_tx, operation_rx) = mpsc::channel();
         let authenticated = client.is_authenticated();
         let launcher_config = runtime.block_on(load_launcher_config()).unwrap_or_default();
+        let user_configs = runtime.block_on(crate::config::load_user_configs()).unwrap_or_default();
         let (steam_protons, custom_protons) = scan_proton_runtimes();
         let user_profile = runtime
             .block_on(client.get_user_profile(library.len()))
@@ -199,6 +211,7 @@ impl SteamLauncher {
             refreshing_account_data: false,
             uninstall_modal: None,
             properties_modal: None,
+            game_properties_modal: None,
             depot_browser: None,
             platform_selection: None,
             launch_selector: None,
@@ -209,6 +222,7 @@ impl SteamLauncher {
             depot_list: Vec::new(),
             depot_selection: HashSet::new(),
             is_verifying: false,
+            user_configs,
             operation_tx,
             operation_rx,
         }
@@ -560,6 +574,9 @@ impl SteamLauncher {
                     });
                     self.pending_metadata.remove(&appid);
                 }
+                AsyncOp::UserConfigsFetched(configs) => {
+                    self.user_configs = configs;
+                }
                 AsyncOp::BranchesFetched(appid, branches) => {
                     if let Some(game) = self.library.iter().find(|g| g.app_id == appid) {
                         self.properties_modal = Some(PropertiesModalState {
@@ -782,6 +799,7 @@ impl SteamLauncher {
     fn start_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
         let game = game.clone();
         let client = self.client.clone();
+        let user_config = self.user_configs.get(&game.app_id).cloned();
         let (tx, rx) = mpsc::channel();
         self.play_result_rx = Some(rx);
         self.status = format!("Syncing Cloud... {}", game.name);
@@ -814,7 +832,7 @@ impl SteamLauncher {
             }
 
             let mut child: std::process::Child =
-                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config) {
+                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()) {
                     Ok(child) => child,
                     Err(e) => {
                         let _ = tx.send(format!("Launch failed for {}: {e}", game.name));
@@ -846,6 +864,21 @@ impl SteamLauncher {
                     let _ = tx.send(AsyncOp::Error(format!("Failed to fetch branches: {err}")));
                 }
             }
+        });
+    }
+
+    fn open_game_properties(&mut self, game: &LibraryGame) {
+        let config = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
+        let mut env_vars = String::new();
+        for (k, v) in config.env_variables {
+            env_vars.push_str(&format!("{}={}\n", k, v));
+        }
+
+        self.game_properties_modal = Some(GamePropertiesModalState {
+            app_id: game.app_id,
+            game_name: game.name.clone(),
+            launch_options: config.launch_options,
+            env_vars,
         });
     }
 
@@ -1032,6 +1065,62 @@ impl SteamLauncher {
 
         if close {
             self.properties_modal = None;
+        }
+    }
+
+    fn draw_game_properties_modal(&mut self, ctx: &egui::Context) {
+        let mut save_config = None;
+        let mut close = false;
+
+        if let Some(state) = &mut self.game_properties_modal {
+            egui::Window::new(format!("Game Properties - {}", state.game_name))
+                .collapsible(false)
+                .resizable(true)
+                .default_size([400.0, 300.0])
+                .show(ctx, |ui| {
+                    ui.label("Launch Options");
+                    ui.text_edit_singleline(&mut state.launch_options);
+                    ui.add_space(8.0);
+
+                    ui.label("Environment Variables (KEY=VALUE per line)");
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.text_edit_multiline(&mut state.env_vars);
+                    });
+
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            let mut env_map = HashMap::new();
+                            for line in state.env_vars.lines() {
+                                if let Some((k, v)) = line.split_once('=') {
+                                    env_map.insert(k.trim().to_string(), v.trim().to_string());
+                                }
+                            }
+                            // Note: we'll update the config in the outer scope to avoid borrowing issues
+                            save_config = Some((state.app_id, state.launch_options.clone(), env_map));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+        }
+
+        if let Some((app_id, launch_opts, env_map)) = save_config {
+            let mut config = self.user_configs.get(&app_id).cloned().unwrap_or_default();
+            config.launch_options = launch_opts;
+            config.env_variables = env_map;
+            self.user_configs.insert(app_id, config);
+
+            let store = self.user_configs.clone();
+            self.runtime.spawn(async move {
+                let _ = crate::config::save_user_configs(&store).await;
+            });
+            self.game_properties_modal = None;
+        }
+
+        if close {
+            self.game_properties_modal = None;
         }
     }
 
@@ -1879,8 +1968,7 @@ impl eframe::App for SteamLauncher {
                                 ui.close();
                             }
                             if ui.button("Properties").clicked() {
-                                self.selected_app = Some(app_id);
-                                self.current_tab = GameTab::Options;
+                                self.open_game_properties(game);
                                 ui.close();
                             }
                         });
@@ -1946,6 +2034,10 @@ impl eframe::App for SteamLauncher {
 
                                 if ui.add(play_btn).clicked() {
                                     self.handle_play_click(&game);
+                                }
+
+                                if ui.button("PROPERTIES").clicked() {
+                                    self.open_game_properties(&game);
                                 }
 
                                 if game.update_available {
@@ -2110,6 +2202,7 @@ impl eframe::App for SteamLauncher {
         });
 
         self.draw_properties_modal(ctx);
+        self.draw_game_properties_modal(ctx);
         self.draw_uninstall_modal(ctx);
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
