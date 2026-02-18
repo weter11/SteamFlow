@@ -1642,7 +1642,8 @@ impl SteamClient {
             .arg(&steam_exe)
             .env("WINEPREFIX", compat_data_path.join("pfx"))
             .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
-            .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?);
+            .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?)
+            .env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
         let mut child = steam_cmd.spawn().context("failed to start Ghost Steam")?;
         child.wait().await?;
@@ -2241,7 +2242,8 @@ impl SteamClient {
                             .arg(&steam_exe)
                             .env("WINEPREFIX", compat_data_path.join("pfx"))
                             .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
-                            .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?);
+                        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?)
+                        .env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
                         let mut steam_child = steam_cmd.spawn().context("failed to start Ghost Steam for interactive login")?;
                         let _ = steam_child.wait().await;
@@ -2263,7 +2265,8 @@ impl SteamClient {
                     steam_cmd
                         .env("WINEPREFIX", compat_data_path.join("pfx"))
                         .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
-                        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?);
+                    .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?)
+                    .env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
                     let _steam_child = steam_cmd.spawn().context("failed to start Ghost Steam")?;
 
@@ -2281,6 +2284,7 @@ impl SteamClient {
                 cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?);
+                cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
