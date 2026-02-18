@@ -43,7 +43,9 @@ pub fn get_proton_runner() -> Option<PathBuf> {
     ];
 
     if let Ok(cfg_dir) = config_dir() {
-        search_paths.push(cfg_dir.join("compatibilitytools.d"));
+        if let Ok(abs_cfg) = crate::config::absolute_path(cfg_dir) {
+            search_paths.push(abs_cfg.join("compatibilitytools.d"));
+        }
     }
 
     let mut candidates = Vec::new();

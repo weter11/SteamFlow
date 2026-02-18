@@ -99,6 +99,15 @@ pub fn secrets_dir() -> Result<PathBuf> {
     Ok(PathBuf::from("./config/SteamFlow/secrets"))
 }
 
+pub fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        let cwd = std::env::current_dir().with_context(|| "failed to get current directory")?;
+        Ok(cwd.join(path))
+    }
+}
+
 pub async fn load_session() -> Result<SessionState> {
     let session_path = config_dir()?.join("session.json");
     if !session_path.exists() {

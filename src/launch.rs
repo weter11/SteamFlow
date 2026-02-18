@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use crate::config::config_dir;
+use crate::config::{config_dir, absolute_path};
 use crate::utils::download_windows_steam_client;
 use anyhow::{anyhow, Result, Context};
 use tokio::process::Command;
@@ -7,7 +7,7 @@ use tokio::process::Command;
 /// Installs the "Ghost Steam" client into a specific Proton prefix for a game.
 /// This avoids dependency conflicts by giving each game its own minimal Steam installation.
 pub async fn install_ghost_steam_in_prefix(game_id: u32, proton_path: PathBuf) -> Result<PathBuf> {
-    let base_dir = config_dir()?;
+    let base_dir = absolute_path(config_dir()?)?;
     let compat_data_path = base_dir.join("steamapps/compatdata").join(game_id.to_string());
     let prefix_path = compat_data_path.join("pfx");
 
@@ -26,8 +26,8 @@ pub async fn install_ghost_steam_in_prefix(game_id: u32, proton_path: PathBuf) -
     tracing::info!(appid = game_id, "Installing Ghost Steam into prefix...");
 
     // 1. Ensure the installer is cached
-    let installer_path = download_windows_steam_client().await
-        .context("Failed to ensure Steam installer is cached")?;
+    let installer_path = absolute_path(download_windows_steam_client().await
+        .context("Failed to ensure Steam installer is cached")?)?;
 
     // 2. Ensure compatdata directory exists
     tokio::fs::create_dir_all(&compat_data_path).await
@@ -40,6 +40,7 @@ pub async fn install_ghost_steam_in_prefix(game_id: u32, proton_path: PathBuf) -
     cmd.arg("run")
        .arg(&installer_path)
        .arg("/S") // Silent install flag
+       .env("WINEPREFIX", compat_data_path.join("pfx"))
        .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &base_dir);
 
