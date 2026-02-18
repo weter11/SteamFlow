@@ -29,45 +29,53 @@ pub async fn install_ghost_steam_in_prefix(game_id: u32, proton_path: PathBuf) -
     let installer_path = absolute_path(download_windows_steam_client().await
         .context("Failed to ensure Steam installer is cached")?)?;
 
-    // 2. Ensure compatdata directory exists
-    tokio::fs::create_dir_all(&compat_data_path).await
-        .context("Failed to create compatdata directory")?;
+    // 2. Locate the Raw Wine binary inside the Proton directory
+    // We must bypass the 'proton' script to avoid its Steam environment checks.
+    let wine_candidates = [
+        proton_path.parent().and_then(|p| p.parent()).map(|p| p.join("dist/bin/wine")),
+        proton_path.parent().and_then(|p| p.parent()).map(|p| p.join("files/bin/wine")),
+    ];
 
-    // 3. Manual Sanitization & Installer Execution
+    let wine_exe = wine_candidates.into_iter()
+        .flatten()
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow!("Failed to locate wine binary within Proton path: {:?}", proton_path))?;
+
+    // 3. Manual Sanitization (Remove Proton's built-in Steam stubs)
     let steam_dir = prefix_path.join("drive_c/Program Files (x86)/Steam");
-    tokio::fs::create_dir_all(&steam_dir).await
-        .context("Failed to create Steam directory in prefix")?;
-
-    // Step A: Sanitize the Prefix (Remove Proton's stubs)
-    // If these exist, the installer thinks Steam is already installed/running.
-    let stubs = ["steam.exe", "lsteamclient.dll", "tier0_s.dll", "vstdlib_s.dll"];
-    for stub in stubs {
-        let path = steam_dir.join(stub);
-        if path.exists() {
-            tracing::info!(appid = game_id, stub = stub, "Removing built-in stub before install");
-            let _ = tokio::fs::remove_file(&path).await;
+    if steam_dir.exists() {
+        let stubs = ["steam.exe", "lsteamclient.dll", "tier0_s.dll", "vstdlib_s.dll"];
+        for stub in stubs {
+            let path = steam_dir.join(stub);
+            if path.exists() {
+                tracing::info!(appid = game_id, stub = stub, "Removing built-in stub before install");
+                let _ = tokio::fs::remove_file(&path).await;
+            }
         }
+    } else {
+        tokio::fs::create_dir_all(&steam_dir).await
+            .context("Failed to create Steam directory in prefix")?;
     }
 
-    // Step B: Run the installer via Proton with Overrides
-    tracing::info!(appid = game_id, "Executing Steam installer via Proton...");
-    let mut cmd = Command::new(&proton_path);
-    cmd.arg("run")
-       .arg(&installer_path)
+    // 4. Run the installer via Raw Wine
+    tracing::info!(appid = game_id, wine = ?wine_exe, "Executing Steam installer via Raw Wine...");
+    let mut cmd = Command::new(&wine_exe);
+    cmd.arg(&installer_path)
        .arg("/S") // Silent install flag
        .env("WINEPREFIX", &prefix_path)
-       .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
-       .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &base_dir)
-       .env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+       .env("WINEDLLOVERRIDES", "mscoree,mshtml=;steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n")
+       .env_remove("SteamAppId")
+       .env_remove("STEAM_COMPAT_DATA_PATH")
+       .env_remove("STEAM_COMPAT_CLIENT_INSTALL_PATH");
 
     let status = cmd.status().await
-        .context(format!("Failed to run Proton installer for app {}", game_id))?;
+        .context(format!("Failed to run Wine installer for app {}", game_id))?;
 
     if !status.success() {
-        return Err(anyhow!("Proton installer exited with non-zero status for app {}", game_id));
+        return Err(anyhow!("Wine installer exited with non-zero status for app {}", game_id));
     }
 
-    // 4. Verify installation
+    // 5. Verify installation
     if !steam_exe_path.exists() {
         return Err(anyhow!(
             "Steam installation seemed to succeed, but steam.exe was not found at {}",
