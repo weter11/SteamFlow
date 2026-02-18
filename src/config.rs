@@ -78,14 +78,6 @@ pub fn config_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config/SteamFlow"))
 }
 
-pub fn opensteam_image_cache_dir() -> Result<PathBuf> {
-    Ok(config_dir()?.join("images"))
-}
-
-pub fn data_dir() -> Result<PathBuf> {
-    config_dir()  // or use XDG_DATA_HOME if you want proper separation
-}
-
 pub async fn ensure_config_dirs() -> Result<()> {
     let config = config_dir()?;
     fs::create_dir_all(&config).await?;
@@ -95,7 +87,11 @@ pub async fn ensure_config_dirs() -> Result<()> {
 }
 
 pub fn opensteam_image_cache_dir() -> Result<PathBuf> {
-    Ok(PathBuf::from("./config/SteamFlow/images"))
+    Ok(config_dir()?.join("images"))
+}
+
+pub fn data_dir() -> Result<PathBuf> {
+    config_dir()  // or use XDG_DATA_HOME if you want proper separation
 }
 
 pub async fn load_session() -> Result<SessionState> {
