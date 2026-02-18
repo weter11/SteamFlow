@@ -2188,12 +2188,30 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
+                let proton_root = resolved_proton.parent().unwrap_or(&resolved_proton);
+                let steam_setup_path = launcher_config.steam_setup_path.clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        crate::config::config_dir().unwrap_or_default().join("SteamSetup.exe")
+                    });
+
+                if let Err(e) = crate::launch::install_ghost_steam_in_prefix(
+                    proton_root,
+                    &compat_data_path,
+                    &steam_setup_path,
+                ) {
+                    tracing::warn!("Ghost Steam installation failed for App {}: {e}", app.app_id);
+                }
+
                 let mut cmd = Command::new(&resolved_proton);
                 cmd.arg("run").arg(&executable).args(&args);
                 cmd.current_dir(&install_dir);
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+
+                // Task 3: Force use of real Steam files
+                cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n");
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {

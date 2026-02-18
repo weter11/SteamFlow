@@ -1896,6 +1896,16 @@ impl eframe::App for SteamLauncher {
                         &self.custom_protons
                     };
 
+                    ui.label("SteamSetup.exe Path");
+                    let mut setup_path = self.launcher_config.steam_setup_path.clone().unwrap_or_default();
+                    if ui.text_edit_singleline(&mut setup_path).changed() {
+                        self.launcher_config.steam_setup_path = if setup_path.trim().is_empty() {
+                            None
+                        } else {
+                            Some(setup_path.trim().to_string())
+                        };
+                    }
+
                     egui::ComboBox::from_label("Proton Version")
                         .selected_text(self.launcher_config.proton_version.clone())
                         .show_ui(ui, |ui| {
