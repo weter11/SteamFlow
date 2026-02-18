@@ -2214,59 +2214,64 @@ impl SteamClient {
                 let library_root = absolute_path(PathBuf::from(&launcher_config.steam_library_path))?;
                 let resolved_proton = self.resolve_proton_path(proton_name, &library_root);
 
-                // --- Ghost Steam Flow ---
-                let proton_runner = get_proton_runner().unwrap_or_else(|| resolved_proton.clone());
-
                 let compat_data_path = absolute_path(config_dir()?
                     .join("steamapps/compatdata")
                     .join(app.app_id.to_string()))?;
 
-                let steam_exe_path = compat_data_path
-                    .join("pfx/drive_c/Program Files (x86)/Steam/steam.exe");
+                // --- Ghost Steam Flow ---
+                let use_steam_runtime = user_config.map(|c| c.use_steam_runtime).unwrap_or(true);
+                if use_steam_runtime {
+                    let proton_runner = get_proton_runner().unwrap_or_else(|| resolved_proton.clone());
 
-                let first_run = !steam_exe_path.exists();
+                    let steam_exe_path = compat_data_path
+                        .join("pfx/drive_c/Program Files (x86)/Steam/steam.exe");
 
-                let steam_exe = install_ghost_steam_in_prefix(app.app_id, proton_runner.clone()).await?;
+                    let first_run = !steam_exe_path.exists();
 
-                // Step 2: inject_credentials(prefix)
-                let has_credentials = inject_credentials(&compat_data_path).await.unwrap_or(false);
+                    let steam_exe = install_ghost_steam_in_prefix(app.app_id, proton_runner.clone()).await?;
 
-                if first_run && !has_credentials {
-                    tracing::info!(appid = app.app_id, "Ghost Steam First Run: Interactive Login required.");
+                    // Step 2: inject_credentials(prefix)
+                    let has_credentials = inject_credentials(&compat_data_path).await.unwrap_or(false);
+
+                    if first_run && !has_credentials {
+                        tracing::info!(appid = app.app_id, "Ghost Steam First Run: Interactive Login required.");
+                        let mut steam_cmd = Command::new(&proton_runner);
+                        steam_cmd
+                            .arg("run")
+                            .arg(&steam_exe)
+                            .env("WINEPREFIX", compat_data_path.join("pfx"))
+                            .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
+                            .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?);
+
+                        let mut steam_child = steam_cmd.spawn().context("failed to start Ghost Steam for interactive login")?;
+                        let _ = steam_child.wait().await;
+                        tracing::info!(appid = app.app_id, "Interactive Ghost Steam exited. Proceeding with game launch.");
+
+                        // Harvest after first manual login
+                        let _ = harvest_credentials(&compat_data_path).await;
+                    }
+
+                    // Step 3: Launch Steam (-silent if credentials existed, Normal UI if not)
+                    tracing::info!(appid = app.app_id, "Starting Ghost Steam for Pipe...");
                     let mut steam_cmd = Command::new(&proton_runner);
+                    steam_cmd.arg("run").arg(&steam_exe);
+
+                    if has_credentials || !first_run {
+                        steam_cmd.arg("-silent").arg("-no-browser").arg("-noverifyfiles");
+                    }
+
                     steam_cmd
-                        .arg("run")
-                        .arg(&steam_exe)
                         .env("WINEPREFIX", compat_data_path.join("pfx"))
                         .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
                         .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?);
 
-                    let mut steam_child = steam_cmd.spawn().context("failed to start Ghost Steam for interactive login")?;
-                    let _ = steam_child.wait().await;
-                    tracing::info!(appid = app.app_id, "Interactive Ghost Steam exited. Proceeding with game launch.");
+                    let _steam_child = steam_cmd.spawn().context("failed to start Ghost Steam")?;
 
-                    // Harvest after first manual login
-                    let _ = harvest_credentials(&compat_data_path).await;
+                    // Wait for Steam Pipe to initialize
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                } else {
+                    tracing::info!(appid = app.app_id, "Ghost Steam is disabled in user config. Launching raw executable.");
                 }
-
-                // Step 3: Launch Steam (-silent if credentials existed, Normal UI if not)
-                tracing::info!(appid = app.app_id, "Starting Ghost Steam for Pipe...");
-                let mut steam_cmd = Command::new(&proton_runner);
-                steam_cmd.arg("run").arg(&steam_exe);
-
-                if has_credentials || !first_run {
-                    steam_cmd.arg("-silent").arg("-no-browser").arg("-noverifyfiles");
-                }
-
-                steam_cmd
-                    .env("WINEPREFIX", compat_data_path.join("pfx"))
-                    .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
-                    .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?);
-
-                let _steam_child = steam_cmd.spawn().context("failed to start Ghost Steam")?;
-
-                // Wait for Steam Pipe to initialize
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
                 // 2. Launch actual game binary
                 let mut cmd = Command::new(&resolved_proton);

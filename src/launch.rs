@@ -39,11 +39,12 @@ pub async fn install_ghost_steam_in_prefix(game_id: u32, proton_path: PathBuf) -
     let mut cmd = Command::new(&proton_path);
     cmd.arg("run")
        .arg(&installer_path)
-       .arg("/S") // Silent install flag
+       // .arg("/S") // Silent install flag - DISABLED FOR DEBUGGING
        .env("WINEPREFIX", compat_data_path.join("pfx"))
        .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &base_dir);
 
+    tracing::info!("DEBUG: Launching Installer for App {}: {:?}", game_id, cmd);
     let status = cmd.status().await
         .context(format!("Failed to run Proton installer for app {}", game_id))?;
 

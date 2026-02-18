@@ -33,6 +33,7 @@ struct GamePropertiesModalState {
     game_name: String,
     launch_options: String,
     env_vars: String, // Key=Value per line
+    use_steam_runtime: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -900,6 +901,7 @@ impl SteamLauncher {
             game_name: game.name.clone(),
             launch_options: config.launch_options,
             env_vars,
+            use_steam_runtime: config.use_steam_runtime,
         });
     }
 
@@ -1167,6 +1169,10 @@ impl SteamLauncher {
                 .resizable(true)
                 .default_size([400.0, 300.0])
                 .show(ctx, |ui| {
+                    ui.checkbox(&mut state.use_steam_runtime, "Use Steam Runtime (Windows)")
+                        .on_hover_text("Enables the official Steam client in the background. Required for most games. Disable for DRM-free games to launch faster.");
+                    ui.add_space(8.0);
+
                     ui.label("Launch Options");
                     ui.text_edit_singleline(&mut state.launch_options);
                     ui.add_space(8.0);
@@ -1186,7 +1192,7 @@ impl SteamLauncher {
                                 }
                             }
                             // Note: we'll update the config in the outer scope to avoid borrowing issues
-                            save_config = Some((state.app_id, state.launch_options.clone(), env_map));
+                            save_config = Some((state.app_id, state.launch_options.clone(), env_map, state.use_steam_runtime));
                         }
                         if ui.button("Cancel").clicked() {
                             close = true;
@@ -1195,10 +1201,11 @@ impl SteamLauncher {
                 });
         }
 
-        if let Some((app_id, launch_opts, env_map)) = save_config {
+        if let Some((app_id, launch_opts, env_map, use_steam_runtime)) = save_config {
             let mut config = self.user_configs.get(&app_id).cloned().unwrap_or_default();
             config.launch_options = launch_opts;
             config.env_variables = env_map;
+            config.use_steam_runtime = use_steam_runtime;
             self.user_configs.insert(app_id, config);
 
             let store = self.user_configs.clone();
