@@ -2,10 +2,11 @@ use std::path::PathBuf;
 use crate::config::{config_dir, absolute_path};
 use crate::utils::download_windows_steam_client;
 use anyhow::{anyhow, Result, Context};
+use tokio::process::Command;
 
 /// Installs the "Ghost Steam" client into a specific Proton prefix for a game.
 /// This avoids dependency conflicts by giving each game its own minimal Steam installation.
-pub async fn install_ghost_steam_in_prefix(game_id: u32, _proton_path: PathBuf) -> Result<PathBuf> {
+pub async fn install_ghost_steam_in_prefix(game_id: u32, proton_path: PathBuf) -> Result<PathBuf> {
     let base_dir = absolute_path(config_dir()?)?;
     let compat_data_path = base_dir.join("steamapps/compatdata").join(game_id.to_string());
     let prefix_path = compat_data_path.join("pfx");
@@ -32,55 +33,39 @@ pub async fn install_ghost_steam_in_prefix(game_id: u32, _proton_path: PathBuf) 
     tokio::fs::create_dir_all(&compat_data_path).await
         .context("Failed to create compatdata directory")?;
 
-    // 3. Manual Installation (Extract from SteamSetup.exe and sanitize stubs)
+    // 3. Manual Sanitization & Installer Execution
     let steam_dir = prefix_path.join("drive_c/Program Files (x86)/Steam");
     tokio::fs::create_dir_all(&steam_dir).await
         .context("Failed to create Steam directory in prefix")?;
 
     // Step A: Sanitize the Prefix (Remove Proton's stubs)
+    // If these exist, the installer thinks Steam is already installed/running.
     let stubs = ["steam.exe", "lsteamclient.dll", "tier0_s.dll", "vstdlib_s.dll"];
     for stub in stubs {
         let path = steam_dir.join(stub);
         if path.exists() {
-            tracing::info!(appid = game_id, stub = stub, "Removing built-in stub");
+            tracing::info!(appid = game_id, stub = stub, "Removing built-in stub before install");
             let _ = tokio::fs::remove_file(&path).await;
         }
     }
 
-    // Step B: Extract the Real Client from SteamSetup.exe
-    tracing::info!(appid = game_id, "Extracting real Steam client from installer...");
+    // Step B: Run the installer via Proton with Overrides
+    tracing::info!(appid = game_id, "Executing Steam installer via Proton...");
+    let mut cmd = Command::new(&proton_path);
+    cmd.arg("run")
+       .arg(&installer_path)
+       .arg("/S") // Silent install flag
+       .env("WINEPREFIX", &prefix_path)
+       .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
+       .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &base_dir)
+       .env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
 
-    // We use a blocking task for ZIP extraction to avoid blocking the async executor
-    let installer_path_clone = installer_path.clone();
-    let steam_dir_clone = steam_dir.clone();
+    let status = cmd.status().await
+        .context(format!("Failed to run Proton installer for app {}", game_id))?;
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let file = std::fs::File::open(&installer_path_clone)
-            .context("Failed to open SteamSetup.exe")?;
-        let mut archive = zip::ZipArchive::new(file)
-            .context("Failed to open SteamSetup.exe as ZIP archive (NSIS might not be ZIP-compatible or file is corrupt)")?;
-
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
-            let outpath = match file.enclosed_name() {
-                Some(path) => steam_dir_clone.join(path),
-                None => continue,
-            };
-
-            if file.name().ends_with('/') {
-                std::fs::create_dir_all(&outpath)?;
-            } else {
-                if let Some(p) = outpath.parent() {
-                    if !p.exists() {
-                        std::fs::create_dir_all(p)?;
-                    }
-                }
-                let mut outfile = std::fs::File::create(&outpath)?;
-                std::io::copy(&mut file, &mut outfile)?;
-            }
-        }
-        Ok(())
-    }).await??;
+    if !status.success() {
+        return Err(anyhow!("Proton installer exited with non-zero status for app {}", game_id));
+    }
 
     // 4. Verify installation
     if !steam_exe_path.exists() {
