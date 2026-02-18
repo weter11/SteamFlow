@@ -73,7 +73,6 @@ Powered by `steam-cdn` (Vendored & Modified) and `zip` crate.
 - [steam-vent](https://github.com/n00b67/steam-vent) - Steam protocol implementation
 - [egui](https://github.com/emilk/egui) - Immediate mode GUI library
 - [open-steamworks](https://github.com/SteamRE/open-steamworks) - Research resources
-- [Logo and sound assets by nPHYN1T3](https://github.com/nPHYN1T3)
 
 # Q&A
 ## Is this a full replacement for Steam?
