@@ -2,6 +2,7 @@ pub mod cloud_sync;
 pub mod cm_list;
 pub mod config;
 pub mod depot_browser;
+pub mod launch;
 pub mod library;
 pub mod models;
 pub mod steam_client;

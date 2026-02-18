@@ -2185,8 +2185,27 @@ impl SteamClient {
                     .join("compatdata")
                     .join(app.app_id.to_string());
 
-                std::fs::create_dir_all(&compat_data_path)
-                    .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
+                let prefix_path = compat_data_path.join("pfx");
+                std::fs::create_dir_all(&prefix_path)
+                    .with_context(|| format!("failed creating {}", prefix_path.display()))?;
+
+                let steam_setup_path = launcher_config.steam_setup_path.clone()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        crate::config::config_dir().unwrap_or_default().join("SteamSetup.exe")
+                    });
+
+                let _ghost_steam_exe = match crate::launch::install_ghost_steam_in_prefix(
+                    &resolved_proton,
+                    &prefix_path,
+                    &steam_setup_path,
+                ) {
+                    Ok(path) => Some(path),
+                    Err(e) => {
+                        tracing::warn!("Ghost Steam installation failed for App {}: {e}", app.app_id);
+                        None
+                    }
+                };
 
                 let mut cmd = Command::new(&resolved_proton);
                 cmd.arg("run").arg(&executable).args(&args);
@@ -2194,6 +2213,14 @@ impl SteamClient {
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+
+                // Task 3: Force use of real Steam files
+                let steam_filename = _ghost_steam_exe.as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("steam.exe");
+
+                cmd.env("WINEDLLOVERRIDES", format!("{}={};lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n", steam_filename, "n"));
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
