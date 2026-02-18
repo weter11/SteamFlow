@@ -74,11 +74,16 @@ pub fn detect_steam_path() -> Option<PathBuf> {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
-    Ok(PathBuf::from("./config/SteamFlow"))
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".config/SteamFlow"))
+}
+
+pub fn opensteam_image_cache_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("images"))
 }
 
 pub fn data_dir() -> Result<PathBuf> {
-    Ok(PathBuf::from("./config/SteamFlow"))
+    config_dir()  // or use XDG_DATA_HOME if you want proper separation
 }
 
 pub async fn ensure_config_dirs() -> Result<()> {
