@@ -2195,13 +2195,17 @@ impl SteamClient {
                         crate::config::config_dir().unwrap_or_default().join("SteamSetup.exe")
                     });
 
-                if let Err(e) = crate::launch::install_ghost_steam_in_prefix(
+                let _ghost_steam_exe = match crate::launch::install_ghost_steam_in_prefix(
                     &resolved_proton,
                     &prefix_path,
                     &steam_setup_path,
                 ) {
-                    tracing::warn!("Ghost Steam installation failed for App {}: {e}", app.app_id);
-                }
+                    Ok(path) => Some(path),
+                    Err(e) => {
+                        tracing::warn!("Ghost Steam installation failed for App {}: {e}", app.app_id);
+                        None
+                    }
+                };
 
                 let mut cmd = Command::new(&resolved_proton);
                 cmd.arg("run").arg(&executable).args(&args);
@@ -2211,7 +2215,12 @@ impl SteamClient {
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
 
                 // Task 3: Force use of real Steam files
-                cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+                let steam_filename = _ghost_steam_exe.as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|f| f.to_str())
+                    .unwrap_or("steam.exe");
+
+                cmd.env("WINEDLLOVERRIDES", format!("{}={};lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n", steam_filename, "n"));
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
