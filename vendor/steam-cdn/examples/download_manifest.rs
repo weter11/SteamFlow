@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let full_path = manifest_file.full_path();
             let target_path = std::path::Path::new(&full_path);
             manifest_file
-                .download(depot_key.unwrap(), target_path, false, None, None)
+                .download(depot_key.unwrap(), target_path, false, None, None, None)
                 .await?;
         }
     }

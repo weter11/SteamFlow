@@ -1,6 +1,7 @@
 use futures::{stream::FuturesOrdered, StreamExt};
 use itertools::Itertools;
 use sha1::Digest;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing;
 use std::{fmt::Write, sync::Arc};
 use tokio::{
@@ -115,6 +116,7 @@ impl ManifestFile {
         depot_key: [u8; 32],
         target_path: &std::path::Path,
         verify_mode: bool,
+        abort_signal: Option<Arc<AtomicBool>>,
         max_tasks: Option<usize>,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
@@ -145,15 +147,30 @@ impl ManifestFile {
             .map(|chunk_data| {
                 let semaphore_owned = semaphore.clone();
                 let verify_mode = verify_mode;
+                let abort_signal = abort_signal.clone();
                 let target_path = target_path.to_path_buf();
-                let already_complete = file_exists_before && current_len_before == self.size;
+                let file_exists_before = file_exists_before;
+                let current_len_before = current_len_before;
+                let on_progress = on_progress.clone();
                 async move {
+                    // Cancellation check
+                    if let Some(signal) = &abort_signal {
+                        if signal.load(Ordering::Relaxed) {
+                            return Ok((chunk_data.offset, None));
+                        }
+                    }
+
                     let permit = semaphore_owned.acquire_owned().await?;
 
-                    // Task 1: Fast Check
-                    if !verify_mode && already_complete {
-                        drop(permit);
-                        return Ok((chunk_data.offset, None));
+                    // Task 1: Partial Resume / Smart Skip
+                    if !verify_mode && file_exists_before {
+                        if current_len_before >= (chunk_data.offset + chunk_data.original_size as u64) {
+                            if let Some(ref cb) = on_progress {
+                                cb(chunk_data.original_size as u64);
+                            }
+                            drop(permit);
+                            return Ok((chunk_data.offset, None));
+                        }
                     }
 
                     let metadata = tokio::fs::metadata(&target_path).await;
@@ -178,6 +195,9 @@ impl ManifestFile {
 
                                 if hash == chunk_data.sha {
                                     tracing::info!("Verified chunk {}", chunk_data.id());
+                                    if let Some(ref cb) = on_progress {
+                                        cb(chunk_data.original_size as u64);
+                                    }
                                     drop(permit);
                                     return Ok((chunk_data.offset, None));
                                 } else {
@@ -198,6 +218,11 @@ impl ManifestFile {
             .collect::<FuturesOrdered<_>>();
 
         while let Some(result) = tasks.next().await {
+            if let Some(signal) = &abort_signal {
+                if signal.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             let (offset, data) = result?;
             if let Some(data) = data {
                 let len = data.len() as u64;
@@ -209,16 +234,6 @@ impl ManifestFile {
                     .map_err(|e| Error::Unexpected(e.to_string()))?;
                 if let Some(ref cb) = on_progress {
                     cb(len);
-                }
-            } else {
-                // Skipped chunk
-                if let Some(ref cb) = on_progress {
-                    let chunk = self
-                        .chunks
-                        .iter()
-                        .find(|c| c.offset == offset)
-                        .ok_or(Error::Unexpected("chunk not found".to_string()))?;
-                    cb(chunk.original_size as u64);
                 }
             }
         }

@@ -2,6 +2,7 @@ use depot::AppDepots;
 use inner::InnerClient;
 use manifest::DepotManifest;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use steam_vent::{
     proto::{
         steammessages_clientserver_2::{
@@ -128,6 +129,7 @@ impl CDNClient {
         target_dir: impl AsRef<std::path::Path>,
         manifest_request_code: Option<u64>,
         verify_mode: bool,
+        abort_signal: Option<Arc<AtomicBool>>,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
         on_manifest: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
@@ -151,14 +153,26 @@ impl CDNClient {
         }
 
         for file in manifest.files() {
+            if let Some(signal) = &abort_signal {
+                if signal.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             let full_path = target_dir.as_ref().join(file.full_path());
             if let Some(parent) = full_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| Error::Unexpected(e.to_string()))?;
             }
 
             if file.size() > 0 {
-                file.download(key_arr, &full_path, verify_mode, None, on_progress.clone())
-                    .await?;
+                file.download(
+                    key_arr,
+                    &full_path,
+                    verify_mode,
+                    abort_signal.clone(),
+                    None,
+                    on_progress.clone(),
+                )
+                .await?;
             }
         }
         Ok(())

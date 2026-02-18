@@ -377,6 +377,10 @@ impl SteamLauncher {
                     }
                     DownloadProgressState::Completed => {
                         self.status = "Install completed".to_string();
+                        if let Ok(mut state) = self.download_state.write() {
+                            state.is_downloading = false;
+                            state.is_paused = false;
+                        }
                         if let Some(appid) = self.active_download_appid {
                             let tx = self.operation_tx.clone();
                             self.runtime.spawn(async move {
@@ -389,6 +393,10 @@ impl SteamLauncher {
                     }
                     DownloadProgressState::Failed => {
                         self.status = format!("Install failed: {}", progress.current_file);
+                        if let Ok(mut state) = self.download_state.write() {
+                            state.is_downloading = false;
+                            state.is_paused = false;
+                        }
                         should_clear_receiver = true;
                     }
                 }
@@ -1122,8 +1130,9 @@ impl SteamLauncher {
                     let app_id = game.app_id;
                     let client = self.client.clone();
                     let tx = self.operation_tx.clone();
+                    let download_state = self.download_state.clone();
                     self.runtime.spawn(async move {
-                        match client.verify_game(app_id).await {
+                        match client.verify_game(app_id, download_state).await {
                             Ok(rx) => {
                                 let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
                             }
@@ -1956,8 +1965,9 @@ impl eframe::App for SteamLauncher {
                                         let app_id = game.app_id;
                                         let client = self.client.clone();
                                         let tx = self.operation_tx.clone();
+                                        let download_state = self.download_state.clone();
                                         self.runtime.spawn(async move {
-                                            match client.update_game(app_id).await {
+                                            match client.update_game(app_id, download_state).await {
                                                 Ok(rx) => {
                                                     let _ = tx.send(AsyncOp::DownloadStarted(
                                                         app_id, rx,
@@ -2008,24 +2018,70 @@ impl eframe::App for SteamLauncher {
 
                 ui.add_space(10.0);
 
-                if let Some(progress) = &self.live_download_progress {
+                if let Some(progress) = self.live_download_progress.clone() {
                     let denom = if progress.total_bytes == 0 {
                         1.0
                     } else {
                         progress.total_bytes as f32
                     };
                     let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .show_percentage()
-                            .text(format!(
-                                "Live operation: {:?} - {} ({} / {} bytes)",
-                                progress.state,
-                                progress.current_file,
-                                progress.bytes_downloaded,
-                                progress.total_bytes
-                            )),
-                    );
+
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .show_percentage()
+                                .text(format!(
+                                    "Live operation: {:?} - {} ({} / {} bytes)",
+                                    progress.state,
+                                    progress.current_file,
+                                    progress.bytes_downloaded,
+                                    progress.total_bytes
+                                )),
+                        );
+
+                        let mut download_state = self.download_state.write().unwrap();
+                        if download_state.is_downloading || download_state.is_paused {
+                            if download_state.is_paused {
+                                if ui.button("▶ Resume").clicked() {
+                                    download_state.is_paused = false;
+                                    download_state.abort_signal.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                                    let app_id = download_state.app_id;
+                                    drop(download_state);
+
+                                    // Resume logic: Re-trigger the appropriate operation
+                                    if let Some(game) = self.library.iter().find(|g| g.app_id == app_id).cloned() {
+                                        if progress.state == DownloadProgressState::Verifying {
+                                            let client = self.client.clone();
+                                            let tx = self.operation_tx.clone();
+                                            let ds = self.download_state.clone();
+                                            self.runtime.spawn(async move {
+                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.verify_game(app_id, ds).await.unwrap()));
+                                            });
+                                        } else if game.is_installed {
+                                            let client = self.client.clone();
+                                            let tx = self.operation_tx.clone();
+                                            let ds = self.download_state.clone();
+                                            self.runtime.spawn(async move {
+                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.update_game(app_id, ds).await.unwrap()));
+                                            });
+                                        } else {
+                                            let platform = self.launcher_config.game_configs.get(&app_id)
+                                                .and_then(|c| c.platform_preference.as_ref())
+                                                .map(|p| if p == "linux" { DepotPlatform::Linux } else { DepotPlatform::Windows })
+                                                .unwrap_or(if cfg!(target_os = "linux") { DepotPlatform::Linux } else { DepotPlatform::Windows });
+                                            self.start_install(app_id, platform, None, None);
+                                        }
+                                    }
+                                }
+                            } else {
+                                if ui.button("⏸ Pause").clicked() {
+                                    download_state.is_paused = true;
+                                    download_state.abort_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    });
                 }
 
                 ui.separator();

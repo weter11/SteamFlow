@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionState {
@@ -124,14 +126,31 @@ pub struct DownloadProgress {
     pub current_file: String,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DownloadState {
     pub is_downloading: bool,
+    pub is_paused: bool,
     pub app_id: u32,
     pub app_name: String,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
     pub status_text: String,
+    pub abort_signal: Arc<AtomicBool>,
+}
+
+impl Default for DownloadState {
+    fn default() -> Self {
+        Self {
+            is_downloading: false,
+            is_paused: false,
+            app_id: 0,
+            app_name: String::new(),
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            status_text: String::new(),
+            abort_signal: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
