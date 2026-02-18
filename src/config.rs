@@ -100,11 +100,36 @@ pub fn secrets_dir() -> Result<PathBuf> {
 }
 
 pub fn absolute_path(path: PathBuf) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path)
+    let absolute = if path.is_absolute() {
+        path
     } else {
         let cwd = std::env::current_dir().with_context(|| "failed to get current directory")?;
-        Ok(cwd.join(path))
+        cwd.join(path)
+    };
+
+    // Normalize path by stripping '.' components
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {} // Skip '.'
+            _ => normalized.push(component),
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_absolute_path_normalization() {
+        let cwd = std::env::current_dir().unwrap();
+        let path = PathBuf::from("./foo/bar");
+        let abs = absolute_path(path).unwrap();
+        assert!(abs.is_absolute());
+        assert_eq!(abs, cwd.join("foo/bar"));
+        assert!(!abs.to_string_lossy().contains("/./"));
     }
 }
 
