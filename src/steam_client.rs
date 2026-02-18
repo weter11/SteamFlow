@@ -1,10 +1,12 @@
 use crate::cloud_sync::{default_cloud_root, CloudClient};
 use crate::cm_list::get_cm_endpoints;
 use crate::config::{
-    delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
-    save_library_cache, save_session,
+    absolute_path, config_dir, delete_session, library_cache_path, load_launcher_config,
+    load_library_cache, load_session, save_library_cache, save_session,
 };
 use crate::depot_browser::{self, DepotInfo as BrowserDepotInfo, ManifestFileEntry};
+use crate::launch::install_ghost_steam_in_prefix;
+use crate::utils::{get_proton_runner, harvest_credentials, inject_credentials};
 use crate::models::{
     AppInfoRoot, DepotPlatform, DownloadProgress, DownloadProgressState, LibraryGame,
     ManifestSelection, OwnedGame, SessionState, SteamGuardReq, UserProfile,
@@ -15,7 +17,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -45,6 +46,7 @@ use steam_vent::proto::steammessages_player_steamclient::{
 };
 use steam_vent::{ConnectionError, ConnectionTrait, ServerList};
 use tokio::io::{duplex, sink, AsyncWriteExt};
+use tokio::process::Command;
 use tokio::sync::mpsc::Receiver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1592,10 +1594,8 @@ impl SteamClient {
         }
 
         let mut child =
-            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config)?;
-        child
-            .wait()
-            .context("failed waiting for game process exit")?;
+            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config).await?;
+        child.wait().await.context("failed waiting for game process exit")?;
 
         if let (Some(client), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
             client.sync_up(app.app_id, root).await?;
@@ -1613,7 +1613,42 @@ impl SteamClient {
         user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<()> {
         let launcher_config = load_launcher_config().await.unwrap_or_default();
-        self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config)?;
+        self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config).await?;
+        Ok(())
+    }
+
+    pub async fn launch_ghost_steam_only(
+        &self,
+        app_id: u32,
+        proton_path: Option<&str>,
+    ) -> Result<()> {
+        let launcher_config = load_launcher_config().await.unwrap_or_default();
+        let proton_name = proton_path.unwrap_or(launcher_config.proton_version.as_str());
+        let library_root = absolute_path(PathBuf::from(&launcher_config.steam_library_path))?;
+        let resolved_proton = self.resolve_proton_path(proton_name, &library_root);
+        let proton_runner = get_proton_runner().unwrap_or_else(|| resolved_proton.clone());
+
+        let compat_data_path = absolute_path(config_dir()?
+            .join("steamapps/compatdata")
+            .join(app_id.to_string()))?;
+
+        let _ = inject_credentials(&compat_data_path).await;
+        let steam_exe = install_ghost_steam_in_prefix(app_id, proton_runner.clone()).await?;
+
+        tracing::info!(appid = app_id, "Launching Ghost Steam for Management...");
+        let mut steam_cmd = Command::new(&proton_runner);
+        steam_cmd
+            .arg("run")
+            .arg(&steam_exe)
+            .env("WINEPREFIX", compat_data_path.join("pfx"))
+            .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
+            .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?)
+            .env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+
+        let mut child = steam_cmd.spawn().context("failed to start Ghost Steam")?;
+        child.wait().await?;
+
+        let _ = harvest_credentials(&compat_data_path).await;
         Ok(())
     }
 
@@ -2104,19 +2139,19 @@ impl SteamClient {
         PathBuf::from(proton_name)
     }
 
-    pub(crate) fn spawn_game_process(
+    pub(crate) async fn spawn_game_process(
         &self,
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
         launcher_config: &crate::config::LauncherConfig,
         user_config: Option<&crate::models::UserAppConfig>,
-    ) -> Result<std::process::Child> {
-        let install_dir = PathBuf::from(
+    ) -> Result<tokio::process::Child> {
+        let install_dir = absolute_path(PathBuf::from(
             app.install_path
                 .clone()
                 .ok_or_else(|| anyhow!("game {} is not installed", app.app_id))?,
-        );
+        ))?;
 
         let executable = install_dir.join(&launch_info.executable);
         let mut args = split_args(&launch_info.arguments);
@@ -2165,7 +2200,7 @@ impl SteamClient {
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
-                let proton = if let Some(forced) = launcher_config
+                let proton_name = if let Some(forced) = launcher_config
                     .game_configs
                     .get(&app.app_id)
                     .and_then(|c| c.forced_proton_version.as_ref())
@@ -2177,23 +2212,79 @@ impl SteamClient {
                         .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
                 };
 
-                let library_root = PathBuf::from(&launcher_config.steam_library_path);
-                let resolved_proton = self.resolve_proton_path(proton, &library_root);
+                let library_root = absolute_path(PathBuf::from(&launcher_config.steam_library_path))?;
+                let resolved_proton = self.resolve_proton_path(proton_name, &library_root);
 
-                let compat_data_path = library_root
-                    .join("steamapps")
-                    .join("compatdata")
-                    .join(app.app_id.to_string());
+                let compat_data_path = absolute_path(config_dir()?
+                    .join("steamapps/compatdata")
+                    .join(app.app_id.to_string()))?;
 
-                std::fs::create_dir_all(&compat_data_path)
-                    .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
+                // --- Ghost Steam Flow ---
+                let use_steam_runtime = user_config.map(|c| c.use_steam_runtime).unwrap_or(true);
+                if use_steam_runtime {
+                    let proton_runner = get_proton_runner().unwrap_or_else(|| resolved_proton.clone());
 
+                    let steam_exe_path = compat_data_path
+                        .join("pfx/drive_c/Program Files (x86)/Steam/steam.exe");
+
+                    let first_run = !steam_exe_path.exists();
+
+                    let steam_exe = install_ghost_steam_in_prefix(app.app_id, proton_runner.clone()).await?;
+
+                    // Step 2: inject_credentials(prefix)
+                    let has_credentials = inject_credentials(&compat_data_path).await.unwrap_or(false);
+
+                    if first_run && !has_credentials {
+                        tracing::info!(appid = app.app_id, "Ghost Steam First Run: Interactive Login required.");
+                        let mut steam_cmd = Command::new(&proton_runner);
+                        steam_cmd
+                            .arg("run")
+                            .arg(&steam_exe)
+                            .env("WINEPREFIX", compat_data_path.join("pfx"))
+                            .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
+                        .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?)
+                        .env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+
+                        let mut steam_child = steam_cmd.spawn().context("failed to start Ghost Steam for interactive login")?;
+                        let _ = steam_child.wait().await;
+                        tracing::info!(appid = app.app_id, "Interactive Ghost Steam exited. Proceeding with game launch.");
+
+                        // Harvest after first manual login
+                        let _ = harvest_credentials(&compat_data_path).await;
+                    }
+
+                    // Step 3: Launch Steam (-silent if credentials existed, Normal UI if not)
+                    tracing::info!(appid = app.app_id, "Starting Ghost Steam for Pipe...");
+                    let mut steam_cmd = Command::new(&proton_runner);
+                    steam_cmd.arg("run").arg(&steam_exe);
+
+                    if has_credentials || !first_run {
+                        steam_cmd.arg("-silent").arg("-no-browser").arg("-noverifyfiles");
+                    }
+
+                    steam_cmd
+                        .env("WINEPREFIX", compat_data_path.join("pfx"))
+                        .env("STEAM_COMPAT_DATA_PATH", &compat_data_path)
+                    .env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?)
+                    .env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+
+                    let _steam_child = steam_cmd.spawn().context("failed to start Ghost Steam")?;
+
+                    // Wait for Steam Pipe to initialize
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                } else {
+                    tracing::info!(appid = app.app_id, "Ghost Steam is disabled in user config. Launching raw executable.");
+                }
+
+                // 2. Launch actual game binary
                 let mut cmd = Command::new(&resolved_proton);
                 cmd.arg("run").arg(&executable).args(&args);
                 cmd.current_dir(&install_dir);
                 cmd.env("SteamAppId", app.app_id.to_string());
+                cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", absolute_path(config_dir()?)?);
+                cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
@@ -2201,7 +2292,7 @@ impl SteamClient {
                     }
                 }
 
-                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, cmd.get_args());
+                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, cmd.as_std().get_args());
                 cmd.spawn().context("failed to spawn proton game")
             }
         }

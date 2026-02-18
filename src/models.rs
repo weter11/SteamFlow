@@ -10,6 +10,12 @@ pub struct UserAppConfig {
     pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
     pub hidden: bool,                // Future use
     pub favorite: bool,              // Future use
+    #[serde(default = "default_true")]
+    pub use_steam_runtime: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub type UserConfigStore = HashMap<u32, UserAppConfig>;

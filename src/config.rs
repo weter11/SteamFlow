@@ -83,6 +83,8 @@ pub async fn ensure_config_dirs() -> Result<()> {
     fs::create_dir_all(&config).await?;
     let images = opensteam_image_cache_dir()?;
     fs::create_dir_all(&images).await?;
+    let secrets = secrets_dir()?;
+    fs::create_dir_all(&secrets).await?;
     Ok(())
 }
 
@@ -92,6 +94,44 @@ pub fn opensteam_image_cache_dir() -> Result<PathBuf> {
 
 pub fn data_dir() -> Result<PathBuf> {
     config_dir()  // or use XDG_DATA_HOME if you want proper separation
+}
+
+pub fn secrets_dir() -> Result<PathBuf> {
+    Ok(PathBuf::from("./config/SteamFlow/secrets"))
+}
+
+pub fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        let cwd = std::env::current_dir().with_context(|| "failed to get current directory")?;
+        cwd.join(path)
+    };
+
+    // Normalize path by stripping '.' components
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {} // Skip '.'
+            _ => normalized.push(component),
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_absolute_path_normalization() {
+        let cwd = std::env::current_dir().unwrap();
+        let path = PathBuf::from("./foo/bar");
+        let abs = absolute_path(path).unwrap();
+        assert!(abs.is_absolute());
+        assert_eq!(abs, cwd.join("foo/bar"));
+        assert!(!abs.to_string_lossy().contains("/./"));
+    }
 }
 
 pub async fn load_session() -> Result<SessionState> {
