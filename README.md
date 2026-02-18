@@ -1,4 +1,4 @@
-<img src="https://lh3.googleusercontent.com/gg/AMW1TPr5-3If5nhYyvCYFdwZP-PSBKtW8M1hHDROiSgf-L6tvWyoIR6RieuKDfnkpL88OabVnv8GixMr8Er5xBAbzQ5uBKeu3u5fmVRt0X-vQ99dCGNSxSqXsFoLT_4fKyKOQ0fvdkv_7_02fUMOAv20rQN50qCaKdh0-tKDgfEWLDkXbkIR3Z8K9SpVKyBU8DqHPiMhnVLZJWXbADIdT1CZeZfvMc6aSs03gzRdEaN57fG9qZbtYJ_WWziTfVI7u02xsgQED05XH2M_iFrSgn6HGUAgePxoYp2S7Jiy5-F5-iD1ukHQbfPjusMEXlMwQZmXKpTtrv3qeNW-T75nvYKjwIGp=s1024-rj" alt="SteamFlow logo" title="SteamFlow" align="left" height="65" />
+<img src="Assets/steamflow-logo.png" alt="SteamFlow logo" title="SteamFlow" align="left" height="65" />
 
 # SteamFlow
 A custom, lightweight Steam launcher and client written in Rust.

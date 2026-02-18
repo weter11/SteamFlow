@@ -2,7 +2,6 @@ pub mod cloud_sync;
 pub mod cm_list;
 pub mod config;
 pub mod depot_browser;
-pub mod download_pipeline;
 pub mod install;
 pub mod library;
 pub mod models;

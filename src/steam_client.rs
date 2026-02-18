@@ -5,12 +5,9 @@ use crate::config::{
     save_library_cache, save_session,
 };
 use crate::depot_browser::{self, DepotInfo as BrowserDepotInfo, ManifestFileEntry};
-use crate::download_pipeline::{
-    self, parse_appinfo, should_keep_depot, AppInfoRoot, DepotPlatform, ManifestSelection,
-};
 use crate::models::{
-    DownloadProgress, DownloadProgressState, LibraryGame, OwnedGame, SessionState, SteamGuardReq,
-    UserProfile,
+    AppInfoRoot, DepotPlatform, DownloadProgress, DownloadProgressState, LibraryGame,
+    ManifestSelection, OwnedGame, SessionState, SteamGuardReq, UserProfile,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -777,6 +774,7 @@ impl SteamClient {
 
             // 3. Download Loop
             let mut success = true;
+            let mut successful_depots = Vec::new();
             for selection in selections {
                 tracing::info!(
                     "Starting download for Depot {} (GID: {})...",
@@ -858,7 +856,10 @@ impl SteamClient {
                 });
 
                 let state_for_manifest = shared_state_clone.clone();
+                let depot_size = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let size_clone = depot_size.clone();
                 let on_manifest = Arc::new(move |total_bytes: u64| {
+                    size_clone.store(total_bytes, std::sync::atomic::Ordering::SeqCst);
                     if let Ok(mut state) = state_for_manifest.write() {
                         state.total_bytes += total_bytes;
                     }
@@ -872,8 +873,9 @@ impl SteamClient {
                             &key,
                             &install_dir,
                             manifest_code,
-                        Some(on_progress),
-                        Some(on_manifest),
+                            false,
+                            Some(on_progress),
+                            Some(on_manifest.clone()),
                         )
                         .await
                     {
@@ -884,6 +886,11 @@ impl SteamClient {
                                 host
                             );
                             depot_success = true;
+                            successful_depots.push((
+                                selection.depot_id,
+                                selection.manifest_id,
+                                depot_size.load(std::sync::atomic::Ordering::SeqCst),
+                            ));
                             break;
                         }
                         Err(e) => {
@@ -915,9 +922,12 @@ impl SteamClient {
                     state.status_text = "Download complete".to_string();
                 }
 
-                if let Err(err) =
-                    SteamClient::write_basic_appmanifest(&manifest_path, appid, &game_name)
-                {
+                if let Err(err) = SteamClient::write_appmanifest(
+                    &manifest_path,
+                    appid,
+                    &game_name,
+                    successful_depots,
+                ) {
                     tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
                 }
                 let _ = tx
@@ -1421,7 +1431,7 @@ impl SteamClient {
 
         let name = common.and_then(|c| c.name.clone());
 
-        let dlcs = common
+        let dlcs: Vec<u32> = common
             .map(|c| {
                 c.dlc
                     .keys()
@@ -1437,7 +1447,8 @@ impl SteamClient {
             .unwrap_or(&parsed.depots);
         let mut depots = Vec::new();
         for (id_str, node) in depots_map {
-            if id_str.chars().all(|c| c.is_ascii_digit()) {
+            let is_digit = id_str.chars().all(|c| c.is_ascii_digit());
+            if is_digit {
                 let id = id_str.parse::<u32>().unwrap_or(0);
                 let name = node
                     ._other
@@ -1609,6 +1620,7 @@ impl SteamClient {
             .await
             .unwrap_or_else(|_| (HashMap::new(), "public".to_string()));
 
+        let client_clone = self.clone();
         tokio::task::spawn(async move {
             let _ = tx
                 .send(DownloadProgress {
@@ -1653,68 +1665,161 @@ impl SteamClient {
                 return;
             };
 
-            let (progress_tx, mut progress_rx) =
-                tokio::sync::mpsc::unbounded_channel::<crate::install::ProgressEvent>();
-            let tx_clone = tx.clone();
-            tokio::task::spawn(async move {
-                while let Some(event) = progress_rx.recv().await {
-                    let state = if smart_verify_existing {
-                        DownloadProgressState::Verifying
-                    } else {
-                        DownloadProgressState::Downloading
-                    };
-                    let _ = tx_clone
-                        .send(DownloadProgress {
-                            state,
-                            bytes_downloaded: event.bytes_downloaded,
-                            total_bytes: event.total_bytes,
-                            current_file: event.file_name,
-                        })
-                        .await;
-                }
-            });
-
-            let result = download_pipeline::execute_multi_depot_download_async(
-                &connection,
-                appid,
-                selections,
-                install_root,
-                smart_verify_existing,
-                Some(progress_tx),
-            )
-            .await;
-
-            match result {
-                Ok(()) => {
-                    if !smart_verify_existing {
-                        let _ = SteamClient::write_manifest_ids_at_path(
-                            &manifest_path,
-                            &remote_manifests,
-                        );
-                    }
-                    let _ = tx
-                        .send(DownloadProgress {
-                            state: DownloadProgressState::Completed,
-                            bytes_downloaded: 1,
-                            total_bytes: 1,
-                            current_file: if smart_verify_existing {
-                                "verify completed".to_string()
-                            } else {
-                                "update completed".to_string()
-                            },
-                        })
-                        .await;
-                }
-                Err(err) => {
+            let hosts = match client_clone.get_content_servers(connection.cell_id()).await {
+                Ok(h) => h,
+                Err(e) => {
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
                             bytes_downloaded: 0,
                             total_bytes: 0,
-                            current_file: err.to_string(),
+                            current_file: format!("Failed to fetch content servers: {}", e),
                         })
                         .await;
+                    return;
                 }
+            };
+
+            let mut success = true;
+            let mut successful_depots = Vec::new();
+
+            for selection in selections {
+                let key: Vec<u8> = match client_clone.get_depot_key(appid, selection.depot_id).await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Skipping Depot {} (No Key/Not Owned): {}",
+                            selection.depot_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+
+                let manifest_code: Option<u64> = client_clone
+                    .get_manifest_request_code(appid, selection.depot_id, selection.manifest_id)
+                    .await
+                    .ok();
+
+                let mut depot_success = false;
+                for host in &hosts {
+                    let token: Option<String> = client_clone
+                        .get_cdn_auth_token(appid, selection.depot_id, host)
+                        .await
+                        .ok();
+
+                    let (host_name, port) = if let Some(pos) = host.find(':') {
+                        (
+                            &host[..pos],
+                            host[pos + 1..].parse::<u16>().unwrap_or(80),
+                        )
+                    } else {
+                        (host.as_str(), 80)
+                    };
+
+                    let cdn_server = steam_cdn::web_api::content_service::CDNServer {
+                        r#type: "CDN".to_string(),
+                        https: port == 443,
+                        host: host_name.to_string(),
+                        vhost: host_name.to_string(),
+                        port,
+                        cell_id: connection.cell_id(),
+                        load: 0,
+                        weighted_load: 0,
+                        auth_token: token,
+                    };
+
+                    let cdn_client = steam_cdn::CDNClient::with_server(
+                        Arc::new(connection.clone()),
+                        cdn_server,
+                    );
+
+                    let tx_clone = tx.clone();
+                    let selection_depot_id = selection.depot_id;
+                    let on_progress = Arc::new(move |bytes: u64| {
+                        let _ = tx_clone.try_send(DownloadProgress {
+                            state: if smart_verify_existing {
+                                DownloadProgressState::Verifying
+                            } else {
+                                DownloadProgressState::Downloading
+                            },
+                            bytes_downloaded: bytes,
+                            total_bytes: 0, // We don't have total file size here easily
+                            current_file: format!("Depot {}", selection_depot_id),
+                        });
+                    });
+
+                    let depot_size = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let size_clone = depot_size.clone();
+                    let on_manifest = Arc::new(move |total_bytes: u64| {
+                        size_clone.store(total_bytes, std::sync::atomic::Ordering::SeqCst);
+                    });
+
+                    match cdn_client
+                        .download_depot(
+                            appid,
+                            selection.depot_id,
+                            selection.manifest_id,
+                            &key,
+                            &install_root,
+                            manifest_code,
+                            smart_verify_existing,
+                            Some(on_progress),
+                            Some(on_manifest),
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            depot_success = true;
+                            successful_depots.push((
+                                selection.depot_id,
+                                selection.manifest_id,
+                                depot_size.load(std::sync::atomic::Ordering::SeqCst),
+                            ));
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!("CDN Error from {}: {}", host, e);
+                        }
+                    }
+                }
+
+                if !depot_success {
+                    let _ = tx
+                        .send(DownloadProgress {
+                            state: DownloadProgressState::Failed,
+                            bytes_downloaded: 0,
+                            total_bytes: 0,
+                            current_file: format!(
+                                "Failed to download/verify depot {} from all servers",
+                                selection.depot_id
+                            ),
+                        })
+                        .await;
+                    success = false;
+                    break;
+                }
+            }
+
+            if success {
+                let game_name: String = client_clone.resolve_install_game_name(appid).await;
+                if let Err(err) =
+                    SteamClient::write_appmanifest(&manifest_path, appid, &game_name, successful_depots)
+                {
+                    tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
+                }
+                let _ = tx
+                    .send(DownloadProgress {
+                        state: DownloadProgressState::Completed,
+                        bytes_downloaded: 1,
+                        total_bytes: 1,
+                        current_file: if smart_verify_existing {
+                            "verify completed".to_string()
+                        } else {
+                            "update completed".to_string()
+                        },
+                    })
+                    .await;
             }
         });
 
@@ -1819,17 +1924,6 @@ impl SteamClient {
         Ok(manifests)
     }
 
-    fn write_manifest_ids_at_path(path: &Path, new_manifest_ids: &HashMap<u64, u64>) -> Result<()> {
-        if !path.exists() || new_manifest_ids.is_empty() {
-            return Ok(());
-        }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("failed reading {}", path.display()))?;
-        let rewritten = rewrite_installed_manifest_ids(&raw, new_manifest_ids);
-        std::fs::write(path, rewritten)
-            .with_context(|| format!("failed writing {}", path.display()))?;
-        Ok(())
-    }
 
     pub async fn fetch_app_metadata(&self, appid: u32) -> Option<AppMetadata> {
         let url = format!("https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic");
@@ -1869,7 +1963,12 @@ impl SteamClient {
         format!("App {appid}")
     }
 
-    fn write_basic_appmanifest(path: &Path, appid: u32, game_name: &str) -> Result<()> {
+    pub fn write_appmanifest(
+        path: &Path,
+        appid: u32,
+        game_name: &str,
+        installed_depots: Vec<(u32, u64, u64)>,
+    ) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed creating {}", parent.display()))?;
@@ -1877,9 +1976,22 @@ impl SteamClient {
 
         let installdir = sanitize_install_dir(game_name);
         let game_name = game_name.replace('"', "");
-        let content = format!(
-            "\"AppState\"\n{{\n\t\"appid\"\t\"{appid}\"\n\t\"name\"\t\"{game_name}\"\n\t\"StateFlags\"\t\"4\"\n\t\"installdir\"\t\"{installdir}\"\n}}\n"
+
+        let mut content = format!(
+            "\"AppState\"\n{{\n\t\"appid\"\t\"{appid}\"\n\t\"name\"\t\"{game_name}\"\n\t\"StateFlags\"\t\"4\"\n\t\"installdir\"\t\"{installdir}\"\n"
         );
+
+        if !installed_depots.is_empty() {
+            content.push_str("\t\"InstalledDepots\"\n\t{\n");
+            for (depot_id, manifest_id, size) in installed_depots {
+                content.push_str(&format!(
+                    "\t\t\"{depot_id}\"\n\t\t{{\n\t\t\t\"manifest\"\t\t\"{manifest_id}\"\n\t\t\t\"size\"\t\t\"{size}\"\n\t\t}}\n"
+                ));
+            }
+            content.push_str("\t}\n");
+        }
+
+        content.push_str("}\n");
 
         std::fs::write(path, content)
             .with_context(|| format!("failed writing {}", path.display()))?;
@@ -2004,6 +2116,62 @@ fn sanitize_install_dir(name: &str) -> String {
         })
         .collect();
     sanitized.trim().to_string()
+}
+
+/// Steam wraps the entire VDF in a top-level key that is the numeric app ID.
+/// This wrapper accepts that outer key transparently.
+#[derive(Debug, serde::Deserialize)]
+pub struct AppInfoEnvelope(pub HashMap<String, crate::models::AppInfoRoot>);
+
+impl AppInfoEnvelope {
+    /// Extract the inner AppInfoRoot regardless of the outer key name.
+    pub fn into_inner(self) -> Option<crate::models::AppInfoRoot> {
+        self.0.into_values().next()
+    }
+}
+
+pub fn parse_appinfo(vdf: &str) -> Result<crate::models::AppInfoRoot> {
+    // Try direct parse first (in case steam-vent already strips the wrapper)
+    if let Ok(parsed) = keyvalues_serde::from_str::<crate::models::AppInfoRoot>(vdf) {
+        return Ok(parsed);
+    }
+    // Fall back to envelope parse
+    let envelope: AppInfoEnvelope =
+        keyvalues_serde::from_str(vdf).context("failed parsing appinfo VDF (envelope)")?;
+    envelope
+        .into_inner()
+        .context("appinfo envelope was empty")
+}
+
+pub fn should_keep_depot(oslist: Option<&str>, target: DepotPlatform) -> bool {
+    match target {
+        DepotPlatform::Windows => match oslist {
+            Some(os) => {
+                let os = os.to_lowercase();
+                if os.contains("windows") {
+                    return true;
+                }
+                if os.contains("linux") || os.contains("macos") {
+                    return false;
+                }
+                true
+            }
+            None => true,
+        },
+        DepotPlatform::Linux => match oslist {
+            Some(os) => {
+                let os = os.to_lowercase();
+                if os.contains("linux") {
+                    return true;
+                }
+                if os.contains("windows") || os.contains("macos") {
+                    return false;
+                }
+                true
+            }
+            None => true,
+        },
+    }
 }
 
 fn map_confirmation(method: &ConfirmationMethod) -> ConfirmationPrompt {
@@ -2423,60 +2591,6 @@ fn parse_installdir_from_acf(raw: &str) -> Option<String> {
     }
     None
 }
-
-fn rewrite_installed_manifest_ids(raw: &str, updated: &HashMap<u64, u64>) -> String {
-    let mut out = Vec::new();
-    let mut in_installed_depots = false;
-    let mut current_depot: Option<u64> = None;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.contains("\"InstalledDepots\"") {
-            in_installed_depots = true;
-            out.push(line.to_string());
-            continue;
-        }
-
-        if in_installed_depots && trimmed == "}" {
-            if current_depot.is_some() {
-                current_depot = None;
-                out.push(line.to_string());
-                continue;
-            }
-            in_installed_depots = false;
-            out.push(line.to_string());
-            continue;
-        }
-
-        if in_installed_depots {
-            let quoted = extract_quoted_values(trimmed);
-            if quoted.len() == 1 {
-                current_depot = quoted[0].parse::<u64>().ok();
-                out.push(line.to_string());
-                continue;
-            }
-
-            if quoted.len() >= 2 && quoted[0] == "manifest" {
-                if let Some(depot_id) = current_depot {
-                    if let Some(new_manifest) = updated.get(&depot_id) {
-                        let indent = line
-                            .chars()
-                            .take_while(|ch| ch.is_whitespace())
-                            .collect::<String>();
-                        out.push(format!(r#"{indent}"manifest"	"{new_manifest}""#));
-                        continue;
-                    }
-                }
-            }
-        }
-
-        out.push(line.to_string());
-    }
-
-    format!("{}\n", out.join("\n"))
-}
-
 fn parse_installed_depots_from_acf(raw: &str) -> HashMap<u64, u64> {
     let mut manifests = HashMap::new();
     let mut in_installed_depots = false;

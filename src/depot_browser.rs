@@ -5,16 +5,14 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use steam_vent::connection::Connection;
-use steam_vent::proto::content_manifest::ContentManifestPayload;
 use steam_vent::proto::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
 };
 use steam_vent::ConnectionTrait;
 
-use crate::download_pipeline::{
-    phase2_get_security_info, phase3_download_manifest, LocalDownloadState, ManifestSelection,
-};
+use steam_cdn::CDNClient;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct DepotInfo {
@@ -101,24 +99,21 @@ pub async fn fetch_manifest_files(
     manifest_ref: &str,
 ) -> Result<Vec<ManifestFileEntry>> {
     let manifest_id = resolve_manifest_id(connection, appid, depot_id, manifest_ref).await?;
-    let security = phase2_get_security_info(connection, appid, depot_id, None).await?;
-    let selection = ManifestSelection {
-        app_id: appid,
-        depot_id,
-        manifest_id,
-        appinfo_vdf: String::new(),
-    };
+    let cdn_client = CDNClient::new(Arc::new(connection.clone()));
+    let manifest = cdn_client
+        .get_manifest(appid, depot_id, manifest_id, None, None)
+        .await
+        .map_err(|e| anyhow!("failed to get manifest: {e}"))?;
 
-    let manifest = phase3_download_manifest(&selection, &security).await?;
     let mut files = Vec::new();
-    for file in &manifest.mappings {
-        let filename = file.filename().to_string();
+    for file in manifest.files() {
+        let filename = file.full_path();
         if filename.is_empty() {
             continue;
         }
 
         let mut hasher = sha1::Sha1::new();
-        for chunk in &file.chunks {
+        for chunk in file.chunks() {
             hasher.update(chunk.sha());
         }
         let sha_hash = hex::encode(hasher.finalize());
@@ -127,7 +122,7 @@ pub async fn fetch_manifest_files(
             filename,
             size: file.size(),
             sha_hash,
-            chunks: file.chunks.len(),
+            chunks: file.chunks().len(),
         });
     }
 
@@ -150,33 +145,36 @@ pub fn download_single_file(
         depot_id,
         manifest_ref,
     ))?;
-    let security = runtime.block_on(phase2_get_security_info(connection, appid, depot_id, None))?;
-    let selection = ManifestSelection {
-        app_id: appid,
-        depot_id,
-        manifest_id,
-        appinfo_vdf: String::new(),
-    };
-    let manifest = runtime.block_on(phase3_download_manifest(&selection, &security))?;
 
-    let file_entry = manifest
-        .mappings
+    let cdn_client = CDNClient::new(Arc::new(connection.clone()));
+    let manifest = runtime
+        .block_on(cdn_client.get_manifest(appid, depot_id, manifest_id, None, None))
+        .map_err(|e| anyhow!("failed to get manifest: {e}"))?;
+
+    let file = manifest
+        .files()
         .iter()
-        .find(|entry| entry.filename() == file_path)
-        .cloned()
+        .find(|f| f.full_path() == file_path)
         .ok_or_else(|| anyhow!("file not found in manifest: {file_path}"))?;
+
+    let depot_key = runtime
+        .block_on(cdn_client.get_depot_decryption_key(appid, depot_id))
+        .map_err(|e| anyhow!("failed to get depot key: {e}"))?
+        .ok_or_else(|| anyhow!("no decryption key for depot {depot_id}"))?;
 
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("failed creating {}", output_dir.display()))?;
 
-    let state = LocalDownloadState::new(
-        ContentManifestPayload::default(),
-        output_dir.to_path_buf(),
-        security,
-        None,
-        false,
-    );
-    runtime.block_on(state.download_file(file_entry))
+    let full_path = output_dir.join(file.full_path());
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent).context("failed creating directory for file")?;
+    }
+
+    runtime
+        .block_on(file.download(depot_key, &full_path, false, None, None))
+        .map_err(|e| anyhow!("failed to download file: {e}"))?;
+
+    Ok(())
 }
 
 async fn resolve_manifest_id(

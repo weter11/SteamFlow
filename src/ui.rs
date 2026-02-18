@@ -2,10 +2,10 @@ use crate::config::{
     load_launcher_config, opensteam_image_cache_dir, save_launcher_config, LauncherConfig,
 };
 use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
-use crate::download_pipeline::DepotPlatform;
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
-    DownloadProgress, DownloadProgressState, DownloadState, LibraryGame, SteamGuardReq, UserProfile,
+    DepotPlatform, DownloadProgress, DownloadProgressState, DownloadState, LibraryGame,
+    SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
 use anyhow::anyhow;
@@ -294,7 +294,7 @@ impl SteamLauncher {
             let target_path = cache_dir.join(format!("{appid}_library.jpg"));
             if tokio::fs::metadata(&target_path).await.is_err() {
                 let candidates = [
-                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900.jpg"),
+                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900_2x.jpg"),
                     format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"),
                     format!("https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.jpg"),
                 ];

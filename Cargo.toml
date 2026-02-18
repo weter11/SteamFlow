@@ -11,12 +11,12 @@ directories = "5"
 eframe = { version = "0.33", default-features = true }
 egui = "0.33"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-keyvalues-serde = "0.2"
+keyvalues-serde = "0.2" # Used for text VDF deserialization into structs
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-steam-vdf-parser = "0.1.1"
+steam-vdf-parser = "0.1.1" # Needed for raw binary PICS VDF parsing (not supported by keyvalues-serde or steam-vent yet)
 steam-vent = "0.4.2"
 steam-vent-proto = "=0.5.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }

@@ -1,7 +1,11 @@
 use futures::{stream::FuturesOrdered, StreamExt};
 use itertools::Itertools;
+use sha1::Digest;
 use std::{fmt::Write, sync::Arc};
-use tokio::{io::AsyncWriteExt, sync::Semaphore};
+use tokio::{
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::Semaphore,
+};
 
 use crate::{cdn::inner::InnerClient, Error};
 
@@ -105,15 +109,28 @@ impl ManifestFile {
         self.linktarget.clone()
     }
 
-    pub async fn download<S: AsyncWriteExt + Unpin>(
+    pub async fn download(
         &self,
         depot_key: [u8; 32],
-        stream: &mut S,
+        target_path: &std::path::Path,
+        verify: bool,
         max_tasks: Option<usize>,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
         let max_tasks = max_tasks.unwrap_or(4);
         let semaphore = Arc::new(Semaphore::new(max_tasks));
+
+        let mut out = tokio::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(target_path)
+            .await
+            .map_err(|e| Error::Unexpected(e.to_string()))?;
+
+        out.set_len(self.size)
+            .await
+            .map_err(|e| Error::Unexpected(e.to_string()))?;
 
         let mut tasks = self
             .chunks()
@@ -121,26 +138,67 @@ impl ManifestFile {
             .sorted_by(|&a, &b| a.offset.cmp(&b.offset))
             .map(|chunk_data| {
                 let semaphore_owned = semaphore.clone();
+                let verify_chunk = verify;
                 async move {
                     let permit = semaphore_owned.acquire_owned().await?;
+
+                    if verify_chunk {
+                        let mut file = tokio::fs::File::open(target_path)
+                            .await
+                            .map_err(|e| Error::Unexpected(e.to_string()))?;
+                        file.seek(tokio::io::SeekFrom::Start(chunk_data.offset))
+                            .await
+                            .map_err(|e| Error::Unexpected(e.to_string()))?;
+
+                        let mut buffer = vec![0u8; chunk_data.original_size as usize];
+                        if file.read_exact(&mut buffer).await.is_ok() {
+                            let mut hasher = sha1::Sha1::new();
+                            hasher.update(&buffer);
+                            let hash = hasher.finalize().to_vec();
+
+                            if hash == chunk_data.sha {
+                                drop(permit);
+                                return Ok((chunk_data.offset, None));
+                            }
+                        }
+                    }
+
                     let result = self
                         .inner
                         .get_chunk(self.app_id, self.depot_id, depot_key, chunk_data.id())
                         .await;
                     drop(permit);
-                    result
+                    result.map(|data| (chunk_data.offset, Some(data)))
                 }
             })
             .collect::<FuturesOrdered<_>>();
+
         while let Some(result) = tasks.next().await {
-            let data = result?;
-            let len = data.len() as u64;
-            stream.write_all(&data).await?;
-            if let Some(ref cb) = on_progress {
-                cb(len);
+            let (offset, data) = result?;
+            if let Some(data) = data {
+                let len = data.len() as u64;
+                out.seek(tokio::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(|e| Error::Unexpected(e.to_string()))?;
+                out.write_all(&data)
+                    .await
+                    .map_err(|e| Error::Unexpected(e.to_string()))?;
+                if let Some(ref cb) = on_progress {
+                    cb(len);
+                }
+            } else {
+                // Skipped chunk
+                if let Some(ref cb) = on_progress {
+                    let chunk = self
+                        .chunks
+                        .iter()
+                        .find(|c| c.offset == offset)
+                        .ok_or(Error::Unexpected("chunk not found".to_string()))?;
+                    cb(chunk.original_size as u64);
+                }
             }
         }
-        stream.flush().await?;
+        out.flush().await.map_err(|e| Error::Unexpected(e.to_string()))?;
         Ok(())
     }
 }
