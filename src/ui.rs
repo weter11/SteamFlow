@@ -3,6 +3,7 @@ use crate::config::{
 };
 use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::library::{build_game_library, scan_installed_app_paths};
+use crate::utils::harvest_credentials;
 use crate::models::{
     DepotPlatform, DownloadProgress, DownloadProgressState, DownloadState, LibraryGame,
     SteamGuardReq, UserProfile,
@@ -855,6 +856,12 @@ impl SteamLauncher {
                 };
 
             let _ = child.wait().await;
+
+            // Step 5 (After Exit): harvest_credentials(prefix) to keep the cache fresh.
+            let compat_data_path = crate::config::config_dir().unwrap()
+                .join("steamapps/compatdata")
+                .join(game.app_id.to_string());
+            let _ = harvest_credentials(&compat_data_path).await;
 
             if let (Some(c), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
                 let _ = c.sync_up(game.app_id, root).await;

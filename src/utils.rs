@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use crate::config::config_dir;
+use crate::config::{config_dir, secrets_dir};
 use anyhow::Result;
 
 /// Ensures the Windows Steam installer exists in the runtimes directory.
@@ -98,6 +98,99 @@ fn extract_version(name: &str) -> f32 {
         }
     }
     v_str.parse::<f32>().unwrap_or(0.0)
+}
+
+/// Harvests Steam credentials from a specific Proton prefix and stores them in a central cache.
+pub async fn harvest_credentials(prefix_path: &PathBuf) -> Result<()> {
+    let steam_root = prefix_path.join("drive_c/Program Files (x86)/Steam");
+    let loginusers_vdf = steam_root.join("config/loginusers.vdf");
+
+    if !loginusers_vdf.exists() {
+        return Ok(());
+    }
+
+    let content = tokio::fs::read_to_string(&loginusers_vdf).await?;
+    if !content.contains("\"RememberPassword\"\t\t\"1\"") && !content.contains("\"RememberPassword\" \"1\"") {
+        tracing::info!("RememberPassword not set in loginusers.vdf, skipping credential harvest.");
+        return Ok(());
+    }
+
+    let secrets = secrets_dir()?;
+    tokio::fs::create_dir_all(&secrets).await?;
+
+    // Copy config files
+    let config_src = steam_root.join("config");
+    let config_dst = secrets.join("config");
+    tokio::fs::create_dir_all(&config_dst).await?;
+
+    let files_to_copy = ["config.vdf", "loginusers.vdf"];
+    for file in files_to_copy {
+        let src = config_src.join(file);
+        if src.exists() {
+            tokio::fs::copy(&src, config_dst.join(file)).await?;
+        }
+    }
+
+    // Copy ssfn* files
+    if let Ok(mut entries) = tokio::fs::read_dir(&steam_root).await {
+        while let Some(entry) = entries.next_entry().await? {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with("ssfn") {
+                tokio::fs::copy(entry.path(), secrets.join(file_name)).await?;
+            }
+        }
+    }
+
+    tracing::info!("Steam credentials harvested successfully to {}", secrets.display());
+    Ok(())
+}
+
+/// Injects cached Steam credentials into a specific Proton prefix.
+/// Returns true if credentials were injected.
+pub async fn inject_credentials(prefix_path: &PathBuf) -> Result<bool> {
+    let secrets = secrets_dir()?;
+    if !secrets.exists() {
+        return Ok(false);
+    }
+
+    let steam_root = prefix_path.join("drive_c/Program Files (x86)/Steam");
+    if !steam_root.exists() {
+        return Ok(false);
+    }
+
+    let mut injected = false;
+
+    // Inject config files
+    let config_src = secrets.join("config");
+    let config_dst = steam_root.join("config");
+    if config_src.exists() {
+        tokio::fs::create_dir_all(&config_dst).await?;
+        let files_to_copy = ["config.vdf", "loginusers.vdf"];
+        for file in files_to_copy {
+            let src = config_src.join(file);
+            if src.exists() {
+                tokio::fs::copy(&src, config_dst.join(file)).await?;
+                injected = true;
+            }
+        }
+    }
+
+    // Inject ssfn* files
+    if let Ok(mut entries) = tokio::fs::read_dir(&secrets).await {
+        while let Some(entry) = entries.next_entry().await? {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with("ssfn") {
+                tokio::fs::copy(entry.path(), steam_root.join(file_name)).await?;
+                injected = true;
+            }
+        }
+    }
+
+    if injected {
+        tracing::info!("Steam credentials injected into {}", steam_root.display());
+    }
+
+    Ok(injected)
 }
 
 #[cfg(test)]

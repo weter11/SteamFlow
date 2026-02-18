@@ -86,11 +86,17 @@ pub async fn ensure_config_dirs() -> Result<()> {
     fs::create_dir_all(&config).await?;
     let images = opensteam_image_cache_dir()?;
     fs::create_dir_all(&images).await?;
+    let secrets = secrets_dir()?;
+    fs::create_dir_all(&secrets).await?;
     Ok(())
 }
 
 pub fn opensteam_image_cache_dir() -> Result<PathBuf> {
     Ok(PathBuf::from("./config/SteamFlow/images"))
+}
+
+pub fn secrets_dir() -> Result<PathBuf> {
+    Ok(PathBuf::from("./config/SteamFlow/secrets"))
 }
 
 pub async fn load_session() -> Result<SessionState> {
