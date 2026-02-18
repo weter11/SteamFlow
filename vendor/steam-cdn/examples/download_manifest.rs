@@ -1,7 +1,7 @@
 use std::{error::Error, sync::Arc};
 use steam_cdn::CDNClient;
 use steam_vent::{Connection, ServerList};
-use tokio::fs::{self, OpenOptions};
+use tokio::fs;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -18,21 +18,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .get_manifest_request_code(app_id, depot_id, manifest_id)
         .await?;
     let manifest = cdn
-        .get_manifest(depot_id, manifest_id, Some(request_code), depot_key)
+        .get_manifest(app_id, depot_id, manifest_id, Some(request_code), depot_key)
         .await?;
 
     for manifest_file in manifest.files() {
         if manifest_file.filename().ends_with("server.dll") {
             fs::create_dir_all(manifest_file.path()).await?;
 
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .write(true)
-                .open(manifest_file.full_path())
-                .await?;
+            let full_path = manifest_file.full_path();
+            let target_path = std::path::Path::new(&full_path);
             manifest_file
-                .download(depot_key.unwrap(), &mut file, None)
+                .download(depot_key.unwrap(), target_path, false, None, None)
                 .await?;
         }
     }

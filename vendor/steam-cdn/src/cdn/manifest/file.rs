@@ -1,6 +1,7 @@
 use futures::{stream::FuturesOrdered, StreamExt};
 use itertools::Itertools;
 use sha1::Digest;
+use tracing;
 use std::{fmt::Write, sync::Arc};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -113,24 +114,29 @@ impl ManifestFile {
         &self,
         depot_key: [u8; 32],
         target_path: &std::path::Path,
-        verify: bool,
+        verify_mode: bool,
         max_tasks: Option<usize>,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
         let max_tasks = max_tasks.unwrap_or(4);
         let semaphore = Arc::new(Semaphore::new(max_tasks));
 
+        let metadata_before = tokio::fs::metadata(target_path).await;
+        let file_exists_before = metadata_before.is_ok();
+        let current_len_before = metadata_before.map(|m| m.len()).unwrap_or(0);
+
         let mut out = tokio::fs::OpenOptions::new()
             .write(true)
-            .read(true)
             .create(true)
             .open(target_path)
             .await
             .map_err(|e| Error::Unexpected(e.to_string()))?;
 
-        out.set_len(self.size)
-            .await
-            .map_err(|e| Error::Unexpected(e.to_string()))?;
+        if current_len_before != self.size {
+            out.set_len(self.size)
+                .await
+                .map_err(|e| Error::Unexpected(e.to_string()))?;
+        }
 
         let mut tasks = self
             .chunks()
@@ -138,27 +144,45 @@ impl ManifestFile {
             .sorted_by(|&a, &b| a.offset.cmp(&b.offset))
             .map(|chunk_data| {
                 let semaphore_owned = semaphore.clone();
-                let verify_chunk = verify;
+                let verify_mode = verify_mode;
+                let target_path = target_path.to_path_buf();
+                let already_complete = file_exists_before && current_len_before == self.size;
                 async move {
                     let permit = semaphore_owned.acquire_owned().await?;
 
-                    if verify_chunk {
-                        let mut file = tokio::fs::File::open(target_path)
+                    // Task 1: Fast Check
+                    if !verify_mode && already_complete {
+                        drop(permit);
+                        return Ok((chunk_data.offset, None));
+                    }
+
+                    let metadata = tokio::fs::metadata(&target_path).await;
+                    let file_exists = metadata.is_ok();
+                    let current_len = metadata.map(|m| m.len()).unwrap_or(0);
+
+                    // Task 1: Deep Check
+                    if verify_mode && file_exists {
+                        let mut file = tokio::fs::File::open(&target_path)
                             .await
                             .map_err(|e| Error::Unexpected(e.to_string()))?;
-                        file.seek(tokio::io::SeekFrom::Start(chunk_data.offset))
-                            .await
-                            .map_err(|e| Error::Unexpected(e.to_string()))?;
+                        if current_len >= chunk_data.offset + chunk_data.original_size as u64 {
+                            file.seek(tokio::io::SeekFrom::Start(chunk_data.offset))
+                                .await
+                                .map_err(|e| Error::Unexpected(e.to_string()))?;
 
-                        let mut buffer = vec![0u8; chunk_data.original_size as usize];
-                        if file.read_exact(&mut buffer).await.is_ok() {
-                            let mut hasher = sha1::Sha1::new();
-                            hasher.update(&buffer);
-                            let hash = hasher.finalize().to_vec();
+                            let mut buffer = vec![0u8; chunk_data.original_size as usize];
+                            if file.read_exact(&mut buffer).await.is_ok() {
+                                let mut hasher = sha1::Sha1::new();
+                                hasher.update(&buffer);
+                                let hash = hasher.finalize().to_vec();
 
-                            if hash == chunk_data.sha {
-                                drop(permit);
-                                return Ok((chunk_data.offset, None));
+                                if hash == chunk_data.sha {
+                                    tracing::info!("Verified chunk {}", chunk_data.id());
+                                    drop(permit);
+                                    return Ok((chunk_data.offset, None));
+                                } else {
+                                    tracing::warn!("Corruption detected in chunk {}", chunk_data.id());
+                                }
                             }
                         }
                     }

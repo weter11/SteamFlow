@@ -127,7 +127,7 @@ impl CDNClient {
         depot_key: &[u8],
         target_dir: impl AsRef<std::path::Path>,
         manifest_request_code: Option<u64>,
-        verify: bool,
+        verify_mode: bool,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
         on_manifest: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
@@ -157,18 +157,7 @@ impl CDNClient {
             }
 
             if file.size() > 0 {
-                if !verify {
-                    if let Ok(metadata) = std::fs::metadata(&full_path) {
-                        if metadata.len() == file.size() {
-                            if let Some(ref cb) = on_progress {
-                                cb(file.size());
-                            }
-                            continue;
-                        }
-                    }
-                }
-
-                file.download(key_arr, &full_path, verify, None, on_progress.clone())
+                file.download(key_arr, &full_path, verify_mode, None, on_progress.clone())
                     .await?;
             }
         }

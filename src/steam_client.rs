@@ -873,7 +873,7 @@ impl SteamClient {
                             &key,
                             &install_dir,
                             manifest_code,
-                            false,
+                            false, // verify_mode: false
                             Some(on_progress),
                             Some(on_manifest.clone()),
                         )
@@ -1603,7 +1603,7 @@ impl SteamClient {
     async fn start_manifest_download(
         &self,
         appid: u32,
-        smart_verify_existing: bool,
+        verify_mode: bool,
     ) -> Result<Receiver<DownloadProgress>> {
         let connection = self
             .connection
@@ -1627,7 +1627,7 @@ impl SteamClient {
                     state: DownloadProgressState::Queued,
                     bytes_downloaded: 0,
                     total_bytes: 0,
-                    current_file: if smart_verify_existing {
+                    current_file: if verify_mode {
                         "verifying installed chunks".to_string()
                     } else {
                         "resolving latest manifest".to_string()
@@ -1635,7 +1635,7 @@ impl SteamClient {
                 })
                 .await;
 
-            let remote_manifests = if smart_verify_existing {
+            let remote_manifests = if verify_mode {
                 local_manifests.clone()
             } else {
                 SteamClient::remote_manifest_ids_static(&connection, appid, &active_branch)
@@ -1738,7 +1738,7 @@ impl SteamClient {
                     let selection_depot_id = selection.depot_id;
                     let on_progress = Arc::new(move |bytes: u64| {
                         let _ = tx_clone.try_send(DownloadProgress {
-                            state: if smart_verify_existing {
+                            state: if verify_mode {
                                 DownloadProgressState::Verifying
                             } else {
                                 DownloadProgressState::Downloading
@@ -1763,7 +1763,7 @@ impl SteamClient {
                             &key,
                             &install_root,
                             manifest_code,
-                            smart_verify_existing,
+                            verify_mode,
                             Some(on_progress),
                             Some(on_manifest),
                         )
@@ -1813,7 +1813,7 @@ impl SteamClient {
                         state: DownloadProgressState::Completed,
                         bytes_downloaded: 1,
                         total_bytes: 1,
-                        current_file: if smart_verify_existing {
+                        current_file: if verify_mode {
                             "verify completed".to_string()
                         } else {
                             "update completed".to_string()

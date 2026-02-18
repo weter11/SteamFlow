@@ -52,6 +52,12 @@ cd OpenSteamClient
 cargo run --release
 ```
 
+## Configuration
+SteamFlow stores its configuration and local data in `./config/SteamFlow` relative to the executable.
+- **Library Path:** By default, SteamFlow attempts to detect your existing Steam installation. You can manually override this in the **Settings** panel within the application.
+- **Session:** Encrypted refresh tokens are stored in `session.json` to allow automatic login on subsequent launches.
+- **Unified Download Pipeline:** All game installations, updates, and integrity verifications use a robust, single-engine architecture for maximum reliability and speed.
+
 # Features & Goals
 - **No Web Technology:** Unlike the official Steam client, SteamFlow does not use CEF or WebViews for its core interface, making it extremely lightweight.
 - **Fast and Responsive:** Built with Rust and `egui` for a native, snappy experience.
