@@ -171,7 +171,7 @@ pub fn download_single_file(
     }
 
     runtime
-        .block_on(file.download(depot_key, &full_path, false, None, None))
+        .block_on(file.download(depot_key, &full_path, false, None, None, None))
         .map_err(|e| anyhow!("failed to download file: {e}"))?;
 
     Ok(())

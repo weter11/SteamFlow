@@ -748,6 +748,7 @@ impl SteamClient {
             // Update shared state for the start of the download
             if let Ok(mut state) = shared_state_clone.write() {
                 state.is_downloading = true;
+                state.is_paused = false;
                 state.app_id = appid;
                 state.app_name = game_name.clone();
                 state.downloaded_bytes = 0;
@@ -865,6 +866,11 @@ impl SteamClient {
                     }
                 });
 
+                let abort_signal = shared_state_clone
+                    .read()
+                    .ok()
+                    .map(|s| s.abort_signal.clone());
+
                     match cdn_client
                         .download_depot(
                             appid,
@@ -873,13 +879,21 @@ impl SteamClient {
                             &key,
                             &install_dir,
                             manifest_code,
-                            false,
+                            false, // verify_mode: false
+                            abort_signal,
                             Some(on_progress),
                             Some(on_manifest.clone()),
                         )
                         .await
                     {
                         Ok(_) => {
+                            let aborted = shared_state_clone.read()
+                                .map(|s| s.abort_signal.load(std::sync::atomic::Ordering::Relaxed))
+                                .unwrap_or(false);
+                            if aborted {
+                                break;
+                            }
+
                             tracing::info!(
                                 "Depot {} download complete from {}!",
                                 selection.depot_id,
@@ -900,6 +914,15 @@ impl SteamClient {
                 }
 
                 if !depot_success {
+                    let aborted = shared_state_clone.read()
+                        .map(|s| s.abort_signal.load(std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or(false);
+
+                    if aborted {
+                        success = false;
+                        break;
+                    }
+
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
@@ -1533,6 +1556,7 @@ impl SteamClient {
         &mut self,
         app: &LibraryGame,
         proton_path: Option<&str>,
+        user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<LaunchInfo> {
         let prefer_proton = proton_path.is_some();
         let launch_options = self.get_product_info(app.app_id, prefer_proton).await?;
@@ -1568,7 +1592,7 @@ impl SteamClient {
         }
 
         let mut child =
-            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config)?;
+            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config)?;
         child
             .wait()
             .context("failed waiting for game process exit")?;
@@ -1586,24 +1610,36 @@ impl SteamClient {
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
+        user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<()> {
         let launcher_config = load_launcher_config().await.unwrap_or_default();
-        self.spawn_game_process(app, launch_info, proton_path, &launcher_config)?;
+        self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config)?;
         Ok(())
     }
 
-    pub async fn update_game(&self, appid: u32) -> Result<Receiver<DownloadProgress>> {
-        self.start_manifest_download(appid, false).await
+    pub async fn update_game(
+        &self,
+        appid: u32,
+        shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
+    ) -> Result<Receiver<DownloadProgress>> {
+        self.start_manifest_download(appid, false, shared_state)
+            .await
     }
 
-    pub async fn verify_game(&self, appid: u32) -> Result<Receiver<DownloadProgress>> {
-        self.start_manifest_download(appid, true).await
+    pub async fn verify_game(
+        &self,
+        appid: u32,
+        shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
+    ) -> Result<Receiver<DownloadProgress>> {
+        self.start_manifest_download(appid, true, shared_state)
+            .await
     }
 
     async fn start_manifest_download(
         &self,
         appid: u32,
-        smart_verify_existing: bool,
+        verify_mode: bool,
+        shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
     ) -> Result<Receiver<DownloadProgress>> {
         let connection = self
             .connection
@@ -1621,13 +1657,24 @@ impl SteamClient {
             .unwrap_or_else(|_| (HashMap::new(), "public".to_string()));
 
         let client_clone = self.clone();
+        let shared_state_clone = shared_state.clone();
+        let game_name = self.resolve_install_game_name(appid).await;
         tokio::task::spawn(async move {
+            if let Ok(mut state) = shared_state_clone.write() {
+                state.is_downloading = true;
+                state.is_paused = false;
+                state.app_id = appid;
+                state.app_name = game_name.clone();
+                state.downloaded_bytes = 0;
+                state.status_text = format!("Preparing operation for {}...", game_name);
+            }
+
             let _ = tx
                 .send(DownloadProgress {
                     state: DownloadProgressState::Queued,
                     bytes_downloaded: 0,
                     total_bytes: 0,
-                    current_file: if smart_verify_existing {
+                    current_file: if verify_mode {
                         "verifying installed chunks".to_string()
                     } else {
                         "resolving latest manifest".to_string()
@@ -1635,7 +1682,7 @@ impl SteamClient {
                 })
                 .await;
 
-            let remote_manifests = if smart_verify_existing {
+            let remote_manifests = if verify_mode {
                 local_manifests.clone()
             } else {
                 SteamClient::remote_manifest_ids_static(&connection, appid, &active_branch)
@@ -1738,7 +1785,7 @@ impl SteamClient {
                     let selection_depot_id = selection.depot_id;
                     let on_progress = Arc::new(move |bytes: u64| {
                         let _ = tx_clone.try_send(DownloadProgress {
-                            state: if smart_verify_existing {
+                            state: if verify_mode {
                                 DownloadProgressState::Verifying
                             } else {
                                 DownloadProgressState::Downloading
@@ -1755,6 +1802,11 @@ impl SteamClient {
                         size_clone.store(total_bytes, std::sync::atomic::Ordering::SeqCst);
                     });
 
+                    let abort_signal = shared_state_clone
+                        .read()
+                        .ok()
+                        .map(|s| s.abort_signal.clone());
+
                     match cdn_client
                         .download_depot(
                             appid,
@@ -1763,13 +1815,21 @@ impl SteamClient {
                             &key,
                             &install_root,
                             manifest_code,
-                            smart_verify_existing,
+                            verify_mode,
+                            abort_signal,
                             Some(on_progress),
                             Some(on_manifest),
                         )
                         .await
                     {
                         Ok(_) => {
+                            let aborted = shared_state_clone.read()
+                                .map(|s| s.abort_signal.load(std::sync::atomic::Ordering::Relaxed))
+                                .unwrap_or(false);
+                            if aborted {
+                                break;
+                            }
+
                             depot_success = true;
                             successful_depots.push((
                                 selection.depot_id,
@@ -1785,6 +1845,15 @@ impl SteamClient {
                 }
 
                 if !depot_success {
+                    let aborted = shared_state_clone.read()
+                        .map(|s| s.abort_signal.load(std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or(false);
+
+                    if aborted {
+                        success = false;
+                        break;
+                    }
+
                     let _ = tx
                         .send(DownloadProgress {
                             state: DownloadProgressState::Failed,
@@ -1802,6 +1871,11 @@ impl SteamClient {
             }
 
             if success {
+                if let Ok(mut state) = shared_state_clone.write() {
+                    state.is_downloading = false;
+                    state.status_text = "Operation complete".to_string();
+                }
+
                 let game_name: String = client_clone.resolve_install_game_name(appid).await;
                 if let Err(err) =
                     SteamClient::write_appmanifest(&manifest_path, appid, &game_name, successful_depots)
@@ -1813,13 +1887,18 @@ impl SteamClient {
                         state: DownloadProgressState::Completed,
                         bytes_downloaded: 1,
                         total_bytes: 1,
-                        current_file: if smart_verify_existing {
+                        current_file: if verify_mode {
                             "verify completed".to_string()
                         } else {
                             "update completed".to_string()
                         },
                     })
                     .await;
+            } else {
+                if let Ok(mut state) = shared_state_clone.write() {
+                    state.is_downloading = false;
+                    state.status_text = "Operation failed or paused".to_string();
+                }
             }
         });
 
@@ -2031,6 +2110,7 @@ impl SteamClient {
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
         launcher_config: &crate::config::LauncherConfig,
+        user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<std::process::Child> {
         let install_dir = PathBuf::from(
             app.install_path
@@ -2039,7 +2119,14 @@ impl SteamClient {
         );
 
         let executable = install_dir.join(&launch_info.executable);
-        let args = split_args(&launch_info.arguments);
+        let mut args = split_args(&launch_info.arguments);
+
+        if let Some(config) = user_config {
+            if !config.launch_options.trim().is_empty() {
+                let custom_args = split_args(&config.launch_options);
+                args.extend(custom_args);
+            }
+        }
 
         // Standard Steam identity fallback: steam_appid.txt
         let _ = std::fs::write(install_dir.join("steam_appid.txt"), app.app_id.to_string());
@@ -2057,7 +2144,7 @@ impl SteamClient {
                 }
 
                 let mut cmd = Command::new(&executable);
-                cmd.args(args);
+                cmd.args(&args);
                 cmd.current_dir(&install_dir);
 
                 let bin_dir = executable.parent().unwrap_or_else(|| Path::new("."));
@@ -2068,6 +2155,13 @@ impl SteamClient {
                 cmd.env("PATH", format!("{}:{}", bin_dir.display(), existing_path));
                 cmd.env("SteamAppId", app.app_id.to_string());
 
+                if let Some(config) = user_config {
+                    for (key, val) in &config.env_variables {
+                        cmd.env(key, val);
+                    }
+                }
+
+                tracing::info!("Launching game (Native): {:?} with args {:?}", executable, args);
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
@@ -2094,13 +2188,20 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
-                let mut cmd = Command::new(resolved_proton);
-                cmd.arg("run").arg(&executable).args(args);
+                let mut cmd = Command::new(&resolved_proton);
+                cmd.arg("run").arg(&executable).args(&args);
                 cmd.current_dir(&install_dir);
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
 
+                if let Some(config) = user_config {
+                    for (key, val) in &config.env_variables {
+                        cmd.env(key, val);
+                    }
+                }
+
+                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, cmd.get_args());
                 cmd.spawn().context("failed to spawn proton game")
             }
         }
