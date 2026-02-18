@@ -76,6 +76,11 @@ struct LaunchSelectorState {
     always_use: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PrefixManagerModalState {
+    selected_app_id: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameTab {
     Options,
@@ -151,6 +156,7 @@ pub struct SteamLauncher {
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
+    prefix_manager_modal: Option<PrefixManagerModalState>,
     current_tab: GameTab,
     main_tab: MainTab,
     account_data: Option<crate::steam_client::AccountData>,
@@ -215,6 +221,7 @@ impl SteamLauncher {
             depot_browser: None,
             platform_selection: None,
             launch_selector: None,
+            prefix_manager_modal: None,
             current_tab: GameTab::Options,
             main_tab: MainTab::Library,
             account_data: None,
@@ -767,6 +774,13 @@ impl SteamLauncher {
     }
 
     fn handle_play_click(&mut self, game: &LibraryGame) {
+        if game.app_id == 0 {
+            self.prefix_manager_modal = Some(PrefixManagerModalState {
+                selected_app_id: None,
+            });
+            return;
+        }
+
         let proton_path = if self.proton_path_for_windows.trim().is_empty() {
             None
         } else {
@@ -831,8 +845,8 @@ impl SteamLauncher {
                 local_root = Some(root);
             }
 
-            let mut child: std::process::Child =
-                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()) {
+            let mut child: tokio::process::Child =
+                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()).await {
                     Ok(child) => child,
                     Err(e) => {
                         let _ = tx.send(format!("Launch failed for {}: {e}", game.name));
@@ -840,7 +854,7 @@ impl SteamLauncher {
                     }
                 };
 
-            let _ = child.wait();
+            let _ = child.wait().await;
 
             if let (Some(c), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
                 let _ = c.sync_up(game.app_id, root).await;
@@ -904,6 +918,74 @@ impl SteamLauncher {
                 }
             }
         });
+    }
+
+    fn draw_prefix_manager_modal(&mut self, ctx: &egui::Context) {
+        let mut launch_appid = None;
+        let mut close = false;
+
+        if let Some(state) = &mut self.prefix_manager_modal {
+            egui::Window::new("Manage Steam Runtime")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Which game prefix do you want to manage?");
+                    ui.add_space(8.0);
+
+                    let windows_games: Vec<&LibraryGame> = self.library
+                        .iter()
+                        .filter(|g| g.app_id != 0 && g.is_installed)
+                        .collect();
+
+                    if windows_games.is_empty() {
+                        ui.label("No installed Windows games found.");
+                    } else {
+                        egui::ComboBox::from_id_salt("prefix_selector")
+                            .selected_text(
+                                state.selected_app_id
+                                    .and_then(|id| windows_games.iter().find(|g| g.app_id == id))
+                                    .map(|g| g.name.as_str())
+                                    .unwrap_or("Select a game...")
+                            )
+                            .show_ui(ui, |ui| {
+                                for game in windows_games {
+                                    ui.selectable_value(&mut state.selected_app_id, Some(game.app_id), &game.name);
+                                }
+                            });
+                    }
+
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(state.selected_app_id.is_some(), egui::Button::new("Launch Steam")).clicked() {
+                            launch_appid = state.selected_app_id;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+        }
+
+        if let Some(appid) = launch_appid {
+            let client = self.client.clone();
+            let (tx, rx) = mpsc::channel();
+            self.play_result_rx = Some(rx);
+            let proton_path = if self.proton_path_for_windows.trim().is_empty() {
+                None
+            } else {
+                Some(self.proton_path_for_windows.trim().to_string())
+            };
+
+            self.runtime.spawn(async move {
+                match client.launch_ghost_steam_only(appid, proton_path.as_deref()).await {
+                    Ok(_) => { let _ = tx.send(format!("Finished managing prefix for app {appid}")); }
+                    Err(e) => { let _ = tx.send(format!("Failed to launch Steam: {e}")); }
+                }
+            });
+            self.prefix_manager_modal = None;
+        } else if close {
+            self.prefix_manager_modal = None;
+        }
     }
 
     fn draw_launch_selector_modal(&mut self, ctx: &egui::Context) {
@@ -2207,6 +2289,7 @@ impl eframe::App for SteamLauncher {
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
         self.draw_launch_selector_modal(ctx);
+        self.draw_prefix_manager_modal(ctx);
         ctx.request_repaint();
     }
 }

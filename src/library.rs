@@ -286,6 +286,19 @@ pub fn build_game_library(
 ) -> GameLibrary {
     let mut games = Vec::new();
 
+    // Inject Virtual App ID 0 for Steam Runtime management
+    games.push(LibraryGame {
+        app_id: 0,
+        name: "Steam Runtime (Windows)".to_string(),
+        playtime_forever_minutes: None,
+        is_installed: true,
+        install_path: Some("virtual".to_string()),
+        local_manifest_ids: HashMap::new(),
+        update_available: false,
+        update_queued: false,
+        active_branch: "public".to_string(),
+    });
+
     for owned_game in owned {
         let info = installed_info.get(&owned_game.app_id);
         let install_path = info.map(|i| i.install_path.to_string_lossy().to_string());
