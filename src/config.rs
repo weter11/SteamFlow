@@ -163,6 +163,30 @@ pub async fn save_launcher_config(config: &LauncherConfig) -> Result<()> {
     Ok(())
 }
 
+pub fn absolute_path(path: impl AsRef<std::path::Path>) -> Result<PathBuf> {
+    let path = path.as_ref();
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    // Normalize: remove "." and handle ".."
+    let mut components = abs_path.components().peekable();
+    let mut ret = PathBuf::new();
+
+    while let Some(c) = components.next() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                ret.pop();
+            }
+            _ => ret.push(c),
+        }
+    }
+    Ok(ret)
+}
+
 pub fn library_cache_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("library_cache.json"))
 }

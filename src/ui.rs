@@ -32,6 +32,7 @@ struct GamePropertiesModalState {
     game_name: String,
     launch_options: String,
     env_vars: String, // Key=Value per line
+    use_steam_runtime: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -832,7 +833,7 @@ impl SteamLauncher {
             }
 
             let mut child: std::process::Child =
-                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()) {
+                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()).await {
                     Ok(child) => child,
                     Err(e) => {
                         let _ = tx.send(format!("Launch failed for {}: {e}", game.name));
@@ -879,6 +880,7 @@ impl SteamLauncher {
             game_name: game.name.clone(),
             launch_options: config.launch_options,
             env_vars,
+            use_steam_runtime: config.use_steam_runtime,
         });
     }
 
@@ -1087,6 +1089,10 @@ impl SteamLauncher {
                         ui.text_edit_multiline(&mut state.env_vars);
                     });
 
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut state.use_steam_runtime, "Use Steam Runtime (Windows)")
+                        .on_hover_text("Enables the official Steam client in the background. Required for games with DRM. Disable for faster launch on DRM-free games.");
+
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
@@ -1097,7 +1103,12 @@ impl SteamLauncher {
                                 }
                             }
                             // Note: we'll update the config in the outer scope to avoid borrowing issues
-                            save_config = Some((state.app_id, state.launch_options.clone(), env_map));
+                            save_config = Some((
+                                state.app_id,
+                                state.launch_options.clone(),
+                                env_map,
+                                state.use_steam_runtime,
+                            ));
                         }
                         if ui.button("Cancel").clicked() {
                             close = true;
@@ -1106,10 +1117,11 @@ impl SteamLauncher {
                 });
         }
 
-        if let Some((app_id, launch_opts, env_map)) = save_config {
+        if let Some((app_id, launch_opts, env_map, use_runtime)) = save_config {
             let mut config = self.user_configs.get(&app_id).cloned().unwrap_or_default();
             config.launch_options = launch_opts;
             config.env_variables = env_map;
+            config.use_steam_runtime = use_runtime;
             self.user_configs.insert(app_id, config);
 
             let store = self.user_configs.clone();
