@@ -46,6 +46,35 @@ pub async fn install_ghost_steam(app_id: u32, proton_path: &Path, library_root: 
     Ok(())
 }
 
+pub async fn launch_ghost_steam(
+    app_id: u32,
+    resolved_proton: &Path,
+    steam_exe: &Path,
+    prefix: &Path,
+    library_root: &Path,
+) -> Result<()> {
+    println!("Launching Steam Runtime in background...");
+    let mut steam_cmd = Command::new(resolved_proton);
+    steam_cmd.arg("run").arg(steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles");
+
+    let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
+    steam_cmd.env("WINEPREFIX", &abs_prefix);
+    steam_cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(prefix)?);
+    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(library_root)?);
+    steam_cmd.env("SteamAppId", app_id.to_string());
+
+    // Ensure Steam uses its own binaries
+    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;Steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+
+    // Spawn detached
+    let _steam_child = steam_cmd.spawn().context("failed to launch Ghost Steam")?;
+
+    println!("Waiting for Steam Runtime initialization...");
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    Ok(())
+}
+
 pub fn get_installed_steam_path(prefix: &Path) -> Option<PathBuf> {
     let pfx_path = prefix.join("pfx");
     if !pfx_path.exists() {

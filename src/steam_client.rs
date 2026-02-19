@@ -2116,26 +2116,33 @@ impl SteamClient {
             matches!(launch_info.target, LaunchTarget::WindowsProton)
         });
 
+        // Determine resolved proton if needed
+        let resolved_proton = if matches!(launch_info.target, LaunchTarget::WindowsProton) {
+            let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
+            let proton = if let Some(forced) = launcher_config
+                .game_configs
+                .get(&app.app_id)
+                .and_then(|c| c.forced_proton_version.as_ref())
+            {
+                forced
+            } else {
+                proton_path
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
+            };
+            Some(self.resolve_proton_path(proton, &library_root))
+        } else {
+            None
+        };
+
         if !use_runtime || matches!(launch_info.target, LaunchTarget::NativeLinux) {
-            return self.spawn_raw_game_process(app, launch_info, proton_path, launcher_config, user_config);
+            return self.spawn_raw_game_process(app, launch_info, resolved_proton.as_deref(), launcher_config, user_config);
         }
 
         // Ghost Steam Logic
         let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
         let prefix = library_root.join("steamapps/compatdata").join(app.app_id.to_string());
-
-        let proton = if let Some(forced) = launcher_config
-            .game_configs
-            .get(&app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced
-        } else {
-            proton_path
-                .filter(|p| !p.is_empty())
-                .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
-        };
-        let resolved_proton = self.resolve_proton_path(proton, &library_root);
+        let resolved_proton = resolved_proton.ok_or_else(|| anyhow!("Resolved proton missing for Windows launch"))?;
 
         // Check Install
         let steam_exe = crate::launch::get_installed_steam_path(&prefix);
@@ -2148,30 +2155,23 @@ impl SteamClient {
         };
 
         // Launch Steam (Background)
-        println!("Launching Steam Runtime in background...");
-        let mut steam_cmd = Command::new(&resolved_proton);
-        steam_cmd.arg("run").arg(&steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles");
-
-        let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
-        steam_cmd.env("WINEPREFIX", &abs_prefix);
-        // Ensure Steam uses its own binaries
-        let steam_filename = steam_exe.file_name().unwrap().to_string_lossy();
-        steam_cmd.env("WINEDLLOVERRIDES", format!("{}=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n", steam_filename));
-
-        let _steam_child = steam_cmd.spawn().context("failed to launch Ghost Steam")?;
-
-        println!("Waiting for Steam Runtime initialization...");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        crate::launch::launch_ghost_steam(
+            app.app_id,
+            &resolved_proton,
+            &steam_exe,
+            &prefix,
+            &library_root,
+        ).await?;
 
         println!("Launching Game Executable...");
-        self.spawn_raw_game_process(app, launch_info, proton_path, launcher_config, user_config)
+        self.spawn_raw_game_process(app, launch_info, Some(&resolved_proton), launcher_config, user_config)
     }
 
     pub(crate) fn spawn_raw_game_process(
         &self,
         app: &LibraryGame,
         launch_info: &LaunchInfo,
-        proton_path: Option<&str>,
+        resolved_proton_path: Option<&Path>,
         launcher_config: &crate::config::LauncherConfig,
         user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<std::process::Child> {
@@ -2228,20 +2228,9 @@ impl SteamClient {
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
-                let proton = if let Some(forced) = launcher_config
-                    .game_configs
-                    .get(&app.app_id)
-                    .and_then(|c| c.forced_proton_version.as_ref())
-                {
-                    forced
-                } else {
-                    proton_path
-                        .filter(|p| !p.is_empty())
-                        .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
-                };
-
                 let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
-                let resolved_proton = self.resolve_proton_path(proton, &library_root);
+                let resolved_proton = resolved_proton_path
+                    .ok_or_else(|| anyhow!("Resolved proton path missing for Windows launch"))?;
 
                 let compat_data_path = library_root
                     .join("steamapps")
