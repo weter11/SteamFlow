@@ -28,38 +28,60 @@ pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, libr
     println!("Installer Path: {}", installer_path.display());
 
     println!("First time setup: Please complete the Steam installation, log in to your account, and then close Steam.");
-    println!("Starting Steam Runtime Installation...");
+    println!("Starting Steam Runtime Installation (Raw Wine)...");
 
-    let trap_path = crate::utils::setup_fake_steam_env()?;
-    println!("Fake Steam Trap: {}", trap_path.display());
+    let proton_dir = proton_path.parent().context("failed to get proton directory")?;
+    let wine_bin = find_wine_binary(proton_dir).context("failed to find wine binary in proton directory")?;
+    let lib64_dir = proton_dir.join("files/lib64");
+    let lib32_dir = proton_dir.join("files/lib");
 
-    let mut cmd = Command::new(proton_path);
-    cmd.arg("run").arg(&installer_path);
+    println!("Wine Binary: {}", wine_bin.display());
+
+    let mut cmd = Command::new(wine_bin);
+    cmd.arg(&installer_path);
 
     let abs_prefix_path = crate::config::absolute_path(prefix.join("pfx"))?;
     cmd.env("WINEPREFIX", &abs_prefix_path);
-    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n;mscoree=d;mshtml=d");
+    cmd.env("WINEDLLOVERRIDES", "mscoree=d;mshtml=d");
 
-    // Proton requires these to function correctly
-    cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&prefix)?);
-    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &trap_path);
-
-    // Modify PATH to prioritize the fake steam trap
-    let existing_path = std::env::var("PATH").unwrap_or_default();
-    cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
+    // Manual LD_LIBRARY_PATH to fix network/GnuTLS
+    let existing_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let new_ld = if existing_ld.is_empty() {
+        format!("{}:{}", lib64_dir.display(), lib32_dir.display())
+    } else {
+        format!("{}:{}:{}", lib64_dir.display(), lib32_dir.display(), existing_ld)
+    };
+    cmd.env("LD_LIBRARY_PATH", new_ld);
 
     // Fix TLS/Network Error by providing host SSL certificates
     cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
     cmd.env("SSL_CERT_DIR", "/etc/ssl/certs");
 
-    // Hide the fact we are launching from a Steam-like app
+    // Bypass Proton Python Script - Remove all Proton vars
+    cmd.env_remove("STEAM_COMPAT_DATA_PATH");
+    cmd.env_remove("STEAM_COMPAT_CLIENT_INSTALL_PATH");
     cmd.env_remove("SteamAppId");
     cmd.env_remove("SteamGameId");
 
-    let status = cmd.status().context("failed to run Steam installer")?;
+    let status = cmd.status().context("failed to run Steam installer via raw Wine")?;
     println!("Installer finished with exit code: {}", status);
 
     Ok(())
+}
+
+fn find_wine_binary(proton_dir: &Path) -> Option<PathBuf> {
+    let candidates = [
+        proton_dir.join("files/bin/wine"),
+        proton_dir.join("dist/bin/wine"),
+        proton_dir.join("bin/wine"),
+    ];
+
+    for path in candidates {
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 pub async fn launch_ghost_steam(
