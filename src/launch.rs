@@ -27,13 +27,14 @@ pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, libr
     let installer_path = ensure_steam_installer().await?;
     println!("Installer Path: {}", installer_path.display());
 
+    println!("First time setup: Please complete the Steam installation, log in to your account, and then close Steam.");
     println!("Starting Steam Runtime Installation...");
 
     let trap_path = crate::utils::setup_fake_steam_env()?;
     println!("Fake Steam Trap: {}", trap_path.display());
 
     let mut cmd = Command::new(proton_path);
-    cmd.arg("run").arg(&installer_path).arg("/S");
+    cmd.arg("run").arg(&installer_path);
 
     let abs_prefix_path = crate::config::absolute_path(prefix.join("pfx"))?;
     cmd.env("WINEPREFIX", &abs_prefix_path);

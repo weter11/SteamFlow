@@ -2149,13 +2149,19 @@ impl SteamClient {
 
         // Check Install
         let steam_exe = crate::launch::get_installed_steam_path(&prefix);
-        let steam_exe = if let Some(path) = steam_exe {
-            path
+        let (steam_exe, just_installed) = if let Some(path) = steam_exe {
+            (path, false)
         } else {
             crate::launch::install_ghost_steam_in_prefix(app.app_id, &resolved_proton, &library_root).await?;
-            crate::launch::get_installed_steam_path(&prefix)
-                .ok_or_else(|| anyhow!("Failed to find steam.exe after installation"))?
+            let path = crate::launch::get_installed_steam_path(&prefix)
+                .ok_or_else(|| anyhow!("Failed to find steam.exe after installation"))?;
+            (path, true)
         };
+
+        if just_installed {
+            println!("Setup complete. Harvesting credentials...");
+            let _ = crate::utils::harvest_credentials(&prefix).await;
+        }
 
         // Launch Steam (Background)
         let _ = crate::utils::inject_credentials(&prefix).await;
