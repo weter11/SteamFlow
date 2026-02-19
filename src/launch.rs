@@ -105,7 +105,7 @@ pub async fn launch_ghost_steam(
 
     println!("Launching Steam Runtime in background...");
     let mut steam_cmd = Command::new(resolved_proton);
-    steam_cmd.arg("run").arg(steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles").arg("-cef-disable-gpu-compositing");
+    steam_cmd.arg("run").arg(steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles").arg("-tcp").arg("-cef-disable-gpu-compositing");
 
     let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
     steam_cmd.env("WINEPREFIX", &abs_prefix);
@@ -118,7 +118,7 @@ pub async fn launch_ghost_steam(
     steam_cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
 
     // Ensure Steam uses its own binaries
-    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
     // Spawn detached
     let _steam_child = steam_cmd.spawn().context("failed to launch Ghost Steam")?;
@@ -140,7 +140,7 @@ pub async fn launch_ghost_steam_interactive(
 
     println!("Launching Steam Runtime for interactive login...");
     let mut steam_cmd = Command::new(resolved_proton);
-    steam_cmd.arg("run").arg(steam_exe).arg("-cef-disable-gpu-compositing");
+    steam_cmd.arg("run").arg(steam_exe).arg("-tcp").arg("-cef-disable-gpu-compositing");
 
     let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
     steam_cmd.env("WINEPREFIX", &abs_prefix);
@@ -150,7 +150,11 @@ pub async fn launch_ghost_steam_interactive(
 
     let existing_path = std::env::var("PATH").unwrap_or_default();
     steam_cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
-    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
+
+    // Fix TLS/Network Error for login
+    steam_cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
+    steam_cmd.env("SSL_CERT_DIR", "/etc/ssl/certs");
 
     let status = steam_cmd.status().context("failed to launch interactive Steam")?;
     println!("Interactive Steam exited with status: {}", status);
