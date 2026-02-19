@@ -56,6 +56,28 @@ pub async fn harvest_credentials(prefix_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+pub fn setup_fake_steam_env() -> Result<std::path::PathBuf> {
+    let config_dir = crate::config::config_dir()?;
+    let fake_env_dir = config_dir.join("fake_env");
+    std::fs::create_dir_all(&fake_env_dir)?;
+
+    let scripts = ["steam", "steam.sh"];
+    let content = "#!/bin/sh\nexit 0\n";
+
+    for script in scripts {
+        let script_path = fake_env_dir.join(script);
+        std::fs::write(&script_path, content)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+
+    Ok(fake_env_dir.canonicalize()?)
+}
+
 pub async fn inject_credentials(prefix_path: &std::path::Path) -> Result<()> {
     let secrets_dir = crate::config::config_dir()?.join("secrets");
     if !secrets_dir.exists() {

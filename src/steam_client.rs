@@ -2263,10 +2263,18 @@ impl SteamClient {
                 }
 
                 cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&compat_data_path)?);
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(&library_root)?);
+                let abs_pfx = crate::config::absolute_path(compat_data_path.join("pfx"))?;
+                cmd.env("WINEPREFIX", abs_pfx);
+
+                let trap_path = crate::utils::setup_fake_steam_env()?;
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &trap_path);
+
+                // Modify PATH to prioritize the fake steam trap
+                let existing_path = std::env::var("PATH").unwrap_or_default();
+                cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
 
                 if use_runtime {
-                    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n");
+                    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
                 }
 
                 if let Some(config) = user_config {

@@ -29,6 +29,9 @@ pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, libr
 
     println!("Starting Steam Runtime Installation...");
 
+    let trap_path = crate::utils::setup_fake_steam_env()?;
+    println!("Fake Steam Trap: {}", trap_path.display());
+
     let mut cmd = Command::new(proton_path);
     cmd.arg("run").arg(&installer_path).arg("/S");
 
@@ -38,7 +41,11 @@ pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, libr
 
     // Proton requires these to function correctly
     cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&prefix)?);
-    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(library_root)?);
+    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &trap_path);
+
+    // Modify PATH to prioritize the fake steam trap
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
 
     // Fix TLS/Network Error by providing host SSL certificates
     cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
@@ -59,8 +66,11 @@ pub async fn launch_ghost_steam(
     resolved_proton: &Path,
     steam_exe: &Path,
     prefix: &Path,
-    library_root: &Path,
+    _library_root: &Path,
 ) -> Result<()> {
+    let trap_path = crate::utils::setup_fake_steam_env()?;
+    println!("Fake Steam Trap: {}", trap_path.display());
+
     println!("Launching Steam Runtime in background...");
     let mut steam_cmd = Command::new(resolved_proton);
     steam_cmd.arg("run").arg(steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles");
@@ -68,11 +78,15 @@ pub async fn launch_ghost_steam(
     let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
     steam_cmd.env("WINEPREFIX", &abs_prefix);
     steam_cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(prefix)?);
-    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(library_root)?);
+    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &trap_path);
     steam_cmd.env("SteamAppId", app_id.to_string());
 
+    // Modify PATH to prioritize the fake steam trap
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    steam_cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
+
     // Ensure Steam uses its own binaries
-    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n");
+    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
 
     // Spawn detached
     let _steam_child = steam_cmd.spawn().context("failed to launch Ghost Steam")?;
