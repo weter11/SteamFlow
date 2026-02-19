@@ -31,9 +31,13 @@ pub async fn install_ghost_steam(app_id: u32, proton_path: &Path, library_root: 
     let mut cmd = Command::new(proton_path);
     cmd.arg("run").arg(&installer_path).arg("/S");
 
-    let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
-    cmd.env("WINEPREFIX", &abs_prefix);
+    let abs_prefix_path = crate::config::absolute_path(prefix.join("pfx"))?;
+    cmd.env("WINEPREFIX", &abs_prefix_path);
     cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+
+    // Proton requires these to function correctly
+    cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&prefix)?);
+    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(library_root)?);
 
     // Fix TLS/Network Error by providing host SSL certificates
     cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
@@ -42,7 +46,6 @@ pub async fn install_ghost_steam(app_id: u32, proton_path: &Path, library_root: 
     // Hide the fact we are launching from a Steam-like app
     cmd.env_remove("SteamAppId");
     cmd.env_remove("SteamGameId");
-    cmd.env_remove("STEAM_COMPAT_CLIENT_INSTALL_PATH");
 
     let status = cmd.status().context("failed to run Steam installer")?;
     println!("Installer finished with exit code: {}", status);

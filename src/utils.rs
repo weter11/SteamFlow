@@ -22,3 +22,72 @@ pub async fn ensure_steam_installer() -> Result<PathBuf> {
 
     Ok(installer_path.canonicalize()?)
 }
+
+pub async fn harvest_credentials(prefix_path: &std::path::Path) -> Result<()> {
+    let secrets_dir = crate::config::config_dir()?.join("secrets");
+    fs::create_dir_all(&secrets_dir).await?;
+
+    let steam_dir = prefix_path.join("pfx/drive_c/Program Files (x86)/Steam");
+    if !steam_dir.exists() {
+        return Ok(());
+    }
+
+    let config_dir = steam_dir.join("config");
+    let files_to_harvest = ["config.vdf", "loginusers.vdf"];
+
+    for file_name in files_to_harvest {
+        let src = config_dir.join(file_name);
+        if src.exists() {
+            let dest = secrets_dir.join(file_name);
+            fs::copy(src, dest).await?;
+        }
+    }
+
+    // Harvest ssfn* files
+    let mut entries = fs::read_dir(&steam_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("ssfn") {
+            let dest = secrets_dir.join(name);
+            fs::copy(entry.path(), dest).await?;
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn inject_credentials(prefix_path: &std::path::Path) -> Result<()> {
+    let secrets_dir = crate::config::config_dir()?.join("secrets");
+    if !secrets_dir.exists() {
+        return Ok(());
+    }
+
+    let steam_dir = prefix_path.join("pfx/drive_c/Program Files (x86)/Steam");
+    if !steam_dir.exists() {
+        return Ok(());
+    }
+
+    let config_dir = steam_dir.join("config");
+    fs::create_dir_all(&config_dir).await?;
+
+    let files_to_inject = ["config.vdf", "loginusers.vdf"];
+    for file_name in files_to_inject {
+        let src = secrets_dir.join(file_name);
+        if src.exists() {
+            let dest = config_dir.join(file_name);
+            fs::copy(src, dest).await?;
+        }
+    }
+
+    // Inject ssfn* files
+    let mut entries = fs::read_dir(&secrets_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("ssfn") {
+            let dest = steam_dir.join(name);
+            fs::copy(entry.path(), dest).await?;
+        }
+    }
+
+    Ok(())
+}
