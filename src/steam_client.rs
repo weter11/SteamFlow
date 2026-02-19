@@ -2287,7 +2287,7 @@ impl SteamClient {
                 cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
 
                 if use_runtime {
-                    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+                    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
                 }
 
                 if let Some(config) = user_config {
