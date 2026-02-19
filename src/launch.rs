@@ -38,11 +38,17 @@ pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, libr
     println!("Wine Binary: {}", wine_bin.display());
 
     let mut cmd = Command::new(wine_bin);
-    cmd.arg(&installer_path).arg("/S");
+    cmd.arg(&installer_path);
 
     let abs_prefix_path = crate::config::absolute_path(prefix.join("pfx"))?;
     cmd.env("WINEPREFIX", &abs_prefix_path);
-    cmd.env("WINEDLLOVERRIDES", "mscoree=d;mshtml=d");
+
+    // Pass through display variables
+    for var in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
 
     // Manual LD_LIBRARY_PATH to fix network/GnuTLS
     let existing_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
@@ -141,6 +147,13 @@ pub async fn launch_ghost_steam_interactive(
     println!("Launching Steam Runtime for interactive login...");
     let mut steam_cmd = Command::new(resolved_proton);
     steam_cmd.arg("run").arg(steam_exe).arg("-tcp").arg("-cef-disable-gpu-compositing");
+
+    // Pass through display variables
+    for var in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"] {
+        if let Ok(val) = std::env::var(var) {
+            steam_cmd.env(var, val);
+        }
+    }
 
     let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
     steam_cmd.env("WINEPREFIX", &abs_prefix);
