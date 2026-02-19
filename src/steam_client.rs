@@ -2152,7 +2152,7 @@ impl SteamClient {
         let steam_exe = if let Some(path) = steam_exe {
             path
         } else {
-            crate::launch::install_ghost_steam(app.app_id, &resolved_proton, &library_root).await?;
+            crate::launch::install_ghost_steam_in_prefix(app.app_id, &resolved_proton, &library_root).await?;
             crate::launch::get_installed_steam_path(&prefix)
                 .ok_or_else(|| anyhow!("Failed to find steam.exe after installation"))?
         };
@@ -2264,6 +2264,10 @@ impl SteamClient {
 
                 cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&compat_data_path)?);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(&library_root)?);
+
+                if use_runtime {
+                    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n");
+                }
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {

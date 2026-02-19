@@ -1,9 +1,26 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use crate::utils::ensure_steam_installer;
 
-pub async fn install_ghost_steam(app_id: u32, proton_path: &Path, library_root: &Path) -> Result<()> {
+pub fn find_wine_binary(proton_path: &Path) -> Result<PathBuf> {
+    let candidates = [
+        "files/bin/wine",
+        "dist/bin/wine",
+        "bin/wine",
+    ];
+
+    for rel_path in candidates {
+        let full_path = proton_path.join(rel_path);
+        if full_path.exists() {
+            return Ok(full_path);
+        }
+    }
+
+    bail!("Wine binary not found in Proton dir: {}", proton_path.display())
+}
+
+pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, library_root: &Path) -> Result<()> {
     let prefix = library_root.join("steamapps/compatdata").join(app_id.to_string());
     let steam_dir = prefix.join("pfx/drive_c/Program Files (x86)/Steam");
 
@@ -12,10 +29,11 @@ pub async fn install_ghost_steam(app_id: u32, proton_path: &Path, library_root: 
 
     let mut deleted_count = 0;
     if steam_dir.exists() {
+        let files_to_delete = ["steam.exe", "lsteamclient.dll", "tier0_s.dll", "vstdlib_s.dll"];
         for entry in std::fs::read_dir(&steam_dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if name == "steam.exe" || name == "lsteamclient.dll" {
+            if files_to_delete.contains(&name.as_str()) {
                 std::fs::remove_file(entry.path())?;
                 deleted_count += 1;
             }
@@ -26,28 +44,25 @@ pub async fn install_ghost_steam(app_id: u32, proton_path: &Path, library_root: 
     let installer_path = ensure_steam_installer().await?;
     println!("Installer Path: {}", installer_path.display());
 
-    println!("Starting Steam Runtime Installation...");
+    let wine_binary = find_wine_binary(proton_path)?;
+    println!("Wine Binary: {}", wine_binary.display());
 
-    let mut cmd = Command::new(proton_path);
-    cmd.arg("run").arg(&installer_path).arg("/S");
+    println!("Starting Steam Runtime Installation (Raw Wine)...");
+
+    let mut cmd = Command::new(&wine_binary);
+    cmd.arg(&installer_path).arg("/S");
 
     let abs_prefix_path = crate::config::absolute_path(prefix.join("pfx"))?;
     cmd.env("WINEPREFIX", &abs_prefix_path);
-    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+    cmd.env("WINEDLLOVERRIDES", "mscoree=d;mshtml=d");
 
-    // Proton requires these to function correctly
-    cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&prefix)?);
-    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(library_root)?);
-
-    // Fix TLS/Network Error by providing host SSL certificates
-    cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
-    cmd.env("SSL_CERT_DIR", "/etc/ssl/certs");
-
-    // Hide the fact we are launching from a Steam-like app
+    // Remove Proton variables to bypass Steam emulation during install
+    cmd.env_remove("STEAM_COMPAT_DATA_PATH");
+    cmd.env_remove("STEAM_COMPAT_CLIENT_INSTALL_PATH");
     cmd.env_remove("SteamAppId");
     cmd.env_remove("SteamGameId");
 
-    let status = cmd.status().context("failed to run Steam installer")?;
+    let status = cmd.status().context("failed to run Steam installer via raw wine")?;
     println!("Installer finished with exit code: {}", status);
 
     Ok(())
@@ -71,7 +86,7 @@ pub async fn launch_ghost_steam(
     steam_cmd.env("SteamAppId", app_id.to_string());
 
     // Ensure Steam uses its own binaries
-    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;Steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n");
 
     // Spawn detached
     let _steam_child = steam_cmd.spawn().context("failed to launch Ghost Steam")?;
