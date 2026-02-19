@@ -2159,7 +2159,14 @@ impl SteamClient {
         };
 
         if just_installed {
-            println!("Setup complete. Harvesting credentials...");
+            println!("Setup complete. Launching interactive Steam for login...");
+            crate::launch::launch_ghost_steam_interactive(
+                app.app_id,
+                &resolved_proton,
+                &steam_exe,
+                &prefix,
+            ).await?;
+            println!("Harvesting credentials...");
             let _ = crate::utils::harvest_credentials(&prefix).await;
         }
 

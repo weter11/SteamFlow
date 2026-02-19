@@ -38,7 +38,7 @@ pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, libr
     println!("Wine Binary: {}", wine_bin.display());
 
     let mut cmd = Command::new(wine_bin);
-    cmd.arg(&installer_path);
+    cmd.arg(&installer_path).arg("/S");
 
     let abs_prefix_path = crate::config::absolute_path(prefix.join("pfx"))?;
     cmd.env("WINEPREFIX", &abs_prefix_path);
@@ -65,6 +65,15 @@ pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, libr
 
     let status = cmd.status().context("failed to run Steam installer via raw Wine")?;
     println!("Installer finished with exit code: {}", status);
+
+    if get_installed_steam_path(&prefix).is_some() {
+        println!("Steam installation verified (steam.exe found).");
+        return Ok(());
+    }
+
+    if !status.success() {
+        anyhow::bail!("Steam installer failed and steam.exe was not found.");
+    }
 
     Ok(())
 }
@@ -96,7 +105,7 @@ pub async fn launch_ghost_steam(
 
     println!("Launching Steam Runtime in background...");
     let mut steam_cmd = Command::new(resolved_proton);
-    steam_cmd.arg("run").arg(steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles");
+    steam_cmd.arg("run").arg(steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles").arg("-cef-disable-gpu-compositing");
 
     let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
     steam_cmd.env("WINEPREFIX", &abs_prefix);
@@ -116,6 +125,35 @@ pub async fn launch_ghost_steam(
 
     println!("Waiting for Steam Runtime initialization...");
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    Ok(())
+}
+
+pub async fn launch_ghost_steam_interactive(
+    app_id: u32,
+    resolved_proton: &Path,
+    steam_exe: &Path,
+    prefix: &Path,
+) -> Result<()> {
+    let trap_path = crate::utils::setup_fake_steam_env()?;
+    println!("Fake Steam Trap: {}", trap_path.display());
+
+    println!("Launching Steam Runtime for interactive login...");
+    let mut steam_cmd = Command::new(resolved_proton);
+    steam_cmd.arg("run").arg(steam_exe).arg("-cef-disable-gpu-compositing");
+
+    let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
+    steam_cmd.env("WINEPREFIX", &abs_prefix);
+    steam_cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(prefix)?);
+    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &trap_path);
+    steam_cmd.env("SteamAppId", app_id.to_string());
+
+    let existing_path = std::env::var("PATH").unwrap_or_default();
+    steam_cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
+    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
+
+    let status = steam_cmd.status().context("failed to launch interactive Steam")?;
+    println!("Interactive Steam exited with status: {}", status);
 
     Ok(())
 }
