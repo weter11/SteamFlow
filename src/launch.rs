@@ -35,6 +35,10 @@ pub async fn install_ghost_steam(app_id: u32, proton_path: &Path, library_root: 
     cmd.env("WINEPREFIX", &abs_prefix);
     cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
 
+    // Fix TLS/Network Error by providing host SSL certificates
+    cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
+    cmd.env("SSL_CERT_DIR", "/etc/ssl/certs");
+
     // Hide the fact we are launching from a Steam-like app
     cmd.env_remove("SteamAppId");
     cmd.env_remove("SteamGameId");

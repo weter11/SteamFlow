@@ -2136,7 +2136,7 @@ impl SteamClient {
         };
 
         if !use_runtime || matches!(launch_info.target, LaunchTarget::NativeLinux) {
-            return self.spawn_raw_game_process(app, launch_info, resolved_proton.as_deref(), launcher_config, user_config);
+            return self.spawn_raw_game_process(app, launch_info, resolved_proton.as_deref(), launcher_config, user_config, use_runtime);
         }
 
         // Ghost Steam Logic
@@ -2164,7 +2164,7 @@ impl SteamClient {
         ).await?;
 
         println!("Launching Game Executable...");
-        self.spawn_raw_game_process(app, launch_info, Some(&resolved_proton), launcher_config, user_config)
+        self.spawn_raw_game_process(app, launch_info, Some(&resolved_proton), launcher_config, user_config, use_runtime)
     }
 
     pub(crate) fn spawn_raw_game_process(
@@ -2174,6 +2174,7 @@ impl SteamClient {
         resolved_proton_path: Option<&Path>,
         launcher_config: &crate::config::LauncherConfig,
         user_config: Option<&crate::models::UserAppConfig>,
+        use_runtime: bool,
     ) -> Result<std::process::Child> {
         let install_dir = PathBuf::from(
             app.install_path
@@ -2243,7 +2244,14 @@ impl SteamClient {
                 let mut cmd = Command::new(&resolved_proton);
                 cmd.arg("run").arg(&executable).args(&args);
                 cmd.current_dir(&install_dir);
-                cmd.env("SteamAppId", app.app_id.to_string());
+
+                if use_runtime {
+                    cmd.env("SteamAppId", app.app_id.to_string());
+                } else {
+                    cmd.env_remove("SteamAppId");
+                    cmd.env_remove("SteamGameId");
+                }
+
                 cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&compat_data_path)?);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(&library_root)?);
 
