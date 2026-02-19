@@ -1,24 +1,7 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use crate::utils::ensure_steam_installer;
-
-pub fn find_wine_binary(proton_path: &Path) -> Result<PathBuf> {
-    let candidates = [
-        "files/bin/wine",
-        "dist/bin/wine",
-        "bin/wine",
-    ];
-
-    for rel_path in candidates {
-        let full_path = proton_path.join(rel_path);
-        if full_path.exists() {
-            return Ok(full_path);
-        }
-    }
-
-    bail!("Wine binary not found in Proton dir: {}", proton_path.display())
-}
 
 pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, library_root: &Path) -> Result<()> {
     let prefix = library_root.join("steamapps/compatdata").join(app_id.to_string());
@@ -44,25 +27,28 @@ pub async fn install_ghost_steam_in_prefix(app_id: u32, proton_path: &Path, libr
     let installer_path = ensure_steam_installer().await?;
     println!("Installer Path: {}", installer_path.display());
 
-    let wine_binary = find_wine_binary(proton_path)?;
-    println!("Wine Binary: {}", wine_binary.display());
+    println!("Starting Steam Runtime Installation...");
 
-    println!("Starting Steam Runtime Installation (Raw Wine)...");
-
-    let mut cmd = Command::new(&wine_binary);
-    cmd.arg(&installer_path).arg("/S");
+    let mut cmd = Command::new(proton_path);
+    cmd.arg("run").arg(&installer_path).arg("/S");
 
     let abs_prefix_path = crate::config::absolute_path(prefix.join("pfx"))?;
     cmd.env("WINEPREFIX", &abs_prefix_path);
-    cmd.env("WINEDLLOVERRIDES", "mscoree=d;mshtml=d");
+    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n;mscoree=d;mshtml=d");
 
-    // Remove Proton variables to bypass Steam emulation during install
-    cmd.env_remove("STEAM_COMPAT_DATA_PATH");
-    cmd.env_remove("STEAM_COMPAT_CLIENT_INSTALL_PATH");
+    // Proton requires these to function correctly
+    cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&prefix)?);
+    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", crate::config::absolute_path(library_root)?);
+
+    // Fix TLS/Network Error by providing host SSL certificates
+    cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
+    cmd.env("SSL_CERT_DIR", "/etc/ssl/certs");
+
+    // Hide the fact we are launching from a Steam-like app
     cmd.env_remove("SteamAppId");
     cmd.env_remove("SteamGameId");
 
-    let status = cmd.status().context("failed to run Steam installer via raw wine")?;
+    let status = cmd.status().context("failed to run Steam installer")?;
     println!("Installer finished with exit code: {}", status);
 
     Ok(())
