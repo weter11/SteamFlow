@@ -1,7 +1,7 @@
 use crate::cloud_sync::{default_cloud_root, CloudClient};
 use crate::cm_list::get_cm_endpoints;
 use crate::config::{
-    delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
+    config_dir, delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
     save_library_cache, save_session,
 };
 use crate::depot_browser::{self, DepotInfo as BrowserDepotInfo, ManifestFileEntry};
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 
 use steam_vent::auth::{
     AuthConfirmationHandler, ConfirmationMethod, DeviceConfirmationHandler, FileGuardDataStore,
@@ -2198,6 +2198,35 @@ impl SteamClient {
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
                         cmd.env(key, val);
+                    }
+                }
+
+                if let Some(config) = user_config {
+                    if config.use_steam_runtime {
+                        let master_steam_dir = config_dir()?.join("master_steam_prefix/drive_c/Program Files (x86)/Steam");
+                        let target_steam_dir = compat_data_path.join("pfx/drive_c/Program Files (x86)/Steam");
+
+                        if master_steam_dir.exists() {
+                            tracing::info!("Cloning Master Steam to game prefix...");
+                            let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
+
+                            if let Some(runner_root) = resolved_proton.parent() {
+                                if let Ok(mut steam_cmd) = crate::utils::build_runner_command(runner_root) {
+                                    steam_cmd.arg(target_steam_dir.join("steam.exe"));
+                                    steam_cmd.args(&["-silent", "-no-browser", "-noverifyfiles", "-tcp", "-cef-disable-gpu-compositing"]);
+                                    steam_cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
+                                    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;lsteamclient=n;steam_api=n;steam_api64=n");
+
+                                    tracing::info!("Launching Background Steam Runtime...");
+                                    let _ = steam_cmd.spawn();
+
+                                    tracing::info!("Waiting 5 seconds for Steam Runtime...");
+                                    std::thread::sleep(Duration::from_secs(5));
+                                }
+                            }
+                        } else {
+                            tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
+                        }
                     }
                 }
 

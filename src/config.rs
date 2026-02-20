@@ -15,6 +15,8 @@ pub struct GameConfig {
 pub struct LauncherConfig {
     pub steam_library_path: String,
     pub proton_version: String,
+    #[serde(default)]
+    pub steam_runtime_runner: PathBuf,
     pub enable_cloud_sync: bool,
     #[serde(default)]
     pub use_shared_compat_data: bool,
@@ -46,6 +48,7 @@ impl Default for LauncherConfig {
         Self {
             steam_library_path,
             proton_version: "experimental".to_string(),
+            steam_runtime_runner: PathBuf::new(),
             enable_cloud_sync: true,
             use_shared_compat_data: false,
             preferred_launch_options: HashMap::new(),
