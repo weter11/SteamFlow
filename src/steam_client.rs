@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-use std::time::{Instant, Duration};
+use std::time::Instant;
 
 use steam_vent::auth::{
     AuthConfirmationHandler, ConfirmationMethod, DeviceConfirmationHandler, FileGuardDataStore,
@@ -2196,14 +2196,52 @@ impl SteamClient {
 
                 let bat_path = compat_data_path.join("pfx/drive_c/steamflow_launch.bat");
                 let exe_name = executable.file_name().unwrap().to_string_lossy();
-                let bat_content = format!(
+                let dir_z_path = format!("Z:{}", game_working_dir.to_string_lossy().replace('/', "\\"));
+
+                let mut bat_content = format!(
                     "@echo off\r\n\
+                     :: 1. Heal the registry from Proton's Python wrapper\r\n\
                      reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient.dll\" /f\r\n\
                      reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll64 /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient64.dll\" /f\r\n\
-                     start /wait \"\" \"{}\" {}\r\n",
-                    exe_name,
-                    args.join(" ")
+                     \r\n"
                 );
+
+                if let Some(config) = user_config {
+                    if config.use_steam_runtime {
+                        let base_config = config_dir()?;
+                        let master_prefix = base_config.join("master_steam_prefix");
+                        let master_steam_dir = if master_prefix.join("pfx").exists() {
+                            master_prefix.join("pfx/drive_c/Program Files (x86)/Steam")
+                        } else {
+                            master_prefix.join("drive_c/Program Files (x86)/Steam")
+                        };
+                        let target_steam_dir = compat_data_path.join("pfx/drive_c/Program Files (x86)/Steam");
+
+                        if master_steam_dir.exists() {
+                            tracing::info!("Cloning Master Steam to game prefix...");
+                            let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
+
+                            bat_content.push_str(&format!(
+                                ":: 2. Start Ghost Steam in the background\r\n\
+                                 start \"\" \"C:\\Program Files (x86)\\Steam\\steam.exe\" -silent -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -no-dwrite -noverifyfiles\r\n\
+                                 \r\n\
+                                 :: 3. Wait 12 seconds for DRM pipes to open (ping is highly reliable in Wine)\r\n\
+                                 ping -n 13 127.0.0.1 > nul\r\n\
+                                 \r\n"
+                            ));
+                        } else {
+                            tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
+                        }
+                    }
+                }
+
+                bat_content.push_str(&format!(
+                    ":: 4. Change to Game Directory and Launch (Blocks until game exits)\r\n\
+                     cd /d \"{}\"\r\n\
+                     \"{}\" {}\r\n",
+                    dir_z_path, exe_name, args.join(" ")
+                ));
+
                 std::fs::write(&bat_path, bat_content).context("Failed to write launch batch script")?;
 
                 let mut cmd = crate::utils::build_runner_command(resolved_proton.parent().unwrap_or_else(|| Path::new(".")))?;
@@ -2213,7 +2251,19 @@ impl SteamClient {
                 cmd.env("SteamGameId", &app_id_str);
                 cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+
+                if let Some(config) = user_config {
+                    if config.use_steam_runtime {
+                        cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
+                        let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
+                        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
+                        cmd.env("WINEDLLOVERRIDES", "steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+                    } else {
+                        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+                    }
+                } else {
+                    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+                }
 
                 if let Ok(display) = std::env::var("DISPLAY") {
                     cmd.env("DISPLAY", display);
@@ -2228,70 +2278,6 @@ impl SteamClient {
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
                         cmd.env(key, val);
-                    }
-                }
-
-                if let Some(config) = user_config {
-                    if config.use_steam_runtime {
-                        cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
-                        let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
-                        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
-                        cmd.env("WINEDLLOVERRIDES", "steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
-
-                        let base_config = config_dir()?;
-                        let master_prefix = base_config.join("master_steam_prefix");
-                        let master_steam_dir = if master_prefix.join("pfx").exists() {
-                            master_prefix.join("pfx/drive_c/Program Files (x86)/Steam")
-                        } else {
-                            master_prefix.join("drive_c/Program Files (x86)/Steam")
-                        };
-                        let target_steam_dir = compat_data_path.join("pfx/drive_c/Program Files (x86)/Steam");
-
-                        if master_steam_dir.exists() {
-                            tracing::info!("Cloning Master Steam to game prefix...");
-                            let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
-
-                            if let Some(runner_root) = resolved_proton.parent() {
-                                if let Ok(mut steam_cmd) = crate::utils::build_runner_command(runner_root) {
-                                    steam_cmd.arg(target_steam_dir.join("steam.exe"));
-                                    steam_cmd.args(&[
-                                        "-silent",
-                                        "-tcp",
-                                        "-cef-disable-gpu",
-                                        "-cef-disable-gpu-compositing",
-                                        "-cef-disable-d3d11",
-                                        "-disable-overlay",
-                                        "-nofriendsui",
-                                        "-no-dwrite",
-                                        "-noverifyfiles",
-                                    ]);
-                                    steam_cmd.env("SteamAppId", &app_id_str);
-                                    steam_cmd.env("SteamGameId", &app_id_str);
-                                    steam_cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
-                                    steam_cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                                    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
-                                    steam_cmd.env("WINEDLLOVERRIDES", "steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
-
-                                    if let Ok(display) = std::env::var("DISPLAY") {
-                                        steam_cmd.env("DISPLAY", display);
-                                    }
-                                    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
-                                        steam_cmd.env("WAYLAND_DISPLAY", wayland);
-                                    }
-                                    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
-                                        steam_cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
-                                    }
-
-                                    tracing::info!("Launching Background Steam Runtime...");
-                                    let _ = steam_cmd.spawn();
-
-                                    tracing::info!("Waiting 12 seconds for Steam Runtime...");
-                                    std::thread::sleep(Duration::from_secs(12));
-                                }
-                            }
-                        } else {
-                            tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
-                        }
                     }
                 }
 
