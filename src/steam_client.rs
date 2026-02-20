@@ -2180,6 +2180,10 @@ impl SteamClient {
                 let library_root = PathBuf::from(&launcher_config.steam_library_path);
                 let resolved_proton = self.resolve_proton_path(proton, &library_root);
 
+                if !resolved_proton.exists() && !resolved_proton.is_absolute() {
+                    bail!("Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.", resolved_proton.display());
+                }
+
                 let compat_data_path = library_root
                     .join("steamapps")
                     .join("compatdata")
@@ -2194,7 +2198,10 @@ impl SteamClient {
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", config_dir()?);
+
+                let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
+                cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
                 if let Ok(display) = std::env::var("DISPLAY") {
                     cmd.env("DISPLAY", display);
@@ -2237,8 +2244,8 @@ impl SteamClient {
                                     ]);
                                     steam_cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                                     steam_cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                                    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", config_dir()?);
-                                    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;lsteamclient=n;steam_api=n;steam_api64=n");
+                                    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
+                                    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
                                     if let Ok(display) = std::env::var("DISPLAY") {
                                         steam_cmd.env("DISPLAY", display);
