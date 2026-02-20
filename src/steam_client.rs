@@ -2129,7 +2129,9 @@ impl SteamClient {
         }
 
         // Standard Steam identity fallback: steam_appid.txt
-        let _ = std::fs::write(install_dir.join("steam_appid.txt"), app.app_id.to_string());
+        let app_id_str = app.app_id.to_string();
+        let game_working_dir = executable.parent().unwrap_or(&install_dir);
+        let _ = std::fs::write(game_working_dir.join("steam_appid.txt"), &app_id_str);
 
         match launch_info.target {
             LaunchTarget::NativeLinux => {
@@ -2192,10 +2194,21 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
+                let bat_path = compat_data_path.join("pfx/drive_c/steamflow_launch.bat");
+                let exe_name = executable.file_name().unwrap().to_string_lossy();
+                let bat_content = format!(
+                    "@echo off\r\n\
+                     reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient.dll\" /f\r\n\
+                     reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll64 /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient64.dll\" /f\r\n\
+                     start /wait \"\" \"{}\" {}\r\n",
+                    exe_name,
+                    args.join(" ")
+                );
+                std::fs::write(&bat_path, bat_content).context("Failed to write launch batch script")?;
+
                 let mut cmd = crate::utils::build_runner_command(resolved_proton.parent().unwrap_or_else(|| Path::new(".")))?;
-                cmd.arg(&executable).args(&args);
-                cmd.current_dir(executable.parent().unwrap_or(&install_dir));
-                let app_id_str = app.app_id.to_string();
+                cmd.arg(&bat_path);
+                cmd.current_dir(game_working_dir);
                 cmd.env("SteamAppId", &app_id_str);
                 cmd.env("SteamGameId", &app_id_str);
                 cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
