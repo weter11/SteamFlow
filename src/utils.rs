@@ -23,36 +23,37 @@ pub async fn ensure_steam_installer() -> Result<PathBuf> {
     Ok(installer_path.canonicalize()?)
 }
 
-pub async fn harvest_credentials(prefix_path: &std::path::Path) -> Result<()> {
-    let secrets_dir = crate::config::config_dir()?.join("secrets");
-    fs::create_dir_all(&secrets_dir).await?;
+pub async fn deploy_master_steam(game_prefix: &std::path::Path) -> Result<()> {
+    let master_prefix = crate::config::master_steam_prefix()?;
+    let src_steam_dir = master_prefix.join("pfx/drive_c/Program Files (x86)/Steam");
+    let dest_steam_dir = game_prefix.join("pfx/drive_c/Program Files (x86)/Steam");
 
-    let steam_dir = prefix_path.join("pfx/drive_c/Program Files (x86)/Steam");
-    if !steam_dir.exists() {
-        return Ok(());
+    if !src_steam_dir.exists() {
+        anyhow::bail!("Master Steam installation not found. Please launch 'Steam Runtime (Windows)' from the library first.");
     }
 
-    let config_dir = steam_dir.join("config");
-    let files_to_harvest = ["config.vdf", "loginusers.vdf"];
+    println!("Deploying Master Steam to game prefix...");
+    println!("Source: {}", src_steam_dir.display());
+    println!("Destination: {}", dest_steam_dir.display());
 
-    for file_name in files_to_harvest {
-        let src = config_dir.join(file_name);
-        if src.exists() {
-            let dest = secrets_dir.join(file_name);
-            fs::copy(src, dest).await?;
+    if dest_steam_dir.exists() {
+        let _ = std::fs::remove_dir_all(&dest_steam_dir);
+    }
+    std::fs::create_dir_all(&dest_steam_dir)?;
+
+    for entry in walkdir::WalkDir::new(&src_steam_dir) {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let rel = path.strip_prefix(&src_steam_dir)?;
+            std::fs::create_dir_all(dest_steam_dir.join(rel))?;
+        } else {
+            let rel = path.strip_prefix(&src_steam_dir)?;
+            std::fs::copy(path, dest_steam_dir.join(rel))?;
         }
     }
 
-    // Harvest ssfn* files
-    let mut entries = fs::read_dir(&steam_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("ssfn") {
-            let dest = secrets_dir.join(name);
-            fs::copy(entry.path(), dest).await?;
-        }
-    }
-
+    println!("Master Steam deployment complete.");
     Ok(())
 }
 
@@ -76,40 +77,4 @@ pub fn setup_fake_steam_env() -> Result<std::path::PathBuf> {
     }
 
     Ok(fake_env_dir.canonicalize()?)
-}
-
-pub async fn inject_credentials(prefix_path: &std::path::Path) -> Result<()> {
-    let secrets_dir = crate::config::config_dir()?.join("secrets");
-    if !secrets_dir.exists() {
-        return Ok(());
-    }
-
-    let steam_dir = prefix_path.join("pfx/drive_c/Program Files (x86)/Steam");
-    if !steam_dir.exists() {
-        return Ok(());
-    }
-
-    let config_dir = steam_dir.join("config");
-    fs::create_dir_all(&config_dir).await?;
-
-    let files_to_inject = ["config.vdf", "loginusers.vdf"];
-    for file_name in files_to_inject {
-        let src = secrets_dir.join(file_name);
-        if src.exists() {
-            let dest = config_dir.join(file_name);
-            fs::copy(src, dest).await?;
-        }
-    }
-
-    // Inject ssfn* files
-    let mut entries = fs::read_dir(&secrets_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with("ssfn") {
-            let dest = steam_dir.join(name);
-            fs::copy(entry.path(), dest).await?;
-        }
-    }
-
-    Ok(())
 }

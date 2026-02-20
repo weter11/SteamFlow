@@ -94,6 +94,10 @@ pub fn data_dir() -> Result<PathBuf> {
     config_dir()  // or use XDG_DATA_HOME if you want proper separation
 }
 
+pub fn master_steam_prefix() -> Result<PathBuf> {
+    Ok(config_dir()?.join("master_steam_prefix"))
+}
+
 pub async fn load_session() -> Result<SessionState> {
     let session_path = config_dir()?.join("session.json");
     if !session_path.exists() {

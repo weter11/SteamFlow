@@ -1602,9 +1602,6 @@ impl SteamClient {
             tracing::info!(appid = app.app_id, "Upload Complete");
         }
 
-        let prefix = self.get_compat_data_path(app.app_id).await?;
-        let _ = crate::utils::harvest_credentials(&prefix).await;
-
         Ok(launch_info)
     }
 
@@ -2115,13 +2112,32 @@ impl SteamClient {
         launcher_config: &crate::config::LauncherConfig,
         user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<std::process::Child> {
+        let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
+
+        // Special handling for Master Steam Runtime (AppID 0)
+        if app.app_id == 0 {
+            let proton = if let Some(forced) = launcher_config
+                .game_configs
+                .get(&0)
+                .and_then(|c| c.forced_proton_version.as_ref())
+            {
+                forced
+            } else {
+                proton_path
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| anyhow!("proton path is required for Steam Runtime launch"))?
+            };
+            let resolved_proton = self.resolve_proton_path(proton, &library_root);
+            crate::launch::launch_master_steam(&resolved_proton).await?;
+            return Err(anyhow!("Steam Runtime session finished.")); // Wait for it to finish and return status to UI
+        }
+
         let use_runtime = user_config.map(|c| c.use_steam_runtime).unwrap_or_else(|| {
             matches!(launch_info.target, LaunchTarget::WindowsProton)
         });
 
         // Determine resolved proton if needed
         let resolved_proton = if matches!(launch_info.target, LaunchTarget::WindowsProton) {
-            let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
             let proton = if let Some(forced) = launcher_config
                 .game_configs
                 .get(&app.app_id)
@@ -2142,42 +2158,23 @@ impl SteamClient {
             return self.spawn_raw_game_process(app, launch_info, resolved_proton.as_deref(), launcher_config, user_config, use_runtime);
         }
 
-        // Ghost Steam Logic
-        let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
+        // Master Prefix Cloning Logic
         let prefix = library_root.join("steamapps/compatdata").join(app.app_id.to_string());
         let resolved_proton = resolved_proton.ok_or_else(|| anyhow!("Resolved proton missing for Windows launch"))?;
 
-        // Check Install
-        let steam_exe = crate::launch::get_installed_steam_path(&prefix);
-        let (steam_exe, just_installed) = if let Some(path) = steam_exe {
-            (path, false)
-        } else {
-            crate::launch::install_ghost_steam_in_prefix(app.app_id, &resolved_proton, &library_root).await?;
-            let path = crate::launch::get_installed_steam_path(&prefix)
-                .ok_or_else(|| anyhow!("Failed to find steam.exe after installation"))?;
-            (path, true)
-        };
+        // Deploy Master Steam
+        crate::utils::deploy_master_steam(&prefix).await?;
 
-        if just_installed {
-            println!("Setup complete. Launching interactive Steam for login...");
-            crate::launch::launch_ghost_steam_interactive(
-                app.app_id,
-                &resolved_proton,
-                &steam_exe,
-                &prefix,
-            ).await?;
-            println!("Harvesting credentials...");
-            let _ = crate::utils::harvest_credentials(&prefix).await;
-        }
+        // Check for the deployed steam.exe
+        let steam_exe = crate::launch::get_installed_steam_path(&prefix)
+            .ok_or_else(|| anyhow!("Failed to find steam.exe in game prefix after deployment"))?;
 
         // Launch Steam (Background)
-        let _ = crate::utils::inject_credentials(&prefix).await;
-        crate::launch::launch_ghost_steam(
+        crate::launch::launch_silent_steam(
             app.app_id,
             &resolved_proton,
             &steam_exe,
             &prefix,
-            &library_root,
         ).await?;
 
         println!("Launching Game Executable...");
