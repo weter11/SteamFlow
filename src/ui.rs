@@ -120,7 +120,6 @@ pub struct SteamLauncher {
     selected_app: Option<AppId>,
     show_installed_only: bool,
     search_text: String,
-    proton_path_for_windows: String,
     status: String,
     auth_username: String,
     auth_password: String,
@@ -179,7 +178,6 @@ impl SteamLauncher {
             selected_app: None,
             show_installed_only: false,
             search_text: String::new(),
-            proton_path_for_windows: String::new(),
             status: if authenticated {
                 "Ready".to_string()
             } else {
@@ -759,13 +757,7 @@ impl SteamLauncher {
     }
 
     fn handle_play_click(&mut self, game: &LibraryGame) {
-        let proton_path = if self.proton_path_for_windows.trim().is_empty() {
-            None
-        } else {
-            Some(self.proton_path_for_windows.trim().to_string())
-        };
-
-        let mut prefer_proton = proton_path.is_some();
+        let mut prefer_proton = false;
         if let Some(config) = self.launcher_config.game_configs.get(&game.app_id) {
             if let Some(pref) = &config.platform_preference {
                 prefer_proton = pref == "windows";
@@ -779,7 +771,7 @@ impl SteamLauncher {
         self.runtime.spawn(async move {
             match client.get_product_info(app_id, prefer_proton).await {
                 Ok(options) => {
-                    let _ = tx.send(AsyncOp::LaunchOptionsFetched(app_id, options, proton_path));
+                    let _ = tx.send(AsyncOp::LaunchOptionsFetched(app_id, options, None));
                 }
                 Err(err) => {
                     let _ = tx.send(AsyncOp::Error(format!("Failed to get launch options: {err}")));
@@ -924,14 +916,9 @@ impl SteamLauncher {
                     let _ = config.save().await;
                 });
             }
-            let proton_path = if self.proton_path_for_windows.trim().is_empty() {
-                None
-            } else {
-                Some(self.proton_path_for_windows.trim().to_string())
-            };
             let game = self.library.iter().find(|g| g.app_id == app_id).cloned();
             if let Some(game) = game {
-                self.start_launch_task(&game, option, proton_path);
+                self.start_launch_task(&game, option, None);
             }
             self.launch_selector = None;
         } else if close {
@@ -1768,9 +1755,6 @@ impl eframe::App for SteamLauncher {
                 if ui.button("Settings").clicked() {
                     self.show_settings = !self.show_settings;
                 }
-                ui.separator();
-                ui.label("Proton path (for Windows games):");
-                ui.text_edit_singleline(&mut self.proton_path_for_windows);
             });
             if self.client.is_offline() {
                 ui.colored_label(egui::Color32::YELLOW, "OFFLINE MODE");

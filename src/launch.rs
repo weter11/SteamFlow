@@ -38,6 +38,7 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     // Environment Variables
     cmd.env("WINEPREFIX", &master_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &master_prefix);
     cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
     if let Ok(display) = std::env::var("DISPLAY") {

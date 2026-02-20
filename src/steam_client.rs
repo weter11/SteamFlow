@@ -2188,12 +2188,23 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
-                let mut cmd = Command::new(&resolved_proton);
-                cmd.arg("run").arg(&executable).args(&args);
+                let mut cmd = crate::utils::build_runner_command(resolved_proton.parent().unwrap_or_else(|| Path::new(".")))?;
+                cmd.arg(&executable).args(&args);
                 cmd.current_dir(&install_dir);
                 cmd.env("SteamAppId", app.app_id.to_string());
+                cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+
+                if let Ok(display) = std::env::var("DISPLAY") {
+                    cmd.env("DISPLAY", display);
+                }
+                if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+                    cmd.env("WAYLAND_DISPLAY", wayland);
+                }
+                if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                    cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+                }
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
@@ -2213,9 +2224,30 @@ impl SteamClient {
                             if let Some(runner_root) = resolved_proton.parent() {
                                 if let Ok(mut steam_cmd) = crate::utils::build_runner_command(runner_root) {
                                     steam_cmd.arg(target_steam_dir.join("steam.exe"));
-                                    steam_cmd.args(&["-silent", "-no-browser", "-noverifyfiles", "-tcp", "-cef-disable-gpu-compositing"]);
+                                    steam_cmd.args(&[
+                                        "-silent",
+                                        "-tcp",
+                                        "-cef-disable-gpu",
+                                        "-cef-disable-gpu-compositing",
+                                        "-cef-disable-d3d11",
+                                        "-disable-overlay",
+                                        "-nofriendsui",
+                                        "-no-dwrite",
+                                        "-noverifyfiles",
+                                    ]);
                                     steam_cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
+                                    steam_cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
                                     steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;lsteamclient=n;steam_api=n;steam_api64=n");
+
+                                    if let Ok(display) = std::env::var("DISPLAY") {
+                                        steam_cmd.env("DISPLAY", display);
+                                    }
+                                    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+                                        steam_cmd.env("WAYLAND_DISPLAY", wayland);
+                                    }
+                                    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                                        steam_cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+                                    }
 
                                     tracing::info!("Launching Background Steam Runtime...");
                                     let _ = steam_cmd.spawn();
