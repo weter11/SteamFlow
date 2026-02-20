@@ -2,7 +2,7 @@ use crate::cloud_sync::{default_cloud_root, CloudClient};
 use crate::cm_list::get_cm_endpoints;
 use crate::config::{
     delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
-    save_library_cache, save_session,
+    save_library_cache, save_session, UserAppConfig,
 };
 use crate::depot_browser::{self, DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::models::{
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -1556,7 +1556,7 @@ impl SteamClient {
         &mut self,
         app: &LibraryGame,
         proton_path: Option<&str>,
-        user_config: Option<&crate::models::UserAppConfig>,
+        user_config: Option<&UserAppConfig>,
     ) -> Result<LaunchInfo> {
         let prefer_proton = proton_path.is_some();
         let launch_options = self.get_product_info(app.app_id, prefer_proton).await?;
@@ -1595,6 +1595,7 @@ impl SteamClient {
             self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config).await?;
         child
             .wait()
+            .await
             .context("failed waiting for game process exit")?;
 
         if let (Some(client), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
@@ -1610,7 +1611,7 @@ impl SteamClient {
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
-        user_config: Option<&crate::models::UserAppConfig>,
+        user_config: Option<&UserAppConfig>,
     ) -> Result<()> {
         let launcher_config = load_launcher_config().await.unwrap_or_default();
         self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config).await?;
@@ -2082,23 +2083,21 @@ impl SteamClient {
             return PathBuf::from(proton_name);
         }
 
-        let standard_path = library_root
+        let standard_dir = library_root
             .join("steamapps/common")
-            .join(proton_name)
-            .join("proton");
+            .join(proton_name);
 
-        if standard_path.exists() {
-            return standard_path;
+        if standard_dir.exists() {
+            return standard_dir;
         }
 
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let custom_path = PathBuf::from(home)
+        let custom_dir = PathBuf::from(home)
             .join(".local/share/Steam/compatibilitytools.d")
-            .join(proton_name)
-            .join("proton");
+            .join(proton_name);
 
-        if custom_path.exists() {
-            return custom_path;
+        if custom_dir.exists() {
+            return custom_dir;
         }
 
         PathBuf::from(proton_name)
@@ -2110,27 +2109,9 @@ impl SteamClient {
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
         launcher_config: &crate::config::LauncherConfig,
-        user_config: Option<&crate::models::UserAppConfig>,
-    ) -> Result<std::process::Child> {
+        user_config: Option<&UserAppConfig>,
+    ) -> Result<tokio::process::Child> {
         let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
-
-        // Special handling for Master Steam Runtime (AppID 0)
-        if app.app_id == 0 {
-            let proton = if let Some(forced) = launcher_config
-                .game_configs
-                .get(&0)
-                .and_then(|c| c.forced_proton_version.as_ref())
-            {
-                forced
-            } else {
-                proton_path
-                    .filter(|p| !p.is_empty())
-                    .ok_or_else(|| anyhow!("proton path is required for Steam Runtime launch"))?
-            };
-            let resolved_proton = self.resolve_proton_path(proton, &library_root);
-            crate::launch::launch_master_steam(&resolved_proton).await?;
-            return Err(anyhow!("Steam Runtime session finished.")); // Wait for it to finish and return status to UI
-        }
 
         let use_runtime = user_config.map(|c| c.use_steam_runtime).unwrap_or_else(|| {
             matches!(launch_info.target, LaunchTarget::WindowsProton)
@@ -2158,23 +2139,28 @@ impl SteamClient {
             return self.spawn_raw_game_process(app, launch_info, resolved_proton.as_deref(), launcher_config, user_config, use_runtime);
         }
 
-        // Master Prefix Cloning Logic
+        // Ghost Steam Logic (Phase 4)
         let prefix = library_root.join("steamapps/compatdata").join(app.app_id.to_string());
         let resolved_proton = resolved_proton.ok_or_else(|| anyhow!("Resolved proton missing for Windows launch"))?;
 
-        // Deploy Master Steam
-        crate::utils::deploy_master_steam(&prefix).await?;
-
-        // Check for the deployed steam.exe
-        let steam_exe = crate::launch::get_installed_steam_path(&prefix)
-            .ok_or_else(|| anyhow!("Failed to find steam.exe in game prefix after deployment"))?;
+        // Check Install
+        let steam_exe = crate::launch::get_installed_steam_path(&prefix);
+        let steam_exe = match steam_exe {
+            Some(exe) => exe,
+            None => {
+                crate::launch::install_ghost_steam(app.app_id, &resolved_proton).await?;
+                crate::launch::get_installed_steam_path(&prefix)
+                    .ok_or_else(|| anyhow!("Failed to find steam.exe in game prefix after installation"))?
+            }
+        };
 
         // Launch Steam (Background)
-        crate::launch::launch_silent_steam(
+        crate::launch::launch_ghost_steam(
             app.app_id,
             &resolved_proton,
             &steam_exe,
             &prefix,
+            true, // silent
         ).await?;
 
         println!("Launching Game Executable...");
@@ -2193,9 +2179,9 @@ impl SteamClient {
         launch_info: &LaunchInfo,
         resolved_proton_path: Option<&Path>,
         launcher_config: &crate::config::LauncherConfig,
-        user_config: Option<&crate::models::UserAppConfig>,
+        user_config: Option<&UserAppConfig>,
         use_runtime: bool,
-    ) -> Result<std::process::Child> {
+    ) -> Result<tokio::process::Child> {
         let install_dir = PathBuf::from(
             app.install_path
                 .clone()
@@ -2261,8 +2247,8 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
-                let mut cmd = Command::new(&resolved_proton);
-                cmd.arg("run").arg(&executable).args(&args);
+                let mut cmd = crate::launch::build_runner_command(resolved_proton)?;
+                cmd.arg(&executable).args(&args);
                 cmd.current_dir(&install_dir);
 
                 if use_runtime {
@@ -2293,7 +2279,7 @@ impl SteamClient {
                     }
                 }
 
-                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, cmd.get_args());
+                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, args);
                 cmd.spawn().context("failed to spawn proton game")
             }
         }

@@ -1,4 +1,4 @@
-use crate::models::{OwnedGame, SessionState, UserConfigStore};
+use crate::models::{OwnedGame, SessionState};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,6 +10,34 @@ pub struct GameConfig {
     pub forced_proton_version: Option<String>,
     pub platform_preference: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAppConfig {
+    pub launch_options: String,      // e.g. "-novid -console"
+    pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
+    pub hidden: bool,                // Future use
+    pub favorite: bool,              // Future use
+    #[serde(default = "default_true")]
+    pub use_steam_runtime: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UserAppConfig {
+    fn default() -> Self {
+        Self {
+            launch_options: String::new(),
+            env_variables: HashMap::new(),
+            hidden: false,
+            favorite: false,
+            use_steam_runtime: true,
+        }
+    }
+}
+
+pub type UserConfigStore = HashMap<u32, UserAppConfig>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
@@ -92,10 +120,6 @@ pub fn opensteam_image_cache_dir() -> Result<PathBuf> {
 
 pub fn data_dir() -> Result<PathBuf> {
     config_dir()  // or use XDG_DATA_HOME if you want proper separation
-}
-
-pub fn master_steam_prefix() -> Result<PathBuf> {
-    Ok(config_dir()?.join("master_steam_prefix"))
 }
 
 pub async fn load_session() -> Result<SessionState> {

@@ -1,126 +1,138 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 use crate::utils::ensure_steam_installer;
 
-pub async fn launch_master_steam(proton_path: &Path) -> Result<()> {
-    let master_prefix = crate::config::master_steam_prefix()?;
-    let steam_exe = get_installed_steam_path(&master_prefix);
+pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
+    // 1. Check if it's Proton (has a 'proton' script in the root)
+    let proton_script = runner_path.join("proton");
+    if proton_script.exists() {
+        let mut cmd = Command::new(proton_script);
+        cmd.arg("run");
+        return Ok(cmd);
+    }
 
-    if let Some(exe_path) = steam_exe {
-        println!("Master Steam found. Launching interactively...");
-        let mut cmd = Command::new(proton_path);
-        cmd.arg("run").arg(exe_path).arg("-tcp").arg("-cef-disable-gpu-compositing");
+    // 2. Check if it's standard Wine / wine-tkg (has 'bin/wine')
+    let wine_bin = runner_path.join("bin/wine");
+    if wine_bin.exists() {
+        return Ok(Command::new(wine_bin));
+    }
 
-        let abs_master_pfx = crate::config::absolute_path(master_prefix.join("pfx"))?;
-        cmd.env("WINEPREFIX", &abs_master_pfx);
-        cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&master_prefix)?);
+    // 3. Fallback for system wine if runner_path is just "/usr/bin/wine"
+    if runner_path.is_file() && runner_path.file_name() == Some(std::ffi::OsStr::new("wine")) {
+        return Ok(Command::new(runner_path));
+    }
 
-        // Pass through display variables
-        for var in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
+    Err(anyhow::anyhow!("failed to find wine binary in runner directory: {:?}", runner_path))
+}
+
+pub async fn install_ghost_steam(app_id: u32, proton_path: &Path) -> Result<()> {
+    println!("Starting Steam Runtime Installation for AppID: {}...", app_id);
+    let launcher_config = crate::config::load_launcher_config().await?;
+    let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
+    let prefix = library_root.join("steamapps/compatdata").join(app_id.to_string());
+
+    let installer_path = ensure_steam_installer().await?;
+    println!("Installer Path: {}", installer_path.display());
+    println!("Prefix Path: {}", prefix.display());
+
+    // Step A: Sanitize Target
+    let target_dir = prefix.join("pfx/drive_c/Program Files (x86)/Steam");
+    if target_dir.exists() {
+        println!("Sanitizing prefix...");
+        let mut deleted_count = 0;
+        let entries = ["steam.exe", "lsteamclient.dll"];
+        for entry in entries {
+            let file_path = target_dir.join(entry);
+            if file_path.exists() {
+                std::fs::remove_file(&file_path)?;
+                deleted_count += 1;
             }
         }
+        println!("Sanitizing prefix... deleted {} files.", deleted_count);
+    }
 
-        cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
+    // Step B: Construct Command
+    let mut cmd = build_runner_command(proton_path)?;
+    cmd.arg(&installer_path).arg("/S");
 
-        let status = cmd.status().context("failed to run master Steam")?;
-        println!("Master Steam exited with status: {}", status);
-    } else {
-        println!("Master Steam NOT found. Starting Installation...");
-        let installer_path = ensure_steam_installer().await?;
+    let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
+    cmd.env("WINEPREFIX", &abs_prefix);
+    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
 
-        let proton_dir = proton_path.parent().context("failed to get proton directory")?;
-        let wine_bin = find_wine_binary(proton_dir).context("failed to find wine binary in proton directory")?;
-        let lib64_dir = proton_dir.join("files/lib64");
-        let lib32_dir = proton_dir.join("files/lib");
+    // REMOVE: SteamAppId, SteamGameId, STEAM_COMPAT_CLIENT_INSTALL_PATH
+    cmd.env_remove("SteamAppId");
+    cmd.env_remove("SteamGameId");
+    cmd.env_remove("STEAM_COMPAT_CLIENT_INSTALL_PATH");
 
-        let mut cmd = Command::new(wine_bin);
-        cmd.arg(&installer_path);
+    // Fix TLS/Network Error
+    cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
+    cmd.env("SSL_CERT_DIR", "/etc/ssl/certs");
 
-        let abs_master_pfx = crate::config::absolute_path(master_prefix.join("pfx"))?;
-        cmd.env("WINEPREFIX", &abs_master_pfx);
-
-        // Pass through display variables
-        for var in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-
-        // Manual LD_LIBRARY_PATH to fix network/GnuTLS
-        let existing_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-        let new_ld = if existing_ld.is_empty() {
-            format!("{}:{}", lib64_dir.display(), lib32_dir.display())
-        } else {
-            format!("{}:{}:{}", lib64_dir.display(), lib32_dir.display(), existing_ld)
-        };
-        cmd.env("LD_LIBRARY_PATH", new_ld);
-
-        // Fix TLS/Network Error
-        cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
-        cmd.env("SSL_CERT_DIR", "/etc/ssl/certs");
-
-        let status = cmd.status().context("failed to run Steam installer")?;
-        println!("Installer finished with exit code: {}", status);
-
-        if get_installed_steam_path(&master_prefix).is_some() {
-            println!("Master Steam installation verified.");
-        } else {
-            anyhow::bail!("Steam installer failed to create steam.exe in master prefix.");
+    // Pass through display variables for installer UI (even if silent, sometimes needed)
+    for var in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
         }
     }
+
+    // Step C: Execute & Wait
+    let status = cmd.status().await.context("failed to run Steam installer")?;
+    println!("Installer finished with exit code: {}", status);
 
     Ok(())
 }
 
-fn find_wine_binary(proton_dir: &Path) -> Option<PathBuf> {
-    let candidates = [
-        proton_dir.join("files/bin/wine"),
-        proton_dir.join("dist/bin/wine"),
-        proton_dir.join("bin/wine"),
-    ];
-
-    for path in candidates {
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
-}
-
-pub async fn launch_silent_steam(
+pub async fn launch_ghost_steam(
     app_id: u32,
-    resolved_proton: &Path,
+    proton_path: &Path,
     steam_exe: &Path,
     prefix: &Path,
+    silent: bool,
 ) -> Result<()> {
-    let trap_path = crate::utils::setup_fake_steam_env()?;
-    println!("Fake Steam Trap: {}", trap_path.display());
+    if silent {
+        println!("Launching Steam Runtime in background...");
+    } else {
+        println!("Launching Steam Runtime interactively...");
+    }
 
-    println!("Launching Steam Runtime in background...");
-    let mut steam_cmd = Command::new(resolved_proton);
-    steam_cmd.arg("run").arg(steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles").arg("-tcp").arg("-cef-disable-gpu-compositing");
+    let mut cmd = build_runner_command(proton_path)?;
+    if silent {
+        cmd.arg(steam_exe).arg("-silent").arg("-no-browser").arg("-noverifyfiles").arg("-tcp").arg("-cef-disable-gpu-compositing");
+    } else {
+        cmd.arg(steam_exe).arg("-tcp").arg("-cef-disable-gpu-compositing");
+    }
 
     let abs_prefix = crate::config::absolute_path(prefix.join("pfx"))?;
-    steam_cmd.env("WINEPREFIX", &abs_prefix);
-    steam_cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(prefix)?);
-    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &trap_path);
-    steam_cmd.env("SteamAppId", app_id.to_string());
+    cmd.env("WINEPREFIX", &abs_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(prefix)?);
 
-    // Modify PATH to prioritize the fake steam trap
-    let existing_path = std::env::var("PATH").unwrap_or_default();
-    steam_cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
+    if app_id != 0 {
+        cmd.env("SteamAppId", app_id.to_string());
+    }
 
-    // Ensure Steam uses its own binaries
-    steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
+    // Ensure it uses native binaries
+    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;lsteamclient=n;steam_api=n;steam_api64=n;steamclient=n");
 
-    // Spawn detached
-    let _steam_child = steam_cmd.spawn().context("failed to launch Ghost Steam")?;
+    // Fix TLS/Network Error
+    cmd.env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt");
+    cmd.env("SSL_CERT_DIR", "/etc/ssl/certs");
 
-    println!("Waiting for Steam Runtime initialization...");
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // Pass through display variables
+    for var in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+
+    if silent {
+        let _child = cmd.spawn().context("failed to launch Ghost Steam")?;
+        println!("Waiting for Steam Runtime initialization...");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    } else {
+        let status = cmd.status().await.context("failed to run interactive Steam")?;
+        println!("Interactive Steam exited with status: {}", status);
+    }
 
     Ok(())
 }

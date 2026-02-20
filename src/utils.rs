@@ -23,39 +23,6 @@ pub async fn ensure_steam_installer() -> Result<PathBuf> {
     Ok(installer_path.canonicalize()?)
 }
 
-pub async fn deploy_master_steam(game_prefix: &std::path::Path) -> Result<()> {
-    let master_prefix = crate::config::master_steam_prefix()?;
-    let src_steam_dir = master_prefix.join("pfx/drive_c/Program Files (x86)/Steam");
-    let dest_steam_dir = game_prefix.join("pfx/drive_c/Program Files (x86)/Steam");
-
-    if !src_steam_dir.exists() {
-        anyhow::bail!("Master Steam installation not found. Please launch 'Steam Runtime (Windows)' from the library first.");
-    }
-
-    println!("Deploying Master Steam to game prefix...");
-    println!("Source: {}", src_steam_dir.display());
-    println!("Destination: {}", dest_steam_dir.display());
-
-    if dest_steam_dir.exists() {
-        let _ = std::fs::remove_dir_all(&dest_steam_dir);
-    }
-    std::fs::create_dir_all(&dest_steam_dir)?;
-
-    for entry in walkdir::WalkDir::new(&src_steam_dir) {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let rel = path.strip_prefix(&src_steam_dir)?;
-            std::fs::create_dir_all(dest_steam_dir.join(rel))?;
-        } else {
-            let rel = path.strip_prefix(&src_steam_dir)?;
-            std::fs::copy(path, dest_steam_dir.join(rel))?;
-        }
-    }
-
-    println!("Master Steam deployment complete.");
-    Ok(())
-}
 
 pub fn setup_fake_steam_env() -> Result<std::path::PathBuf> {
     let config_dir = crate::config::config_dir()?;

@@ -4,33 +4,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserAppConfig {
-    pub launch_options: String,      // e.g. "-novid -console"
-    pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
-    pub hidden: bool,                // Future use
-    pub favorite: bool,              // Future use
-    #[serde(default = "default_true")]
-    pub use_steam_runtime: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl Default for UserAppConfig {
-    fn default() -> Self {
-        Self {
-            launch_options: String::new(),
-            env_variables: HashMap::new(),
-            hidden: false,
-            favorite: false,
-            use_steam_runtime: true,
-        }
-    }
-}
-
-pub type UserConfigStore = HashMap<u32, UserAppConfig>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionState {

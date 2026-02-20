@@ -1,5 +1,6 @@
 use crate::config::{
     load_launcher_config, opensteam_image_cache_dir, save_launcher_config, LauncherConfig,
+    UserConfigStore,
 };
 use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::library::{build_game_library, scan_installed_app_paths};
@@ -111,7 +112,7 @@ pub enum AsyncOp {
     SettingsSaved(bool),
     ScanCompleted(u32, HashMap<u32, String>),
     MetadataFetched(u32, crate::steam_client::AppMetadata),
-    UserConfigsFetched(crate::models::UserConfigStore),
+    UserConfigsFetched(UserConfigStore),
     Error(String),
 }
 
@@ -159,7 +160,7 @@ pub struct SteamLauncher {
     depot_list: Vec<crate::steam_client::DepotInfo>,
     depot_selection: HashSet<u64>,
     is_verifying: bool,
-    user_configs: crate::models::UserConfigStore,
+    user_configs: UserConfigStore,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -774,18 +775,6 @@ impl SteamLauncher {
             Some(self.proton_path_for_windows.trim().to_string())
         };
 
-        // Special handling for Steam Runtime (AppID 0)
-        if game.app_id == 0 {
-            self.start_launch_task(game, crate::steam_client::LaunchInfo {
-                app_id: 0,
-                id: "0".to_string(),
-                description: "Steam Runtime".to_string(),
-                executable: String::new(),
-                arguments: String::new(),
-                target: crate::steam_client::LaunchTarget::WindowsProton,
-            }, proton_path);
-            return;
-        }
 
         let mut prefer_proton = proton_path.is_some();
         if let Some(config) = self.launcher_config.game_configs.get(&game.app_id) {
@@ -845,7 +834,7 @@ impl SteamLauncher {
                 local_root = Some(root);
             }
 
-            let mut child: std::process::Child =
+            let mut child: tokio::process::Child =
                 match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()).await {
                     Ok(child) => child,
                     Err(e) => {
@@ -854,7 +843,7 @@ impl SteamLauncher {
                     }
                 };
 
-            let _ = child.wait();
+            let _ = child.wait().await;
 
             if let (Some(c), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
                 let _ = c.sync_up(game.app_id, root).await;
@@ -866,15 +855,6 @@ impl SteamLauncher {
     }
 
     fn open_properties_modal(&mut self, game: &LibraryGame) {
-        if game.app_id == 0 {
-            self.properties_modal = Some(PropertiesModalState {
-                app_id: 0,
-                game_name: game.name.clone(),
-                available_branches: vec!["public".to_string()],
-                active_branch: "public".to_string(),
-            });
-            return;
-        }
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
         let app_id = game.app_id;
