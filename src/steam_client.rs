@@ -2194,7 +2194,7 @@ impl SteamClient {
 
                 let mut cmd = crate::utils::build_runner_command(resolved_proton.parent().unwrap_or_else(|| Path::new(".")))?;
                 cmd.arg(&executable).args(&args);
-                cmd.current_dir(&install_dir);
+                cmd.current_dir(executable.parent().unwrap_or(&install_dir));
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
@@ -2278,7 +2278,20 @@ impl SteamClient {
                     }
                 }
 
-                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, cmd.get_args());
+                println!("--- GAME LAUNCH DEBUG ---");
+                println!("Program: {:?}", cmd.get_program());
+                println!("Args: {:?}", cmd.get_args().collect::<Vec<_>>());
+                println!("Working Dir: {:?}", cmd.get_current_dir());
+                // Print critical environment variables
+                for env_key in ["WINEPREFIX", "STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_CLIENT_INSTALL_PATH", "WINEDLLOVERRIDES", "WINEPATH"] {
+                    let val = cmd.get_envs().find_map(|(k, v)| if k == std::ffi::OsStr::new(env_key) { v } else { None });
+                    println!("Env {}: {:?}", env_key, val);
+                }
+                println!("-------------------------");
+
+                cmd.stdout(std::process::Stdio::inherit());
+                cmd.stderr(std::process::Stdio::inherit());
+
                 cmd.spawn().context("failed to spawn proton game")
             }
         }
