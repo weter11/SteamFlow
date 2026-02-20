@@ -2194,7 +2194,7 @@ impl SteamClient {
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", config_dir()?);
 
                 if let Ok(display) = std::env::var("DISPLAY") {
                     cmd.env("DISPLAY", display);
@@ -2237,6 +2237,7 @@ impl SteamClient {
                                     ]);
                                     steam_cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                                     steam_cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
+                                    steam_cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", config_dir()?);
                                     steam_cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;lsteamclient=n;steam_api=n;steam_api64=n");
 
                                     if let Ok(display) = std::env::var("DISPLAY") {

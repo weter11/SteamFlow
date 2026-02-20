@@ -1998,7 +1998,15 @@ impl eframe::App for SteamLauncher {
                 self.ensure_image_requested(game.app_id);
 
                 ui.vertical(|ui| {
-                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    egui::TopBottomPanel::bottom("game_status_bar").show_inside(ui, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("game_status_scroll")
+                            .show(ui, |ui| {
+                                ui.label(&self.status);
+                            });
+                    });
+
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("game_view_scroll")
                             .show(ui, |ui| {
@@ -2041,142 +2049,142 @@ impl eframe::App for SteamLauncher {
                                                 }
 
                                                 if game.update_available {
-                                    ui.add_space(50.0);
-                                    let update_btn = egui::Button::new(
-                                        egui::RichText::new("UPDATE AVAILABLE")
-                                            .color(egui::Color32::WHITE)
-                                            .strong(),
-                                    )
-                                    .fill(egui::Color32::from_rgb(33, 150, 243))
-                                    .min_size(egui::vec2(120.0, 40.0));
+                                                    ui.add_space(50.0);
+                                                    let update_btn = egui::Button::new(
+                                                        egui::RichText::new("UPDATE AVAILABLE")
+                                                            .color(egui::Color32::WHITE)
+                                                            .strong(),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(33, 150, 243))
+                                                    .min_size(egui::vec2(120.0, 40.0));
 
-                                    if ui
-                                        .add_enabled(!self.client.is_offline(), update_btn)
-                                        .clicked()
-                                    {
-                                        let app_id = game.app_id;
-                                        let client = self.client.clone();
-                                        let tx = self.operation_tx.clone();
-                                        let download_state = self.download_state.clone();
-                                        self.runtime.spawn(async move {
-                                            match client.update_game(app_id, download_state).await {
-                                                Ok(rx) => {
-                                                    let _ = tx.send(AsyncOp::DownloadStarted(
-                                                        app_id, rx,
-                                                    ));
+                                                    if ui
+                                                        .add_enabled(!self.client.is_offline(), update_btn)
+                                                        .clicked()
+                                                    {
+                                                        let app_id = game.app_id;
+                                                        let client = self.client.clone();
+                                                        let tx = self.operation_tx.clone();
+                                                        let download_state = self.download_state.clone();
+                                                        self.runtime.spawn(async move {
+                                                            match client.update_game(app_id, download_state).await {
+                                                                Ok(rx) => {
+                                                                    let _ = tx.send(AsyncOp::DownloadStarted(
+                                                                        app_id, rx,
+                                                                    ));
+                                                                }
+                                                                Err(err) => {
+                                                                    let _ = tx.send(AsyncOp::Error(format!(
+                                                                        "Failed to update {app_id}: {err}"
+                                                                    )));
+                                                                }
+                                                            }
+                                                        });
+                                                    }
                                                 }
-                                                Err(err) => {
-                                                    let _ = tx.send(AsyncOp::Error(format!(
-                                                        "Failed to update {app_id}: {err}"
-                                                    )));
+                                            } else {
+                                                let install_btn = egui::Button::new(
+                                                    egui::RichText::new("INSTALL")
+                                                        .color(egui::Color32::WHITE)
+                                                        .strong(),
+                                                )
+                                                .fill(egui::Color32::from_rgb(46, 125, 50))
+                                                .min_size(egui::vec2(120.0, 40.0));
+
+                                                if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
+                                                {
+                                                    let app_id = game.app_id;
+                                                    let mut client = self.client.clone();
+                                                    let tx = self.operation_tx.clone();
+                                                    self.runtime.spawn(async move {
+                                                        match client.get_available_platforms(app_id).await {
+                                                            Ok((platforms, buffer)) => {
+                                                                let _ = tx.send(AsyncOp::PlatformsFetched(
+                                                                    app_id, platforms, buffer,
+                                                                ));
+                                                            }
+                                                            Err(err) => {
+                                                                let _ = tx.send(AsyncOp::Error(format!(
+                                                                    "Failed to fetch platforms for {app_id}: {err}"
+                                                                )));
+                                                            }
+                                                        }
+                                                    });
                                                 }
                                             }
                                         });
-                                    }
-                                }
-                            } else {
-                                let install_btn = egui::Button::new(
-                                    egui::RichText::new("INSTALL")
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(egui::Color32::from_rgb(46, 125, 50))
-                                .min_size(egui::vec2(120.0, 40.0));
+                                    });
+                                });
 
-                                if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
-                                {
-                                    let app_id = game.app_id;
-                                    let mut client = self.client.clone();
-                                    let tx = self.operation_tx.clone();
-                                    self.runtime.spawn(async move {
-                                        match client.get_available_platforms(app_id).await {
-                                            Ok((platforms, buffer)) => {
-                                                let _ = tx.send(AsyncOp::PlatformsFetched(
-                                                    app_id, platforms, buffer,
-                                                ));
-                                            }
-                                            Err(err) => {
-                                                let _ = tx.send(AsyncOp::Error(format!(
-                                                    "Failed to fetch platforms for {app_id}: {err}"
-                                                )));
+                                ui.add_space(10.0);
+
+                                if let Some(progress) = self.live_download_progress.clone() {
+                                    let denom = if progress.total_bytes == 0 {
+                                        1.0
+                                    } else {
+                                        progress.total_bytes as f32
+                                    };
+                                    let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
+
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::ProgressBar::new(fraction)
+                                                .show_percentage()
+                                                .text(format!(
+                                                    "Live operation: {:?} - {} ({} / {} bytes)",
+                                                    progress.state,
+                                                    progress.current_file,
+                                                    progress.bytes_downloaded,
+                                                    progress.total_bytes
+                                                )),
+                                        );
+
+                                        let mut download_state = self.download_state.write().unwrap();
+                                        if download_state.is_downloading || download_state.is_paused {
+                                            if download_state.is_paused {
+                                                if ui.button("▶ Resume").clicked() {
+                                                    download_state.is_paused = false;
+                                                    download_state.abort_signal.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                                                    let app_id = download_state.app_id;
+                                                    drop(download_state);
+
+                                                    // Resume logic: Re-trigger the appropriate operation
+                                                    if let Some(game) = self.library.iter().find(|g| g.app_id == app_id).cloned() {
+                                                        if progress.state == DownloadProgressState::Verifying {
+                                                            let client = self.client.clone();
+                                                            let tx = self.operation_tx.clone();
+                                                            let ds = self.download_state.clone();
+                                                            self.runtime.spawn(async move {
+                                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.verify_game(app_id, ds).await.unwrap()));
+                                                            });
+                                                        } else if game.is_installed {
+                                                            let client = self.client.clone();
+                                                            let tx = self.operation_tx.clone();
+                                                            let ds = self.download_state.clone();
+                                                            self.runtime.spawn(async move {
+                                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.update_game(app_id, ds).await.unwrap()));
+                                                            });
+                                                        } else {
+                                                            let platform = self.launcher_config.game_configs.get(&app_id)
+                                                                .and_then(|c| c.platform_preference.as_ref())
+                                                                .map(|p| if p == "linux" { DepotPlatform::Linux } else { DepotPlatform::Windows })
+                                                                .unwrap_or(if cfg!(target_os = "linux") { DepotPlatform::Linux } else { DepotPlatform::Windows });
+                                                            self.start_install(app_id, platform, None, None);
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                if ui.button("⏸ Pause").clicked() {
+                                                    download_state.is_paused = true;
+                                                    download_state.abort_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                                                }
                                             }
                                         }
                                     });
                                 }
-                            }
-                        });
-                    });
-                });
 
-                ui.add_space(10.0);
-
-                if let Some(progress) = self.live_download_progress.clone() {
-                    let denom = if progress.total_bytes == 0 {
-                        1.0
-                    } else {
-                        progress.total_bytes as f32
-                    };
-                    let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
-
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::ProgressBar::new(fraction)
-                                .show_percentage()
-                                .text(format!(
-                                    "Live operation: {:?} - {} ({} / {} bytes)",
-                                    progress.state,
-                                    progress.current_file,
-                                    progress.bytes_downloaded,
-                                    progress.total_bytes
-                                )),
-                        );
-
-                        let mut download_state = self.download_state.write().unwrap();
-                        if download_state.is_downloading || download_state.is_paused {
-                            if download_state.is_paused {
-                                if ui.button("▶ Resume").clicked() {
-                                    download_state.is_paused = false;
-                                    download_state.abort_signal.store(false, std::sync::atomic::Ordering::Relaxed);
-
-                                    let app_id = download_state.app_id;
-                                    drop(download_state);
-
-                                    // Resume logic: Re-trigger the appropriate operation
-                                    if let Some(game) = self.library.iter().find(|g| g.app_id == app_id).cloned() {
-                                        if progress.state == DownloadProgressState::Verifying {
-                                            let client = self.client.clone();
-                                            let tx = self.operation_tx.clone();
-                                            let ds = self.download_state.clone();
-                                            self.runtime.spawn(async move {
-                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.verify_game(app_id, ds).await.unwrap()));
-                                            });
-                                        } else if game.is_installed {
-                                            let client = self.client.clone();
-                                            let tx = self.operation_tx.clone();
-                                            let ds = self.download_state.clone();
-                                            self.runtime.spawn(async move {
-                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.update_game(app_id, ds).await.unwrap()));
-                                            });
-                                        } else {
-                                            let platform = self.launcher_config.game_configs.get(&app_id)
-                                                .and_then(|c| c.platform_preference.as_ref())
-                                                .map(|p| if p == "linux" { DepotPlatform::Linux } else { DepotPlatform::Windows })
-                                                .unwrap_or(if cfg!(target_os = "linux") { DepotPlatform::Linux } else { DepotPlatform::Windows });
-                                            self.start_install(app_id, platform, None, None);
-                                        }
-                                    }
-                                }
-                            } else {
-                                if ui.button("⏸ Pause").clicked() {
-                                    download_state.is_paused = true;
-                                    download_state.abort_signal.store(true, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    });
-                }
-
-                ui.separator();
+                                ui.separator();
 
                                 ui.horizontal(|ui| {
                                     ui.selectable_value(&mut self.current_tab, GameTab::Options, "Options");
@@ -2199,13 +2207,6 @@ impl eframe::App for SteamLauncher {
                                 }
                             });
                     });
-
-                    ui.separator();
-                    egui::ScrollArea::horizontal()
-                        .id_salt("game_status_scroll")
-                        .show(ui, |ui| {
-                            ui.label(&self.status);
-                        });
                 });
             } else {
                 ui.heading("SteamFlow");
