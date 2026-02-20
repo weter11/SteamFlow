@@ -2198,10 +2198,7 @@ impl SteamClient {
                 cmd.env("SteamAppId", app.app_id.to_string());
                 cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-
-                let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
-                cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
 
                 if let Ok(display) = std::env::var("DISPLAY") {
                     cmd.env("DISPLAY", display);
@@ -2221,7 +2218,18 @@ impl SteamClient {
 
                 if let Some(config) = user_config {
                     if config.use_steam_runtime {
-                        let master_steam_dir = config_dir()?.join("master_steam_prefix/drive_c/Program Files (x86)/Steam");
+                        cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
+                        let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
+                        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
+                        cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
+
+                        let base_config = config_dir()?;
+                        let master_prefix = base_config.join("master_steam_prefix");
+                        let master_steam_dir = if master_prefix.join("pfx").exists() {
+                            master_prefix.join("pfx/drive_c/Program Files (x86)/Steam")
+                        } else {
+                            master_prefix.join("drive_c/Program Files (x86)/Steam")
+                        };
                         let target_steam_dir = compat_data_path.join("pfx/drive_c/Program Files (x86)/Steam");
 
                         if master_steam_dir.exists() {
@@ -2260,8 +2268,8 @@ impl SteamClient {
                                     tracing::info!("Launching Background Steam Runtime...");
                                     let _ = steam_cmd.spawn();
 
-                                    tracing::info!("Waiting 5 seconds for Steam Runtime...");
-                                    std::thread::sleep(Duration::from_secs(5));
+                                    tracing::info!("Waiting 12 seconds for Steam Runtime...");
+                                    std::thread::sleep(Duration::from_secs(12));
                                 }
                             }
                         } else {

@@ -37,8 +37,9 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     cmd.arg("-cef-disable-gpu-compositing");
 
     // Environment Variables
-    cmd.env("WINEPREFIX", &master_prefix);
+    cmd.env("WINEPREFIX", master_prefix.join("pfx"));
     cmd.env("STEAM_COMPAT_DATA_PATH", &master_prefix);
+    cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
     let fake_env = crate::utils::setup_fake_steam_trap(&base_dir)?;
     cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
@@ -78,6 +79,8 @@ async fn download_steam_setup(path: &Path) -> Result<()> {
 
 fn find_steam_exe_in_prefix(prefix: &Path) -> Option<PathBuf> {
     let common_paths = [
+        "pfx/drive_c/Program Files (x86)/Steam/steam.exe",
+        "pfx/drive_c/Program Files/Steam/steam.exe",
         "drive_c/Program Files (x86)/Steam/steam.exe",
         "drive_c/Program Files/Steam/steam.exe",
     ];
