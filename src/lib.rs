@@ -6,3 +6,5 @@ pub mod library;
 pub mod models;
 pub mod steam_client;
 pub mod ui;
+pub mod utils;
+pub mod launch;

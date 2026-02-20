@@ -1,5 +1,9 @@
 name: SteamFlow Rust Build
 
+permissions:
+  contents: read
+  actions: write
+
 on:
   push:
     paths:

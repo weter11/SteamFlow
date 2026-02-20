@@ -2,7 +2,7 @@ use crate::cloud_sync::{default_cloud_root, CloudClient};
 use crate::cm_list::get_cm_endpoints;
 use crate::config::{
     delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
-    save_library_cache, save_session,
+    save_library_cache, save_session, UserAppConfig,
 };
 use crate::depot_browser::{self, DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::models::{
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -1556,7 +1556,7 @@ impl SteamClient {
         &mut self,
         app: &LibraryGame,
         proton_path: Option<&str>,
-        user_config: Option<&crate::models::UserAppConfig>,
+        user_config: Option<&UserAppConfig>,
     ) -> Result<LaunchInfo> {
         let prefer_proton = proton_path.is_some();
         let launch_options = self.get_product_info(app.app_id, prefer_proton).await?;
@@ -1592,9 +1592,10 @@ impl SteamClient {
         }
 
         let mut child =
-            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config)?;
+            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config).await?;
         child
             .wait()
+            .await
             .context("failed waiting for game process exit")?;
 
         if let (Some(client), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
@@ -1610,10 +1611,10 @@ impl SteamClient {
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
-        user_config: Option<&crate::models::UserAppConfig>,
+        user_config: Option<&UserAppConfig>,
     ) -> Result<()> {
         let launcher_config = load_launcher_config().await.unwrap_or_default();
-        self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config)?;
+        self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config).await?;
         Ok(())
     }
 
@@ -2082,36 +2083,105 @@ impl SteamClient {
             return PathBuf::from(proton_name);
         }
 
-        let standard_path = library_root
+        let standard_dir = library_root
             .join("steamapps/common")
-            .join(proton_name)
-            .join("proton");
+            .join(proton_name);
 
-        if standard_path.exists() {
-            return standard_path;
+        if standard_dir.exists() {
+            return standard_dir;
         }
 
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let custom_path = PathBuf::from(home)
+        let custom_dir = PathBuf::from(home)
             .join(".local/share/Steam/compatibilitytools.d")
-            .join(proton_name)
-            .join("proton");
+            .join(proton_name);
 
-        if custom_path.exists() {
-            return custom_path;
+        if custom_dir.exists() {
+            return custom_dir;
         }
 
         PathBuf::from(proton_name)
     }
 
-    pub(crate) fn spawn_game_process(
+    pub(crate) async fn spawn_game_process(
         &self,
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
         launcher_config: &crate::config::LauncherConfig,
-        user_config: Option<&crate::models::UserAppConfig>,
-    ) -> Result<std::process::Child> {
+        user_config: Option<&UserAppConfig>,
+    ) -> Result<tokio::process::Child> {
+        let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
+
+        let use_runtime = user_config.map(|c| c.use_steam_runtime).unwrap_or_else(|| {
+            matches!(launch_info.target, LaunchTarget::WindowsProton)
+        });
+
+        // Determine resolved proton if needed
+        let resolved_proton = if matches!(launch_info.target, LaunchTarget::WindowsProton) {
+            let proton = if let Some(forced) = launcher_config
+                .game_configs
+                .get(&app.app_id)
+                .and_then(|c| c.forced_proton_version.as_ref())
+            {
+                forced
+            } else {
+                proton_path
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
+            };
+            Some(self.resolve_proton_path(proton, &library_root))
+        } else {
+            None
+        };
+
+        if !use_runtime || matches!(launch_info.target, LaunchTarget::NativeLinux) {
+            return self.spawn_raw_game_process(app, launch_info, resolved_proton.as_deref(), launcher_config, user_config, use_runtime);
+        }
+
+        // Ghost Steam Logic (Phase 4)
+        let prefix = library_root.join("steamapps/compatdata").join(app.app_id.to_string());
+        let resolved_proton = resolved_proton.ok_or_else(|| anyhow!("Resolved proton missing for Windows launch"))?;
+
+        // Check Install
+        let steam_exe = crate::launch::get_installed_steam_path(&prefix);
+        let steam_exe = match steam_exe {
+            Some(exe) => exe,
+            None => {
+                crate::launch::install_ghost_steam(app.app_id, &resolved_proton).await?;
+                crate::launch::get_installed_steam_path(&prefix)
+                    .ok_or_else(|| anyhow!("Failed to find steam.exe in game prefix after installation"))?
+            }
+        };
+
+        // Launch Steam (Background)
+        crate::launch::launch_ghost_steam(
+            app.app_id,
+            &resolved_proton,
+            &steam_exe,
+            &prefix,
+            true, // silent
+        ).await?;
+
+        println!("Launching Game Executable...");
+        self.spawn_raw_game_process(app, launch_info, Some(&resolved_proton), launcher_config, user_config, use_runtime)
+    }
+
+    pub async fn get_compat_data_path(&self, app_id: u32) -> Result<PathBuf> {
+        let cfg = load_launcher_config().await?;
+        let library_root = crate::config::absolute_path(&cfg.steam_library_path)?;
+        Ok(library_root.join("steamapps/compatdata").join(app_id.to_string()))
+    }
+
+    pub(crate) fn spawn_raw_game_process(
+        &self,
+        app: &LibraryGame,
+        launch_info: &LaunchInfo,
+        resolved_proton_path: Option<&Path>,
+        launcher_config: &crate::config::LauncherConfig,
+        user_config: Option<&UserAppConfig>,
+        use_runtime: bool,
+    ) -> Result<tokio::process::Child> {
         let install_dir = PathBuf::from(
             app.install_path
                 .clone()
@@ -2165,20 +2235,9 @@ impl SteamClient {
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
-                let proton = if let Some(forced) = launcher_config
-                    .game_configs
-                    .get(&app.app_id)
-                    .and_then(|c| c.forced_proton_version.as_ref())
-                {
-                    forced
-                } else {
-                    proton_path
-                        .filter(|p| !p.is_empty())
-                        .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
-                };
-
-                let library_root = PathBuf::from(&launcher_config.steam_library_path);
-                let resolved_proton = self.resolve_proton_path(proton, &library_root);
+                let library_root = crate::config::absolute_path(&launcher_config.steam_library_path)?;
+                let resolved_proton = resolved_proton_path
+                    .ok_or_else(|| anyhow!("Resolved proton path missing for Windows launch"))?;
 
                 let compat_data_path = library_root
                     .join("steamapps")
@@ -2188,12 +2247,31 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
-                let mut cmd = Command::new(&resolved_proton);
-                cmd.arg("run").arg(&executable).args(&args);
+                let mut cmd = crate::launch::build_runner_command(resolved_proton)?;
+                cmd.arg(&executable).args(&args);
                 cmd.current_dir(&install_dir);
-                cmd.env("SteamAppId", app.app_id.to_string());
-                cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+
+                if use_runtime {
+                    cmd.env("SteamAppId", app.app_id.to_string());
+                } else {
+                    cmd.env_remove("SteamAppId");
+                    cmd.env_remove("SteamGameId");
+                }
+
+                cmd.env("STEAM_COMPAT_DATA_PATH", crate::config::absolute_path(&compat_data_path)?);
+                let abs_pfx = crate::config::absolute_path(compat_data_path.join("pfx"))?;
+                cmd.env("WINEPREFIX", abs_pfx);
+
+                let trap_path = crate::utils::setup_fake_steam_env()?;
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &trap_path);
+
+                // Modify PATH to prioritize the fake steam trap
+                let existing_path = std::env::var("PATH").unwrap_or_default();
+                cmd.env("PATH", format!("{}:{}", trap_path.display(), existing_path));
+
+                if use_runtime {
+                    cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=n;steam_api=n;steam_api64=n");
+                }
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
@@ -2201,7 +2279,7 @@ impl SteamClient {
                     }
                 }
 
-                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, cmd.get_args());
+                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, args);
                 cmd.spawn().context("failed to spawn proton game")
             }
         }

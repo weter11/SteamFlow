@@ -1,4 +1,4 @@
-use crate::models::{OwnedGame, SessionState, UserConfigStore};
+use crate::models::{OwnedGame, SessionState};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -10,6 +10,34 @@ pub struct GameConfig {
     pub forced_proton_version: Option<String>,
     pub platform_preference: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAppConfig {
+    pub launch_options: String,      // e.g. "-novid -console"
+    pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
+    pub hidden: bool,                // Future use
+    pub favorite: bool,              // Future use
+    #[serde(default = "default_true")]
+    pub use_steam_runtime: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UserAppConfig {
+    fn default() -> Self {
+        Self {
+            launch_options: String::new(),
+            env_variables: HashMap::new(),
+            hidden: false,
+            favorite: false,
+            use_steam_runtime: true,
+        }
+    }
+}
+
+pub type UserConfigStore = HashMap<u32, UserAppConfig>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
@@ -161,6 +189,30 @@ pub async fn save_launcher_config(config: &LauncherConfig) -> Result<()> {
         .await
         .with_context(|| format!("failed writing {}", path.display()))?;
     Ok(())
+}
+
+pub fn absolute_path(path: impl AsRef<std::path::Path>) -> Result<PathBuf> {
+    let path = path.as_ref();
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    // Normalize: remove "." and handle ".."
+    let mut components = abs_path.components().peekable();
+    let mut ret = PathBuf::new();
+
+    while let Some(c) = components.next() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                ret.pop();
+            }
+            _ => ret.push(c),
+        }
+    }
+    Ok(ret)
 }
 
 pub fn library_cache_path() -> Result<PathBuf> {
