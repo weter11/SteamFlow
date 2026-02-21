@@ -4,5 +4,7 @@ pub mod config;
 pub mod depot_browser;
 pub mod library;
 pub mod models;
+pub mod launch;
 pub mod steam_client;
 pub mod ui;
+pub mod utils;
