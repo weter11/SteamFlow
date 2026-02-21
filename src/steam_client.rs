@@ -2222,8 +2222,9 @@ impl SteamClient {
                             let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
 
                             bat_content.push_str(&format!(
-                                ":: 2. Start Ghost Steam in the background\r\n\
-                                 start \"\" \"C:\\Program Files (x86)\\Steam\\steam.exe\" -silent -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -no-dwrite -noverifyfiles\r\n\
+                                ":: 2. Set working directory to Steam and launch in background\r\n\
+                                 cd /d \"C:\\Program Files (x86)\\Steam\"\r\n\
+                                 start steam.exe -silent -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -no-dwrite -noverifyfiles\r\n\
                                  \r\n\
                                  :: 3. Wait 12 seconds for DRM pipes to open (ping is highly reliable in Wine)\r\n\
                                  ping -n 13 127.0.0.1 > nul\r\n\
