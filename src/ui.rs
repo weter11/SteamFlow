@@ -35,14 +35,6 @@ struct UninstallModalState {
 }
 
 #[derive(Debug, Clone)]
-struct PropertiesModalState {
-    app_id: u32,
-    game_name: String,
-    available_branches: Vec<String>,
-    active_branch: String,
-}
-
-#[derive(Debug, Clone)]
 struct DepotBrowserState {
     app_id: u32,
     game_name: String,
@@ -139,7 +131,6 @@ pub struct SteamLauncher {
     user_profile: Option<UserProfile>,
     refreshing_account_data: bool,
     uninstall_modal: Option<UninstallModalState>,
-    properties_modal: Option<PropertiesModalState>,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
@@ -149,8 +140,10 @@ pub struct SteamLauncher {
     extended_info: HashMap<u32, crate::steam_client::ExtendedAppInfo>,
     depot_list: Vec<crate::steam_client::DepotInfo>,
     depot_selection: HashSet<u64>,
+    available_branches: HashMap<u32, Vec<String>>,
     is_verifying: bool,
     user_configs: crate::models::UserConfigStore,
+    env_vars_edit_buffer: String,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -201,7 +194,6 @@ impl SteamLauncher {
             user_profile,
             refreshing_account_data: false,
             uninstall_modal: None,
-            properties_modal: None,
             depot_browser: None,
             platform_selection: None,
             launch_selector: None,
@@ -211,8 +203,10 @@ impl SteamLauncher {
             extended_info: HashMap::new(),
             depot_list: Vec::new(),
             depot_selection: HashSet::new(),
+            available_branches: HashMap::new(),
             is_verifying: false,
             user_configs,
+            env_vars_edit_buffer: String::new(),
             operation_tx,
             operation_rx,
         }
@@ -568,14 +562,7 @@ impl SteamLauncher {
                     self.user_configs = configs;
                 }
                 AsyncOp::BranchesFetched(appid, branches) => {
-                    if let Some(game) = self.library.iter().find(|g| g.app_id == appid) {
-                        self.properties_modal = Some(PropertiesModalState {
-                            app_id: appid,
-                            game_name: game.name.clone(),
-                            available_branches: branches,
-                            active_branch: game.active_branch.clone(),
-                        });
-                    }
+                    self.available_branches.insert(appid, branches);
                 }
                 AsyncOp::DepotListFetched(_appid, list) => {
                     self.depot_list = list;
@@ -979,61 +966,6 @@ impl SteamLauncher {
         }
     }
 
-    fn draw_properties_modal(&mut self, ctx: &egui::Context) {
-        let mut new_branch = None;
-        let mut close = false;
-
-        if let Some(state) = &mut self.properties_modal {
-            egui::Window::new(format!("Properties - {}", state.game_name))
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.heading("Betas");
-                    ui.label("Select the beta you would like to opt into:");
-
-                    egui::ComboBox::from_id_salt("branch_selector")
-                        .selected_text(&state.active_branch)
-                        .show_ui(ui, |ui| {
-                            for branch in &state.available_branches {
-                                if ui
-                                    .selectable_value(&mut state.active_branch, branch.clone(), branch)
-                                    .clicked()
-                                {
-                                    new_branch = Some((state.app_id, branch.clone()));
-                                }
-                            }
-                        });
-
-                    ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                });
-        }
-
-        if let Some((app_id, branch)) = new_branch {
-            let client = self.client.clone();
-            let tx = self.operation_tx.clone();
-            self.runtime.spawn(async move {
-                match client.update_app_branch(app_id, &branch).await {
-                    Ok(()) => {
-                        let _ = tx.send(AsyncOp::BranchUpdated(app_id, branch));
-                    }
-                    Err(err) => {
-                        let _ = tx.send(AsyncOp::Error(format!(
-                            "Failed to switch branch for {app_id}: {err}"
-                        )));
-                    }
-                }
-            });
-        }
-
-        if close {
-            self.properties_modal = None;
-        }
-    }
-
-
     fn draw_properties_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
         let mut config = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
         let mut changed = false;
@@ -1048,16 +980,13 @@ impl SteamLauncher {
             ui.heading("Environment Variables");
             ui.label("KEY=VALUE (one per line)");
 
-            let mut env_keys: Vec<_> = config.env_variables.keys().collect();
-            env_keys.sort();
-            let mut env_text = env_keys.iter()
-                .map(|k| format!("{}={}", k, config.env_variables.get(*k).unwrap()))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if ui.add(egui::TextEdit::multiline(&mut env_text).desired_width(f32::INFINITY)).changed() {
+            if ui.add(egui::TextEdit::multiline(&mut self.env_vars_edit_buffer)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace))
+                .changed()
+            {
                 let mut new_env = HashMap::new();
-                for line in env_text.lines() {
+                for line in self.env_vars_edit_buffer.lines() {
                     if let Some((k, v)) = line.split_once('=') {
                         new_env.insert(k.trim().to_string(), v.trim().to_string());
                     }
@@ -1072,6 +1001,50 @@ impl SteamLauncher {
                 .on_hover_text("Required for DRM-protected games. Runs an official Steam client in the background.")
                 .changed() {
                 changed = true;
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Beta Branches");
+            if let Some(branches) = self.available_branches.get(&game.app_id) {
+                let mut active_branch = game.active_branch.clone();
+                egui::ComboBox::from_id_salt("branch_selector_tab")
+                    .selected_text(&active_branch)
+                    .show_ui(ui, |ui| {
+                        for branch in branches {
+                            if ui.selectable_value(&mut active_branch, branch.clone(), branch).clicked() {
+                                let app_id = game.app_id;
+                                let branch = branch.clone();
+                                let client = self.client.clone();
+                                let tx = self.operation_tx.clone();
+                                self.runtime.spawn(async move {
+                                    match client.update_app_branch(app_id, &branch).await {
+                                        Ok(()) => {
+                                            let _ = tx.send(AsyncOp::BranchUpdated(app_id, branch));
+                                        }
+                                        Err(err) => {
+                                            let _ = tx.send(AsyncOp::Error(format!("Failed to switch branch: {err}")));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+            } else {
+                if ui.button("Check for Beta Branches").clicked() {
+                    let app_id = game.app_id;
+                    let client = self.client.clone();
+                    let tx = self.operation_tx.clone();
+                    self.runtime.spawn(async move {
+                        match client.fetch_branches(app_id).await {
+                            Ok(branches) => {
+                                let _ = tx.send(AsyncOp::BranchesFetched(app_id, branches));
+                            }
+                            Err(err) => {
+                                let _ = tx.send(AsyncOp::Error(format!("Failed to fetch branches: {err}")));
+                            }
+                        }
+                    });
+                }
             }
         });
 
@@ -1949,7 +1922,16 @@ impl eframe::App for SteamLauncher {
 
                         let response = ui.selectable_label(selected, job);
                         if response.clicked() {
-                            self.selected_app = Some(app_id);
+                            if self.selected_app != Some(app_id) {
+                                self.selected_app = Some(app_id);
+                                self.env_vars_edit_buffer = self.user_configs.get(&app_id)
+                                    .map(|cfg| {
+                                        let mut keys: Vec<_> = cfg.env_variables.keys().collect();
+                                        keys.sort();
+                                        keys.iter().map(|k| format!("{}={}", k, cfg.env_variables.get(*k).unwrap())).collect::<Vec<_>>().join("\n")
+                                    })
+                                    .unwrap_or_default();
+                            }
                         }
 
                         response.context_menu(|ui| {
@@ -1966,7 +1948,16 @@ impl eframe::App for SteamLauncher {
                                 ui.close();
                             }
                             if ui.button("Properties").clicked() {
-                                self.selected_app = Some(game.app_id);
+                                if self.selected_app != Some(game.app_id) {
+                                    self.selected_app = Some(game.app_id);
+                                    self.env_vars_edit_buffer = self.user_configs.get(&game.app_id)
+                                        .map(|cfg| {
+                                            let mut keys: Vec<_> = cfg.env_variables.keys().collect();
+                                            keys.sort();
+                                            keys.iter().map(|k| format!("{}={}", k, cfg.env_variables.get(*k).unwrap())).collect::<Vec<_>>().join("\n")
+                                        })
+                                        .unwrap_or_default();
+                                }
                                 self.current_tab = GameTab::Properties;
                                 ui.close();
                             }
@@ -2214,7 +2205,6 @@ impl eframe::App for SteamLauncher {
             }
         });
 
-        self.draw_properties_modal(ctx);
         self.draw_uninstall_modal(ctx);
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
