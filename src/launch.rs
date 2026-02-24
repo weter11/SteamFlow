@@ -43,7 +43,7 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     let fake_env = crate::utils::setup_fake_steam_trap(&base_dir)?;
     cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
-    cmd.env("WINEDLLOVERRIDES", "steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+    cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
 
     if let Ok(display) = std::env::var("DISPLAY") {
         cmd.env("DISPLAY", display);

@@ -2256,7 +2256,7 @@ impl SteamClient {
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
 
                 // Restore Environment Shields
-                cmd.env("WINEDLLOVERRIDES", "steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+                cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
                 let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
