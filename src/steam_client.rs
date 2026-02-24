@@ -2255,18 +2255,11 @@ impl SteamClient {
                 cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
 
-                if let Some(config) = user_config {
-                    if config.use_steam_runtime {
-                        cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
-                        let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
-                        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
-                        cmd.env("WINEDLLOVERRIDES", "steam.exe=n;steamclient=n;steamclient64=n;lsteamclient=;steam_api=n;steam_api64=n");
-                    } else {
-                        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
-                    }
-                } else {
-                    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
-                }
+                // Restore Environment Shields
+                cmd.env("WINEDLLOVERRIDES", "steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+                cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
+                let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
 
                 if let Ok(display) = std::env::var("DISPLAY") {
                     cmd.env("DISPLAY", display);
