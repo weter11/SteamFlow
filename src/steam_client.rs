@@ -2275,7 +2275,7 @@ impl SteamClient {
                 std::fs::write(&bat_path, bat_content).context("Failed to write launch batch script")?;
 
                 let mut cmd = crate::utils::build_runner_command(resolved_proton.parent().unwrap_or_else(|| Path::new(".")))?;
-                cmd.arg("cmd").arg("/c").arg(&bat_path);
+                cmd.arg("cmd").arg("/c").arg("C:\\steamflow_launch.bat");
                 cmd.current_dir(game_working_dir);
                 cmd.env("SteamAppId", &app_id_str);
                 cmd.env("SteamGameId", &app_id_str);
