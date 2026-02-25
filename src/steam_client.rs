@@ -2201,7 +2201,28 @@ impl SteamClient {
 
                 let mut bat_content = format!(
                     "@echo off\r\n\
-                     :: 1. Heal the registry from Proton's Python wrapper\r\n\
+                     :: 0. Nuke Proton's fake DLLs from system directories so WINEPATH works\r\n\
+                     del /q /f \"C:\\windows\\system32\\lsteamclient.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\steamclient.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\steamclient64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\steam_api.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\steam_api64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\tier0_s.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\vstdlib_s.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\tier0_s64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\vstdlib_s64.dll\" 2>nul\r\n\
+                     \r\n\
+                     del /q /f \"C:\\windows\\syswow64\\lsteamclient.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\steamclient.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\steamclient64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\steam_api.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\steam_api64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\tier0_s.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\vstdlib_s.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\tier0_s64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\vstdlib_s64.dll\" 2>nul\r\n\
+                     \r\n\
+                     :: 1. Heal the registry\r\n\
                      reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient.dll\" /f\r\n\
                      reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll64 /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient64.dll\" /f\r\n\
                      \r\n"
@@ -2222,15 +2243,13 @@ impl SteamClient {
                             tracing::info!("Cloning Master Steam to game prefix...");
                             let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
 
-                            bat_content.push_str(":: 2. Prepare Sleep Script\r\n\
-                                 echo WScript.Sleep 4000 > %TEMP%\\sleep.vbs\r\n\
+                            bat_content.push_str(":: 2. Launch Steam absolutely\r\n\
+                                 cd /d \"C:\\Program Files (x86)\\Steam\"\r\n\
+                                 start \"\" \"steam.exe\" -silent -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -no-dwrite -noverifyfiles\r\n\
                                  \r\n\
-                                 :: 3. Launch Steam with absolute path\r\n\
-                                 start \"\" \"C:\\Program Files (x86)\\Steam\\steam.exe\" -silent -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -no-dwrite -noverifyfiles\r\n\
-                                 \r\n\
-                                 :: 4. Wait 4 seconds for DRM pipes to open via VBScript\r\n\
-                                 cscript //nologo %TEMP%\\sleep.vbs\r\n\
-                                 del %TEMP%\\sleep.vbs\r\n\
+                                 :: 3. Bulletproof Sleep (Wait 4 seconds without ping)\r\n\
+                                 echo WScript.Sleep 4000 > \"%TEMP%\\sleep.vbs\"\r\n\
+                                 cscript //nologo \"%TEMP%\\sleep.vbs\"\r\n\
                                  \r\n");
                         } else {
                             tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
@@ -2239,7 +2258,7 @@ impl SteamClient {
                 }
 
                 bat_content.push_str(&format!(
-                    ":: 5. Change to Game Directory and Launch (Blocks until game exits)\r\n\
+                    ":: 4. Launch Game\r\n\
                      cd /d \"{}\"\r\n\
                      \"{}\" {}\r\n",
                     dir_z_path, exe_name, quoted_args.join(" ")
