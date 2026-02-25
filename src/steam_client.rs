@@ -2255,10 +2255,9 @@ impl SteamClient {
                                  echo WScript.Sleep 10000 > \"%TEMP%\\sleep.vbs\"\r\n\
                                  cscript //nologo \"%TEMP%\\sleep.vbs\"\r\n\
                                  \r\n\
-                                 :: 5. Verify Steam is running (This will print to the terminal)\r\n\
-                                 echo === DEBUG: CHECKING FOR STEAM.EXE ===\r\n\
-                                 tasklist /FI \"IMAGENAME eq steam.exe\"\r\n\
-                                 echo ======================================\r\n\
+                                 :: 5. Write Tasklist to physical file\r\n\
+                                 echo === STEAM PROCESS CHECK === > \"C:\\steamflow_debug.txt\"\r\n\
+                                 tasklist /FI \"IMAGENAME eq steam.exe\" >> \"C:\\steamflow_debug.txt\"\r\n\
                                  \r\n");
                         } else {
                             tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
@@ -2276,7 +2275,7 @@ impl SteamClient {
                 std::fs::write(&bat_path, bat_content).context("Failed to write launch batch script")?;
 
                 let mut cmd = crate::utils::build_runner_command(resolved_proton.parent().unwrap_or_else(|| Path::new(".")))?;
-                cmd.arg(&bat_path);
+                cmd.arg("cmd").arg("/c").arg(&bat_path);
                 cmd.current_dir(game_working_dir);
                 cmd.env("SteamAppId", &app_id_str);
                 cmd.env("SteamGameId", &app_id_str);
