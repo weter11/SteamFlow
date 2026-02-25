@@ -2225,7 +2225,11 @@ impl SteamClient {
                      :: 1. Heal the registry\r\n\
                      reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient.dll\" /f\r\n\
                      reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll64 /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient64.dll\" /f\r\n\
-                     \r\n"
+                     \r\n\
+                     :: 2. Drop the physical AppID file for Source Engine games\r\n\
+                     echo {} > \"{}\\steam_appid.txt\"\r\n\
+                     \r\n",
+                    app_id_str, dir_z_path
                 );
 
                 if let Some(config) = user_config {
@@ -2243,13 +2247,18 @@ impl SteamClient {
                             tracing::info!("Cloning Master Steam to game prefix...");
                             let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
 
-                            bat_content.push_str(":: 2. Launch Steam absolutely\r\n\
+                            bat_content.push_str(":: 3. Launch Steam absolutely\r\n\
                                  cd /d \"C:\\Program Files (x86)\\Steam\"\r\n\
                                  start \"\" \"steam.exe\" -silent -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -no-dwrite -noverifyfiles\r\n\
                                  \r\n\
-                                 :: 3. Bulletproof Sleep (Wait 4 seconds without ping)\r\n\
-                                 echo WScript.Sleep 4000 > \"%TEMP%\\sleep.vbs\"\r\n\
+                                 :: 4. Bulletproof Sleep (Wait 10 seconds)\r\n\
+                                 echo WScript.Sleep 10000 > \"%TEMP%\\sleep.vbs\"\r\n\
                                  cscript //nologo \"%TEMP%\\sleep.vbs\"\r\n\
+                                 \r\n\
+                                 :: 5. Verify Steam is running (This will print to the terminal)\r\n\
+                                 echo === DEBUG: CHECKING FOR STEAM.EXE ===\r\n\
+                                 tasklist /FI \"IMAGENAME eq steam.exe\"\r\n\
+                                 echo ======================================\r\n\
                                  \r\n");
                         } else {
                             tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
@@ -2258,7 +2267,7 @@ impl SteamClient {
                 }
 
                 bat_content.push_str(&format!(
-                    ":: 4. Launch Game\r\n\
+                    ":: 6. Launch Game\r\n\
                      cd /d \"{}\"\r\n\
                      \"{}\" {}\r\n",
                     dir_z_path, exe_name, quoted_args.join(" ")
