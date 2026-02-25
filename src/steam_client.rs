@@ -2247,9 +2247,9 @@ impl SteamClient {
                             tracing::info!("Cloning Master Steam to game prefix...");
                             let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
 
-                            bat_content.push_str(":: 3. Launch Steam absolutely\r\n\
+                            bat_content.push_str(":: 3. Launch Steam VISIBLY (Removed -silent)\r\n\
                                  cd /d \"C:\\Program Files (x86)\\Steam\"\r\n\
-                                 start \"\" \"steam.exe\" -silent -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -no-dwrite -noverifyfiles\r\n\
+                                 start \"\" \"steam.exe\" -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -noverifyfiles\r\n\
                                  \r\n\
                                  :: 4. Bulletproof Sleep (Wait 10 seconds)\r\n\
                                  echo WScript.Sleep 10000 > \"%TEMP%\\sleep.vbs\"\r\n\
