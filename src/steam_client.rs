@@ -1,7 +1,7 @@
 use crate::cloud_sync::{default_cloud_root, CloudClient};
 use crate::cm_list::get_cm_endpoints;
 use crate::config::{
-    delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
+    config_dir, delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
     save_library_cache, save_session,
 };
 use crate::depot_browser::{self, DepotInfo as BrowserDepotInfo, ManifestFileEntry};
@@ -2129,7 +2129,9 @@ impl SteamClient {
         }
 
         // Standard Steam identity fallback: steam_appid.txt
-        let _ = std::fs::write(install_dir.join("steam_appid.txt"), app.app_id.to_string());
+        let app_id_str = app.app_id.to_string();
+        let game_working_dir = executable.parent().unwrap_or(&install_dir);
+        let _ = std::fs::write(game_working_dir.join("steam_appid.txt"), &app_id_str);
 
         match launch_info.target {
             LaunchTarget::NativeLinux => {
@@ -2180,6 +2182,10 @@ impl SteamClient {
                 let library_root = PathBuf::from(&launcher_config.steam_library_path);
                 let resolved_proton = self.resolve_proton_path(proton, &library_root);
 
+                if !resolved_proton.exists() && !resolved_proton.is_absolute() {
+                    bail!("Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.", resolved_proton.display());
+                }
+
                 let compat_data_path = library_root
                     .join("steamapps")
                     .join("compatdata")
@@ -2188,12 +2194,109 @@ impl SteamClient {
                 std::fs::create_dir_all(&compat_data_path)
                     .with_context(|| format!("failed creating {}", compat_data_path.display()))?;
 
-                let mut cmd = Command::new(&resolved_proton);
-                cmd.arg("run").arg(&executable).args(&args);
-                cmd.current_dir(&install_dir);
-                cmd.env("SteamAppId", app.app_id.to_string());
+                let bat_path = compat_data_path.join("pfx/drive_c/steamflow_launch.bat");
+                let exe_name = executable.file_name().unwrap().to_string_lossy();
+                let dir_z_path = format!("Z:{}", game_working_dir.to_string_lossy().replace('/', "\\"));
+                let quoted_args: Vec<String> = args.iter().map(|a| format!("\"{}\"", a)).collect();
+
+                let mut bat_content = format!(
+                    "@echo off\r\n\
+                     :: 0. Nuke Proton's fake DLLs from system directories so WINEPATH works\r\n\
+                     del /q /f \"C:\\windows\\system32\\lsteamclient.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\steamclient.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\steamclient64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\steam_api.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\steam_api64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\tier0_s.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\vstdlib_s.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\tier0_s64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\system32\\vstdlib_s64.dll\" 2>nul\r\n\
+                     \r\n\
+                     del /q /f \"C:\\windows\\syswow64\\lsteamclient.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\steamclient.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\steamclient64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\steam_api.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\steam_api64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\tier0_s.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\vstdlib_s.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\tier0_s64.dll\" 2>nul\r\n\
+                     del /q /f \"C:\\windows\\syswow64\\vstdlib_s64.dll\" 2>nul\r\n\
+                     \r\n\
+                     :: 1. Heal the registry\r\n\
+                     reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient.dll\" /f\r\n\
+                     reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll64 /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient64.dll\" /f\r\n\
+                     \r\n\
+                     :: 2. Drop the physical AppID file for Source Engine games\r\n\
+                     echo {} > \"{}\\steam_appid.txt\"\r\n\
+                     \r\n",
+                    app_id_str, dir_z_path
+                );
+
+                if let Some(config) = user_config {
+                    if config.use_steam_runtime {
+                        let base_config = config_dir()?;
+                        let master_prefix = base_config.join("master_steam_prefix");
+                        let master_steam_dir = if master_prefix.join("pfx").exists() {
+                            master_prefix.join("pfx/drive_c/Program Files (x86)/Steam")
+                        } else {
+                            master_prefix.join("drive_c/Program Files (x86)/Steam")
+                        };
+                        let target_steam_dir = compat_data_path.join("pfx/drive_c/Program Files (x86)/Steam");
+
+                        if master_steam_dir.exists() {
+                            tracing::info!("Cloning Master Steam to game prefix...");
+                            let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
+
+                            bat_content.push_str(":: 3. Launch Steam VISIBLY (Removed -silent)\r\n\
+                                 cd /d \"C:\\Program Files (x86)\\Steam\"\r\n\
+                                 start \"\" \"steam.exe\" -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -noverifyfiles\r\n\
+                                 \r\n\
+                                 :: 4. Bulletproof Sleep (Wait 10 seconds)\r\n\
+                                 echo WScript.Sleep 10000 > \"%TEMP%\\sleep.vbs\"\r\n\
+                                 cscript //nologo \"%TEMP%\\sleep.vbs\"\r\n\
+                                 \r\n\
+                                 :: 5. Write Tasklist to physical file\r\n\
+                                 echo === STEAM PROCESS CHECK === > \"C:\\steamflow_debug.txt\"\r\n\
+                                 tasklist /FI \"IMAGENAME eq steam.exe\" >> \"C:\\steamflow_debug.txt\"\r\n\
+                                 \r\n");
+                        } else {
+                            tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
+                        }
+                    }
+                }
+
+                bat_content.push_str(&format!(
+                    ":: 6. Launch Game\r\n\
+                     cd /d \"{}\"\r\n\
+                     \"{}\" {}\r\n",
+                    dir_z_path, exe_name, quoted_args.join(" ")
+                ));
+
+                std::fs::write(&bat_path, bat_content).context("Failed to write launch batch script")?;
+
+                let mut cmd = crate::utils::build_runner_command(resolved_proton.parent().unwrap_or_else(|| Path::new(".")))?;
+                cmd.arg("cmd").arg("/c").arg("C:\\steamflow_launch.bat");
+                cmd.current_dir(game_working_dir);
+                cmd.env("SteamAppId", &app_id_str);
+                cmd.env("SteamGameId", &app_id_str);
+                cmd.env("WINEPREFIX", compat_data_path.join("pfx"));
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &library_root);
+
+                // Restore Environment Shields
+                cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+                cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
+                let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
+                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
+
+                if let Ok(display) = std::env::var("DISPLAY") {
+                    cmd.env("DISPLAY", display);
+                }
+                if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+                    cmd.env("WAYLAND_DISPLAY", wayland);
+                }
+                if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                    cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+                }
 
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
@@ -2201,7 +2304,20 @@ impl SteamClient {
                     }
                 }
 
-                tracing::info!("Launching game (Proton): {:?} with args {:?}", resolved_proton, cmd.get_args());
+                println!("--- GAME LAUNCH DEBUG ---");
+                println!("Program: {:?}", cmd.get_program());
+                println!("Args: {:?}", cmd.get_args().collect::<Vec<_>>());
+                println!("Working Dir: {:?}", cmd.get_current_dir());
+                // Print critical environment variables
+                for env_key in ["WINEPREFIX", "STEAM_COMPAT_DATA_PATH", "STEAM_COMPAT_CLIENT_INSTALL_PATH", "WINEDLLOVERRIDES", "WINEPATH"] {
+                    let val = cmd.get_envs().find_map(|(k, v)| if k == std::ffi::OsStr::new(env_key) { v } else { None });
+                    println!("Env {}: {:?}", env_key, val);
+                }
+                println!("-------------------------");
+
+                cmd.stdout(std::process::Stdio::inherit());
+                cmd.stderr(std::process::Stdio::inherit());
+
                 cmd.spawn().context("failed to spawn proton game")
             }
         }

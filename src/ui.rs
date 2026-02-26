@@ -26,27 +26,12 @@ enum ProtonSource {
     Custom,
 }
 
-#[derive(Debug, Clone)]
-struct GamePropertiesModalState {
-    app_id: u32,
-    game_name: String,
-    launch_options: String,
-    env_vars: String, // Key=Value per line
-}
 
 #[derive(Debug, Clone)]
 struct UninstallModalState {
     app_id: u32,
     game_name: String,
     delete_prefix: bool,
-}
-
-#[derive(Debug, Clone)]
-struct PropertiesModalState {
-    app_id: u32,
-    game_name: String,
-    available_branches: Vec<String>,
-    active_branch: String,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +64,7 @@ struct LaunchSelectorState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameTab {
     Options,
+    Properties,
     Mods,
     Info,
     Misc,
@@ -126,7 +112,6 @@ pub struct SteamLauncher {
     selected_app: Option<AppId>,
     show_installed_only: bool,
     search_text: String,
-    proton_path_for_windows: String,
     status: String,
     auth_username: String,
     auth_password: String,
@@ -146,8 +131,6 @@ pub struct SteamLauncher {
     user_profile: Option<UserProfile>,
     refreshing_account_data: bool,
     uninstall_modal: Option<UninstallModalState>,
-    properties_modal: Option<PropertiesModalState>,
-    game_properties_modal: Option<GamePropertiesModalState>,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
@@ -157,8 +140,10 @@ pub struct SteamLauncher {
     extended_info: HashMap<u32, crate::steam_client::ExtendedAppInfo>,
     depot_list: Vec<crate::steam_client::DepotInfo>,
     depot_selection: HashSet<u64>,
+    available_branches: HashMap<u32, Vec<String>>,
     is_verifying: bool,
     user_configs: crate::models::UserConfigStore,
+    env_vars_edit_buffer: String,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -186,7 +171,6 @@ impl SteamLauncher {
             selected_app: None,
             show_installed_only: false,
             search_text: String::new(),
-            proton_path_for_windows: String::new(),
             status: if authenticated {
                 "Ready".to_string()
             } else {
@@ -210,8 +194,6 @@ impl SteamLauncher {
             user_profile,
             refreshing_account_data: false,
             uninstall_modal: None,
-            properties_modal: None,
-            game_properties_modal: None,
             depot_browser: None,
             platform_selection: None,
             launch_selector: None,
@@ -221,8 +203,10 @@ impl SteamLauncher {
             extended_info: HashMap::new(),
             depot_list: Vec::new(),
             depot_selection: HashSet::new(),
+            available_branches: HashMap::new(),
             is_verifying: false,
             user_configs,
+            env_vars_edit_buffer: String::new(),
             operation_tx,
             operation_rx,
         }
@@ -578,14 +562,7 @@ impl SteamLauncher {
                     self.user_configs = configs;
                 }
                 AsyncOp::BranchesFetched(appid, branches) => {
-                    if let Some(game) = self.library.iter().find(|g| g.app_id == appid) {
-                        self.properties_modal = Some(PropertiesModalState {
-                            app_id: appid,
-                            game_name: game.name.clone(),
-                            available_branches: branches,
-                            active_branch: game.active_branch.clone(),
-                        });
-                    }
+                    self.available_branches.insert(appid, branches);
                 }
                 AsyncOp::DepotListFetched(_appid, list) => {
                     self.depot_list = list;
@@ -767,13 +744,7 @@ impl SteamLauncher {
     }
 
     fn handle_play_click(&mut self, game: &LibraryGame) {
-        let proton_path = if self.proton_path_for_windows.trim().is_empty() {
-            None
-        } else {
-            Some(self.proton_path_for_windows.trim().to_string())
-        };
-
-        let mut prefer_proton = proton_path.is_some();
+        let mut prefer_proton = false;
         if let Some(config) = self.launcher_config.game_configs.get(&game.app_id) {
             if let Some(pref) = &config.platform_preference {
                 prefer_proton = pref == "windows";
@@ -787,7 +758,7 @@ impl SteamLauncher {
         self.runtime.spawn(async move {
             match client.get_product_info(app_id, prefer_proton).await {
                 Ok(options) => {
-                    let _ = tx.send(AsyncOp::LaunchOptionsFetched(app_id, options, proton_path));
+                    let _ = tx.send(AsyncOp::LaunchOptionsFetched(app_id, options, None));
                 }
                 Err(err) => {
                     let _ = tx.send(AsyncOp::Error(format!("Failed to get launch options: {err}")));
@@ -867,20 +838,6 @@ impl SteamLauncher {
         });
     }
 
-    fn open_game_properties(&mut self, game: &LibraryGame) {
-        let config = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
-        let mut env_vars = String::new();
-        for (k, v) in config.env_variables {
-            env_vars.push_str(&format!("{}={}\n", k, v));
-        }
-
-        self.game_properties_modal = Some(GamePropertiesModalState {
-            app_id: game.app_id,
-            game_name: game.name.clone(),
-            launch_options: config.launch_options,
-            env_vars,
-        });
-    }
 
     fn open_uninstall_modal(&mut self, game: &LibraryGame) {
         self.uninstall_modal = Some(UninstallModalState {
@@ -946,14 +903,9 @@ impl SteamLauncher {
                     let _ = config.save().await;
                 });
             }
-            let proton_path = if self.proton_path_for_windows.trim().is_empty() {
-                None
-            } else {
-                Some(self.proton_path_for_windows.trim().to_string())
-            };
             let game = self.library.iter().find(|g| g.app_id == app_id).cloned();
             if let Some(game) = game {
-                self.start_launch_task(&game, option, proton_path);
+                self.start_launch_task(&game, option, None);
             }
             self.launch_selector = None;
         } else if close {
@@ -1014,113 +966,94 @@ impl SteamLauncher {
         }
     }
 
-    fn draw_properties_modal(&mut self, ctx: &egui::Context) {
-        let mut new_branch = None;
-        let mut close = false;
+    fn draw_properties_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
+        let mut config = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
+        let mut changed = false;
 
-        if let Some(state) = &mut self.properties_modal {
-            egui::Window::new(format!("Properties - {}", state.game_name))
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.heading("Betas");
-                    ui.label("Select the beta you would like to opt into:");
+        ui.vertical(|ui| {
+            ui.heading("Launch Options");
+            if ui.add(egui::TextEdit::singleline(&mut config.launch_options).desired_width(f32::INFINITY)).changed() {
+                changed = true;
+            }
 
-                    egui::ComboBox::from_id_salt("branch_selector")
-                        .selected_text(&state.active_branch)
-                        .show_ui(ui, |ui| {
-                            for branch in &state.available_branches {
-                                if ui
-                                    .selectable_value(&mut state.active_branch, branch.clone(), branch)
-                                    .clicked()
-                                {
-                                    new_branch = Some((state.app_id, branch.clone()));
-                                }
-                            }
-                        });
+            ui.add_space(8.0);
+            ui.heading("Environment Variables");
+            ui.label("KEY=VALUE (one per line)");
 
-                    ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                });
-        }
-
-        if let Some((app_id, branch)) = new_branch {
-            let client = self.client.clone();
-            let tx = self.operation_tx.clone();
-            self.runtime.spawn(async move {
-                match client.update_app_branch(app_id, &branch).await {
-                    Ok(()) => {
-                        let _ = tx.send(AsyncOp::BranchUpdated(app_id, branch));
-                    }
-                    Err(err) => {
-                        let _ = tx.send(AsyncOp::Error(format!(
-                            "Failed to switch branch for {app_id}: {err}"
-                        )));
+            if ui.add(egui::TextEdit::multiline(&mut self.env_vars_edit_buffer)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace))
+                .changed()
+            {
+                let mut new_env = HashMap::new();
+                for line in self.env_vars_edit_buffer.lines() {
+                    if let Some((k, v)) = line.split_once('=') {
+                        new_env.insert(k.trim().to_string(), v.trim().to_string());
                     }
                 }
-            });
-        }
+                config.env_variables = new_env;
+                changed = true;
+            }
 
-        if close {
-            self.properties_modal = None;
-        }
-    }
+            ui.add_space(8.0);
+            ui.heading("Runtime Settings");
+            if ui.checkbox(&mut config.use_steam_runtime, "Use Steam Runtime (Windows)")
+                .on_hover_text("Required for DRM-protected games. Runs an official Steam client in the background.")
+                .changed() {
+                changed = true;
+            }
 
-    fn draw_game_properties_modal(&mut self, ctx: &egui::Context) {
-        let mut save_config = None;
-        let mut close = false;
-
-        if let Some(state) = &mut self.game_properties_modal {
-            egui::Window::new(format!("Game Properties - {}", state.game_name))
-                .collapsible(false)
-                .resizable(true)
-                .default_size([400.0, 300.0])
-                .show(ctx, |ui| {
-                    ui.label("Launch Options");
-                    ui.text_edit_singleline(&mut state.launch_options);
-                    ui.add_space(8.0);
-
-                    ui.label("Environment Variables (KEY=VALUE per line)");
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.text_edit_multiline(&mut state.env_vars);
-                    });
-
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Save").clicked() {
-                            let mut env_map = HashMap::new();
-                            for line in state.env_vars.lines() {
-                                if let Some((k, v)) = line.split_once('=') {
-                                    env_map.insert(k.trim().to_string(), v.trim().to_string());
-                                }
+            ui.add_space(8.0);
+            ui.heading("Beta Branches");
+            if let Some(branches) = self.available_branches.get(&game.app_id) {
+                let mut active_branch = game.active_branch.clone();
+                egui::ComboBox::from_id_salt("branch_selector_tab")
+                    .selected_text(&active_branch)
+                    .show_ui(ui, |ui| {
+                        for branch in branches {
+                            if ui.selectable_value(&mut active_branch, branch.clone(), branch).clicked() {
+                                let app_id = game.app_id;
+                                let branch = branch.clone();
+                                let client = self.client.clone();
+                                let tx = self.operation_tx.clone();
+                                self.runtime.spawn(async move {
+                                    match client.update_app_branch(app_id, &branch).await {
+                                        Ok(()) => {
+                                            let _ = tx.send(AsyncOp::BranchUpdated(app_id, branch));
+                                        }
+                                        Err(err) => {
+                                            let _ = tx.send(AsyncOp::Error(format!("Failed to switch branch: {err}")));
+                                        }
+                                    }
+                                });
                             }
-                            // Note: we'll update the config in the outer scope to avoid borrowing issues
-                            save_config = Some((state.app_id, state.launch_options.clone(), env_map));
-                        }
-                        if ui.button("Cancel").clicked() {
-                            close = true;
                         }
                     });
-                });
-        }
+            } else {
+                if ui.button("Check for Beta Branches").clicked() {
+                    let app_id = game.app_id;
+                    let client = self.client.clone();
+                    let tx = self.operation_tx.clone();
+                    self.runtime.spawn(async move {
+                        match client.fetch_branches(app_id).await {
+                            Ok(branches) => {
+                                let _ = tx.send(AsyncOp::BranchesFetched(app_id, branches));
+                            }
+                            Err(err) => {
+                                let _ = tx.send(AsyncOp::Error(format!("Failed to fetch branches: {err}")));
+                            }
+                        }
+                    });
+                }
+            }
+        });
 
-        if let Some((app_id, launch_opts, env_map)) = save_config {
-            let mut config = self.user_configs.get(&app_id).cloned().unwrap_or_default();
-            config.launch_options = launch_opts;
-            config.env_variables = env_map;
-            self.user_configs.insert(app_id, config);
-
+        if changed {
+            self.user_configs.insert(game.app_id, config);
             let store = self.user_configs.clone();
             self.runtime.spawn(async move {
                 let _ = crate::config::save_user_configs(&store).await;
             });
-            self.game_properties_modal = None;
-        }
-
-        if close {
-            self.game_properties_modal = None;
         }
     }
 
@@ -1788,8 +1721,6 @@ impl eframe::App for SteamLauncher {
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(&self.status);
-                ui.separator();
                 if ui.button("Refresh Library").clicked() {
                     self.refresh_library();
                 }
@@ -1797,9 +1728,6 @@ impl eframe::App for SteamLauncher {
                 if ui.button("Settings").clicked() {
                     self.show_settings = !self.show_settings;
                 }
-                ui.separator();
-                ui.label("Proton path (for Windows games):");
-                ui.text_edit_singleline(&mut self.proton_path_for_windows);
             });
             if self.client.is_offline() {
                 ui.colored_label(egui::Color32::YELLOW, "OFFLINE MODE");
@@ -1908,6 +1836,49 @@ impl eframe::App for SteamLauncher {
                             }
                         });
 
+                    ui.add_space(8.0);
+                    ui.label("Steam Runtime Runner (Master Prefix)");
+                    let runner_name = self.launcher_config.steam_runtime_runner
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "None Selected".to_string());
+
+                    egui::ComboBox::from_id_salt("runtime_runner_selector")
+                        .selected_text(runner_name)
+                        .show_ui(ui, |ui| {
+                            let home = std::env::var("HOME").unwrap_or_default();
+                            let custom_tools_paths = [
+                                PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
+                                PathBuf::from(&home).join(".steam/steam/compatibilitytools.d"),
+                            ];
+
+                            for path in custom_tools_paths {
+                                if let Ok(entries) = std::fs::read_dir(path) {
+                                    for entry in entries.flatten() {
+                                        if entry.path().is_dir() {
+                                            let p = entry.path();
+                                            let name = p.file_name().unwrap().to_string_lossy().to_string();
+                                            if ui.selectable_label(self.launcher_config.steam_runtime_runner == p, name).clicked() {
+                                                self.launcher_config.steam_runtime_runner = p;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                    ui.add_space(4.0);
+                    if ui.button("Install / Manage Windows Steam Runtime").clicked() {
+                        let config = self.launcher_config.clone();
+                        let tx = self.operation_tx.clone();
+                        self.runtime.spawn(async move {
+                            if let Err(e) = crate::launch::install_master_steam(&config).await {
+                                let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
+                            }
+                        });
+                    }
+
+                    ui.add_space(16.0);
                     if ui.button("Save Settings").clicked() {
                         let config = self.launcher_config.clone();
                         let tx = self.operation_tx.clone();
@@ -1951,7 +1922,16 @@ impl eframe::App for SteamLauncher {
 
                         let response = ui.selectable_label(selected, job);
                         if response.clicked() {
-                            self.selected_app = Some(app_id);
+                            if self.selected_app != Some(app_id) {
+                                self.selected_app = Some(app_id);
+                                self.env_vars_edit_buffer = self.user_configs.get(&app_id)
+                                    .map(|cfg| {
+                                        let mut keys: Vec<_> = cfg.env_variables.keys().collect();
+                                        keys.sort();
+                                        keys.iter().map(|k| format!("{}={}", k, cfg.env_variables.get(*k).unwrap())).collect::<Vec<_>>().join("\n")
+                                    })
+                                    .unwrap_or_default();
+                            }
                         }
 
                         response.context_menu(|ui| {
@@ -1968,7 +1948,17 @@ impl eframe::App for SteamLauncher {
                                 ui.close();
                             }
                             if ui.button("Properties").clicked() {
-                                self.open_game_properties(game);
+                                if self.selected_app != Some(game.app_id) {
+                                    self.selected_app = Some(game.app_id);
+                                    self.env_vars_edit_buffer = self.user_configs.get(&game.app_id)
+                                        .map(|cfg| {
+                                            let mut keys: Vec<_> = cfg.env_variables.keys().collect();
+                                            keys.sort();
+                                            keys.iter().map(|k| format!("{}={}", k, cfg.env_variables.get(*k).unwrap())).collect::<Vec<_>>().join("\n")
+                                        })
+                                        .unwrap_or_default();
+                                }
+                                self.current_tab = GameTab::Properties;
                                 ui.close();
                             }
                         });
@@ -1998,211 +1988,223 @@ impl eframe::App for SteamLauncher {
             if let Some(game) = self.selected_game().cloned() {
                 self.ensure_image_requested(game.app_id);
 
-                ui.horizontal(|ui| {
-                    if let Some(texture) = self.image_cache.get(&game.app_id) {
-                        ui.add(egui::Image::new(texture).max_width(250.0));
-                    } else {
-                        let (rect, _response) = ui.allocate_exact_size(
-                            egui::vec2(250.0, 375.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "STEAM",
-                            egui::FontId::proportional(20.0),
-                            egui::Color32::from_gray(100),
-                        );
-                    }
+                ui.vertical(|ui| {
+                    egui::TopBottomPanel::bottom("game_status_bar").show_inside(ui, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("game_status_scroll")
+                            .show(ui, |ui| {
+                                ui.label(&self.status);
+                            });
+                    });
 
-                    ui.vertical(|ui| {
-                        ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
-                        ui.label(format!("AppID: {}", game.app_id));
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("game_view_scroll")
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if let Some(texture) = self.image_cache.get(&game.app_id) {
+                                        ui.add(egui::Image::new(texture).max_width(250.0));
+                                    } else {
+                                        let (rect, _response) = ui.allocate_exact_size(
+                                            egui::vec2(250.0, 375.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(30));
+                                        ui.painter().text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "STEAM",
+                                            egui::FontId::proportional(20.0),
+                                            egui::Color32::from_gray(100),
+                                        );
+                                    }
 
-                        ui.add_space(20.0);
+                                    ui.vertical(|ui| {
+                                        ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
+                                        ui.label(format!("AppID: {}", game.app_id));
 
-                        ui.horizontal(|ui| {
-                            if game.is_installed {
-                                let play_btn = egui::Button::new(
-                                    egui::RichText::new("PLAY")
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(egui::Color32::from_rgb(46, 125, 50))
-                                .min_size(egui::vec2(120.0, 40.0));
+                                        ui.add_space(20.0);
 
-                                if ui.add(play_btn).clicked() {
-                                    self.handle_play_click(&game);
-                                }
+                                        ui.horizontal(|ui| {
+                                            if game.is_installed {
+                                                let play_btn = egui::Button::new(
+                                                    egui::RichText::new("PLAY")
+                                                        .color(egui::Color32::WHITE)
+                                                        .strong(),
+                                                )
+                                                .fill(egui::Color32::from_rgb(46, 125, 50))
+                                                .min_size(egui::vec2(120.0, 40.0));
 
-                                if ui.button("PROPERTIES").clicked() {
-                                    self.open_game_properties(&game);
-                                }
-
-                                if game.update_available {
-                                    ui.add_space(50.0);
-                                    let update_btn = egui::Button::new(
-                                        egui::RichText::new("UPDATE AVAILABLE")
-                                            .color(egui::Color32::WHITE)
-                                            .strong(),
-                                    )
-                                    .fill(egui::Color32::from_rgb(33, 150, 243))
-                                    .min_size(egui::vec2(120.0, 40.0));
-
-                                    if ui
-                                        .add_enabled(!self.client.is_offline(), update_btn)
-                                        .clicked()
-                                    {
-                                        let app_id = game.app_id;
-                                        let client = self.client.clone();
-                                        let tx = self.operation_tx.clone();
-                                        let download_state = self.download_state.clone();
-                                        self.runtime.spawn(async move {
-                                            match client.update_game(app_id, download_state).await {
-                                                Ok(rx) => {
-                                                    let _ = tx.send(AsyncOp::DownloadStarted(
-                                                        app_id, rx,
-                                                    ));
+                                                if ui.add(play_btn).clicked() {
+                                                    self.handle_play_click(&game);
                                                 }
-                                                Err(err) => {
-                                                    let _ = tx.send(AsyncOp::Error(format!(
-                                                        "Failed to update {app_id}: {err}"
-                                                    )));
+
+                                                if game.update_available {
+                                                    ui.add_space(50.0);
+                                                    let update_btn = egui::Button::new(
+                                                        egui::RichText::new("UPDATE AVAILABLE")
+                                                            .color(egui::Color32::WHITE)
+                                                            .strong(),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(33, 150, 243))
+                                                    .min_size(egui::vec2(120.0, 40.0));
+
+                                                    if ui
+                                                        .add_enabled(!self.client.is_offline(), update_btn)
+                                                        .clicked()
+                                                    {
+                                                        let app_id = game.app_id;
+                                                        let client = self.client.clone();
+                                                        let tx = self.operation_tx.clone();
+                                                        let download_state = self.download_state.clone();
+                                                        self.runtime.spawn(async move {
+                                                            match client.update_game(app_id, download_state).await {
+                                                                Ok(rx) => {
+                                                                    let _ = tx.send(AsyncOp::DownloadStarted(
+                                                                        app_id, rx,
+                                                                    ));
+                                                                }
+                                                                Err(err) => {
+                                                                    let _ = tx.send(AsyncOp::Error(format!(
+                                                                        "Failed to update {app_id}: {err}"
+                                                                    )));
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                }
+                                            } else {
+                                                let install_btn = egui::Button::new(
+                                                    egui::RichText::new("INSTALL")
+                                                        .color(egui::Color32::WHITE)
+                                                        .strong(),
+                                                )
+                                                .fill(egui::Color32::from_rgb(46, 125, 50))
+                                                .min_size(egui::vec2(120.0, 40.0));
+
+                                                if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
+                                                {
+                                                    let app_id = game.app_id;
+                                                    let mut client = self.client.clone();
+                                                    let tx = self.operation_tx.clone();
+                                                    self.runtime.spawn(async move {
+                                                        match client.get_available_platforms(app_id).await {
+                                                            Ok((platforms, buffer)) => {
+                                                                let _ = tx.send(AsyncOp::PlatformsFetched(
+                                                                    app_id, platforms, buffer,
+                                                                ));
+                                                            }
+                                                            Err(err) => {
+                                                                let _ = tx.send(AsyncOp::Error(format!(
+                                                                    "Failed to fetch platforms for {app_id}: {err}"
+                                                                )));
+                                                            }
+                                                        }
+                                                    });
                                                 }
                                             }
                                         });
-                                    }
-                                }
-                            } else {
-                                let install_btn = egui::Button::new(
-                                    egui::RichText::new("INSTALL")
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(egui::Color32::from_rgb(46, 125, 50))
-                                .min_size(egui::vec2(120.0, 40.0));
+                                    });
+                                });
 
-                                if ui.add_enabled(!self.client.is_offline(), install_btn).clicked()
-                                {
-                                    let app_id = game.app_id;
-                                    let mut client = self.client.clone();
-                                    let tx = self.operation_tx.clone();
-                                    self.runtime.spawn(async move {
-                                        match client.get_available_platforms(app_id).await {
-                                            Ok((platforms, buffer)) => {
-                                                let _ = tx.send(AsyncOp::PlatformsFetched(
-                                                    app_id, platforms, buffer,
-                                                ));
-                                            }
-                                            Err(err) => {
-                                                let _ = tx.send(AsyncOp::Error(format!(
-                                                    "Failed to fetch platforms for {app_id}: {err}"
-                                                )));
+                                ui.add_space(10.0);
+
+                                if let Some(progress) = self.live_download_progress.clone() {
+                                    let denom = if progress.total_bytes == 0 {
+                                        1.0
+                                    } else {
+                                        progress.total_bytes as f32
+                                    };
+                                    let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
+
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::ProgressBar::new(fraction)
+                                                .show_percentage()
+                                                .text(format!(
+                                                    "Live operation: {:?} - {} ({} / {} bytes)",
+                                                    progress.state,
+                                                    progress.current_file,
+                                                    progress.bytes_downloaded,
+                                                    progress.total_bytes
+                                                )),
+                                        );
+
+                                        let mut download_state = self.download_state.write().unwrap();
+                                        if download_state.is_downloading || download_state.is_paused {
+                                            if download_state.is_paused {
+                                                if ui.button("▶ Resume").clicked() {
+                                                    download_state.is_paused = false;
+                                                    download_state.abort_signal.store(false, std::sync::atomic::Ordering::Relaxed);
+
+                                                    let app_id = download_state.app_id;
+                                                    drop(download_state);
+
+                                                    // Resume logic: Re-trigger the appropriate operation
+                                                    if let Some(game) = self.library.iter().find(|g| g.app_id == app_id).cloned() {
+                                                        if progress.state == DownloadProgressState::Verifying {
+                                                            let client = self.client.clone();
+                                                            let tx = self.operation_tx.clone();
+                                                            let ds = self.download_state.clone();
+                                                            self.runtime.spawn(async move {
+                                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.verify_game(app_id, ds).await.unwrap()));
+                                                            });
+                                                        } else if game.is_installed {
+                                                            let client = self.client.clone();
+                                                            let tx = self.operation_tx.clone();
+                                                            let ds = self.download_state.clone();
+                                                            self.runtime.spawn(async move {
+                                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.update_game(app_id, ds).await.unwrap()));
+                                                            });
+                                                        } else {
+                                                            let platform = self.launcher_config.game_configs.get(&app_id)
+                                                                .and_then(|c| c.platform_preference.as_ref())
+                                                                .map(|p| if p == "linux" { DepotPlatform::Linux } else { DepotPlatform::Windows })
+                                                                .unwrap_or(if cfg!(target_os = "linux") { DepotPlatform::Linux } else { DepotPlatform::Windows });
+                                                            self.start_install(app_id, platform, None, None);
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                if ui.button("⏸ Pause").clicked() {
+                                                    download_state.is_paused = true;
+                                                    download_state.abort_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                                                }
                                             }
                                         }
                                     });
                                 }
-                            }
-                        });
-                    });
-                });
 
-                ui.add_space(10.0);
+                                ui.separator();
 
-                if let Some(progress) = self.live_download_progress.clone() {
-                    let denom = if progress.total_bytes == 0 {
-                        1.0
-                    } else {
-                        progress.total_bytes as f32
-                    };
-                    let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut self.current_tab, GameTab::Options, "Options");
+                                    ui.selectable_value(&mut self.current_tab, GameTab::Properties, "Properties");
+                                    ui.selectable_value(&mut self.current_tab, GameTab::Mods, "Mods");
+                                    ui.selectable_value(&mut self.current_tab, GameTab::Info, "Info");
+                                    ui.selectable_value(&mut self.current_tab, GameTab::Misc, "Misc");
+                                });
 
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::ProgressBar::new(fraction)
-                                .show_percentage()
-                                .text(format!(
-                                    "Live operation: {:?} - {} ({} / {} bytes)",
-                                    progress.state,
-                                    progress.current_file,
-                                    progress.bytes_downloaded,
-                                    progress.total_bytes
-                                )),
-                        );
+                                ui.add_space(8.0);
 
-                        let mut download_state = self.download_state.write().unwrap();
-                        if download_state.is_downloading || download_state.is_paused {
-                            if download_state.is_paused {
-                                if ui.button("▶ Resume").clicked() {
-                                    download_state.is_paused = false;
-                                    download_state.abort_signal.store(false, std::sync::atomic::Ordering::Relaxed);
-
-                                    let app_id = download_state.app_id;
-                                    drop(download_state);
-
-                                    // Resume logic: Re-trigger the appropriate operation
-                                    if let Some(game) = self.library.iter().find(|g| g.app_id == app_id).cloned() {
-                                        if progress.state == DownloadProgressState::Verifying {
-                                            let client = self.client.clone();
-                                            let tx = self.operation_tx.clone();
-                                            let ds = self.download_state.clone();
-                                            self.runtime.spawn(async move {
-                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.verify_game(app_id, ds).await.unwrap()));
-                                            });
-                                        } else if game.is_installed {
-                                            let client = self.client.clone();
-                                            let tx = self.operation_tx.clone();
-                                            let ds = self.download_state.clone();
-                                            self.runtime.spawn(async move {
-                                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, client.update_game(app_id, ds).await.unwrap()));
-                                            });
-                                        } else {
-                                            let platform = self.launcher_config.game_configs.get(&app_id)
-                                                .and_then(|c| c.platform_preference.as_ref())
-                                                .map(|p| if p == "linux" { DepotPlatform::Linux } else { DepotPlatform::Windows })
-                                                .unwrap_or(if cfg!(target_os = "linux") { DepotPlatform::Linux } else { DepotPlatform::Windows });
-                                            self.start_install(app_id, platform, None, None);
-                                        }
+                                match self.current_tab {
+                                    GameTab::Options => self.draw_options_tab(&game, ui),
+                                    GameTab::Properties => self.draw_properties_tab(&game, ui),
+                                    GameTab::Mods => {
+                                        ui.label("Coming Soon");
                                     }
+                                    GameTab::Info => self.draw_info_tab(&game, ui),
+                                    GameTab::Misc => self.draw_misc_tab(&game, ui),
                                 }
-                            } else {
-                                if ui.button("⏸ Pause").clicked() {
-                                    download_state.is_paused = true;
-                                    download_state.abort_signal.store(true, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        }
+                            });
                     });
-                }
-
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.current_tab, GameTab::Options, "Options");
-                    ui.selectable_value(&mut self.current_tab, GameTab::Mods, "Mods");
-                    ui.selectable_value(&mut self.current_tab, GameTab::Info, "Info");
-                    ui.selectable_value(&mut self.current_tab, GameTab::Misc, "Misc");
                 });
-
-                ui.add_space(8.0);
-
-                match self.current_tab {
-                    GameTab::Options => self.draw_options_tab(&game, ui),
-                    GameTab::Mods => {
-                        ui.label("Coming Soon");
-                    }
-                    GameTab::Info => self.draw_info_tab(&game, ui),
-                    GameTab::Misc => self.draw_misc_tab(&game, ui),
-                }
             } else {
                 ui.heading("SteamFlow");
                 ui.label("Select a game from the sidebar.");
             }
         });
 
-        self.draw_properties_modal(ctx);
-        self.draw_game_properties_modal(ctx);
         self.draw_uninstall_modal(ctx);
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
