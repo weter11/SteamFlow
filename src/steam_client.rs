@@ -2198,10 +2198,58 @@ impl SteamClient {
                 let exe_name = executable.file_name().unwrap().to_string_lossy();
                 let dir_z_path = format!("Z:{}", game_working_dir.to_string_lossy().replace('/', "\\"));
                 let quoted_args: Vec<String> = args.iter().map(|a| format!("\"{}\"", a)).collect();
+                let mut steam_launch_block = String::new();
 
-                let mut bat_content = format!(
+                if let Some(config) = user_config {
+                    if config.use_steam_runtime {
+                        let base_config = config_dir()?;
+                        let master_prefix = base_config.join("master_steam_prefix");
+                        let master_steam_dir = if master_prefix.join("pfx").exists() {
+                            master_prefix.join("pfx/drive_c/Program Files (x86)/Steam")
+                        } else {
+                            master_prefix.join("drive_c/Program Files (x86)/Steam")
+                        };
+                        let target_steam_dir = compat_data_path.join("pfx/drive_c/Program Files (x86)/Steam");
+
+                        if master_steam_dir.exists() {
+                            tracing::info!("Cloning Master Steam to game prefix...");
+                            let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
+
+                            steam_launch_block = format!(
+                                "echo [STEP 4] Launching Steam...\r\n\
+                                 cd /d \"C:\\Program Files (x86)\\Steam\"\r\n\
+                                 start \"\" \"steam.exe\" -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -noverifyfiles\r\n\
+                                 \r\n\
+                                 echo [STEP 5] Sleeping...\r\n\
+                                 echo WScript.Sleep 10000 > \"%TEMP%\\sleep.vbs\"\r\n\
+                                 cscript //nologo \"%TEMP%\\sleep.vbs\"\r\n\
+                                 \r\n\
+                                 echo [STEP 6] Checking Tasks...\r\n\
+                                 tasklist /FI \"IMAGENAME eq steam.exe\" > \"{}\\steamflow_debug.txt\"\r\n\
+                                 \r\n\
+                                 echo =========================================\r\n\
+                                 echo SCRIPT PAUSED FOR DEBUGGING.\r\n\
+                                 echo READ THE ERRORS ABOVE, THEN PRESS ANY KEY.\r\n\
+                                 echo =========================================\r\n\
+                                 pause\r\n\
+                                 \r\n",
+                                dir_z_path
+                            );
+                        } else {
+                            tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
+                        }
+                    }
+                }
+
+                let game_exec_cmd = if quoted_args.is_empty() {
+                    format!("\"{}\"", exe_name)
+                } else {
+                    format!("\"{}\" {}", exe_name, quoted_args.join(" "))
+                };
+
+                let bat_content = format!(
                     "@echo off\r\n\
-                     :: 0. Nuke Proton's fake DLLs from system directories so WINEPATH works\r\n\
+                     echo [STEP 1] Nuking fake DLLs...\r\n\
                      del /q /f \"C:\\windows\\system32\\lsteamclient.dll\" 2>nul\r\n\
                      del /q /f \"C:\\windows\\system32\\steamclient.dll\" 2>nul\r\n\
                      del /q /f \"C:\\windows\\system32\\steamclient64.dll\" 2>nul\r\n\
@@ -2222,55 +2270,19 @@ impl SteamClient {
                      del /q /f \"C:\\windows\\syswow64\\tier0_s64.dll\" 2>nul\r\n\
                      del /q /f \"C:\\windows\\syswow64\\vstdlib_s64.dll\" 2>nul\r\n\
                      \r\n\
-                     :: 1. Heal the registry\r\n\
+                     echo [STEP 2] Healing Registry...\r\n\
                      reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient.dll\" /f\r\n\
                      reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll64 /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient64.dll\" /f\r\n\
                      \r\n\
-                     :: 2. Drop the physical AppID file for Source Engine games\r\n\
+                     echo [STEP 3] Writing AppID...\r\n\
                      echo {} > \"{}\\steam_appid.txt\"\r\n\
-                     \r\n",
-                    app_id_str, dir_z_path
-                );
-
-                if let Some(config) = user_config {
-                    if config.use_steam_runtime {
-                        let base_config = config_dir()?;
-                        let master_prefix = base_config.join("master_steam_prefix");
-                        let master_steam_dir = if master_prefix.join("pfx").exists() {
-                            master_prefix.join("pfx/drive_c/Program Files (x86)/Steam")
-                        } else {
-                            master_prefix.join("drive_c/Program Files (x86)/Steam")
-                        };
-                        let target_steam_dir = compat_data_path.join("pfx/drive_c/Program Files (x86)/Steam");
-
-                        if master_steam_dir.exists() {
-                            tracing::info!("Cloning Master Steam to game prefix...");
-                            let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
-
-                            bat_content.push_str(":: 3. Launch Steam VISIBLY (Removed -silent)\r\n\
-                                 cd /d \"C:\\Program Files (x86)\\Steam\"\r\n\
-                                 start \"\" \"steam.exe\" -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -noverifyfiles\r\n\
-                                 \r\n\
-                                 :: 4. Bulletproof Sleep (Wait 10 seconds)\r\n\
-                                 echo WScript.Sleep 10000 > \"%TEMP%\\sleep.vbs\"\r\n\
-                                 cscript //nologo \"%TEMP%\\sleep.vbs\"\r\n\
-                                 \r\n\
-                                 :: 5. Write Tasklist to physical file\r\n\
-                                 echo === STEAM PROCESS CHECK === > \"C:\\steamflow_debug.txt\"\r\n\
-                                 tasklist /FI \"IMAGENAME eq steam.exe\" >> \"C:\\steamflow_debug.txt\"\r\n\
-                                 \r\n");
-                        } else {
-                            tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
-                        }
-                    }
-                }
-
-                bat_content.push_str(&format!(
-                    ":: 6. Launch Game\r\n\
+                     \r\n\
+                     {}\
+                     echo [STEP 7] Launching Game...\r\n\
                      cd /d \"{}\"\r\n\
-                     \"{}\" {}\r\n",
-                    dir_z_path, exe_name, quoted_args.join(" ")
-                ));
+                     {}\r\n",
+                    app_id_str, dir_z_path, steam_launch_block, dir_z_path, game_exec_cmd
+                );
 
                 std::fs::write(&bat_path, bat_content).context("Failed to write launch batch script")?;
 
