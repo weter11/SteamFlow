@@ -2215,31 +2215,17 @@ impl SteamClient {
                             tracing::info!("Cloning Master Steam to game prefix...");
                             let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
 
-                            // TASK 1: Create Ghost Executable decoy
-                            let real_steam_exe = target_steam_dir.join("steam.exe");
-                            let ghost_steam_exe = target_steam_dir.join("ghost_steam.exe");
-                            if real_steam_exe.exists() {
-                                std::fs::copy(&real_steam_exe, &ghost_steam_exe).unwrap_or_default();
-                            }
-
-                            // TASK 2: Use Ghost Steam in Batch
                             steam_launch_block = format!(
-                                "echo [STEP 4] Evading Proton Stub and Launching Ghost Steam...\r\n\
+                                "echo [STEP 2] Launching Windows Steam...\r\n\
                                  cd /d \"C:\\Program Files (x86)\\Steam\"\r\n\
-                                 start \"\" \"ghost_steam.exe\" -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -noverifyfiles\r\n\
+                                 start \"\" \"steam.exe\" -tcp -cef-disable-gpu -cef-disable-gpu-compositing -cef-disable-d3d11 -disable-overlay -nofriendsui -noverifyfiles\r\n\
                                  \r\n\
-                                 echo [STEP 5] Sleeping...\r\n\
-                                 echo WScript.Sleep 10000 > \"%TEMP%\\sleep.vbs\"\r\n\
+                                 echo [STEP 3] Sleeping for 5 seconds...\r\n\
+                                 echo WScript.Sleep 5000 > \"%TEMP%\\sleep.vbs\"\r\n\
                                  cscript //nologo \"%TEMP%\\sleep.vbs\"\r\n\
                                  \r\n\
-                                 echo [STEP 6] Checking Tasks...\r\n\
-                                 tasklist /FI \"IMAGENAME eq ghost_steam.exe\" > \"{}\\steamflow_debug.txt\"\r\n\
-                                 \r\n\
-                                 echo =========================================\r\n\
-                                 echo SCRIPT PAUSED FOR DEBUGGING.\r\n\
-                                 echo READ THE ERRORS ABOVE, THEN PRESS ANY KEY.\r\n\
-                                 echo =========================================\r\n\
-                                 pause\r\n\
+                                 echo [STEP 4] Checking Tasks...\r\n\
+                                 tasklist /FI \"IMAGENAME eq steam.exe\" > \"{}\\steamflow_debug.txt\"\r\n\
                                  \r\n",
                                 dir_z_path
                             );
@@ -2255,41 +2241,24 @@ impl SteamClient {
                     format!("\"{}\" {}", exe_name, quoted_args.join(" "))
                 };
 
+                let step_num = if steam_launch_block.is_empty() { 2 } else { 5 };
+
                 let bat_content = format!(
                     "@echo off\r\n\
-                     echo [STEP 1] Nuking fake DLLs...\r\n\
-                     del /q /f \"C:\\windows\\system32\\lsteamclient.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\system32\\steamclient.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\system32\\steamclient64.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\system32\\steam_api.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\system32\\steam_api64.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\system32\\tier0_s.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\system32\\vstdlib_s.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\system32\\tier0_s64.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\system32\\vstdlib_s64.dll\" 2>nul\r\n\
-                     \r\n\
-                     del /q /f \"C:\\windows\\syswow64\\lsteamclient.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\syswow64\\steamclient.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\syswow64\\steamclient64.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\syswow64\\steam_api.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\syswow64\\steam_api64.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\syswow64\\tier0_s.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\syswow64\\vstdlib_s.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\syswow64\\tier0_s64.dll\" 2>nul\r\n\
-                     del /q /f \"C:\\windows\\syswow64\\vstdlib_s64.dll\" 2>nul\r\n\
-                     \r\n\
-                     echo [STEP 2] Healing Registry...\r\n\
-                     reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient.dll\" /f\r\n\
-                     reg add \"HKCU\\Software\\Valve\\Steam\\ActiveProcess\" /v SteamClientDll64 /t REG_SZ /d \"C:\\Program Files (x86)\\Steam\\steamclient64.dll\" /f\r\n\
-                     \r\n\
-                     echo [STEP 3] Writing AppID...\r\n\
+                     echo [STEP 1] Writing AppID...\r\n\
                      echo {} > \"{}\\steam_appid.txt\"\r\n\
                      \r\n\
                      {}\
-                     echo [STEP 7] Launching Game...\r\n\
+                     echo =========================================\r\n\
+                     echo SCRIPT PAUSED FOR DEBUGGING.\r\n\
+                     echo READ THE ERRORS ABOVE, THEN PRESS ANY KEY.\r\n\
+                     echo =========================================\r\n\
+                     pause\r\n\
+                     \r\n\
+                     echo [STEP {}] Launching Game...\r\n\
                      cd /d \"{}\"\r\n\
                      {}\r\n",
-                    app_id_str, dir_z_path, steam_launch_block, dir_z_path, game_exec_cmd
+                    app_id_str, dir_z_path, steam_launch_block, step_num, dir_z_path, game_exec_cmd
                 );
 
                 std::fs::write(&bat_path, bat_content).context("Failed to write launch batch script")?;

@@ -3,14 +3,33 @@ use std::process::Command;
 use anyhow::{Result, bail};
 
 pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
+    // 1. Check if it's a directory containing 'proton'
     if runner_path.join("proton").exists() {
         let mut cmd = Command::new(runner_path.join("proton"));
         cmd.arg("run");
         return Ok(cmd);
     }
 
+    // 2. Check if it's a directory containing 'bin/wine'
     if runner_path.join("bin/wine").exists() {
         return Ok(Command::new(runner_path.join("bin/wine")));
+    }
+
+    // 3. Check if the path itself is the binary
+    if let Some(file_name) = runner_path.file_name().and_then(|f| f.to_str()) {
+        if file_name == "wine" || file_name == "wine64" {
+            return Ok(Command::new(runner_path));
+        }
+        if file_name == "proton" {
+            let mut cmd = Command::new(runner_path);
+            cmd.arg("run");
+            return Ok(cmd);
+        }
+    }
+
+    // 4. Fallback: check if parent is bin and it's wine
+    if runner_path.ends_with("bin/wine") || runner_path.ends_with("bin/wine64") {
+         return Ok(Command::new(runner_path));
     }
 
     bail!("Failed to find a valid runner (proton or bin/wine) in {}", runner_path.display())
