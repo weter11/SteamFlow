@@ -3,36 +3,66 @@ use std::process::Command;
 use anyhow::{Result, bail};
 
 pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
-    // 1. Check if it's a directory containing 'proton'
-    if runner_path.join("proton").exists() {
-        let mut cmd = Command::new(runner_path.join("proton"));
-        cmd.arg("run");
-        return Ok(cmd);
-    }
+    let mut final_path = runner_path.to_path_buf();
 
-    // 2. Check if it's a directory containing 'bin/wine'
-    if runner_path.join("bin/wine").exists() {
-        return Ok(Command::new(runner_path.join("bin/wine")));
-    }
-
-    // 3. Check if the path itself is the binary
-    if let Some(file_name) = runner_path.file_name().and_then(|f| f.to_str()) {
-        if file_name == "wine" || file_name == "wine64" {
-            return Ok(Command::new(runner_path));
+    // 1. Directory Resolution: If it's a directory, find the binary
+    if final_path.is_dir() {
+        if final_path.join("proton").exists() {
+            final_path.push("proton");
+        } else if final_path.join("bin/wine").exists() {
+            final_path.push("bin/wine");
+        } else if final_path.join("bin/wine64").exists() {
+            final_path.push("bin/wine64");
         }
+    }
+
+    // 2. Identification and Command Building
+    if let Some(file_name) = final_path.file_name().and_then(|f| f.to_str()) {
         if file_name == "proton" {
-            let mut cmd = Command::new(runner_path);
+            let mut cmd = Command::new(&final_path);
             cmd.arg("run");
             return Ok(cmd);
         }
+        if file_name == "wine" || file_name == "wine64" {
+            return Ok(Command::new(&final_path));
+        }
     }
 
-    // 4. Fallback: check if parent is bin and it's wine
-    if runner_path.ends_with("bin/wine") || runner_path.ends_with("bin/wine64") {
-         return Ok(Command::new(runner_path));
+    // 3. Last Resort: Just return the command if it exists
+    if final_path.exists() && final_path.is_file() {
+        return Ok(Command::new(&final_path));
     }
 
-    bail!("Failed to find a valid runner (proton or bin/wine) in {}", runner_path.display())
+    bail!("Failed to resolve a valid runner binary from {}", runner_path.display())
+}
+
+pub fn resolve_runner(name: &str, library_root: &Path) -> PathBuf {
+    let name_path = Path::new(name);
+    if name_path.is_absolute() || name_path.exists() {
+        return name_path.to_path_buf();
+    }
+
+    // 1. Steam Library (steamapps/common)
+    let steam_path = library_root.join("steamapps/common").join(name);
+    if steam_path.exists() {
+        return steam_path;
+    }
+
+    // 2. compatibilitytools.d (Steam Custom)
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let compat_path = PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d").join(name);
+    if compat_path.exists() {
+        return compat_path;
+    }
+
+    // 3. Lutris Runners
+    let lutris_path = PathBuf::from(&home).join(".local/share/lutris/runners/wine").join(name);
+    if lutris_path.exists() {
+        return lutris_path;
+    }
+
+    // 4. Fallback to name as provided
+    name_path.to_path_buf()
 }
 
 pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {

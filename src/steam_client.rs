@@ -2077,33 +2077,6 @@ impl SteamClient {
         Ok(())
     }
 
-    fn resolve_proton_path(&self, proton_name: &str, library_root: &Path) -> PathBuf {
-        if proton_name.contains('/') || proton_name.contains('\\') {
-            return PathBuf::from(proton_name);
-        }
-
-        let standard_path = library_root
-            .join("steamapps/common")
-            .join(proton_name)
-            .join("proton");
-
-        if standard_path.exists() {
-            return standard_path;
-        }
-
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let custom_path = PathBuf::from(home)
-            .join(".local/share/Steam/compatibilitytools.d")
-            .join(proton_name)
-            .join("proton");
-
-        if custom_path.exists() {
-            return custom_path;
-        }
-
-        PathBuf::from(proton_name)
-    }
-
     pub(crate) fn spawn_game_process(
         &self,
         app: &LibraryGame,
@@ -2180,10 +2153,10 @@ impl SteamClient {
                 };
 
                 let library_root = PathBuf::from(&launcher_config.steam_library_path);
-                let resolved_proton = self.resolve_proton_path(proton, &library_root);
+                let resolved_runner = crate::utils::resolve_runner(proton, &library_root);
 
-                if !resolved_proton.exists() && !resolved_proton.is_absolute() {
-                    bail!("Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.", resolved_proton.display());
+                if !resolved_runner.exists() && !resolved_runner.is_absolute() {
+                    bail!("Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.", resolved_runner.display());
                 }
 
                 let compat_data_path = library_root
@@ -2263,7 +2236,7 @@ impl SteamClient {
 
                 std::fs::write(&bat_path, bat_content).context("Failed to write launch batch script")?;
 
-                let mut cmd = crate::utils::build_runner_command(resolved_proton.parent().unwrap_or_else(|| Path::new(".")))?;
+                let mut cmd = crate::utils::build_runner_command(&resolved_runner)?;
                 cmd.arg("cmd").arg("/c").arg("C:\\steamflow_launch.bat");
                 cmd.current_dir(game_working_dir);
                 cmd.env("SteamAppId", &app_id_str);
