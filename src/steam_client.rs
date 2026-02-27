@@ -2142,23 +2142,42 @@ impl SteamClient {
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
-                let proton = if let Some(forced) = launcher_config
-                    .game_configs
-                    .get(&app.app_id)
-                    .and_then(|c| c.forced_proton_version.as_ref())
-                {
-                    forced
+                let library_root = PathBuf::from(&launcher_config.steam_library_path);
+                let use_steam_runtime = user_config.map(|c| c.use_steam_runtime).unwrap_or(false);
+
+                let mut active_runner = if use_steam_runtime {
+                    if launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                         bail!("Steam Runtime is enabled but no Steam Runtime Runner (Wine) is configured in Global Settings.");
+                    }
+                    launcher_config.steam_runtime_runner.clone()
                 } else {
-                    proton_path
-                        .filter(|p| !p.is_empty())
-                        .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
+                    let proton = if let Some(forced) = launcher_config
+                        .game_configs
+                        .get(&app.app_id)
+                        .and_then(|c| c.forced_proton_version.as_ref())
+                    {
+                        forced
+                    } else {
+                        proton_path
+                            .filter(|p| !p.is_empty())
+                            .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
+                    };
+                    crate::utils::resolve_runner(proton, &library_root)
                 };
 
-                let library_root = PathBuf::from(&launcher_config.steam_library_path);
-                let resolved_runner = crate::utils::resolve_runner(proton, &library_root);
+                // Crucial: Smart resolution (appending bin/wine if it is a directory)
+                if active_runner.is_dir() {
+                    if active_runner.join("proton").exists() {
+                        active_runner.push("proton");
+                    } else if active_runner.join("bin/wine").exists() {
+                        active_runner.push("bin/wine");
+                    } else if active_runner.join("bin/wine64").exists() {
+                        active_runner.push("bin/wine64");
+                    }
+                }
 
-                if !resolved_runner.exists() && !resolved_runner.is_absolute() {
-                    bail!("Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.", resolved_runner.display());
+                if !active_runner.exists() && !active_runner.is_absolute() {
+                    bail!("Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.", active_runner.display());
                 }
 
                 let compat_data_path = library_root
@@ -2187,7 +2206,7 @@ impl SteamClient {
                             tracing::info!("Cloning Master Steam to game prefix...");
                             let _ = crate::utils::copy_dir_all(&master_steam_dir, &target_steam_dir);
 
-                            let mut steam_cmd = crate::utils::build_runner_command(&resolved_runner)?;
+                            let mut steam_cmd = crate::utils::build_runner_command(&active_runner)?;
                             steam_cmd.current_dir(&target_steam_dir);
                             steam_cmd.arg("C:\\Program Files (x86)\\Steam\\steam.exe")
                                 .args(["-silent", "-tcp", "-cef-disable-gpu", "-disable-overlay", "-nofriendsui", "-noverifyfiles"]);
@@ -2217,7 +2236,7 @@ impl SteamClient {
                     }
                 }
 
-                let mut cmd = crate::utils::build_runner_command(&resolved_runner)?;
+                let mut cmd = crate::utils::build_runner_command(&active_runner)?;
                 cmd.current_dir(game_working_dir);
                 cmd.arg(&executable);
                 cmd.args(&args);
