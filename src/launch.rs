@@ -14,12 +14,14 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
         download_steam_setup(&setup_exe).await?;
     }
 
-    let runner_path = &config.steam_runtime_runner;
-    if runner_path.as_os_str().is_empty() {
+    let runner_name = config.steam_runtime_runner.to_string_lossy();
+    if runner_name.is_empty() {
         return Err(anyhow!("No Steam Runtime Runner selected in Global Settings"));
     }
 
-    let mut cmd = build_runner_command(runner_path)?;
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&runner_name, &library_root);
+    let mut cmd = build_runner_command(&resolved_runner)?;
 
     // Check if steam.exe exists in the prefix
     let steam_exe_path = find_steam_exe_in_prefix(&master_prefix);
