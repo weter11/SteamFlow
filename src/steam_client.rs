@@ -2222,14 +2222,30 @@ impl SteamClient {
                             if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") { steam_cmd.env("WAYLAND_DISPLAY", wayland); }
                             if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") { steam_cmd.env("XDG_RUNTIME_DIR", xdg_runtime); }
 
-                            tracing::info!("Spawning background Steam...");
-                            let _ = steam_cmd.spawn().context("Failed to spawn background Steam")?;
+                            println!("--- STEAM LAUNCH DEBUG ---");
+                            println!("Program: {:?}", steam_cmd.get_program());
+                            println!("Args: {:?}", steam_cmd.get_args().collect::<Vec<_>>());
+                            println!("Working Dir: {:?}", steam_cmd.get_current_dir());
+                            for env_key in ["WINEPREFIX", "WINEDLLOVERRIDES", "WINEPATH"] {
+                                let val = steam_cmd.get_envs().find_map(|(k, v)| if k == std::ffi::OsStr::new(env_key) { v } else { None });
+                                println!("Env {}: {:?}", env_key, val);
+                            }
+                            println!("--------------------------");
 
-                            // Rust threads are fine here because spawn_game_process is called from play_game (blocking wait)
-                            // or from launch_game (fire and forget).
-                            // However, we should be careful. In this codebase, play_game IS called in a thread/async task
-                            // so a short sleep is usually acceptable for synchronization, but let's stick to user intent.
+                            steam_cmd.stdout(std::process::Stdio::inherit())
+                                     .stderr(std::process::Stdio::inherit());
+
+                            tracing::info!("Spawning background Steam...");
+                            let mut steam_process = steam_cmd.spawn().context("Failed to spawn background Steam")?;
+
+                            println!("Sleeping 5 seconds for Steam to boot...");
                             std::thread::sleep(std::time::Duration::from_secs(5));
+
+                            match steam_process.try_wait() {
+                                Ok(Some(status)) => println!("❌ FATAL: Background Steam exited prematurely with status: {}", status),
+                                Ok(None) => println!("✅ SUCCESS: Background Steam is still running!"),
+                                Err(e) => println!("❌ ERROR: Could not check Steam process: {}", e),
+                            }
                         } else {
                             tracing::warn!("Master Steam not found at {:?}, skipping background launch", master_steam_dir);
                         }
