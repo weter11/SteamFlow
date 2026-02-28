@@ -2290,15 +2290,42 @@ impl SteamClient {
                             let mut steam_process =
                                 steam_cmd.spawn().context("Failed to spawn background Steam")?;
 
-                            println!("Waiting 5s for Steam to initialise...");
-                            std::thread::sleep(std::time::Duration::from_secs(5));
+                            println!("Waiting for Steam to initialise (max 30s)...");
 
-                            match steam_process.try_wait() {
-                                Ok(Some(status)) => {
-                                    println!("❌ FATAL: Background Steam exited early: {}", status)
+                            let steam_pid_path = prefix_steam_dir.join("steam.pid");
+                            let steam_pipe = steam_wineprefix.join("drive_c/windows/temp/.steampath");
+
+                            let ready = 'wait: {
+                                for i in 0..30 {
+                                    std::thread::sleep(std::time::Duration::from_secs(1));
+
+                                    if let Ok(Some(status)) = steam_process.try_wait() {
+                                        println!(
+                                            "❌ FATAL: Background Steam exited after {}s with: {}",
+                                            i + 1,
+                                            status
+                                        );
+                                        break 'wait false;
+                                    }
+
+                                    if steam_pid_path.exists() {
+                                        println!("✅ Steam ready after {}s (pid file found)", i + 1);
+                                        break 'wait true;
+                                    }
+
+                                    if steam_pipe.exists() {
+                                        println!("✅ Steam ready after {}s (.steampath found)", i + 1);
+                                        break 'wait true;
+                                    }
+
+                                    println!("  Waiting... {}s", i + 1);
                                 }
-                                Ok(None) => println!("✅ Background Steam is running"),
-                                Err(e) => println!("❌ Could not check Steam process: {}", e),
+                                println!("⚠️ Steam did not signal ready after 30s, launching game anyway");
+                                true
+                            };
+
+                            if !ready {
+                                bail!("Background Steam crashed before the game could start");
                             }
                         }
                     }
