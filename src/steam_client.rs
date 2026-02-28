@@ -2188,47 +2188,81 @@ impl SteamClient {
                 if use_steam_runtime {
                     let base_config = config_dir()?;
                     let master_prefix = base_config.join("master_steam_prefix");
-                    let master_steam_dir = if master_prefix.join("pfx").exists() {
-                        master_prefix.join("pfx/drive_c/Program Files (x86)/Steam")
-                    } else {
-                        master_prefix.join("drive_c/Program Files (x86)/Steam")
-                    };
-                    let prefix_steam_dir = target_prefix_path.join("drive_c/Program Files (x86)/Steam");
 
-                    if master_steam_dir.exists() {
-                        tracing::info!("Cloning Master Steam to game prefix...");
-                        let _ = crate::utils::copy_dir_all(&master_steam_dir, &prefix_steam_dir);
+                    tracing::info!("Looking for Master Steam in: {}", master_prefix.display());
 
-                        println!("--- STEAM LAUNCH DEBUG ---");
-                        let mut steam_cmd = crate::utils::build_runner_command(&active_runner)?;
-                        steam_cmd.current_dir(&prefix_steam_dir);
-                        steam_cmd.arg("C:\\Program Files (x86)\\Steam\\steam.exe")
-                            .args(["-silent", "-tcp", "-cef-disable-gpu", "-disable-overlay", "-nofriendsui", "-noverifyfiles"]);
-                        steam_cmd.env("WINEPREFIX", &target_prefix_path)
-                            .env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=")
-                            .env("WINEPATH", "C:\\Program Files (x86)\\Steam");
-                        steam_cmd.stdout(std::process::Stdio::inherit())
-                                 .stderr(std::process::Stdio::inherit());
-
-                        println!("Program: {:?}", steam_cmd.get_program());
-                        println!("Args: {:?}", steam_cmd.get_args().collect::<Vec<_>>());
-                        println!("--------------------------");
-
-                        let mut steam_process = steam_cmd.spawn().context("Failed to spawn background Steam")?;
-
-                        println!("Sleeping 5 seconds for Steam to boot...");
-                        std::thread::sleep(std::time::Duration::from_secs(5));
-
-                        match steam_process.try_wait() {
-                            Ok(Some(status)) => println!("❌ FATAL: Background Steam exited prematurely: {}", status),
-                            Ok(None) => println!("✅ Background Steam is running"),
-                            Err(e) => println!("❌ Could not check Steam process: {}", e),
+                    match find_master_steam_dir(&master_prefix) {
+                        None => {
+                            bail!(
+                                "use_steam_runtime is enabled but steam.exe was not found in {}.\n\
+                                 Go to Settings → 'Install / Manage Windows Steam Runtime' first.\n\
+                                 Expected locations checked:\n\
+                                 - {}/pfx/drive_c/Program Files (x86)/Steam/steam.exe\n\
+                                 - {}/drive_c/Program Files (x86)/Steam/steam.exe",
+                                master_prefix.display(),
+                                master_prefix.display(),
+                                master_prefix.display(),
+                            );
                         }
-                    } else {
-                        bail!(
-                            "use_steam_runtime is enabled but Master Steam is not installed. \
-                             Go to Settings → 'Install / Manage Windows Steam Runtime' first."
-                        );
+                        Some(master_steam_dir) => {
+                            let prefix_steam_dir = target_prefix_path.join("drive_c/Program Files (x86)/Steam");
+
+                            tracing::info!(
+                                "Cloning {} → {}",
+                                master_steam_dir.display(),
+                                prefix_steam_dir.display()
+                            );
+                            let _ = crate::utils::copy_dir_all(&master_steam_dir, &prefix_steam_dir);
+
+                            // Determine WINEPREFIX: it's the pfx dir that contains drive_c
+                            // master_steam_dir is .../pfx/drive_c/Program Files (x86)/Steam
+                            // so go up 3 levels to get the pfx root
+                            let master_wineprefix = master_steam_dir
+                                .ancestors()
+                                .find(|p| p.join("drive_c").exists())
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(|| master_prefix.join("pfx"));
+
+                            println!("--- STEAM LAUNCH DEBUG ---");
+                            let mut steam_cmd = crate::utils::build_runner_command(&active_runner)?;
+                            steam_cmd.current_dir(&prefix_steam_dir);
+                            steam_cmd.arg("C:\\Program Files (x86)\\Steam\\steam.exe").args([
+                                "-silent",
+                                "-tcp",
+                                "-cef-disable-gpu",
+                                "-disable-overlay",
+                                "-nofriendsui",
+                                "-noverifyfiles",
+                            ]);
+                            steam_cmd.env("WINEPREFIX", &target_prefix_path).env(
+                                "WINEDLLOVERRIDES",
+                                "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=",
+                            ).env("WINEPATH", "C:\\Program Files (x86)\\Steam");
+                            steam_cmd
+                                .stdout(std::process::Stdio::inherit())
+                                .stderr(std::process::Stdio::inherit());
+
+                            println!("Master Steam dir : {}", master_steam_dir.display());
+                            println!("Master wineprefix: {}", master_wineprefix.display());
+                            println!("Game   wineprefix: {}", target_prefix_path.display());
+                            println!("Program: {:?}", steam_cmd.get_program());
+                            println!("Args: {:?}", steam_cmd.get_args().collect::<Vec<_>>());
+                            println!("--------------------------");
+
+                            let mut steam_process =
+                                steam_cmd.spawn().context("Failed to spawn background Steam")?;
+
+                            println!("Waiting 5s for Steam to initialise...");
+                            std::thread::sleep(std::time::Duration::from_secs(5));
+
+                            match steam_process.try_wait() {
+                                Ok(Some(status)) => {
+                                    println!("❌ FATAL: Background Steam exited early: {}", status)
+                                }
+                                Ok(None) => println!("✅ Background Steam is running"),
+                                Err(e) => println!("❌ Could not check Steam process: {}", e),
+                            }
+                        }
                     }
                 }
 
@@ -2935,4 +2969,28 @@ mod tests {
 
 fn split_args(args: &str) -> Vec<String> {
     args.split_whitespace().map(ToString::to_string).collect()
+}
+
+fn find_master_steam_exe(prefix: &Path) -> Option<PathBuf> {
+    let candidates = [
+        "pfx/drive_c/Program Files (x86)/Steam/steam.exe",
+        "pfx/drive_c/Program Files/Steam/steam.exe",
+        "drive_c/Program Files (x86)/Steam/steam.exe",
+        "drive_c/Program Files/Steam/steam.exe",
+    ];
+
+    for rel_path in candidates {
+        let full_path = prefix.join(rel_path);
+        tracing::info!("Probing for steam.exe: {}", full_path.display());
+        if full_path.exists() {
+            tracing::info!("Found steam.exe at: {}", full_path.display());
+            return Some(full_path);
+        }
+    }
+
+    None
+}
+
+fn find_master_steam_dir(prefix: &Path) -> Option<PathBuf> {
+    find_master_steam_exe(prefix).and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
 }
