@@ -4,13 +4,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum SteamPrefixMode {
+    #[default]
+    Shared, // use master_steam_prefix WINEPREFIX directly
+    PerGame, // copy/symlink Steam into game's own compatdata prefix
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserAppConfig {
-    pub launch_options: String,      // e.g. "-novid -console"
+    pub launch_options: String, // e.g. "-novid -console"
     pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
-    pub use_steam_runtime: bool,     // Ghost Steam / Master Prefix toggle
-    pub hidden: bool,                // Future use
-    pub favorite: bool,              // Future use
+    pub use_steam_runtime: bool, // Ghost Steam / Master Prefix toggle
+    #[serde(default)]
+    pub steam_prefix_mode: SteamPrefixMode,
+    pub hidden: bool,   // Future use
+    pub favorite: bool, // Future use
 }
 
 pub type UserConfigStore = HashMap<u32, UserAppConfig>;
