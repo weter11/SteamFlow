@@ -2294,27 +2294,43 @@ impl SteamClient {
 
                             let steam_pid_path = prefix_steam_dir.join("steam.pid");
                             let steam_pipe = steam_wineprefix.join("drive_c/windows/temp/.steampath");
+                            let steam_config_vdf = prefix_steam_dir.join("config/config.vdf");
+                            let steam_logs_dir   = prefix_steam_dir.join("logs");
 
                             let ready = 'wait: {
                                 for i in 0..30 {
                                     std::thread::sleep(std::time::Duration::from_secs(1));
 
+                                    // Crash detection — bail immediately
                                     if let Ok(Some(status)) = steam_process.try_wait() {
-                                        println!(
-                                            "❌ FATAL: Background Steam exited after {}s with: {}",
-                                            i + 1,
-                                            status
-                                        );
+                                        println!("❌ FATAL: Background Steam exited after {}s with: {}", i + 1, status);
                                         break 'wait false;
                                     }
 
+                                    // Signal 1: pid file (some Wine/Steam combos do write this)
                                     if steam_pid_path.exists() {
-                                        println!("✅ Steam ready after {}s (pid file found)", i + 1);
+                                        println!("✅ Steam ready after {}s (steam.pid found)", i + 1);
                                         break 'wait true;
                                     }
 
+                                    // Signal 2: .steampath in temp (Proton-style)
                                     if steam_pipe.exists() {
                                         println!("✅ Steam ready after {}s (.steampath found)", i + 1);
+                                        break 'wait true;
+                                    }
+
+                                    // Signal 3: config.vdf written — Steam has finished early init
+                                    if steam_config_vdf.exists() {
+                                        println!("✅ Steam ready after {}s (config.vdf found)", i + 1);
+                                        break 'wait true;
+                                    }
+
+                                    // Signal 4: logs dir has multiple entries — Steam's subsystems are running
+                                    let log_count = std::fs::read_dir(&steam_logs_dir)
+                                        .map(|d| d.count())
+                                        .unwrap_or(0);
+                                    if log_count >= 2 {
+                                        println!("✅ Steam ready after {}s ({} log files found)", i + 1, log_count);
                                         break 'wait true;
                                     }
 
@@ -2347,7 +2363,7 @@ impl SteamClient {
                 cmd.env("SteamGameId", &app_id_str);
                 cmd.env("WINEPREFIX", &game_wineprefix);
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+                cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=;GameOverlayRenderer=n;GameOverlayRenderer64=n");
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
                 let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
