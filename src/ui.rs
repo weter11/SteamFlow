@@ -773,7 +773,12 @@ impl SteamLauncher {
         let user_config = self.user_configs.get(&game.app_id).cloned();
         let (tx, rx) = mpsc::channel();
         self.play_result_rx = Some(rx);
-        self.status = format!("Syncing Cloud... {}", game.name);
+        let cloud_enabled_pre = self.launcher_config.enable_cloud_sync && !self.client.is_offline();
+        if cloud_enabled_pre {
+            self.status = format!("Syncing Cloud... {}", game.name);
+        } else {
+            self.status = format!("Launching {}...", game.name);
+        }
 
         self.runtime.spawn(async move {
             let launcher_config = load_launcher_config().await.unwrap_or_default();
@@ -813,9 +818,11 @@ impl SteamLauncher {
 
             let _ = child.wait();
 
-            if let (Some(c), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
-                let _ = c.sync_up(game.app_id, root).await;
-                tracing::info!(appid = game.app_id, "Upload Complete");
+            if cloud_enabled {
+                if let (Some(c), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
+                    let _ = c.sync_up(game.app_id, root).await;
+                    tracing::info!(appid = game.app_id, "Upload Complete");
+                }
             }
 
             let _ = tx.send(format!("Finished playing {}", game.name));
@@ -1001,6 +1008,25 @@ impl SteamLauncher {
                 .on_hover_text("Required for DRM-protected games. Runs an official Steam client in the background.")
                 .changed() {
                 changed = true;
+            }
+
+            if config.use_steam_runtime {
+                ui.add_space(4.0);
+                ui.label("Steam Prefix Mode:");
+                if ui.radio_value(
+                    &mut config.steam_prefix_mode,
+                    crate::models::SteamPrefixMode::Shared,
+                    "Shared — game uses master prefix directly (faster)",
+                ).on_hover_text("All games share one WINEPREFIX. Steam is always visible to the game.").changed() {
+                    changed = true;
+                }
+                if ui.radio_value(
+                    &mut config.steam_prefix_mode,
+                    crate::models::SteamPrefixMode::PerGame,
+                    "Per-game — Steam copied/symlinked into game's own prefix (isolated)",
+                ).on_hover_text("Each game gets its own WINEPREFIX with Steam symlinked in. Safer, uses more disk.").changed() {
+                    changed = true;
+                }
             }
 
             ui.add_space(8.0);
@@ -1806,6 +1832,24 @@ impl eframe::App for SteamLauncher {
                         checkbox.on_hover_text("WARNING: Shares prefix with official Steam. Syncs saves, but may risk corruption if the launcher crashes. Uncheck to use isolated safe mode.");
                     });
 
+                    ui.add_space(8.0);
+                    ui.label("Steam Runtime Prefix Mode:");
+                    if ui.radio_value(
+                        &mut self.launcher_config.steam_prefix_mode,
+                        crate::models::SteamPrefixMode::Shared,
+                        "Shared prefix  — all games share master_steam_prefix (faster, less disk)",
+                    ).changed() {
+                        // Logic to save happens in the separate "Save Settings" button block below
+                    }
+                    if ui.radio_value(
+                        &mut self.launcher_config.steam_prefix_mode,
+                        crate::models::SteamPrefixMode::PerGame,
+                        "Per-game prefix — copy/symlink Steam into each game's compatdata (isolated)",
+                    ).changed() {
+                        // Logic to save happens in the separate "Save Settings" button block below
+                    }
+
+                    ui.add_space(8.0);
                     ui.label("Proton Source");
                     ui.radio_value(
                         &mut self.proton_source,
