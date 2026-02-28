@@ -2267,15 +2267,22 @@ impl SteamClient {
                             steam_cmd.arg("C:\\Program Files (x86)\\Steam\\steam.exe").args([
                                 "-silent",
                                 "-tcp",
-                                "-cef-disable-gpu",
-                                "-disable-overlay",
                                 "-nofriendsui",
                                 "-noverifyfiles",
+                                "-noreactlogin",
+                                "-no-browser",
+                                "-cef-disable-sandbox",
+                                "-cef-disable-gpu",
+                                "-disable-overlay",
+                                "-nochatui",
+                                "-noopenvr",
                             ]);
                             steam_cmd.env("WINEPREFIX", &steam_wineprefix).env(
                                 "WINEDLLOVERRIDES",
                                 "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=",
-                            ).env("WINEPATH", "C:\\Program Files (x86)\\Steam");
+                            ).env("WINEPATH", "C:\\Program Files (x86)\\Steam")
+                            .env("STEAM_DISABLE_BROWSER", "1")
+                            .env("STEAM_NO_BROWSER", "1");
                             steam_cmd
                                 .stdout(std::process::Stdio::inherit())
                                 .stderr(std::process::Stdio::inherit());
