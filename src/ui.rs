@@ -12,7 +12,7 @@ use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -144,6 +144,8 @@ pub struct SteamLauncher {
     is_verifying: bool,
     user_configs: crate::models::UserConfigStore,
     env_vars_edit_buffer: String,
+    runner_components: Option<crate::utils::RunnerComponents>,
+    last_scanned_runner: PathBuf,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -207,6 +209,8 @@ impl SteamLauncher {
             is_verifying: false,
             user_configs,
             env_vars_edit_buffer: String::new(),
+            runner_components: None,
+            last_scanned_runner: PathBuf::new(),
             operation_tx,
             operation_rx,
         }
@@ -1129,6 +1133,70 @@ impl SteamLauncher {
             }
 
             ui.add_space(16.0);
+            ui.heading("Steam Features");
+
+            let game_app_id = game.app_id;
+            let mut user_cfg = self
+                .user_configs
+                .get(&game_app_id)
+                .cloned()
+                .unwrap_or_default();
+            let slc = &mut user_cfg.steam_launch_config;
+            let mut steam_cfg_changed = false;
+
+            ui.label("Only applies when 'Use Steam Runtime' is enabled.");
+            ui.add_space(4.0);
+
+            if ui
+                .checkbox(
+                    &mut slc.no_browser,
+                    "Disable CEF browser (kills steamwebhelper, saves ~2GB RAM)",
+                )
+                .changed()
+            {
+                steam_cfg_changed = true;
+            }
+            if ui.checkbox(&mut slc.no_friends_ui, "Disable Friends UI").changed() {
+                steam_cfg_changed = true;
+            }
+            if ui.checkbox(&mut slc.no_overlay, "Disable In-Game Overlay").changed() {
+                steam_cfg_changed = true;
+            }
+            if ui.checkbox(&mut slc.no_chat_ui, "Disable Chat UI").changed() {
+                steam_cfg_changed = true;
+            }
+            if ui.checkbox(&mut slc.no_vr, "Disable SteamVR/OpenVR").changed() {
+                steam_cfg_changed = true;
+            }
+            if ui
+                .checkbox(&mut slc.big_picture, "Force Big Picture mode (lighter UI)")
+                .changed()
+            {
+                steam_cfg_changed = true;
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Steam Process");
+
+            if ui.button("⏹  Stop Steam in this prefix").clicked() {
+                let prefix = crate::utils::steam_wineprefix_for_game(
+                    &self.launcher_config,
+                    game_app_id,
+                    &self.user_configs,
+                );
+                SteamClient::kill_steam_in_prefix(&prefix);
+                self.status = "Steam stopped".to_string();
+            }
+
+            if steam_cfg_changed {
+                self.user_configs.insert(game_app_id, user_cfg);
+                let store = self.user_configs.clone();
+                self.runtime.spawn(async move {
+                    let _ = crate::config::save_user_configs(&store).await;
+                });
+            }
+
+            ui.add_space(16.0);
             ui.heading("Platform Preference");
             let current_platform = if game.is_installed {
                 let mut is_proton = game.active_branch.contains("experimental")
@@ -1469,6 +1537,29 @@ impl SteamLauncher {
                 });
             }
         });
+    }
+
+    fn refresh_runner_components(&mut self, runner_path: &Path, app_id: u32) {
+        if self.last_scanned_runner == runner_path {
+            return; // already up to date
+        }
+        self.last_scanned_runner = runner_path.to_path_buf();
+
+        // The actual game prefix, not the Steam prefix
+        let game_prefix = std::path::PathBuf::from(&self.launcher_config.steam_library_path)
+            .join("steamapps/compatdata")
+            .join(app_id.to_string())
+            .join("pfx");
+
+        let wineprefix = if game_prefix.exists() {
+            Some(game_prefix)
+        } else {
+            None
+        };
+        self.runner_components = Some(crate::utils::detect_runner_components(
+            runner_path,
+            wineprefix.as_deref(),
+        ));
     }
 
     fn draw_uninstall_modal(&mut self, ctx: &egui::Context) {
@@ -1921,6 +2012,59 @@ impl eframe::App for SteamLauncher {
                             }
                         });
                     }
+
+                if let Some(game) = self.selected_game() {
+                    // Resolve which runner is active for this game
+                    let active_runner_name = self
+                        .launcher_config
+                        .game_configs
+                        .get(&game.app_id)
+                        .and_then(|c| c.forced_proton_version.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| self.launcher_config.proton_version.clone());
+
+                    let library_root =
+                        std::path::PathBuf::from(&self.launcher_config.steam_library_path);
+                    let resolved = crate::utils::resolve_runner(&active_runner_name, &library_root);
+                    self.refresh_runner_components(&resolved, game.app_id);
+                }
+
+                if let Some(components) = &self.runner_components {
+                    ui.add_space(8.0);
+
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label(egui::RichText::new("Bundled Components").strong());
+                        ui.add_space(4.0);
+
+                        egui::Grid::new("runner_components_grid")
+                            .num_columns(3)
+                            .spacing([16.0, 4.0])
+                            .show(ui, |ui| {
+                                let mut row = |label: &str,
+                                               info: &Option<crate::utils::ComponentInfo>| {
+                                    ui.label(label);
+                                    match info {
+                                        Some(c) => {
+                                            ui.colored_label(egui::Color32::GREEN, &c.version);
+                                            ui.colored_label(
+                                                egui::Color32::GRAY,
+                                                format!("({})", c.source),
+                                            );
+                                        }
+                                        None => {
+                                            ui.colored_label(egui::Color32::GRAY, "not found");
+                                            ui.label("using wined3d fallback");
+                                        }
+                                    }
+                                    ui.end_row();
+                                };
+                                let c = components.clone();
+                                row("DXVK:", &c.dxvk);
+                                row("VKD3D-Proton:", &c.vkd3d_proton);
+                                row("VKD3D:", &c.vkd3d);
+                            });
+                    });
+                }
 
                     ui.add_space(16.0);
                     if ui.button("Save Settings").clicked() {
