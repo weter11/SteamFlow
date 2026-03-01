@@ -1539,12 +1539,27 @@ impl SteamLauncher {
         });
     }
 
-    fn refresh_runner_components(&mut self, runner_path: &Path) {
+    fn refresh_runner_components(&mut self, runner_path: &Path, app_id: u32) {
         if self.last_scanned_runner == runner_path {
             return; // already up to date
         }
         self.last_scanned_runner = runner_path.to_path_buf();
-        self.runner_components = Some(crate::utils::detect_runner_components(runner_path));
+
+        // The actual game prefix, not the Steam prefix
+        let game_prefix = std::path::PathBuf::from(&self.launcher_config.steam_library_path)
+            .join("steamapps/compatdata")
+            .join(app_id.to_string())
+            .join("pfx");
+
+        let wineprefix = if game_prefix.exists() {
+            Some(game_prefix)
+        } else {
+            None
+        };
+        self.runner_components = Some(crate::utils::detect_runner_components(
+            runner_path,
+            wineprefix.as_deref(),
+        ));
     }
 
     fn draw_uninstall_modal(&mut self, ctx: &egui::Context) {
@@ -2011,7 +2026,7 @@ impl eframe::App for SteamLauncher {
                     let library_root =
                         std::path::PathBuf::from(&self.launcher_config.steam_library_path);
                     let resolved = crate::utils::resolve_runner(&active_runner_name, &library_root);
-                    self.refresh_runner_components(&resolved);
+                    self.refresh_runner_components(&resolved, game.app_id);
                 }
 
                 if let Some(components) = &self.runner_components {
@@ -2022,41 +2037,31 @@ impl eframe::App for SteamLauncher {
                         ui.add_space(4.0);
 
                         egui::Grid::new("runner_components_grid")
-                            .num_columns(2)
+                            .num_columns(3)
                             .spacing([16.0, 4.0])
                             .show(ui, |ui| {
-                                ui.label("DXVK:");
-                                match &components.dxvk {
-                                    Some(v) => {
-                                        ui.colored_label(egui::Color32::GREEN, v);
+                                let mut row = |label: &str,
+                                               info: &Option<crate::utils::ComponentInfo>| {
+                                    ui.label(label);
+                                    match info {
+                                        Some(c) => {
+                                            ui.colored_label(egui::Color32::GREEN, &c.version);
+                                            ui.colored_label(
+                                                egui::Color32::GRAY,
+                                                format!("({})", c.source),
+                                            );
+                                        }
+                                        None => {
+                                            ui.colored_label(egui::Color32::GRAY, "not found");
+                                            ui.label("using wined3d fallback");
+                                        }
                                     }
-                                    None => {
-                                        ui.colored_label(egui::Color32::GRAY, "not bundled");
-                                    }
-                                }
-                                ui.end_row();
-
-                                ui.label("VKD3D-Proton:");
-                                match &components.vkd3d_proton {
-                                    Some(v) => {
-                                        ui.colored_label(egui::Color32::GREEN, v);
-                                    }
-                                    None => {
-                                        ui.colored_label(egui::Color32::GRAY, "not bundled");
-                                    }
-                                }
-                                ui.end_row();
-
-                                ui.label("VKD3D:");
-                                match &components.vkd3d {
-                                    Some(v) => {
-                                        ui.colored_label(egui::Color32::GREEN, v);
-                                    }
-                                    None => {
-                                        ui.colored_label(egui::Color32::GRAY, "not bundled");
-                                    }
-                                }
-                                ui.end_row();
+                                    ui.end_row();
+                                };
+                                let c = components.clone();
+                                row("DXVK:", &c.dxvk);
+                                row("VKD3D-Proton:", &c.vkd3d_proton);
+                                row("VKD3D:", &c.vkd3d);
                             });
                     });
                 }
