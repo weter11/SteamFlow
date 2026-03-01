@@ -12,7 +12,7 @@ use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -144,6 +144,8 @@ pub struct SteamLauncher {
     is_verifying: bool,
     user_configs: crate::models::UserConfigStore,
     env_vars_edit_buffer: String,
+    runner_components: Option<crate::utils::RunnerComponents>,
+    last_scanned_runner: PathBuf,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -207,6 +209,8 @@ impl SteamLauncher {
             is_verifying: false,
             user_configs,
             env_vars_edit_buffer: String::new(),
+            runner_components: None,
+            last_scanned_runner: PathBuf::new(),
             operation_tx,
             operation_rx,
         }
@@ -1535,6 +1539,14 @@ impl SteamLauncher {
         });
     }
 
+    fn refresh_runner_components(&mut self, runner_path: &Path) {
+        if self.last_scanned_runner == runner_path {
+            return; // already up to date
+        }
+        self.last_scanned_runner = runner_path.to_path_buf();
+        self.runner_components = Some(crate::utils::detect_runner_components(runner_path));
+    }
+
     fn draw_uninstall_modal(&mut self, ctx: &egui::Context) {
         let mut do_uninstall = None;
         let mut close = false;
@@ -1985,6 +1997,69 @@ impl eframe::App for SteamLauncher {
                             }
                         });
                     }
+
+                if let Some(game) = self.selected_game() {
+                    // Resolve which runner is active for this game
+                    let active_runner_name = self
+                        .launcher_config
+                        .game_configs
+                        .get(&game.app_id)
+                        .and_then(|c| c.forced_proton_version.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| self.launcher_config.proton_version.clone());
+
+                    let library_root =
+                        std::path::PathBuf::from(&self.launcher_config.steam_library_path);
+                    let resolved = crate::utils::resolve_runner(&active_runner_name, &library_root);
+                    self.refresh_runner_components(&resolved);
+                }
+
+                if let Some(components) = &self.runner_components {
+                    ui.add_space(8.0);
+
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label(egui::RichText::new("Bundled Components").strong());
+                        ui.add_space(4.0);
+
+                        egui::Grid::new("runner_components_grid")
+                            .num_columns(2)
+                            .spacing([16.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("DXVK:");
+                                match &components.dxvk {
+                                    Some(v) => {
+                                        ui.colored_label(egui::Color32::GREEN, v);
+                                    }
+                                    None => {
+                                        ui.colored_label(egui::Color32::GRAY, "not bundled");
+                                    }
+                                }
+                                ui.end_row();
+
+                                ui.label("VKD3D-Proton:");
+                                match &components.vkd3d_proton {
+                                    Some(v) => {
+                                        ui.colored_label(egui::Color32::GREEN, v);
+                                    }
+                                    None => {
+                                        ui.colored_label(egui::Color32::GRAY, "not bundled");
+                                    }
+                                }
+                                ui.end_row();
+
+                                ui.label("VKD3D:");
+                                match &components.vkd3d {
+                                    Some(v) => {
+                                        ui.colored_label(egui::Color32::GREEN, v);
+                                    }
+                                    None => {
+                                        ui.colored_label(egui::Color32::GRAY, "not bundled");
+                                    }
+                                }
+                                ui.end_row();
+                            });
+                    });
+                }
 
                     ui.add_space(16.0);
                     if ui.button("Save Settings").clicked() {

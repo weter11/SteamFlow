@@ -113,6 +113,131 @@ pub fn setup_fake_steam_trap(config_dir: &Path) -> Result<PathBuf> {
     Ok(trap_dir)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RunnerComponents {
+    pub dxvk: Option<String>,
+    pub vkd3d: Option<String>,
+    pub vkd3d_proton: Option<String>,
+}
+
+pub fn detect_runner_components(runner_path: &Path) -> RunnerComponents {
+    // Walk up to the runner root (parent of bin/ or the dir itself)
+    let root = if runner_path.is_file() {
+        runner_path
+            .parent() // bin/
+            .and_then(|p| p.parent()) // runner root
+            .unwrap_or(runner_path)
+            .to_path_buf()
+    } else {
+        runner_path.to_path_buf()
+    };
+
+    // Candidate sub-paths for each component's DLL, ordered by likelihood
+    let dxvk_dll_paths = [
+        "files/lib/wine/dxvk/d3d11.dll", // official Proton
+        "dist/lib/wine/dxvk/d3d11.dll",  // older Proton
+        "lib/wine/dxvk/d3d11.dll",       // wine-tkg bundled
+        "lib64/wine/dxvk/d3d11.dll",
+    ];
+    let vkd3d_proton_dll_paths = [
+        "files/lib/wine/vkd3d-proton/d3d12.dll", // official Proton
+        "dist/lib/wine/vkd3d-proton/d3d12.dll",
+        "lib/wine/vkd3d-proton/d3d12.dll",
+        "lib64/wine/vkd3d-proton/d3d12.dll",
+    ];
+    let vkd3d_dll_paths = [
+        "files/lib/wine/vkd3d/d3d12.dll",
+        "dist/lib/wine/vkd3d/d3d12.dll",
+        "lib/wine/vkd3d/d3d12.dll",
+        "lib64/wine/vkd3d/d3d12.dll",
+    ];
+
+    let read_version_file = |rel: &str| -> Option<String> {
+        let p = root.join(rel);
+        std::fs::read_to_string(&p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+
+    // Try version file first (fast), then fall back to DLL string scan
+    let detect = |dll_candidates: &[&str], file_a: &str, file_b: &str| -> Option<String> {
+        // 1. Version text file
+        if let Some(v) = read_version_file(file_a).or_else(|| read_version_file(file_b)) {
+            return Some(v);
+        }
+
+        // 2. Find the first existing DLL
+        let dll = dll_candidates
+            .iter()
+            .map(|rel| root.join(rel))
+            .find(|p| p.exists())?;
+
+        // 3. Extract version string embedded in the DLL binary
+        extract_version_from_dll(&dll)
+    };
+
+    RunnerComponents {
+        dxvk: detect(
+            &dxvk_dll_paths,
+            "files/share/dxvk/version",
+            "dist/share/dxvk/version",
+        ),
+        vkd3d_proton: detect(
+            &vkd3d_proton_dll_paths,
+            "files/share/vkd3d-proton/version",
+            "dist/share/vkd3d-proton/version",
+        ),
+        vkd3d: detect(
+            &vkd3d_dll_paths,
+            "files/share/vkd3d/version",
+            "dist/share/vkd3d/version",
+        ),
+    }
+}
+
+/// Scans a PE DLL binary for an embedded semantic version string.
+/// DXVK/VKD3D embed strings like "2.3.1" or "v1.9.4-dirty" in the binary.
+fn extract_version_from_dll(dll_path: &Path) -> Option<String> {
+    let data = std::fs::read(dll_path).ok()?;
+
+    // Collect all printable ASCII runs of length >= 4
+    let mut runs: Vec<String> = Vec::new();
+    let mut current = Vec::new();
+    for &byte in &data {
+        if byte >= 0x20 && byte < 0x7f {
+            current.push(byte as char);
+        } else {
+            if current.len() >= 4 {
+                runs.push(current.iter().collect());
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= 4 {
+        runs.push(current.iter().collect());
+    }
+
+    // Match semver-like patterns: optional 'v', digits, dots, optional suffix
+    // e.g. "2.3.1", "v1.10.3", "2.4-dirty", "v2.0.0-alpha.1+git"
+    let semver_re = regex::Regex::new(r"^v?(\d{1,3})\.(\d{1,3})(\.\d{1,3})?([-.][a-zA-Z0-9._-]+)?$").ok()?;
+
+    // Prefer strings that look like "vX.Y.Z" over bare "X.Y"
+    let mut candidates: Vec<String> = runs
+        .into_iter()
+        .filter(|s| semver_re.is_match(s))
+        .filter(|s| {
+            // Exclude obviously non-version strings (all zeros, single digit etc.)
+            let parts: Vec<&str> = s.trim_start_matches('v').splitn(2, '.').collect();
+            parts.len() >= 2 && parts[0].parse::<u32>().unwrap_or(0) <= 99
+        })
+        .collect();
+
+    // Sort: longer (more specific) versions first
+    candidates.sort_by(|a, b| b.len().cmp(&a.len()));
+    candidates.into_iter().next()
+}
+
 pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,
