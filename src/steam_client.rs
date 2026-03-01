@@ -2557,11 +2557,13 @@ NoSavePersonalInfo=1
                 let _ = std::fs::write(&app_id_path, &app_id_str);
 
                 // 3. LAUNCH GAME
-                println!("--- GAME LAUNCH DEBUG ---");
-
-                let slc = user_config
-                    .map(|c| c.steam_launch_config.clone())
-                    .unwrap_or_default();
+                let user_launch_args: Vec<String> = user_config
+                    .map(|c| split_args(&c.launch_options))
+                    .unwrap_or_default()
+                    .into_iter()
+                    // Filter meta-flags that are not real game arguments
+                    .filter(|a| a != "-mangohud" && a != "--mangohud")
+                    .collect();
 
                 let wants_mangohud = user_config
                     .map(|c| {
@@ -2572,42 +2574,21 @@ NoSavePersonalInfo=1
                     })
                     .unwrap_or(false);
 
-                // For raw wine runners (not proton script), mangohud must wrap the command
-                let is_proton_script = active_runner
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n == "proton")
-                    .unwrap_or(false);
-
-                let use_mangohud_wrap =
-                    wants_mangohud && !is_proton_script && which::which("mangohud").is_ok();
-
-                let mut cmd = if use_mangohud_wrap {
-                    let mut c = std::process::Command::new("mangohud");
-                    c.arg("--");
-                    c.arg(
-                        crate::utils::build_runner_command(&active_runner)?
-                            .get_program()
-                            .to_os_string(),
-                    );
-                    c
-                } else {
-                    crate::utils::build_runner_command(&active_runner)?
-                };
-
-                if use_mangohud_wrap {
-                    cmd.env("MANGOHUD", "1");
-                    cmd.env("MANGOHUD_DLSYM", "1"); // required for wine translation layer
-                }
-
+                println!("--- GAME LAUNCH DEBUG ---");
+                let mut cmd = crate::utils::build_runner_command(&active_runner)?;
                 cmd.current_dir(game_working_dir);
                 cmd.arg(&executable);
-                cmd.args(&args);
+                cmd.args(&args); // args from launch_info (game's own args)
+                cmd.args(&user_launch_args); // user's extra args, de-duped and filtered
+
                 cmd.env("SteamAppId", &app_id_str);
                 cmd.env("SteamGameId", &app_id_str);
                 cmd.env("WINEPREFIX", &game_wineprefix);
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
 
+                let slc = user_config
+                    .map(|c| c.steam_launch_config.clone())
+                    .unwrap_or_default();
                 let dll_overrides = if slc.no_overlay {
                     "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;\
                      steam_api=n;steam_api64=n;lsteamclient=;\
@@ -2619,20 +2600,45 @@ NoSavePersonalInfo=1
                 cmd.env("WINEDLLOVERRIDES", dll_overrides);
 
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
+
                 let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
 
-                if let Ok(display) = std::env::var("DISPLAY") { cmd.env("DISPLAY", display); }
-                if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") { cmd.env("WAYLAND_DISPLAY", wayland); }
-                if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") { cmd.env("XDG_RUNTIME_DIR", xdg_runtime); }
+                if let Ok(display) = std::env::var("DISPLAY") {
+                    cmd.env("DISPLAY", display);
+                }
+                if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+                    cmd.env("WAYLAND_DISPLAY", wayland);
+                }
+                if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+                    cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+                }
 
+                // Apply user env vars (MANGOHUD=1 etc.)
                 if let Some(config) = user_config {
                     for (key, val) in &config.env_variables {
                         cmd.env(key, val);
                     }
-                    if !config.launch_options.trim().is_empty() {
-                        for arg in split_args(&config.launch_options) {
-                            cmd.arg(arg);
+                }
+
+                // MangoHud via LD_PRELOAD — works with wine-tkg where command wrapping doesn't
+                if wants_mangohud {
+                    let lib_path = Self::find_mangohud_lib();
+                    match lib_path {
+                        Some(lib) => {
+                            let existing = std::env::var("LD_PRELOAD").unwrap_or_default();
+                            let new_preload = if existing.is_empty() {
+                                lib.to_string_lossy().to_string()
+                            } else {
+                                format!("{}:{}", lib.to_string_lossy(), existing)
+                            };
+                            cmd.env("LD_PRELOAD", new_preload);
+                            cmd.env("MANGOHUD", "1");
+                            cmd.env("MANGOHUD_DLSYM", "1"); // required for wine translation layers
+                            println!("MangoHud: injecting via LD_PRELOAD ({})", lib.display());
+                        }
+                        None => {
+                            println!("⚠️  MangoHud requested but libMangoHud.so not found — skipping");
                         }
                     }
                 }
@@ -3328,4 +3334,45 @@ fn find_master_steam_exe(prefix: &Path) -> Option<PathBuf> {
 
 fn find_master_steam_dir(prefix: &Path) -> Option<PathBuf> {
     find_master_steam_exe(prefix).and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+}
+
+impl SteamClient {
+    fn find_mangohud_lib() -> Option<PathBuf> {
+        // Common install locations across distros
+        let candidates = [
+            "/usr/lib/mangohud/libMangoHud.so",
+            "/usr/lib/mangohud/libMangoHud_dlsym.so",
+            "/usr/lib/x86_64-linux-gnu/mangohud/libMangoHud.so",
+            "/usr/lib64/mangohud/libMangoHud.so",
+            "/usr/local/lib/mangohud/libMangoHud.so",
+            "/usr/local/lib/x86_64-linux-gnu/mangohud/libMangoHud.so",
+        ];
+
+        for path in candidates {
+            let p = PathBuf::from(path);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+
+        // Try ldconfig as fallback
+        if let Ok(output) = std::process::Command::new("ldconfig")
+            .args(["-p"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if line.contains("libMangoHud") {
+                    if let Some(path) = line.split("=>").nth(1) {
+                        let p = PathBuf::from(path.trim());
+                        if p.exists() {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }

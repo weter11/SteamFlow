@@ -31,7 +31,6 @@ xz2 = "0.1"
 cbc = "0.1"
 aes = "0.8"
 steam-cdn = "1.0.0"
-which = "6"
 libc = "0.2"
 
 [patch.crates-io]
