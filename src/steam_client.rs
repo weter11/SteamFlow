@@ -2080,87 +2080,101 @@ impl SteamClient {
     }
 
     pub fn kill_steam_in_prefix(wineprefix: &Path) {
-        let prefix_str = wineprefix.to_string_lossy().to_string();
-        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
-            return;
-        };
-
-        for entry in proc_dir.flatten() {
-            let pid_path = entry.path();
-            let Some(pid_str) = pid_path.file_name().and_then(|n| n.to_str()) else {
-                continue;
+        #[cfg(unix)]
+        {
+            let prefix_str = wineprefix.to_string_lossy().to_string();
+            let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+                return;
             };
-            if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
 
-            let cmdline = match std::fs::read(pid_path.join("cmdline")) {
-                Ok(b) => String::from_utf8_lossy(&b).replace('\0', " "),
-                Err(_) => continue,
-            };
-            // Kill steam.exe and steamwebhelper.exe processes in this prefix
-            if !cmdline.to_lowercase().contains("steam.exe")
-                && !cmdline.to_lowercase().contains("steamwebhelper.exe")
-            {
-                continue;
-            }
+            for entry in proc_dir.flatten() {
+                let pid_path = entry.path();
+                let Some(pid_str) = pid_path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
 
-            let environ = match std::fs::read(pid_path.join("environ")) {
-                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-                Err(_) => continue,
-            };
-            if !environ.contains(&prefix_str) {
-                continue;
-            }
+                let cmdline = match std::fs::read(pid_path.join("cmdline")) {
+                    Ok(b) => String::from_utf8_lossy(&b).replace('\0', " "),
+                    Err(_) => continue,
+                };
+                // Kill steam.exe and steamwebhelper.exe processes in this prefix
+                if !cmdline.to_lowercase().contains("steam.exe")
+                    && !cmdline.to_lowercase().contains("steamwebhelper.exe")
+                {
+                    continue;
+                }
 
-            if let Ok(pid) = pid_str.parse::<i32>() {
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
+                let environ = match std::fs::read(pid_path.join("environ")) {
+                    Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                    Err(_) => continue,
+                };
+                if !environ.contains(&prefix_str) {
+                    continue;
+                }
+
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
                 }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = wineprefix;
         }
     }
 
     /// Scans /proc to find a wine process running steam.exe inside the given WINEPREFIX.
     fn is_steam_running_in_prefix(wineprefix: &Path) -> bool {
-        let prefix_str = wineprefix.to_string_lossy().to_string();
+        #[cfg(unix)]
+        {
+            let prefix_str = wineprefix.to_string_lossy().to_string();
 
-        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
-            return false;
-        };
-
-        for entry in proc_dir.flatten() {
-            let pid_path = entry.path();
-
-            // Only look at numeric PID directories
-            if !pid_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.chars().all(|c| c.is_ascii_digit()))
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            // Must have steam.exe in cmdline
-            let cmdline = match std::fs::read(pid_path.join("cmdline")) {
-                Ok(b) => b,
-                Err(_) => continue,
+            let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+                return false;
             };
-            let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-            if !cmdline_str.to_lowercase().contains("steam.exe") {
-                continue;
-            }
 
-            // Must have our WINEPREFIX in its environment
-            let environ = match std::fs::read(pid_path.join("environ")) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let environ_str = String::from_utf8_lossy(&environ);
-            if environ_str.contains(&prefix_str) {
-                return true;
+            for entry in proc_dir.flatten() {
+                let pid_path = entry.path();
+
+                // Only look at numeric PID directories
+                if !pid_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+
+                // Must have steam.exe in cmdline
+                let cmdline = match std::fs::read(pid_path.join("cmdline")) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let cmdline_str = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+                if !cmdline_str.to_lowercase().contains("steam.exe") {
+                    continue;
+                }
+
+                // Must have our WINEPREFIX in its environment
+                let environ = match std::fs::read(pid_path.join("environ")) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let environ_str = String::from_utf8_lossy(&environ);
+                if environ_str.contains(&prefix_str) {
+                    return true;
+                }
             }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = wineprefix;
         }
 
         false
