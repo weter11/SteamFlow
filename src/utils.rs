@@ -112,3 +112,24 @@ pub fn setup_fake_steam_trap(config_dir: &Path) -> Result<PathBuf> {
 
     Ok(trap_dir)
 }
+
+pub fn steam_wineprefix_for_game(
+    config: &crate::config::LauncherConfig,
+    app_id: u32,
+    user_configs: &crate::models::UserConfigStore,
+) -> std::path::PathBuf {
+    let mode = user_configs
+        .get(&app_id)
+        .map(|c| c.steam_prefix_mode.clone())
+        .unwrap_or_default();
+
+    match mode {
+        crate::models::SteamPrefixMode::Shared => crate::config::config_dir()
+            .unwrap_or_default()
+            .join("master_steam_prefix/pfx"),
+        crate::models::SteamPrefixMode::PerGame => std::path::PathBuf::from(&config.steam_library_path)
+            .join("steamapps/compatdata")
+            .join(app_id.to_string())
+            .join("pfx"),
+    }
+}

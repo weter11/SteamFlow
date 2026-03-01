@@ -2079,6 +2079,48 @@ impl SteamClient {
         Ok(())
     }
 
+    pub fn kill_steam_in_prefix(wineprefix: &Path) {
+        let prefix_str = wineprefix.to_string_lossy().to_string();
+        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+            return;
+        };
+
+        for entry in proc_dir.flatten() {
+            let pid_path = entry.path();
+            let Some(pid_str) = pid_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+
+            let cmdline = match std::fs::read(pid_path.join("cmdline")) {
+                Ok(b) => String::from_utf8_lossy(&b).replace('\0', " "),
+                Err(_) => continue,
+            };
+            // Kill steam.exe and steamwebhelper.exe processes in this prefix
+            if !cmdline.to_lowercase().contains("steam.exe")
+                && !cmdline.to_lowercase().contains("steamwebhelper.exe")
+            {
+                continue;
+            }
+
+            let environ = match std::fs::read(pid_path.join("environ")) {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(_) => continue,
+            };
+            if !environ.contains(&prefix_str) {
+                continue;
+            }
+
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        }
+    }
+
     /// Scans /proc to find a wine process running steam.exe inside the given WINEPREFIX.
     fn is_steam_running_in_prefix(wineprefix: &Path) -> bool {
         let prefix_str = wineprefix.to_string_lossy().to_string();
@@ -2327,25 +2369,46 @@ NoSavePersonalInfo=1
 
                             Self::write_headless_steam_cfg(&prefix_steam_dir);
 
+                            let slc = user_config
+                                .map(|c| c.steam_launch_config.clone())
+                                .unwrap_or_default();
+
+                            let mut steam_args = vec![
+                                "-silent".to_string(),
+                                "-tcp".to_string(),
+                                "-noverifyfiles".to_string(),
+                                "-noreactlogin".to_string(),
+                                "-cef-disable-gpu".to_string(),
+                                "-cef-disable-sandbox".to_string(),
+                            ];
+
+                            if slc.no_friends_ui {
+                                steam_args.push("-nofriendsui".to_string());
+                            }
+                            if slc.no_chat_ui {
+                                steam_args.push("-nochatui".to_string());
+                            }
+                            if slc.no_browser {
+                                steam_args.push("-no-browser".to_string());
+                            }
+                            if slc.no_overlay {
+                                steam_args.push("-disable-overlay".to_string());
+                            }
+                            if slc.no_vr {
+                                steam_args.push("-noopenvr".to_string());
+                            }
+                            if slc.big_picture {
+                                steam_args.push("-bigpicture".to_string());
+                            }
+
                             if Self::is_steam_running_in_prefix(&steam_wineprefix) {
                                 println!("✅ Steam already running in prefix — skipping spawn");
                             } else {
                                 let mut steam_cmd = crate::utils::build_runner_command(&active_runner)?;
                                 steam_cmd.current_dir(&prefix_steam_dir);
-                                steam_cmd.arg("C:\\Program Files (x86)\\Steam\\steam.exe").args([
-                                    "-silent",
-                                    "-tcp",
-                                    "-nofriendsui",
-                                    "-noverifyfiles",
-                                    "-noreactlogin",
-                                    "-no-browser",
-                                    "-cef-disable-sandbox",
-                                    "-cef-disable-gpu",
-                                    "-disable-overlay",
-                                    "-nochatui",
-                                    "-noopenvr",
-                                    "-bigpicture", // big picture has no CEF browser tabs
-                                ]);
+                                steam_cmd
+                                    .arg("C:\\Program Files (x86)\\Steam\\steam.exe")
+                                    .args(&steam_args);
                                 steam_cmd
                                     .env("WINEPREFIX", &steam_wineprefix)
                                     .env(
@@ -2481,7 +2544,48 @@ NoSavePersonalInfo=1
 
                 // 3. LAUNCH GAME
                 println!("--- GAME LAUNCH DEBUG ---");
-                let mut cmd = crate::utils::build_runner_command(&active_runner)?;
+
+                let slc = user_config
+                    .map(|c| c.steam_launch_config.clone())
+                    .unwrap_or_default();
+
+                let wants_mangohud = user_config
+                    .map(|c| {
+                        c.env_variables.contains_key("MANGOHUD")
+                            || c.launch_options
+                                .split_whitespace()
+                                .any(|a| a == "-mangohud" || a == "--mangohud")
+                    })
+                    .unwrap_or(false);
+
+                // For raw wine runners (not proton script), mangohud must wrap the command
+                let is_proton_script = active_runner
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n == "proton")
+                    .unwrap_or(false);
+
+                let use_mangohud_wrap =
+                    wants_mangohud && !is_proton_script && which::which("mangohud").is_ok();
+
+                let mut cmd = if use_mangohud_wrap {
+                    let mut c = std::process::Command::new("mangohud");
+                    c.arg("--");
+                    c.arg(
+                        crate::utils::build_runner_command(&active_runner)?
+                            .get_program()
+                            .to_os_string(),
+                    );
+                    c
+                } else {
+                    crate::utils::build_runner_command(&active_runner)?
+                };
+
+                if use_mangohud_wrap {
+                    cmd.env("MANGOHUD", "1");
+                    cmd.env("MANGOHUD_DLSYM", "1"); // required for wine translation layer
+                }
+
                 cmd.current_dir(game_working_dir);
                 cmd.arg(&executable);
                 cmd.args(&args);
@@ -2489,7 +2593,17 @@ NoSavePersonalInfo=1
                 cmd.env("SteamGameId", &app_id_str);
                 cmd.env("WINEPREFIX", &game_wineprefix);
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-                cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=;GameOverlayRenderer=n;GameOverlayRenderer64=n");
+
+                let dll_overrides = if slc.no_overlay {
+                    "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;\
+                     steam_api=n;steam_api64=n;lsteamclient=;\
+                     GameOverlayRenderer=n;GameOverlayRenderer64=n"
+                } else {
+                    "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;\
+                     steam_api=n;steam_api64=n;lsteamclient="
+                };
+                cmd.env("WINEDLLOVERRIDES", dll_overrides);
+
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
                 let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
                 cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);

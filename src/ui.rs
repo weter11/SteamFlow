@@ -1129,6 +1129,70 @@ impl SteamLauncher {
             }
 
             ui.add_space(16.0);
+            ui.heading("Steam Features");
+
+            let game_app_id = game.app_id;
+            let mut user_cfg = self
+                .user_configs
+                .get(&game_app_id)
+                .cloned()
+                .unwrap_or_default();
+            let slc = &mut user_cfg.steam_launch_config;
+            let mut steam_cfg_changed = false;
+
+            ui.label("Only applies when 'Use Steam Runtime' is enabled.");
+            ui.add_space(4.0);
+
+            if ui
+                .checkbox(
+                    &mut slc.no_browser,
+                    "Disable CEF browser (kills steamwebhelper, saves ~2GB RAM)",
+                )
+                .changed()
+            {
+                steam_cfg_changed = true;
+            }
+            if ui.checkbox(&mut slc.no_friends_ui, "Disable Friends UI").changed() {
+                steam_cfg_changed = true;
+            }
+            if ui.checkbox(&mut slc.no_overlay, "Disable In-Game Overlay").changed() {
+                steam_cfg_changed = true;
+            }
+            if ui.checkbox(&mut slc.no_chat_ui, "Disable Chat UI").changed() {
+                steam_cfg_changed = true;
+            }
+            if ui.checkbox(&mut slc.no_vr, "Disable SteamVR/OpenVR").changed() {
+                steam_cfg_changed = true;
+            }
+            if ui
+                .checkbox(&mut slc.big_picture, "Force Big Picture mode (lighter UI)")
+                .changed()
+            {
+                steam_cfg_changed = true;
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Steam Process");
+
+            if ui.button("⏹  Stop Steam in this prefix").clicked() {
+                let prefix = crate::utils::steam_wineprefix_for_game(
+                    &self.launcher_config,
+                    game_app_id,
+                    &self.user_configs,
+                );
+                SteamClient::kill_steam_in_prefix(&prefix);
+                self.status = "Steam stopped".to_string();
+            }
+
+            if steam_cfg_changed {
+                self.user_configs.insert(game_app_id, user_cfg);
+                let store = self.user_configs.clone();
+                self.runtime.spawn(async move {
+                    let _ = crate::config::save_user_configs(&store).await;
+                });
+            }
+
+            ui.add_space(16.0);
             ui.heading("Platform Preference");
             let current_platform = if game.is_installed {
                 let mut is_proton = game.active_branch.contains("experimental")
