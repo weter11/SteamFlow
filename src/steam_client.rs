@@ -2446,99 +2446,52 @@ NoSavePersonalInfo=1
                                     steam_cmd.spawn().context("Failed to spawn background Steam")?;
 
                                 println!("Waiting for Steam to initialise (max 30s)...");
-                                let steam_pid_path = prefix_steam_dir.join("steam.pid");
-                                let steam_pipe =
-                                    steam_wineprefix.join("drive_c/windows/temp/.steampath");
-                                let steam_config_vdf = prefix_steam_dir.join("config/config.vdf");
-                                let steam_logs_dir = prefix_steam_dir.join("logs");
-                                let spawn_time = std::time::SystemTime::now();
 
-                                let modified_after_spawn = |path: &std::path::Path| -> bool {
-                                    std::fs::metadata(path)
-                                        .and_then(|m| m.modified())
-                                        .map(|t| t >= spawn_time)
-                                        .unwrap_or(false)
-                                };
+                                let steam_pid_path = prefix_steam_dir.join("steam.pid");
+                                let steam_pipe     = steam_wineprefix.join("drive_c/windows/temp/.steampath");
+                                let steam_config_vdf = prefix_steam_dir.join("config/config.vdf");
+                                let steam_logs_dir   = prefix_steam_dir.join("logs");
 
                                 let ready = 'wait: {
                                     for i in 0..30 {
                                         std::thread::sleep(std::time::Duration::from_secs(1));
 
-                                        match steam_process.try_wait() {
-                                            Ok(Some(status)) if status.success() => {
-                                                println!(
-                                                    "✅ Steam handed off to running instance after {}s",
-                                                    i + 1
-                                                );
-                                                break 'wait true;
-                                            }
-                                            Ok(Some(status)) => {
-                                                println!(
-                                                    "❌ FATAL: Steam exited after {}s with: {}",
-                                                    i + 1,
-                                                    status
-                                                );
-                                                break 'wait false;
-                                            }
-                                            Ok(None) => {}
-                                            Err(e) => {
-                                                println!("⚠️  Could not check Steam process: {}", e)
-                                            }
+                                        // Crash detection — bail immediately
+                                        if let Ok(Some(status)) = steam_process.try_wait() {
+                                            println!("❌ FATAL: Background Steam exited after {}s with: {}", i + 1, status);
+                                            break 'wait false;
                                         }
 
-                                        if steam_pid_path.exists()
-                                            && modified_after_spawn(&steam_pid_path)
-                                        {
-                                            println!(
-                                                "✅ Steam ready after {}s (steam.pid written)",
-                                                i + 1
-                                            );
+                                        // Signal 1: pid file (some Wine/Steam combos do write this)
+                                        if steam_pid_path.exists() {
+                                            println!("✅ Steam ready after {}s (steam.pid found)", i + 1);
                                             break 'wait true;
                                         }
-                                        if steam_pipe.exists() && modified_after_spawn(&steam_pipe) {
-                                            println!(
-                                                "✅ Steam ready after {}s (.steampath written)",
-                                                i + 1
-                                            );
+
+                                        // Signal 2: .steampath in temp (Proton-style)
+                                        if steam_pipe.exists() {
+                                            println!("✅ Steam ready after {}s (.steampath found)", i + 1);
                                             break 'wait true;
                                         }
-                                        if modified_after_spawn(&steam_config_vdf) {
-                                            println!(
-                                                "✅ Steam ready after {}s (config.vdf updated)",
-                                                i + 1
-                                            );
+
+                                        // Signal 3: config.vdf written — Steam has finished early init
+                                        if steam_config_vdf.exists() {
+                                            println!("✅ Steam ready after {}s (config.vdf found)", i + 1);
                                             break 'wait true;
                                         }
-                                        let fresh_logs = std::fs::read_dir(&steam_logs_dir)
-                                            .map(|d| {
-                                                d.flatten()
-                                                    .filter(|e| modified_after_spawn(&e.path()))
-                                                    .count()
-                                            })
+
+                                        // Signal 4: logs dir has multiple entries — Steam's subsystems are running
+                                        let log_count = std::fs::read_dir(&steam_logs_dir)
+                                            .map(|d| d.count())
                                             .unwrap_or(0);
-                                        if fresh_logs >= 2 {
-                                            println!(
-                                                "✅ Steam ready after {}s ({} fresh log files)",
-                                                i + 1,
-                                                fresh_logs
-                                            );
-                                            break 'wait true;
-                                        }
-
-                                        // Also check /proc — most reliable signal
-                                        if Self::is_steam_running_in_prefix(&steam_wineprefix) {
-                                            println!(
-                                                "✅ Steam ready after {}s (process visible in /proc)",
-                                                i + 1
-                                            );
+                                        if log_count >= 2 {
+                                            println!("✅ Steam ready after {}s ({} log files found)", i + 1, log_count);
                                             break 'wait true;
                                         }
 
                                         println!("  Waiting... {}s", i + 1);
                                     }
-                                    println!(
-                                        "⚠️  Steam did not signal ready after 30s, launching game anyway"
-                                    );
+                                    println!("⚠️ Steam did not signal ready after 30s, launching game anyway");
                                     true
                                 };
 
@@ -2586,18 +2539,7 @@ NoSavePersonalInfo=1
                 cmd.env("WINEPREFIX", &game_wineprefix);
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
 
-                let slc = user_config
-                    .map(|c| c.steam_launch_config.clone())
-                    .unwrap_or_default();
-                let dll_overrides = if slc.no_overlay {
-                    "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;\
-                     steam_api=n;steam_api64=n;lsteamclient=;\
-                     GameOverlayRenderer=n;GameOverlayRenderer64=n"
-                } else {
-                    "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;\
-                     steam_api=n;steam_api64=n;lsteamclient="
-                };
-                cmd.env("WINEDLLOVERRIDES", dll_overrides);
+                cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=;GameOverlayRenderer=n;GameOverlayRenderer64=n");
 
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
