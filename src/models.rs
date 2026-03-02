@@ -45,6 +45,16 @@ impl Default for SteamLaunchConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GraphicsLayerConfig {
+    #[serde(default)]
+    pub dxvk_enabled: bool,
+    #[serde(default)]
+    pub vkd3d_proton_enabled: bool,
+    #[serde(default)]
+    pub vkd3d_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserAppConfig {
     pub launch_options: String,                 // e.g. "-novid -console"
     pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
@@ -53,6 +63,8 @@ pub struct UserAppConfig {
     pub steam_prefix_mode: SteamPrefixMode,
     #[serde(default)]
     pub steam_launch_config: SteamLaunchConfig,
+    #[serde(default)]
+    pub graphics_layers: GraphicsLayerConfig,
     pub hidden: bool,   // Future use
     pub favorite: bool, // Future use
 }

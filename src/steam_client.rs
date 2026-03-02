@@ -2539,7 +2539,22 @@ NoSavePersonalInfo=1
                 cmd.env("WINEPREFIX", &game_wineprefix);
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
 
-                cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=;GameOverlayRenderer=n;GameOverlayRenderer64=n");
+                let glc = user_config
+                    .map(|c| c.graphics_layers.clone())
+                    .unwrap_or_default();
+
+                let slc = user_config
+                    .map(|c| c.steam_launch_config.clone())
+                    .unwrap_or_default();
+
+                let dll_overrides = crate::utils::build_dll_overrides(
+                    glc.dxvk_enabled,
+                    glc.vkd3d_proton_enabled,
+                    glc.vkd3d_enabled,
+                    slc.no_overlay,
+                );
+
+                cmd.env("WINEDLLOVERRIDES", dll_overrides);
 
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
