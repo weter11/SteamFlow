@@ -1,6 +1,4 @@
-use crate::config::{
-    load_launcher_config, opensteam_image_cache_dir, save_launcher_config, LauncherConfig,
-};
+use crate::config::{load_launcher_config, opensteam_image_cache_dir, LauncherConfig};
 use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::library::{build_game_library, scan_installed_app_paths};
 use crate::models::{
@@ -1188,6 +1186,192 @@ impl SteamLauncher {
                 self.status = "Steam stopped".to_string();
             }
 
+            ui.add_space(8.0);
+            ui.separator();
+            ui.heading("Graphics Layers (per-prefix)");
+            ui.label(
+                egui::RichText::new(
+                    "Copies DLLs into this game's WINEPREFIX. Required for DX12 on wine-tkg.",
+                )
+                .weak()
+                .italics(),
+            );
+            ui.add_space(4.0);
+
+            let game_prefix = std::path::PathBuf::from(&self.launcher_config.steam_library_path)
+                .join("steamapps/compatdata")
+                .join(game.app_id.to_string())
+                .join("pfx");
+
+            let mut user_cfg_gl = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
+            let glc = &mut user_cfg_gl.graphics_layers;
+            let mut gl_changed = false;
+
+            // Detect what's already in the prefix for status display
+            let dxvk_in_prefix = game_prefix.join("drive_c/windows/system32/d3d11.dll").exists();
+            let vkd3d_in_prefix = game_prefix.join("drive_c/windows/system32/d3d12.dll").exists();
+
+            egui::Grid::new("graphics_layer_grid")
+                .num_columns(4)
+                .spacing([8.0, 6.0])
+                .show(ui, |ui| {
+                    // ── DXVK ──────────────────────────────────────────────
+                    ui.label("DXVK (DX9-11):");
+                    let dxvk_avail =
+                        crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Dxvk).is_some();
+
+                    if dxvk_in_prefix {
+                        ui.colored_label(egui::Color32::GREEN, "installed");
+                    } else {
+                        ui.colored_label(egui::Color32::GRAY, "not installed");
+                    }
+
+                    if ui
+                        .add_enabled(
+                            dxvk_avail && game_prefix.exists(),
+                            egui::Button::new(if dxvk_in_prefix { "Reinstall" } else { "Install" }),
+                        )
+                        .clicked()
+                    {
+                        match crate::utils::install_layer_into_prefix(
+                            &crate::utils::GraphicsLayer::Dxvk,
+                            &game_prefix,
+                        ) {
+                            Ok(dlls) => {
+                                self.status = format!("DXVK installed: {}", dlls.join(", "));
+                                glc.dxvk_enabled = true;
+                                gl_changed = true;
+                            }
+                            Err(e) => self.status = format!("DXVK install failed: {e}"),
+                        }
+                    }
+
+                    if ui.add_enabled(dxvk_in_prefix, egui::Button::new("Remove")).clicked() {
+                        match crate::utils::remove_layer_from_prefix(
+                            &crate::utils::GraphicsLayer::Dxvk,
+                            &game_prefix,
+                        ) {
+                            Ok(()) => {
+                                self.status = "DXVK removed".to_string();
+                                glc.dxvk_enabled = false;
+                                gl_changed = true;
+                            }
+                            Err(e) => self.status = format!("DXVK remove failed: {e}"),
+                        }
+                    }
+
+                    if !dxvk_avail {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "(not found system-wide — install via package manager)",
+                        );
+                    } else {
+                        ui.label("");
+                    }
+                    ui.end_row();
+
+                    // Override toggle (independent of install status)
+                    ui.label("");
+                    if ui
+                        .checkbox(&mut glc.dxvk_enabled, "Enable WINEDLLOVERRIDES for DXVK")
+                        .on_hover_text(
+                            "Sets d3d9=n,b d3d11=n,b dxgi=n,b — requires DLLs to be installed above",
+                        )
+                        .changed()
+                    {
+                        gl_changed = true;
+                    }
+                    ui.label("");
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
+
+                    ui.add_space(4.0);
+                    ui.end_row();
+
+                    // ── VKD3D-Proton ───────────────────────────────────────
+                    ui.label("VKD3D-Proton (DX12):");
+                    let vkd3dp_avail =
+                        crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Vkd3dProton)
+                            .is_some();
+
+                    if vkd3d_in_prefix {
+                        ui.colored_label(egui::Color32::GREEN, "installed");
+                    } else {
+                        ui.colored_label(egui::Color32::GRAY, "not installed");
+                    }
+
+                    if ui
+                        .add_enabled(
+                            vkd3dp_avail && game_prefix.exists(),
+                            egui::Button::new(if vkd3d_in_prefix { "Reinstall" } else { "Install" }),
+                        )
+                        .clicked()
+                    {
+                        match crate::utils::install_layer_into_prefix(
+                            &crate::utils::GraphicsLayer::Vkd3dProton,
+                            &game_prefix,
+                        ) {
+                            Ok(dlls) => {
+                                self.status = format!("VKD3D-Proton installed: {}", dlls.join(", "));
+                                glc.vkd3d_proton_enabled = true;
+                                gl_changed = true;
+                            }
+                            Err(e) => self.status = format!("VKD3D-Proton install failed: {e}"),
+                        }
+                    }
+
+                    if ui.add_enabled(vkd3d_in_prefix, egui::Button::new("Remove")).clicked() {
+                        match crate::utils::remove_layer_from_prefix(
+                            &crate::utils::GraphicsLayer::Vkd3dProton,
+                            &game_prefix,
+                        ) {
+                            Ok(()) => {
+                                self.status = "VKD3D-Proton removed".to_string();
+                                glc.vkd3d_proton_enabled = false;
+                                gl_changed = true;
+                            }
+                            Err(e) => self.status = format!("VKD3D-Proton remove failed: {e}"),
+                        }
+                    }
+
+                    if !vkd3dp_avail {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "(not found — install vkd3d-proton via package manager)",
+                        );
+                    } else {
+                        ui.label("");
+                    }
+                    ui.end_row();
+
+                    ui.label("");
+                    if ui
+                        .checkbox(
+                            &mut glc.vkd3d_proton_enabled,
+                            "Enable WINEDLLOVERRIDES for VKD3D-Proton",
+                        )
+                        .on_hover_text("Sets d3d12=n,b — required for DX12 games on wine-tkg")
+                        .changed()
+                    {
+                        gl_changed = true;
+                    }
+                    ui.label("");
+                    ui.label("");
+                    ui.label("");
+                    ui.end_row();
+                });
+
+            if gl_changed {
+                self.user_configs.insert(game.app_id, user_cfg_gl);
+                let store = self.user_configs.clone();
+                self.runtime.spawn(async move {
+                    let _ = crate::config::save_user_configs(&store).await;
+                });
+                // Invalidate component cache so display refreshes
+                self.last_scanned_runner = PathBuf::new();
+            }
+
             if steam_cfg_changed {
                 self.user_configs.insert(game_app_id, user_cfg);
                 let store = self.user_configs.clone();
@@ -1897,375 +2081,6 @@ impl eframe::App for SteamLauncher {
                 });
                 ui.separator();
 
-                if self.show_settings {
-                    ui.heading("Settings");
-                    ui.label("Steam Library Path");
-                    ui.text_edit_singleline(&mut self.launcher_config.steam_library_path);
-
-                    ui.add_enabled_ui(!self.client.is_offline(), |ui| {
-                        ui.checkbox(
-                            &mut self.launcher_config.enable_cloud_sync,
-                            "Enable Cloud Sync",
-                        );
-                    });
-
-                    let shield_color = if self.launcher_config.use_shared_compat_data {
-                        egui::Color32::from_rgb(220, 80, 80)
-                    } else {
-                        egui::Color32::from_rgb(80, 180, 120)
-                    };
-                    ui.horizontal(|ui| {
-                        ui.colored_label(shield_color, "🛡️");
-                        let checkbox = ui.checkbox(
-                            &mut self.launcher_config.use_shared_compat_data,
-                            "Use Shared Steam Compatibility Data",
-                        );
-                        checkbox.on_hover_text("WARNING: Shares prefix with official Steam. Syncs saves, but may risk corruption if the launcher crashes. Uncheck to use isolated safe mode.");
-                    });
-
-                    ui.add_space(8.0);
-                    ui.label("Steam Runtime Prefix Mode:");
-                    if ui.radio_value(
-                        &mut self.launcher_config.steam_prefix_mode,
-                        crate::models::SteamPrefixMode::Shared,
-                        "Shared prefix  — all games share master_steam_prefix (faster, less disk)",
-                    ).changed() {
-                        // Logic to save happens in the separate "Save Settings" button block below
-                    }
-                    if ui.radio_value(
-                        &mut self.launcher_config.steam_prefix_mode,
-                        crate::models::SteamPrefixMode::PerGame,
-                        "Per-game prefix — copy/symlink Steam into each game's compatdata (isolated)",
-                    ).changed() {
-                        // Logic to save happens in the separate "Save Settings" button block below
-                    }
-
-                    ui.add_space(8.0);
-                    ui.label("Proton Source");
-                    ui.radio_value(
-                        &mut self.proton_source,
-                        ProtonSource::Steam,
-                        "Steam runtimes",
-                    );
-                    ui.radio_value(
-                        &mut self.proton_source,
-                        ProtonSource::Custom,
-                        "Custom compatibilitytools.d",
-                    );
-
-                    let selected_list = if self.proton_source == ProtonSource::Steam {
-                        &self.steam_protons
-                    } else {
-                        &self.custom_protons
-                    };
-
-                    egui::ComboBox::from_label("Proton Version")
-                        .selected_text(self.launcher_config.proton_version.clone())
-                        .show_ui(ui, |ui| {
-                            for entry in selected_list {
-                                ui.selectable_value(
-                                    &mut self.launcher_config.proton_version,
-                                    entry.clone(),
-                                    entry,
-                                );
-                            }
-                        });
-
-                    ui.add_space(8.0);
-                    ui.label("Steam Runtime Runner (Master Prefix)");
-                    let runner_name = self.launcher_config.steam_runtime_runner
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "None Selected".to_string());
-
-                    egui::ComboBox::from_id_salt("runtime_runner_selector")
-                        .selected_text(runner_name)
-                        .show_ui(ui, |ui| {
-                            let home = std::env::var("HOME").unwrap_or_default();
-                            let custom_tools_paths = [
-                                PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
-                                PathBuf::from(&home).join(".steam/steam/compatibilitytools.d"),
-                            ];
-
-                            for path in custom_tools_paths {
-                                if let Ok(entries) = std::fs::read_dir(path) {
-                                    for entry in entries.flatten() {
-                                        if entry.path().is_dir() {
-                                            let p = entry.path();
-                                            let name = p.file_name().unwrap().to_string_lossy().to_string();
-                                            if ui.selectable_label(self.launcher_config.steam_runtime_runner == p, name).clicked() {
-                                                self.launcher_config.steam_runtime_runner = p;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-
-                    ui.add_space(4.0);
-                    if ui.button("Install / Manage Windows Steam Runtime").clicked() {
-                        let config = self.launcher_config.clone();
-                        let tx = self.operation_tx.clone();
-                        self.runtime.spawn(async move {
-                            if let Err(e) = crate::launch::install_master_steam(&config).await {
-                                let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
-                            }
-                        });
-                    }
-
-                if let Some(game) = self.selected_game() {
-                    // Resolve which runner is active for this game
-                    let active_runner_name = self
-                        .launcher_config
-                        .game_configs
-                        .get(&game.app_id)
-                        .and_then(|c| c.forced_proton_version.as_ref())
-                        .cloned()
-                        .unwrap_or_else(|| self.launcher_config.proton_version.clone());
-
-                    let library_root =
-                        std::path::PathBuf::from(&self.launcher_config.steam_library_path);
-                    let resolved = crate::utils::resolve_runner(&active_runner_name, &library_root);
-                    self.refresh_runner_components(&resolved, game.app_id);
-                }
-
-                if let Some(components) = &self.runner_components {
-                    ui.add_space(8.0);
-
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.label(egui::RichText::new("Bundled Components").strong());
-                        ui.add_space(4.0);
-
-                        egui::Grid::new("runner_components_grid")
-                            .num_columns(3)
-                            .spacing([16.0, 4.0])
-                            .show(ui, |ui| {
-                                let mut row = |label: &str,
-                                               info: &Option<crate::utils::ComponentInfo>| {
-                                    ui.label(label);
-                                    match info {
-                                        Some(c) => {
-                                            ui.colored_label(egui::Color32::GREEN, &c.version);
-                                            ui.colored_label(
-                                                egui::Color32::GRAY,
-                                                format!("({})", c.source),
-                                            );
-                                        }
-                                        None => {
-                                            ui.colored_label(egui::Color32::GRAY, "not found");
-                                            ui.label("using wined3d fallback");
-                                        }
-                                    }
-                                    ui.end_row();
-                                };
-                                let c = components.clone();
-                                row("DXVK:", &c.dxvk);
-                                row("VKD3D-Proton:", &c.vkd3d_proton);
-                                row("VKD3D:", &c.vkd3d);
-                            });
-                    });
-                }
-
-                if let Some(game) = self.selected_game().cloned() {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.heading("Graphics Layers (per-prefix)");
-                    ui.label(
-                        egui::RichText::new(
-                            "Copies DLLs into this game's WINEPREFIX. Required for DX12 on wine-tkg.",
-                        )
-                        .weak()
-                        .italics(),
-                    );
-                    ui.add_space(4.0);
-
-                    let game_prefix = std::path::PathBuf::from(&self.launcher_config.steam_library_path)
-                        .join("steamapps/compatdata")
-                        .join(game.app_id.to_string())
-                        .join("pfx");
-
-                    let mut user_cfg = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
-                    let glc = &mut user_cfg.graphics_layers;
-                    let mut gl_changed = false;
-
-                    // Detect what's already in the prefix for status display
-                    let dxvk_in_prefix = game_prefix.join("drive_c/windows/system32/d3d11.dll").exists();
-                    let vkd3d_in_prefix = game_prefix.join("drive_c/windows/system32/d3d12.dll").exists();
-
-                    egui::Grid::new("graphics_layer_grid")
-                        .num_columns(4)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            // ── DXVK ──────────────────────────────────────────────
-                            ui.label("DXVK (DX9-11):");
-                            let dxvk_avail =
-                                crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Dxvk).is_some();
-
-                            if dxvk_in_prefix {
-                                ui.colored_label(egui::Color32::GREEN, "installed");
-                            } else {
-                                ui.colored_label(egui::Color32::GRAY, "not installed");
-                            }
-
-                            if ui
-                                .add_enabled(
-                                    dxvk_avail && game_prefix.exists(),
-                                    egui::Button::new(if dxvk_in_prefix { "Reinstall" } else { "Install" }),
-                                )
-                                .clicked()
-                            {
-                                match crate::utils::install_layer_into_prefix(
-                                    &crate::utils::GraphicsLayer::Dxvk,
-                                    &game_prefix,
-                                ) {
-                                    Ok(dlls) => {
-                                        self.status = format!("DXVK installed: {}", dlls.join(", "));
-                                        glc.dxvk_enabled = true;
-                                        gl_changed = true;
-                                    }
-                                    Err(e) => self.status = format!("DXVK install failed: {e}"),
-                                }
-                            }
-
-                            if ui.add_enabled(dxvk_in_prefix, egui::Button::new("Remove")).clicked() {
-                                match crate::utils::remove_layer_from_prefix(
-                                    &crate::utils::GraphicsLayer::Dxvk,
-                                    &game_prefix,
-                                ) {
-                                    Ok(()) => {
-                                        self.status = "DXVK removed".to_string();
-                                        glc.dxvk_enabled = false;
-                                        gl_changed = true;
-                                    }
-                                    Err(e) => self.status = format!("DXVK remove failed: {e}"),
-                                }
-                            }
-
-                            if !dxvk_avail {
-                                ui.colored_label(
-                                    egui::Color32::YELLOW,
-                                    "(not found system-wide — install via package manager)",
-                                );
-                            } else {
-                                ui.label("");
-                            }
-                            ui.end_row();
-
-                            // Override toggle (independent of install status)
-                            ui.label("");
-                            if ui
-                                .checkbox(&mut glc.dxvk_enabled, "Enable WINEDLLOVERRIDES for DXVK")
-                                .on_hover_text(
-                                    "Sets d3d9=n,b d3d11=n,b dxgi=n,b — requires DLLs to be installed above",
-                                )
-                                .changed()
-                            {
-                                gl_changed = true;
-                            }
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
-                            ui.end_row();
-
-                            ui.add_space(4.0);
-                            ui.end_row();
-
-                            // ── VKD3D-Proton ───────────────────────────────────────
-                            ui.label("VKD3D-Proton (DX12):");
-                            let vkd3dp_avail = crate::utils::find_layer_source(
-                                &crate::utils::GraphicsLayer::Vkd3dProton,
-                            )
-                            .is_some();
-
-                            if vkd3d_in_prefix {
-                                ui.colored_label(egui::Color32::GREEN, "installed");
-                            } else {
-                                ui.colored_label(egui::Color32::GRAY, "not installed");
-                            }
-
-                            if ui
-                                .add_enabled(
-                                    vkd3dp_avail && game_prefix.exists(),
-                                    egui::Button::new(if vkd3d_in_prefix { "Reinstall" } else { "Install" }),
-                                )
-                                .clicked()
-                            {
-                                match crate::utils::install_layer_into_prefix(
-                                    &crate::utils::GraphicsLayer::Vkd3dProton,
-                                    &game_prefix,
-                                ) {
-                                    Ok(dlls) => {
-                                        self.status = format!("VKD3D-Proton installed: {}", dlls.join(", "));
-                                        glc.vkd3d_proton_enabled = true;
-                                        gl_changed = true;
-                                    }
-                                    Err(e) => self.status = format!("VKD3D-Proton install failed: {e}"),
-                                }
-                            }
-
-                            if ui.add_enabled(vkd3d_in_prefix, egui::Button::new("Remove")).clicked() {
-                                match crate::utils::remove_layer_from_prefix(
-                                    &crate::utils::GraphicsLayer::Vkd3dProton,
-                                    &game_prefix,
-                                ) {
-                                    Ok(()) => {
-                                        self.status = "VKD3D-Proton removed".to_string();
-                                        glc.vkd3d_proton_enabled = false;
-                                        gl_changed = true;
-                                    }
-                                    Err(e) => self.status = format!("VKD3D-Proton remove failed: {e}"),
-                                }
-                            }
-
-                            if !vkd3dp_avail {
-                                ui.colored_label(
-                                    egui::Color32::YELLOW,
-                                    "(not found — install vkd3d-proton via package manager)",
-                                );
-                            } else {
-                                ui.label("");
-                            }
-                            ui.end_row();
-
-                            ui.label("");
-                            if ui
-                                .checkbox(
-                                    &mut glc.vkd3d_proton_enabled,
-                                    "Enable WINEDLLOVERRIDES for VKD3D-Proton",
-                                )
-                                .on_hover_text("Sets d3d12=n,b — required for DX12 games on wine-tkg")
-                                .changed()
-                            {
-                                gl_changed = true;
-                            }
-                            ui.label("");
-                            ui.label("");
-                            ui.label("");
-                            ui.end_row();
-                        });
-                    if gl_changed {
-                        self.user_configs.insert(game.app_id, user_cfg);
-                        let store = self.user_configs.clone();
-                        self.runtime.spawn(async move {
-                            let _ = crate::config::save_user_configs(&store).await;
-                        });
-                        // Invalidate component cache so display refreshes
-                        self.last_scanned_runner = PathBuf::new();
-                    }
-                }
-
-                    ui.add_space(16.0);
-                    if ui.button("Save Settings").clicked() {
-                        let config = self.launcher_config.clone();
-                        let tx = self.operation_tx.clone();
-                        self.runtime.spawn(async move {
-                            let success = save_launcher_config(&config).await.is_ok();
-                            let _ = tx.send(AsyncOp::SettingsSaved(success));
-                        });
-                    }
-
-                    ui.separator();
-                }
 
                 ui.heading("Games");
                 ui.checkbox(&mut self.show_installed_only, "Show Installed Only");
@@ -2348,6 +2163,194 @@ impl eframe::App for SteamLauncher {
                     }
                 });
             });
+
+        let mut show_settings = self.show_settings;
+        if show_settings {
+            egui::Window::new("Settings")
+                .open(&mut show_settings)
+                .resizable(true)
+                .default_size([420.0, 600.0])
+                .min_width(320.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.heading("Library");
+                        ui.label("Steam Library Path");
+                        ui.text_edit_singleline(&mut self.launcher_config.steam_library_path);
+
+                        ui.add_space(8.0);
+                        ui.add_enabled_ui(!self.client.is_offline(), |ui| {
+                            ui.checkbox(&mut self.launcher_config.enable_cloud_sync, "Enable Cloud Sync");
+                        });
+
+                        let shield_color = if self.launcher_config.use_shared_compat_data {
+                            egui::Color32::from_rgb(220, 80, 80)
+                        } else {
+                            egui::Color32::from_rgb(80, 180, 120)
+                        };
+                        ui.horizontal(|ui| {
+                            ui.colored_label(shield_color, "🛡");
+                            ui.checkbox(
+                                &mut self.launcher_config.use_shared_compat_data,
+                                "Use Shared Steam Compatibility Data",
+                            )
+                            .on_hover_text("WARNING: Shares prefix with official Steam.");
+                        });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.heading("Steam Runtime");
+
+                        ui.label("Prefix Mode:");
+                        ui.radio_value(
+                            &mut self.launcher_config.steam_prefix_mode,
+                            crate::models::SteamPrefixMode::Shared,
+                            "Shared — all games share master_steam_prefix",
+                        );
+                        ui.radio_value(
+                            &mut self.launcher_config.steam_prefix_mode,
+                            crate::models::SteamPrefixMode::PerGame,
+                            "Per-game — copy/symlink Steam into each compatdata",
+                        );
+
+                        ui.add_space(8.0);
+                        ui.label("Steam Runtime Runner:");
+                        let runner_name = self
+                            .launcher_config
+                            .steam_runtime_runner
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "None Selected".to_string());
+
+                        egui::ComboBox::from_id_salt("runtime_runner_selector")
+                            .selected_text(runner_name)
+                            .show_ui(ui, |ui| {
+                                let home = std::env::var("HOME").unwrap_or_default();
+                                let custom_tools_paths = [
+                                    PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
+                                    PathBuf::from(&home).join(".steam/steam/compatibilitytools.d"),
+                                ];
+                                for path in custom_tools_paths {
+                                    if let Ok(entries) = std::fs::read_dir(path) {
+                                        for entry in entries.flatten() {
+                                            if entry.path().is_dir() {
+                                                let p = entry.path();
+                                                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                                                if ui
+                                                    .selectable_label(self.launcher_config.steam_runtime_runner == p, name)
+                                                    .clicked()
+                                                {
+                                                    self.launcher_config.steam_runtime_runner = p;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+
+                        ui.add_space(4.0);
+                        if ui.button("Install / Manage Windows Steam Runtime").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                if let Err(e) = crate::launch::install_master_steam(&config).await {
+                                    let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
+                                }
+                            });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.heading("Compatibility Layer");
+
+                        ui.radio_value(&mut self.proton_source, ProtonSource::Steam, "Steam runtimes");
+                        ui.radio_value(
+                            &mut self.proton_source,
+                            ProtonSource::Custom,
+                            "Custom compatibilitytools.d",
+                        );
+
+                        let selected_list = if self.proton_source == ProtonSource::Steam {
+                            &self.steam_protons
+                        } else {
+                            &self.custom_protons
+                        };
+                        egui::ComboBox::from_label("Default Proton Version")
+                            .selected_text(self.launcher_config.proton_version.clone())
+                            .show_ui(ui, |ui| {
+                                for entry in selected_list {
+                                    ui.selectable_value(
+                                        &mut self.launcher_config.proton_version,
+                                        entry.clone(),
+                                        entry,
+                                    );
+                                }
+                            });
+
+                        // Runner components for selected game
+                        let selected_game = self.selected_game().cloned();
+                        if let Some(game) = selected_game {
+                            let active_runner_name = self
+                                .launcher_config
+                                .game_configs
+                                .get(&game.app_id)
+                                .and_then(|c| c.forced_proton_version.as_ref())
+                                .cloned()
+                                .unwrap_or_else(|| self.launcher_config.proton_version.clone());
+
+                            let library_root = PathBuf::from(&self.launcher_config.steam_library_path);
+                            let resolved = crate::utils::resolve_runner(&active_runner_name, &library_root);
+                            self.refresh_runner_components(&resolved, game.app_id);
+                        }
+
+                        if let Some(components) = &self.runner_components {
+                            ui.add_space(8.0);
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.label(egui::RichText::new("Detected Graphics Components").strong());
+                                ui.add_space(4.0);
+                                egui::Grid::new("runner_components_grid")
+                                    .num_columns(3)
+                                    .spacing([16.0, 4.0])
+                                    .show(ui, |ui| {
+                                        let mut row =
+                                            |label: &str, info: &Option<crate::utils::ComponentInfo>| {
+                                                ui.label(label);
+                                                match info {
+                                                    Some(c) => {
+                                                        ui.colored_label(egui::Color32::GREEN, &c.version);
+                                                        ui.colored_label(
+                                                            egui::Color32::GRAY,
+                                                            format!("({})", c.source),
+                                                        );
+                                                    }
+                                                    None => {
+                                                        ui.colored_label(egui::Color32::GRAY, "not found");
+                                                        ui.label("wined3d fallback");
+                                                    }
+                                                }
+                                                ui.end_row();
+                                            };
+                                        let c = components.clone();
+                                        row("DXVK:", &c.dxvk);
+                                        row("VKD3D-Proton:", &c.vkd3d_proton);
+                                        row("VKD3D:", &c.vkd3d);
+                                    });
+                            });
+                        }
+
+                        ui.add_space(16.0);
+                        ui.separator();
+                        if ui.button("💾  Save Settings").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                let success = crate::config::save_launcher_config(&config).await.is_ok();
+                                let _ = tx.send(AsyncOp::SettingsSaved(success));
+                            });
+                        }
+                    });
+                });
+            self.show_settings = show_settings;
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.needs_reauth {
