@@ -11,13 +11,48 @@ pub enum SteamPrefixMode {
     PerGame, // copy/symlink Steam into game's own compatdata prefix
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteamLaunchConfig {
+    #[serde(default = "default_true")]
+    pub no_browser: bool, // kill CEF/steamwebhelper entirely
+    #[serde(default = "default_true")]
+    pub no_friends_ui: bool, // no friends list window
+    #[serde(default = "default_true")]
+    pub no_overlay: bool, // no in-game overlay
+    #[serde(default = "default_true")]
+    pub no_chat_ui: bool, // no chat popups
+    #[serde(default)]
+    pub no_vr: bool, // no OpenVR/SteamVR
+    #[serde(default)]
+    pub big_picture: bool, // force Big Picture (lighter than desktop UI)
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SteamLaunchConfig {
+    fn default() -> Self {
+        Self {
+            no_browser: true,
+            no_friends_ui: true,
+            no_overlay: true,
+            no_chat_ui: true,
+            no_vr: false,
+            big_picture: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UserAppConfig {
-    pub launch_options: String, // e.g. "-novid -console"
+    pub launch_options: String,                 // e.g. "-novid -console"
     pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
-    pub use_steam_runtime: bool, // Ghost Steam / Master Prefix toggle
+    pub use_steam_runtime: bool,                // Ghost Steam / Master Prefix toggle
     #[serde(default)]
     pub steam_prefix_mode: SteamPrefixMode,
+    #[serde(default)]
+    pub steam_launch_config: SteamLaunchConfig,
     pub hidden: bool,   // Future use
     pub favorite: bool, // Future use
 }
