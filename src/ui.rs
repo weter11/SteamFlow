@@ -1198,10 +1198,20 @@ impl SteamLauncher {
             );
             ui.add_space(4.0);
 
-            let game_prefix = std::path::PathBuf::from(&self.launcher_config.steam_library_path)
-                .join("steamapps/compatdata")
-                .join(game.app_id.to_string())
-                .join("pfx");
+            let user_cfg_for_prefix = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
+            let game_prefix = if user_cfg_for_prefix.use_steam_runtime {
+                // Shared mode → master prefix; PerGame → game's own prefix
+                crate::utils::steam_wineprefix_for_game(
+                    &self.launcher_config,
+                    game.app_id,
+                    &self.user_configs,
+                )
+            } else {
+                std::path::PathBuf::from(&self.launcher_config.steam_library_path)
+                    .join("steamapps/compatdata")
+                    .join(game.app_id.to_string())
+                    .join("pfx")
+            };
 
             let mut user_cfg_gl = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
             let glc = &mut user_cfg_gl.graphics_layers;
@@ -1729,14 +1739,23 @@ impl SteamLauncher {
         }
         self.last_scanned_runner = runner_path.to_path_buf();
 
-        // The actual game prefix, not the Steam prefix
-        let game_prefix = std::path::PathBuf::from(&self.launcher_config.steam_library_path)
-            .join("steamapps/compatdata")
-            .join(app_id.to_string())
-            .join("pfx");
+        // Use the same prefix that will actually be used at launch
+        let user_cfg = self.user_configs.get(&app_id).cloned().unwrap_or_default();
+        let effective_prefix = if user_cfg.use_steam_runtime {
+            crate::utils::steam_wineprefix_for_game(
+                &self.launcher_config,
+                app_id,
+                &self.user_configs,
+            )
+        } else {
+            std::path::PathBuf::from(&self.launcher_config.steam_library_path)
+                .join("steamapps/compatdata")
+                .join(app_id.to_string())
+                .join("pfx")
+        };
 
-        let wineprefix = if game_prefix.exists() {
-            Some(game_prefix)
+        let wineprefix = if effective_prefix.exists() {
+            Some(effective_prefix)
         } else {
             None
         };
