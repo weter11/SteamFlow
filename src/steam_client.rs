@@ -71,6 +71,7 @@ pub struct LaunchInfo {
     pub description: String,
     pub executable: String,
     pub arguments: String,
+    pub workingdir: Option<String>,
     pub target: LaunchTarget,
 }
 
@@ -2209,7 +2210,9 @@ NoSavePersonalInfo=1
                 .ok_or_else(|| anyhow!("game {} is not installed", app.app_id))?,
         );
 
-        let executable = install_dir.join(&launch_info.executable);
+        // Steam VDF stores Windows paths with backslashes; normalize for Linux
+        let exe_relative = launch_info.executable.replace('\\', "/");
+        let executable = install_dir.join(&exe_relative);
         let mut args = split_args(&launch_info.arguments);
 
         if let Some(config) = user_config {
@@ -2221,7 +2224,16 @@ NoSavePersonalInfo=1
 
         // Standard Steam identity fallback: steam_appid.txt
         let app_id_str = app.app_id.to_string();
-        let game_working_dir = executable.parent().unwrap_or(&install_dir);
+        // Resolve working directory:
+        // 1. Use VDF-specified workingdir if present (normalized from backslashes)
+        // 2. Fall back to executable's parent
+        // 3. Fall back to install_dir
+        let game_working_dir: PathBuf = launch_info.workingdir
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|wd| install_dir.join(wd.replace('\\', "/")))
+            .or_else(|| executable.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| install_dir.clone());
 
         match launch_info.target {
             LaunchTarget::NativeLinux => {
@@ -2505,7 +2517,12 @@ NoSavePersonalInfo=1
 
                 // 2. WRITE APPID
                 let app_id_str = app.app_id.to_string();
-                let game_working_dir = executable.parent().unwrap_or(&install_dir);
+                let game_working_dir: PathBuf = launch_info.workingdir
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|wd| install_dir.join(wd.replace('\\', "/")))
+                    .or_else(|| executable.parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| install_dir.clone());
                 let app_id_path = game_working_dir.join("steam_appid.txt");
                 let _ = std::fs::write(&app_id_path, &app_id_str);
 
@@ -2529,7 +2546,7 @@ NoSavePersonalInfo=1
 
                 println!("--- GAME LAUNCH DEBUG ---");
                 let mut cmd = crate::utils::build_runner_command(&active_runner)?;
-                cmd.current_dir(game_working_dir);
+                cmd.current_dir(&game_working_dir);
                 cmd.arg(&executable);
                 cmd.args(&args); // args from launch_info (game's own args)
                 cmd.args(&user_launch_args); // user's extra args, de-duped and filtered
@@ -2539,7 +2556,21 @@ NoSavePersonalInfo=1
                 cmd.env("WINEPREFIX", &game_wineprefix);
                 cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
 
-                cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=;GameOverlayRenderer=n;GameOverlayRenderer64=n");
+                let glc = user_config
+                    .map(|c| c.graphics_layers.clone())
+                    .unwrap_or_default();
+                let no_overlay = user_config
+                    .map(|c| c.steam_launch_config.no_overlay)
+                    .unwrap_or(true);
+
+                let dll_overrides = crate::utils::build_dll_overrides(
+                    glc.dxvk_enabled,
+                    glc.vkd3d_proton_enabled,
+                    glc.vkd3d_enabled,
+                    no_overlay,
+                    Some(&game_working_dir), // pass game dir so we skip overriding local DLLs
+                );
+                cmd.env("WINEDLLOVERRIDES", &dll_overrides);
 
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
@@ -2772,6 +2803,7 @@ fn parse_launch_info_from_vdf(
             },
             executable: exe.to_string(),
             arguments: entry.arguments.clone().unwrap_or_default(),
+            workingdir: entry.workingdir.clone(),
             target,
         });
     }
@@ -3058,13 +3090,15 @@ struct ProductInfoConfig {
 #[derive(Debug, Deserialize)]
 struct ProductLaunchEntry {
     #[serde(default)]
-    executable: Option<String>,
+    pub executable: Option<String>,
     #[serde(default)]
-    arguments: Option<String>,
+    pub arguments: Option<String>,
     #[serde(default)]
-    description: Option<String>,
+    pub description: Option<String>,
     #[serde(default)]
-    config: Option<ProductLaunchConfigInner>,
+    pub workingdir: Option<String>,
+    #[serde(default)]
+    pub config: Option<ProductLaunchConfigInner>,
 }
 
 #[derive(Debug, Deserialize)]

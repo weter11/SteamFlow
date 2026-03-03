@@ -1,6 +1,6 @@
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use anyhow::{Result, bail};
 
 pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
     let mut final_path = runner_path.to_path_buf();
@@ -412,6 +412,220 @@ fn extract_version_from_dll(dll_path: &Path) -> Option<String> {
     // Sort: longer (more specific) versions first
     candidates.sort_by(|a, b| b.len().cmp(&a.len()));
     candidates.into_iter().next()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GraphicsLayer {
+    Dxvk,
+    Vkd3dProton,
+    Vkd3d,
+}
+
+/// Finds all source DLLs for a given layer from system paths.
+/// Returns (x64_dir, x32_dir) if found.
+pub fn find_layer_source(layer: &GraphicsLayer) -> Option<(PathBuf, Option<PathBuf>)> {
+    let x64_candidates = match layer {
+        GraphicsLayer::Dxvk => vec![
+            "/usr/share/dxvk/x64",
+            "/usr/lib/dxvk/x64",
+            "/usr/lib/x86_64-linux-gnu/dxvk",
+            "/usr/local/share/dxvk/x64",
+        ],
+        GraphicsLayer::Vkd3dProton => vec![
+            "/usr/share/vkd3d-proton/x64",
+            "/usr/lib/vkd3d-proton/x64",
+            "/usr/local/share/vkd3d-proton/x64",
+        ],
+        GraphicsLayer::Vkd3d => vec![
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/local/lib",
+        ],
+    };
+
+    let x32_candidates = match layer {
+        GraphicsLayer::Dxvk => vec![
+            "/usr/share/dxvk/x32",
+            "/usr/lib/dxvk/x32",
+            "/usr/lib/i386-linux-gnu/dxvk",
+            "/usr/local/share/dxvk/x32",
+        ],
+        GraphicsLayer::Vkd3dProton => vec![
+            "/usr/share/vkd3d-proton/x86",
+            "/usr/lib/vkd3d-proton/x86",
+            "/usr/local/share/vkd3d-proton/x86",
+        ],
+        GraphicsLayer::Vkd3d => vec![
+            "/usr/lib/i386-linux-gnu",
+            "/usr/lib32",
+            "/usr/local/lib32",
+        ],
+    };
+
+    let x64 = x64_candidates
+        .iter()
+        .map(|p| Path::new(p))
+        .find(|p| p.exists() && layer_dir_has_dlls(p, layer))?
+        .to_path_buf();
+
+    let x32 = x32_candidates
+        .iter()
+        .map(|p| Path::new(p))
+        .find(|p| p.exists() && layer_dir_has_dlls(p, layer))
+        .map(|p| p.to_path_buf());
+
+    Some((x64, x32))
+}
+
+fn layer_dir_has_dlls(dir: &Path, layer: &GraphicsLayer) -> bool {
+    let sentinel = match layer {
+        GraphicsLayer::Dxvk => "d3d11.dll",
+        GraphicsLayer::Vkd3dProton => "d3d12.dll",
+        GraphicsLayer::Vkd3d => "d3d12.dll",
+    };
+    dir.join(sentinel).exists()
+}
+
+/// Installs a graphics layer into the given WINEPREFIX by copying DLLs
+/// into system32 (x64) and syswow64 (x32).
+pub fn install_layer_into_prefix(layer: &GraphicsLayer, wineprefix: &Path) -> Result<Vec<String>> {
+    let (x64_src, x32_src) =
+        find_layer_source(layer).context("could not find source DLLs for graphics layer")?;
+
+    let sys32 = wineprefix.join("drive_c/windows/system32");
+    let sys64 = wineprefix.join("drive_c/windows/syswow64");
+    std::fs::create_dir_all(&sys32)?;
+    std::fs::create_dir_all(&sys64)?;
+
+    let dlls_for = |layer: &GraphicsLayer| -> &[&str] {
+        match layer {
+            GraphicsLayer::Dxvk => &[
+                "d3d9.dll",
+                "d3d10.dll",
+                "d3d10_1.dll",
+                "d3d10core.dll",
+                "d3d11.dll",
+                "dxgi.dll",
+            ],
+            GraphicsLayer::Vkd3dProton => &["d3d12.dll", "d3d12core.dll"],
+            GraphicsLayer::Vkd3d => &["d3d12.dll"],
+        }
+    };
+
+    let mut installed = Vec::new();
+
+    // x64 DLLs go into system32 (Wine's convention for 64-bit)
+    for dll_name in dlls_for(layer) {
+        let src = x64_src.join(dll_name);
+        if src.exists() {
+            let dst = sys32.join(dll_name);
+            std::fs::copy(&src, &dst).with_context(|| format!("failed copying {} to system32", dll_name))?;
+            installed.push(dll_name.to_string());
+        }
+    }
+
+    // x32 DLLs go into syswow64 (Wine's convention for 32-bit)
+    if let Some(x32) = x32_src {
+        for dll_name in dlls_for(layer) {
+            let src = x32.join(dll_name);
+            if src.exists() {
+                let dst = sys64.join(dll_name);
+                std::fs::copy(&src, &dst).with_context(|| format!("failed copying {} to syswow64", dll_name))?;
+            }
+        }
+    }
+
+    if installed.is_empty() {
+        anyhow::bail!("no DLLs were copied — source directory may be empty");
+    }
+
+    Ok(installed)
+}
+
+/// Removes a graphics layer from the prefix, restoring Wine's builtins.
+pub fn remove_layer_from_prefix(layer: &GraphicsLayer, wineprefix: &Path) -> Result<()> {
+    let sys32 = wineprefix.join("drive_c/windows/system32");
+    let sys64 = wineprefix.join("drive_c/windows/syswow64");
+
+    let dlls: &[&str] = match layer {
+        GraphicsLayer::Dxvk => &[
+            "d3d9.dll",
+            "d3d10.dll",
+            "d3d10_1.dll",
+            "d3d10core.dll",
+            "d3d11.dll",
+            "dxgi.dll",
+        ],
+        GraphicsLayer::Vkd3dProton => &["d3d12.dll", "d3d12core.dll"],
+        GraphicsLayer::Vkd3d => &["d3d12.dll"],
+    };
+
+    for dll in dlls {
+        for dir in [&sys32, &sys64] {
+            let path = dir.join(dll);
+            if path.exists() {
+                std::fs::remove_file(&path).with_context(|| format!("failed removing {}", path.display()))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns the WINEDLLOVERRIDES string needed to activate installed layers.
+pub fn build_dll_overrides(
+    dxvk_active: bool,
+    vkd3d_proton_active: bool,
+    vkd3d_active: bool,
+    no_overlay: bool,
+    game_dir: Option<&std::path::Path>, // check for game-local DLLs
+) -> String {
+    let mut overrides: Vec<String> = vec![
+        "vstdlib_s=n".into(),
+        "tier0_s=n".into(),
+        "steamclient=n".into(),
+        "steamclient64=n".into(),
+        "steam_api=n".into(),
+        "steam_api64=n".into(),
+        "lsteamclient=".into(),
+    ];
+
+    if no_overlay {
+        overrides.push("GameOverlayRenderer=n".into());
+        overrides.push("GameOverlayRenderer64=n".into());
+    }
+
+    if dxvk_active {
+        // If the game ships its own d3d DLLs, don't fight them — just
+        // ensure native wins without specifying which native.
+        // Wine searches exe-dir before system32, so "n,b" is fine UNLESS
+        // a foreign dll landed in system32. We skip the override entirely
+        // for DLLs the game already provides locally.
+        let game_has = |dll: &str| -> bool { game_dir.map(|d| d.join(dll).exists()).unwrap_or(false) };
+
+        for dll in &[
+            "d3d9.dll",
+            "d3d10.dll",
+            "d3d10_1.dll",
+            "d3d10core.dll",
+            "d3d11.dll",
+            "dxgi.dll",
+        ] {
+            let stem = dll.trim_end_matches(".dll");
+            if !game_has(dll) {
+                overrides.push(format!("{stem}=n,b"));
+            }
+            // If the game ships it locally, leave Wine's default search order
+            // alone — exe-dir native wins automatically.
+        }
+    }
+
+    if vkd3d_proton_active || vkd3d_active {
+        overrides.push("d3d12=n,b".into());
+        overrides.push("d3d12core=n,b".into());
+    }
+
+    overrides.join(";")
 }
 
 pub fn steam_wineprefix_for_game(
