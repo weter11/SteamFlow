@@ -578,36 +578,51 @@ pub fn build_dll_overrides(
     vkd3d_proton_active: bool,
     vkd3d_active: bool,
     no_overlay: bool,
+    game_dir: Option<&std::path::Path>, // check for game-local DLLs
 ) -> String {
-    let mut overrides = vec![
-        // Always suppress these Wine stubs
-        "vstdlib_s=n",
-        "tier0_s=n",
-        "steamclient=n",
-        "steamclient64=n",
-        "steam_api=n",
-        "steam_api64=n",
-        "lsteamclient=",
+    let mut overrides: Vec<String> = vec![
+        "vstdlib_s=n".into(),
+        "tier0_s=n".into(),
+        "steamclient=n".into(),
+        "steamclient64=n".into(),
+        "steam_api=n".into(),
+        "steam_api64=n".into(),
+        "lsteamclient=".into(),
     ];
 
+    if no_overlay {
+        overrides.push("GameOverlayRenderer=n".into());
+        overrides.push("GameOverlayRenderer64=n".into());
+    }
+
     if dxvk_active {
-        // n,b = try native first, fall back to builtin
-        overrides.extend_from_slice(&[
-            "d3d9=n,b",
-            "d3d10=n,b",
-            "d3d10_1=n,b",
-            "d3d10core=n,b",
-            "d3d11=n,b",
-            "dxgi=n,b",
-        ]);
+        // If the game ships its own d3d DLLs, don't fight them — just
+        // ensure native wins without specifying which native.
+        // Wine searches exe-dir before system32, so "n,b" is fine UNLESS
+        // a foreign dll landed in system32. We skip the override entirely
+        // for DLLs the game already provides locally.
+        let game_has = |dll: &str| -> bool { game_dir.map(|d| d.join(dll).exists()).unwrap_or(false) };
+
+        for dll in &[
+            "d3d9.dll",
+            "d3d10.dll",
+            "d3d10_1.dll",
+            "d3d10core.dll",
+            "d3d11.dll",
+            "dxgi.dll",
+        ] {
+            let stem = dll.trim_end_matches(".dll");
+            if !game_has(dll) {
+                overrides.push(format!("{stem}=n,b"));
+            }
+            // If the game ships it locally, leave Wine's default search order
+            // alone — exe-dir native wins automatically.
+        }
     }
 
     if vkd3d_proton_active || vkd3d_active {
-        overrides.extend_from_slice(&["d3d12=n,b", "d3d12core=n,b"]);
-    }
-
-    if no_overlay {
-        overrides.extend_from_slice(&["GameOverlayRenderer=n", "GameOverlayRenderer64=n"]);
+        overrides.push("d3d12=n,b".into());
+        overrides.push("d3d12core=n,b".into());
     }
 
     overrides.join(";")

@@ -2209,7 +2209,9 @@ NoSavePersonalInfo=1
                 .ok_or_else(|| anyhow!("game {} is not installed", app.app_id))?,
         );
 
-        let executable = install_dir.join(&launch_info.executable);
+        // Steam VDF stores Windows paths with backslashes; normalize for Linux
+        let exe_relative = launch_info.executable.replace('\\', "/");
+        let executable = install_dir.join(&exe_relative);
         let mut args = split_args(&launch_info.arguments);
 
         if let Some(config) = user_config {
@@ -2542,19 +2544,18 @@ NoSavePersonalInfo=1
                 let glc = user_config
                     .map(|c| c.graphics_layers.clone())
                     .unwrap_or_default();
-
-                let slc = user_config
-                    .map(|c| c.steam_launch_config.clone())
-                    .unwrap_or_default();
+                let no_overlay = user_config
+                    .map(|c| c.steam_launch_config.no_overlay)
+                    .unwrap_or(true);
 
                 let dll_overrides = crate::utils::build_dll_overrides(
                     glc.dxvk_enabled,
                     glc.vkd3d_proton_enabled,
                     glc.vkd3d_enabled,
-                    slc.no_overlay,
+                    no_overlay,
+                    Some(game_working_dir), // pass game dir so we skip overriding local DLLs
                 );
-
-                cmd.env("WINEDLLOVERRIDES", dll_overrides);
+                cmd.env("WINEDLLOVERRIDES", &dll_overrides);
 
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
