@@ -2570,6 +2570,7 @@ NoSavePersonalInfo=1
                     no_overlay,
                     Some(&game_working_dir), // pass game dir so we skip overriding local DLLs
                 );
+                println!("WINEDLLOVERRIDES: {}", dll_overrides);
                 cmd.env("WINEDLLOVERRIDES", &dll_overrides);
 
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
