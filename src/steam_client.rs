@@ -2223,7 +2223,10 @@ NoSavePersonalInfo=1
 
         // Standard Steam identity fallback: steam_appid.txt
         let app_id_str = app.app_id.to_string();
-        let game_working_dir = executable.parent().unwrap_or(&install_dir);
+        // Use install root as working dir. Games with exes in subdirectories
+        // (Batman, many UE3 titles) look for data relative to the install root,
+        // not the exe's own folder. exe-dir is only correct for flat installs.
+        let game_working_dir = &install_dir;
 
         match launch_info.target {
             LaunchTarget::NativeLinux => {
@@ -2507,7 +2510,7 @@ NoSavePersonalInfo=1
 
                 // 2. WRITE APPID
                 let app_id_str = app.app_id.to_string();
-                let game_working_dir = executable.parent().unwrap_or(&install_dir);
+                let game_working_dir = &install_dir;
                 let app_id_path = game_working_dir.join("steam_appid.txt");
                 let _ = std::fs::write(&app_id_path, &app_id_str);
 
