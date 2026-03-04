@@ -1,11 +1,17 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use anyhow::Result;
+use crate::models::{LibraryGame, UserAppConfig};
+use crate::config::LauncherConfig;
+use crate::steam_client::LaunchInfo;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LaunchContext {
-    pub app_id: u32,
-    // TODO: Add more fields as needed (e.g., config, paths)
+    pub app: LibraryGame,
+    pub launch_info: LaunchInfo,
+    pub launcher_config: LauncherConfig,
+    pub user_config: Option<UserAppConfig>,
+    pub proton_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -20,5 +26,5 @@ pub trait Runner {
     fn prepare_prefix(&self, ctx: &LaunchContext) -> Result<()>;
     fn build_env(&self, ctx: &LaunchContext) -> Result<HashMap<String, String>>;
     fn build_command(&self, ctx: &LaunchContext) -> Result<CommandSpec>;
-    fn launch(&self, spec: &CommandSpec) -> Result<()>;
+    fn launch(&self, spec: &CommandSpec) -> Result<std::process::Child>;
 }

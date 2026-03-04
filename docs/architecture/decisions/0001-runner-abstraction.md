@@ -1,7 +1,7 @@
 # ADR 0001: Runner Abstraction
 
 ## Status
-Proposed (Day 1 Scaffolding)
+Accepted
 
 ## Context
 The current launch logic is tightly coupled with specific runner implementations (like Master Steam or Proton). As we support more runners (e.g., Wine-TKG, vanilla Wine, different Proton flavors), we need a clean abstraction to decouple the launch pipeline from the specifics of how a runner prepares the environment and starts the process.
