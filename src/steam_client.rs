@@ -2617,8 +2617,26 @@ NoSavePersonalInfo=1
                 println!("Working Dir: {:?}", cmd.get_current_dir());
                 println!("-------------------------");
 
+                // Wine debug log — captures load errors, missing DLLs, crash reasons
+                let log_dir = crate::config::config_dir()
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                    .join("logs");
+                std::fs::create_dir_all(&log_dir).ok();
+                let log_path = log_dir.join(format!("wine_{}.log", app.app_id));
+
+                cmd.env("WINEDEBUG", "err+all,warn+module,warn+loaddll");
+                cmd.env("WINE_LOG_OUTPUT", &log_path);
+
+                // Redirect stderr to the log file so wine errors are captured
+                if let Ok(log_file) = std::fs::File::create(&log_path) {
+                    cmd.stderr(log_file);
+                } else {
+                    cmd.stderr(std::process::Stdio::inherit());
+                }
+
+                println!("Wine log: {}", log_path.display());
+
                 cmd.stdout(std::process::Stdio::inherit());
-                cmd.stderr(std::process::Stdio::inherit());
                 cmd.spawn().context("failed to spawn proton game")
             }
         }
