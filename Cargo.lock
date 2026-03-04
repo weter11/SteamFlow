@@ -4349,6 +4349,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "anyhow",
+ "async-trait",
  "cbc",
  "directories 5.0.1",
  "eframe",
@@ -4368,6 +4369,7 @@ dependencies = [
  "steam-vdf-parser",
  "steam-vent",
  "steam-vent-proto",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
