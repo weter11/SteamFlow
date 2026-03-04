@@ -2,10 +2,12 @@ use std::fmt;
 use anyhow::Result;
 use async_trait::async_trait;
 
+use std::collections::HashMap;
 use crate::models::{LibraryGame, UserAppConfig};
 use crate::config::LauncherConfig;
 use crate::steam_client::LaunchInfo;
 use crate::infra::runners::{Runner, CommandSpec};
+use crate::infra::logging::{LaunchSession, EventLogger};
 
 pub struct PipelineContext {
     pub app_id: u32,
@@ -18,6 +20,9 @@ pub struct PipelineContext {
     pub runner: Option<Box<dyn Runner>>,
     pub command_spec: Option<CommandSpec>,
     pub child: Option<std::process::Child>,
+
+    pub session: Option<LaunchSession>,
+    pub logger: Option<EventLogger>,
 }
 
 impl PipelineContext {
@@ -32,6 +37,8 @@ impl PipelineContext {
             runner: None,
             command_spec: None,
             child: None,
+            session: None,
+            logger: None,
         }
     }
 }
@@ -83,14 +90,51 @@ impl LaunchPipeline {
     }
 
     pub async fn run(&self, ctx: &mut PipelineContext) -> std::result::Result<(), PipelineError> {
+        if let Some(logger) = &ctx.logger {
+            let mut metadata = HashMap::new();
+            metadata.insert("app_id".to_string(), ctx.app_id.to_string());
+            if let Some(app) = &ctx.app {
+                metadata.insert("app_name".to_string(), app.name.clone());
+            }
+            let _ = logger.info("launch_start", "Starting launch pipeline".to_string(), None, metadata);
+        }
+
         for stage in &self.stages {
+            let stage_name = stage.name().to_string();
+            if let Some(logger) = &ctx.logger {
+                let _ = logger.info("stage_start", format!("Starting stage: {}", stage_name), Some(stage_name.clone()), HashMap::new());
+            }
+
+            let start_time = std::time::Instant::now();
             if let Err(e) = stage.execute(ctx).await {
+                let duration = start_time.elapsed().as_millis();
+                if let Some(logger) = &ctx.logger {
+                    let mut metadata = HashMap::new();
+                    metadata.insert("error".to_string(), e.to_string());
+                    metadata.insert("duration_ms".to_string(), duration.to_string());
+                    let _ = logger.error("stage_failure", format!("Stage failed: {}", stage_name), Some(stage_name.clone()), metadata);
+
+                    let _ = logger.error("launch_end", "Launch failed".to_string(), None, HashMap::new());
+                }
+
                 return Err(PipelineError {
-                    stage_name: stage.name().to_string(),
+                    stage_name,
                     inner: e,
                 });
             }
+
+            let duration = start_time.elapsed().as_millis();
+            if let Some(logger) = &ctx.logger {
+                let mut metadata = HashMap::new();
+                metadata.insert("duration_ms".to_string(), duration.to_string());
+                let _ = logger.info("stage_success", format!("Stage succeeded: {}", stage_name), Some(stage_name.clone()), metadata);
+            }
         }
+
+        if let Some(logger) = &ctx.logger {
+            let _ = logger.info("launch_end", "Launch successful".to_string(), None, HashMap::new());
+        }
+
         Ok(())
     }
 }
@@ -98,6 +142,7 @@ impl LaunchPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     struct SuccessStage(&'static str);
     #[async_trait]
@@ -152,5 +197,27 @@ mod tests {
         let err = res.unwrap_err();
         assert_eq!(err.stage_name, "stage2");
         assert_eq!(err.inner.to_string(), "failure");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_logging() {
+        let mut pipeline = LaunchPipeline::new();
+        pipeline.add_stage(Box::new(SuccessStage("test_stage")));
+
+        let tmp = tempdir().unwrap();
+        let session = LaunchSession::new(tmp.path());
+        let logger = EventLogger::new(&session).unwrap();
+
+        let mut ctx = PipelineContext::new(123);
+        ctx.logger = Some(logger);
+
+        pipeline.run(&mut ctx).await.unwrap();
+
+        let content = std::fs::read_to_string(session.event_log_path()).unwrap();
+        assert!(content.contains("launch_start"));
+        assert!(content.contains("stage_start"));
+        assert!(content.contains("test_stage"));
+        assert!(content.contains("stage_success"));
+        assert!(content.contains("launch_end"));
     }
 }

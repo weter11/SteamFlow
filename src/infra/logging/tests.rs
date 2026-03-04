@@ -2,7 +2,7 @@
 mod tests {
     use crate::infra::logging::{LaunchSessionId, LaunchSession, EventLogger, LogLevel, LogEvent};
     use std::path::PathBuf;
-    use std::collections::HashSet;
+    use std::collections::{HashSet, HashMap};
     use tempfile::tempdir;
 
     #[test]
@@ -32,7 +32,7 @@ mod tests {
         let session = LaunchSession::new(dir.path());
         let logger = EventLogger::new(&session).expect("Failed to create logger");
 
-        logger.log(LogLevel::Info, "Test message".to_string(), Some("Init".to_string()))
+        logger.log(LogLevel::Info, "test_event", "Test message".to_string(), Some("Init".to_string()), HashMap::new())
             .expect("Failed to log event");
 
         let content = std::fs::read_to_string(session.event_log_path())
@@ -47,5 +47,25 @@ mod tests {
             LogLevel::Info => (),
             _ => panic!("Wrong log level"),
         }
+    }
+
+    #[test]
+    fn test_event_redaction() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let session = LaunchSession::new(dir.path());
+        let logger = EventLogger::new(&session).expect("Failed to create logger");
+
+        let mut metadata = HashMap::new();
+        metadata.insert("STEAM_TOKEN".to_string(), "secret123".to_string());
+        metadata.insert("NORMAL_VAR".to_string(), "safe".to_string());
+
+        logger.log(LogLevel::Info, "test", "msg".to_string(), None, metadata)
+            .expect("Failed to log");
+
+        let content = std::fs::read_to_string(session.event_log_path()).unwrap();
+        let event: LogEvent = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(event.metadata.get("STEAM_TOKEN").unwrap(), "[REDACTED]");
+        assert_eq!(event.metadata.get("NORMAL_VAR").unwrap(), "safe");
     }
 }

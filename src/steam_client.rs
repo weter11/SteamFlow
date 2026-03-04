@@ -2205,6 +2205,7 @@ NoSavePersonalInfo=1
         user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<std::process::Child> {
         use crate::launch::pipeline::{LaunchPipeline, PipelineContext};
+        use crate::infra::logging::{LaunchSession, EventLogger};
 
         let mut ctx = PipelineContext::new(app.app_id);
         ctx.app = Some(app.clone());
@@ -2212,6 +2213,14 @@ NoSavePersonalInfo=1
         ctx.launcher_config = Some(launcher_config.clone());
         ctx.user_config = user_config.cloned();
         ctx.proton_path = proton_path.map(|s| s.to_string());
+
+        if let Ok(config_dir) = crate::config::config_dir() {
+            let session = LaunchSession::new(&config_dir.join("logs"));
+            if let Ok(logger) = EventLogger::new(&session) {
+                ctx.session = Some(session);
+                ctx.logger = Some(logger);
+            }
+        }
 
         let pipeline = LaunchPipeline::with_default_stages();
         pipeline.run(&mut ctx).await

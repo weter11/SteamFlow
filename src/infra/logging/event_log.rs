@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -6,7 +7,7 @@ use serde::{Serialize, Deserialize};
 use anyhow::Result;
 use crate::infra::logging::LaunchSession;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogLevel {
     Debug,
     Info,
@@ -14,12 +15,15 @@ pub enum LogLevel {
     Error,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEvent {
     pub timestamp: u64,
     pub level: LogLevel,
+    pub event_type: String,
     pub message: String,
     pub stage: Option<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 pub struct EventLogger {
@@ -33,16 +37,20 @@ impl EventLogger {
         Ok(Self { file_path })
     }
 
-    pub fn log(&self, level: LogLevel, message: String, stage: Option<String>) -> Result<()> {
+    pub fn log(&self, level: LogLevel, event_type: &str, message: String, stage: Option<String>, metadata: HashMap<String, String>) -> Result<()> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)?
             .as_secs();
 
+        let redacted_metadata = redact_metadata(metadata);
+
         let event = LogEvent {
             timestamp,
             level,
+            event_type: event_type.to_string(),
             message,
             stage,
+            metadata: redacted_metadata,
         };
 
         let mut file = OpenOptions::new()
@@ -56,4 +64,23 @@ impl EventLogger {
 
         Ok(())
     }
+
+    pub fn info(&self, event_type: &str, message: String, stage: Option<String>, metadata: HashMap<String, String>) -> Result<()> {
+        self.log(LogLevel::Info, event_type, message, stage, metadata)
+    }
+
+    pub fn error(&self, event_type: &str, message: String, stage: Option<String>, metadata: HashMap<String, String>) -> Result<()> {
+        self.log(LogLevel::Error, event_type, message, stage, metadata)
+    }
+}
+
+fn redact_metadata(mut metadata: HashMap<String, String>) -> HashMap<String, String> {
+    let sensitive_keys = ["STEAM_TOKEN", "STEAM_PASSWORD", "TOKEN", "PASSWORD", "REFRESH_TOKEN"];
+    for (key, value) in metadata.iter_mut() {
+        let upper_key = key.to_uppercase();
+        if sensitive_keys.iter().any(|&sk| upper_key.contains(sk)) {
+            *value = "[REDACTED]".to_string();
+        }
+    }
+    metadata
 }
