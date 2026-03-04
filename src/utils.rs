@@ -647,13 +647,19 @@ pub fn resolve_master_wineprefix() -> PathBuf {
     let base = crate::config::config_dir()
         .unwrap_or_default()
         .join("master_steam_prefix");
-    if base.join("pfx/drive_c").exists() {
-        base.join("pfx")
-    } else if base.join("drive_c").exists() {
-        base
-    } else {
-        base.join("pfx") // default for fresh installs
+
+    // Check direct layout first (drive_c directly under base) — this wins
+    // if Steam was installed with WINEPREFIX=master_steam_prefix (no /pfx).
+    // Only fall back to /pfx if drive_c genuinely lives there.
+    if base.join("drive_c").exists() {
+        return base;
     }
+    if base.join("pfx/drive_c").exists() {
+        return base.join("pfx");
+    }
+
+    // Fresh install default — Proton-style nesting
+    base.join("pfx")
 }
 
 pub fn steam_wineprefix_for_game(
