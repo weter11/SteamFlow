@@ -22,6 +22,7 @@ pub struct CommandSpec {
 }
 
 pub trait Runner: Send + Sync {
+    fn name(&self) -> &str;
     fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), crate::launch::pipeline::LaunchError>;
     fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, crate::launch::pipeline::LaunchError>;
     fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, crate::launch::pipeline::LaunchError>;

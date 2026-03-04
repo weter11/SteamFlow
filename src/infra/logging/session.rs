@@ -21,6 +21,28 @@ impl std::fmt::Display for LaunchSessionId {
     }
 }
 
+use std::collections::HashMap;
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LaunchSummary {
+    pub session_id: String,
+    pub app_id: u32,
+    pub app_name: Option<String>,
+    pub runner_name: Option<String>,
+    pub result: LaunchResult,
+    pub failing_stage: Option<String>,
+    pub total_duration_ms: u128,
+    pub stage_durations_ms: HashMap<String, u128>,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchResult {
+    Success,
+    Failure,
+}
+
 pub struct LaunchSession {
     pub id: LaunchSessionId,
     pub created_at: SystemTime,
@@ -44,11 +66,22 @@ impl LaunchSession {
         self.log_dir.join("events.jsonl")
     }
 
+    pub fn summary_path(&self) -> PathBuf {
+        self.log_dir.join("summary.json")
+    }
+
     pub fn stdout_path(&self) -> PathBuf {
         self.log_dir.join("stdout.log")
     }
 
     pub fn stderr_path(&self) -> PathBuf {
         self.log_dir.join("stderr.log")
+    }
+
+    pub fn write_summary(&self, summary: &LaunchSummary) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.log_dir)?;
+        let content = serde_json::to_string_pretty(summary)?;
+        std::fs::write(self.summary_path(), content)?;
+        Ok(())
     }
 }

@@ -182,6 +182,12 @@ impl LaunchPipeline {
     }
 
     pub async fn run(&self, ctx: &mut PipelineContext) -> std::result::Result<(), PipelineError> {
+        use crate::infra::logging::LaunchResult;
+
+        let total_start = std::time::Instant::now();
+        let mut stage_durations = HashMap::new();
+        let mut failing_stage = None;
+
         if let Some(logger) = &ctx.logger {
             let mut metadata = HashMap::new();
             metadata.insert("app_id".to_string(), ctx.app_id.to_string());
@@ -191,6 +197,8 @@ impl LaunchPipeline {
             let _ = logger.info("launch_start", "Starting launch pipeline".to_string(), None, metadata);
         }
 
+        let mut final_result = LaunchResult::Success;
+
         for stage in &self.stages {
             let stage_name = stage.name().to_string();
             if let Some(logger) = &ctx.logger {
@@ -198,8 +206,14 @@ impl LaunchPipeline {
             }
 
             let start_time = std::time::Instant::now();
-            if let Err(e) = stage.execute(ctx).await {
-                let duration = start_time.elapsed().as_millis();
+            let res = stage.execute(ctx).await;
+            let duration = start_time.elapsed().as_millis();
+            stage_durations.insert(stage_name.clone(), duration);
+
+            if let Err(e) = res {
+                failing_stage = Some(stage_name.clone());
+                final_result = LaunchResult::Failure;
+
                 if let Some(logger) = &ctx.logger {
                     let mut metadata = HashMap::new();
                     metadata.insert("error_kind".to_string(), e.kind.to_string());
@@ -213,13 +227,14 @@ impl LaunchPipeline {
                     let _ = logger.error("launch_end", "Launch failed".to_string(), None, metadata);
                 }
 
+                self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
+
                 return Err(PipelineError {
                     stage_name,
                     inner: e,
                 });
             }
 
-            let duration = start_time.elapsed().as_millis();
             if let Some(logger) = &ctx.logger {
                 let mut metadata = HashMap::new();
                 metadata.insert("duration_ms".to_string(), duration.to_string());
@@ -231,7 +246,39 @@ impl LaunchPipeline {
             let _ = logger.info("launch_end", "Launch successful".to_string(), None, HashMap::new());
         }
 
+        self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
+
         Ok(())
+    }
+
+    fn write_summary_if_possible(
+        &self,
+        ctx: &PipelineContext,
+        result: crate::infra::logging::LaunchResult,
+        failing_stage: Option<String>,
+        total_duration_ms: u128,
+        stage_durations_ms: HashMap<String, u128>,
+    ) {
+        if let Some(session) = &ctx.session {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let summary = crate::infra::logging::LaunchSummary {
+                session_id: session.id.to_string(),
+                app_id: ctx.app_id,
+                app_name: ctx.app.as_ref().map(|a| a.name.clone()),
+                runner_name: ctx.runner.as_ref().map(|r| r.name().to_string()),
+                result,
+                failing_stage,
+                total_duration_ms,
+                stage_durations_ms,
+                timestamp,
+            };
+
+            let _ = session.write_summary(&summary);
+        }
     }
 }
 

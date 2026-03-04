@@ -9,6 +9,7 @@ use crate::launch::pipeline::{LaunchError, LaunchErrorKind};
 pub struct WineTkgRunner;
 
 impl Runner for WineTkgRunner {
+    fn name(&self) -> &str { "Wine-TKG" }
     fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
         let use_steam_runtime = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
