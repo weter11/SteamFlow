@@ -178,6 +178,9 @@ impl Runner for WineTkgRunner {
 
                         let ready = 'wait: {
                             for i in 0..30 {
+                                        // Note: We use std::thread::sleep here because Runner::prepare_prefix
+                                        // is currently synchronous. In a future iteration where Runner methods
+                                        // are async, this should be converted to tokio::time::sleep.
                                 std::thread::sleep(std::time::Duration::from_secs(1));
 
                                 // Crash detection — bail immediately

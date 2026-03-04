@@ -31,7 +31,7 @@ impl PipelineStage for SpawnProcessStage {
 
             // For now, we use the legacy path for NativeLinux until NativeRunner is implemented
             let client = crate::steam_client::SteamClient::new()?;
-            let child = client.spawn_game_process_legacy(
+            let child = client.internal_legacy_launch_adhoc(
                 app,
                 launch_info,
                 ctx.proton_path.as_deref(),
