@@ -22,7 +22,7 @@ pub struct CommandSpec {
     pub env: HashMap<String, String>,
 }
 
-pub trait Runner {
+pub trait Runner: Send + Sync {
     fn prepare_prefix(&self, ctx: &LaunchContext) -> Result<()>;
     fn build_env(&self, ctx: &LaunchContext) -> Result<HashMap<String, String>>;
     fn build_command(&self, ctx: &LaunchContext) -> Result<CommandSpec>;

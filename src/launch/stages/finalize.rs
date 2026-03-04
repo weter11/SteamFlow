@@ -8,7 +8,6 @@ pub struct FinalizeStage;
 impl PipelineStage for FinalizeStage {
     fn name(&self) -> &str { "Finalize" }
     async fn execute(&self, _ctx: &mut PipelineContext) -> Result<()> {
-        // TODO: Day 2 Logic migration
         Ok(())
     }
 }

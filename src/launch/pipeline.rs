@@ -2,10 +2,38 @@ use std::fmt;
 use anyhow::Result;
 use async_trait::async_trait;
 
-#[derive(Debug, Clone, Default)]
+use crate::models::{LibraryGame, UserAppConfig};
+use crate::config::LauncherConfig;
+use crate::steam_client::LaunchInfo;
+use crate::infra::runners::{Runner, CommandSpec};
+
 pub struct PipelineContext {
     pub app_id: u32,
-    // TODO: Add more fields as needed (e.g., config, runner, command spec)
+    pub app: Option<LibraryGame>,
+    pub launch_info: Option<LaunchInfo>,
+    pub launcher_config: Option<LauncherConfig>,
+    pub user_config: Option<UserAppConfig>,
+    pub proton_path: Option<String>,
+
+    pub runner: Option<Box<dyn Runner>>,
+    pub command_spec: Option<CommandSpec>,
+    pub child: Option<std::process::Child>,
+}
+
+impl PipelineContext {
+    pub fn new(app_id: u32) -> Self {
+        Self {
+            app_id,
+            app: None,
+            launch_info: None,
+            launcher_config: None,
+            user_config: None,
+            proton_path: None,
+            runner: None,
+            command_spec: None,
+            child: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -93,7 +121,7 @@ mod tests {
         pipeline.add_stage(Box::new(SuccessStage("stage1")));
         pipeline.add_stage(Box::new(SuccessStage("stage2")));
 
-        let mut ctx = PipelineContext::default();
+        let mut ctx = PipelineContext::new(0);
         assert!(pipeline.run(&mut ctx).await.is_ok());
     }
 
@@ -103,7 +131,7 @@ mod tests {
         pipeline.add_stage(Box::new(FailStage("stage1")));
         pipeline.add_stage(Box::new(SuccessStage("stage2")));
 
-        let mut ctx = PipelineContext::default();
+        let mut ctx = PipelineContext::new(0);
         let res = pipeline.run(&mut ctx).await;
 
         assert!(res.is_err());
@@ -117,7 +145,7 @@ mod tests {
         pipeline.add_stage(Box::new(SuccessStage("stage1")));
         pipeline.add_stage(Box::new(FailStage("stage2")));
 
-        let mut ctx = PipelineContext::default();
+        let mut ctx = PipelineContext::new(0);
         let res = pipeline.run(&mut ctx).await;
 
         assert!(res.is_err());

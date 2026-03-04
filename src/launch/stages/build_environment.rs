@@ -8,7 +8,7 @@ pub struct BuildEnvironmentStage;
 impl PipelineStage for BuildEnvironmentStage {
     fn name(&self) -> &str { "BuildEnvironment" }
     async fn execute(&self, _ctx: &mut PipelineContext) -> Result<()> {
-        // TODO: Day 2 Logic migration
+        // Currently build_env is called internally by build_command in Runner
         Ok(())
     }
 }

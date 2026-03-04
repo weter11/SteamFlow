@@ -810,7 +810,7 @@ impl SteamLauncher {
             }
 
             let mut child: std::process::Child =
-                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()) {
+                match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()).await {
                     Ok(child) => child,
                     Err(e) => {
                         let _ = tx.send(format!("Launch failed for {}: {e}", game.name));

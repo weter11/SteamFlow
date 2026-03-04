@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, Context};
 use async_trait::async_trait;
 use crate::launch::pipeline::{PipelineStage, PipelineContext};
 
@@ -7,8 +7,19 @@ pub struct PreparePrefixStage;
 #[async_trait]
 impl PipelineStage for PreparePrefixStage {
     fn name(&self) -> &str { "PreparePrefix" }
-    async fn execute(&self, _ctx: &mut PipelineContext) -> Result<()> {
-        // TODO: Day 2 Logic migration
+    async fn execute(&self, ctx: &mut PipelineContext) -> Result<()> {
+        use crate::infra::runners::LaunchContext;
+
+        if let Some(runner) = &ctx.runner {
+            let runner_ctx = LaunchContext {
+                app: ctx.app.as_ref().context("app missing")?.clone(),
+                launch_info: ctx.launch_info.as_ref().context("launch_info missing")?.clone(),
+                launcher_config: ctx.launcher_config.as_ref().context("launcher_config missing")?.clone(),
+                user_config: ctx.user_config.clone(),
+                proton_path: ctx.proton_path.clone(),
+            };
+            runner.prepare_prefix(&runner_ctx)?;
+        }
         Ok(())
     }
 }
