@@ -641,6 +641,21 @@ pub fn build_dll_overrides(
     overrides.join(";")
 }
 
+/// Detects the actual WINEPREFIX layout for the master Steam install.
+/// Handles both master_steam_prefix/pfx/drive_c and master_steam_prefix/drive_c layouts.
+pub fn resolve_master_wineprefix() -> PathBuf {
+    let base = crate::config::config_dir()
+        .unwrap_or_default()
+        .join("master_steam_prefix");
+    if base.join("pfx/drive_c").exists() {
+        base.join("pfx")
+    } else if base.join("drive_c").exists() {
+        base
+    } else {
+        base.join("pfx") // default for fresh installs
+    }
+}
+
 pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,
@@ -652,12 +667,12 @@ pub fn steam_wineprefix_for_game(
         .unwrap_or_default();
 
     match mode {
-        crate::models::SteamPrefixMode::Shared => crate::config::config_dir()
-            .unwrap_or_default()
-            .join("master_steam_prefix/pfx"),
-        crate::models::SteamPrefixMode::PerGame => std::path::PathBuf::from(&config.steam_library_path)
-            .join("steamapps/compatdata")
-            .join(app_id.to_string())
-            .join("pfx"),
+        crate::models::SteamPrefixMode::Shared => resolve_master_wineprefix(),
+        crate::models::SteamPrefixMode::PerGame => {
+            std::path::PathBuf::from(&config.steam_library_path)
+                .join("steamapps/compatdata")
+                .join(app_id.to_string())
+                .join("pfx")
+        }
     }
 }

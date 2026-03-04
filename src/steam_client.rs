@@ -2341,12 +2341,7 @@ NoSavePersonalInfo=1
                             );
                         }
                         Some(master_steam_dir) => {
-                            // Determine Master's original WINEPREFIX by walking up from steam.exe
-                            let master_wineprefix_original = master_steam_dir
-                                .ancestors()
-                                .find(|p| p.join("drive_c").exists())
-                                .map(|p| p.to_path_buf())
-                                .unwrap_or_else(|| master_prefix.join("pfx"));
+                            let master_wineprefix_original = crate::utils::resolve_master_wineprefix();
 
                             let prefix_steam_dir = match steam_prefix_mode {
                                 crate::models::SteamPrefixMode::Shared => {
