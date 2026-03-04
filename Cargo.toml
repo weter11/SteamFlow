@@ -14,6 +14,7 @@ egui = "0.33"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 keyvalues-serde = "0.2" # Used for text VDF deserialization into structs
 prost = "0.13"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +26,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 walkdir = "2"
 zip = "2.2.2"
+tempfile = "3"
 hex = "0.4"
 sha1 = "0.10"
 flate2 = "1"
