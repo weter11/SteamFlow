@@ -1,4 +1,5 @@
 pub mod cloud_sync;
+pub mod infra;
 pub mod cm_list;
 pub mod config;
 pub mod depot_browser;
