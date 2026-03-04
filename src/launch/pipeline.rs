@@ -1,5 +1,4 @@
 use std::fmt;
-use anyhow::Result;
 use async_trait::async_trait;
 
 use std::collections::HashMap;
@@ -43,10 +42,103 @@ impl PipelineContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LaunchErrorKind {
+    Validation,      // Missing app context, invalid app id
+    Environment,     // Missing proton path, config issues
+    Permission,      // Failed to create dir, set permissions
+    Runner,          // Runner prepare_prefix/build_command failed
+    GameData,        // appmanifest not found, executable not found
+    Process,         // Failed to spawn process
+    Dependency,      // Missing MangoHud, etc.
+    Unknown,
+}
+
+impl fmt::Display for LaunchErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Validation => "Validation",
+            Self::Environment => "Environment",
+            Self::Permission => "Permission",
+            Self::Runner => "Runner",
+            Self::GameData => "Game Data",
+            Self::Process => "Process",
+            Self::Dependency => "Dependency",
+            Self::Unknown => "Unknown",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl LaunchErrorKind {
+    pub fn remediation_hint(&self) -> &'static str {
+        match self {
+            Self::Validation => "Check if the game is correctly imported.",
+            Self::Environment => "Verify your Global Settings and Compatibility Layer path.",
+            Self::Permission => "Check filesystem permissions for the library and prefix folders.",
+            Self::Runner => "Try a different Proton/Wine version.",
+            Self::GameData => "Verify integrity of game files or reinstall the game.",
+            Self::Process => "Ensure no other instance of the game is running.",
+            Self::Dependency => "Install missing system dependencies.",
+            Self::Unknown => "Check the detailed logs for more information.",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LaunchError {
+    pub kind: LaunchErrorKind,
+    pub message: String,
+    pub context: HashMap<String, String>,
+    pub source: Option<anyhow::Error>,
+}
+
+impl LaunchError {
+    pub fn new(kind: LaunchErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            context: HashMap::new(),
+            source: None,
+        }
+    }
+
+    pub fn with_context(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.context.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn with_source(mut self, source: anyhow::Error) -> Self {
+        self.source = Some(source);
+        self
+    }
+}
+
+impl fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] {} - {}", self.kind, self.message, self.kind.remediation_hint())
+    }
+}
+
+impl std::error::Error for LaunchError {}
+
+pub fn map_anyhow_error(err: anyhow::Error) -> LaunchError {
+    let msg = err.to_string();
+    if msg.contains("Permission denied") || msg.contains("EACCES") {
+        LaunchError::new(LaunchErrorKind::Permission, msg).with_source(err)
+    } else if msg.contains("not found") || msg.contains("No such file or directory") {
+        LaunchError::new(LaunchErrorKind::GameData, msg).with_source(err)
+    } else if msg.contains("proton") || msg.contains("compatibility layer") {
+        LaunchError::new(LaunchErrorKind::Runner, msg).with_source(err)
+    } else {
+        LaunchError::new(LaunchErrorKind::Unknown, msg).with_source(err)
+    }
+}
+
 #[derive(Debug)]
 pub struct PipelineError {
     pub stage_name: String,
-    pub inner: anyhow::Error,
+    pub inner: LaunchError,
 }
 
 impl fmt::Display for PipelineError {
@@ -60,7 +152,7 @@ impl std::error::Error for PipelineError {}
 #[async_trait]
 pub trait PipelineStage: Send + Sync {
     fn name(&self) -> &str;
-    async fn execute(&self, ctx: &mut PipelineContext) -> Result<()>;
+    async fn execute(&self, ctx: &mut PipelineContext) -> std::result::Result<(), LaunchError>;
 }
 
 pub struct LaunchPipeline {
@@ -110,11 +202,15 @@ impl LaunchPipeline {
                 let duration = start_time.elapsed().as_millis();
                 if let Some(logger) = &ctx.logger {
                     let mut metadata = HashMap::new();
-                    metadata.insert("error".to_string(), e.to_string());
+                    metadata.insert("error_kind".to_string(), e.kind.to_string());
+                    metadata.insert("error_message".to_string(), e.message.clone());
                     metadata.insert("duration_ms".to_string(), duration.to_string());
-                    let _ = logger.error("stage_failure", format!("Stage failed: {}", stage_name), Some(stage_name.clone()), metadata);
+                    for (k, v) in &e.context {
+                        metadata.insert(format!("error_ctx_{}", k), v.clone());
+                    }
+                    let _ = logger.error("stage_failure", format!("Stage failed: {}", stage_name), Some(stage_name.clone()), metadata.clone());
 
-                    let _ = logger.error("launch_end", "Launch failed".to_string(), None, HashMap::new());
+                    let _ = logger.error("launch_end", "Launch failed".to_string(), None, metadata);
                 }
 
                 return Err(PipelineError {
@@ -148,15 +244,15 @@ mod tests {
     #[async_trait]
     impl PipelineStage for SuccessStage {
         fn name(&self) -> &str { self.0 }
-        async fn execute(&self, _ctx: &mut PipelineContext) -> Result<()> { Ok(()) }
+        async fn execute(&self, _ctx: &mut PipelineContext) -> std::result::Result<(), LaunchError> { Ok(()) }
     }
 
     struct FailStage(&'static str);
     #[async_trait]
     impl PipelineStage for FailStage {
         fn name(&self) -> &str { self.0 }
-        async fn execute(&self, _ctx: &mut PipelineContext) -> Result<()> {
-            Err(anyhow::anyhow!("failure"))
+        async fn execute(&self, _ctx: &mut PipelineContext) -> std::result::Result<(), LaunchError> {
+            Err(LaunchError::new(LaunchErrorKind::Unknown, "failure"))
         }
     }
 
@@ -196,7 +292,22 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert_eq!(err.stage_name, "stage2");
-        assert_eq!(err.inner.to_string(), "failure");
+        assert!(err.inner.to_string().contains("failure"));
+    }
+
+    #[test]
+    fn test_map_anyhow_error() {
+        let err = anyhow::anyhow!("Permission denied: /tmp/pfx");
+        let mapped = map_anyhow_error(err);
+        assert_eq!(mapped.kind, LaunchErrorKind::Permission);
+
+        let err = anyhow::anyhow!("file not found");
+        let mapped = map_anyhow_error(err);
+        assert_eq!(mapped.kind, LaunchErrorKind::GameData);
+
+        let err = anyhow::anyhow!("random error");
+        let mapped = map_anyhow_error(err);
+        assert_eq!(mapped.kind, LaunchErrorKind::Unknown);
     }
 
     #[tokio::test]
@@ -219,5 +330,27 @@ mod tests {
         assert!(content.contains("test_stage"));
         assert!(content.contains("stage_success"));
         assert!(content.contains("launch_end"));
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_structured_error_logging() {
+        let mut pipeline = LaunchPipeline::new();
+        pipeline.add_stage(Box::new(FailStage("fail_stage")));
+
+        let tmp = tempdir().unwrap();
+        let session = LaunchSession::new(tmp.path());
+        let logger = EventLogger::new(&session).unwrap();
+
+        let mut ctx = PipelineContext::new(456);
+        ctx.logger = Some(logger);
+
+        let _ = pipeline.run(&mut ctx).await;
+
+        let content = std::fs::read_to_string(session.event_log_path()).unwrap();
+        assert!(content.contains("stage_failure"));
+        assert!(content.contains("fail_stage"));
+        assert!(content.contains("error_kind"));
+        assert!(content.contains("Unknown"));
+        assert!(content.contains("failure"));
     }
 }

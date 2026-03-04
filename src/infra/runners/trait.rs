@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use anyhow::Result;
 use crate::models::{LibraryGame, UserAppConfig};
 use crate::config::LauncherConfig;
 use crate::steam_client::LaunchInfo;
@@ -23,8 +22,8 @@ pub struct CommandSpec {
 }
 
 pub trait Runner: Send + Sync {
-    fn prepare_prefix(&self, ctx: &LaunchContext) -> Result<()>;
-    fn build_env(&self, ctx: &LaunchContext) -> Result<HashMap<String, String>>;
-    fn build_command(&self, ctx: &LaunchContext) -> Result<CommandSpec>;
-    fn launch(&self, spec: &CommandSpec) -> Result<std::process::Child>;
+    fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), crate::launch::pipeline::LaunchError>;
+    fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, crate::launch::pipeline::LaunchError>;
+    fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, crate::launch::pipeline::LaunchError>;
+    fn launch(&self, spec: &CommandSpec) -> std::result::Result<std::process::Child, crate::launch::pipeline::LaunchError>;
 }

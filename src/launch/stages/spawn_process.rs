@@ -1,13 +1,12 @@
-use anyhow::{Result, Context};
 use async_trait::async_trait;
-use crate::launch::pipeline::{PipelineStage, PipelineContext};
+use crate::launch::pipeline::{PipelineStage, PipelineContext, LaunchError, LaunchErrorKind};
 
 pub struct SpawnProcessStage;
 
 #[async_trait]
 impl PipelineStage for SpawnProcessStage {
     fn name(&self) -> &str { "SpawnProcess" }
-    async fn execute(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn execute(&self, ctx: &mut PipelineContext) -> std::result::Result<(), LaunchError> {
         if let Some(runner) = &ctx.runner {
             if let Some(spec) = &ctx.command_spec {
                 if let Some(logger) = &ctx.logger {
@@ -25,19 +24,20 @@ impl PipelineStage for SpawnProcessStage {
             }
         } else {
             // Legacy/Native fallback if no runner resolved
-            let app = ctx.app.as_ref().context("app missing")?;
-            let launch_info = ctx.launch_info.as_ref().context("launch_info missing")?;
-            let launcher_config = ctx.launcher_config.as_ref().context("launcher_config missing")?;
+            let app = ctx.app.as_ref().ok_or_else(|| LaunchError::new(LaunchErrorKind::Validation, "app missing"))?;
+            let launch_info = ctx.launch_info.as_ref().ok_or_else(|| LaunchError::new(LaunchErrorKind::Validation, "launch_info missing"))?;
+            let launcher_config = ctx.launcher_config.as_ref().ok_or_else(|| LaunchError::new(LaunchErrorKind::Validation, "launcher_config missing"))?;
 
             // For now, we use the legacy path for NativeLinux until NativeRunner is implemented
-            let client = crate::steam_client::SteamClient::new()?;
+            let client = crate::steam_client::SteamClient::new()
+                .map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to initialize steam client").with_source(e))?;
             let child = client.internal_legacy_launch_adhoc(
                 app,
                 launch_info,
                 ctx.proton_path.as_deref(),
                 launcher_config,
                 ctx.user_config.as_ref()
-            )?;
+            ).map_err(|e| LaunchError::new(LaunchErrorKind::Process, "failed to spawn adhoc process").with_source(e))?;
             ctx.child = Some(child);
         }
         Ok(())

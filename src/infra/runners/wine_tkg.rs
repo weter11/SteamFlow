@@ -1,14 +1,15 @@
 use std::collections::HashMap;
-use anyhow::{Result, Context, anyhow, bail};
+use anyhow::anyhow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use crate::infra::runners::{Runner, LaunchContext, CommandSpec};
 use crate::steam_client::SteamClient;
+use crate::launch::pipeline::{LaunchError, LaunchErrorKind};
 
 pub struct WineTkgRunner;
 
 impl Runner for WineTkgRunner {
-    fn prepare_prefix(&self, ctx: &LaunchContext) -> Result<()> {
+    fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
         let use_steam_runtime = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
         let steam_prefix_mode = ctx.user_config.as_ref()
@@ -21,28 +22,26 @@ impl Runner for WineTkgRunner {
             .join(ctx.app.app_id.to_string());
         let target_prefix_path = compat_data_path.join("pfx");
         std::fs::create_dir_all(&target_prefix_path)
-            .with_context(|| format!("failed creating {}", target_prefix_path.display()))?;
+            .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", target_prefix_path.display())).with_source(anyhow!(e)))?;
 
         let mut steam_wineprefix = target_prefix_path.clone();
 
         if use_steam_runtime {
-            let base_config = crate::config::config_dir()?;
+            let base_config = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
             let master_prefix = base_config.join("master_steam_prefix");
 
             tracing::info!("Looking for Master Steam in: {}", master_prefix.display());
 
             match find_master_steam_dir(&master_prefix) {
                 None => {
-                    bail!(
-                        "use_steam_runtime is enabled but steam.exe was not found in {}.\n\
-                         Go to Settings → 'Install / Manage Windows Steam Runtime' first.\n\
-                         Expected locations checked:\n\
-                         - {}/pfx/drive_c/Program Files (x86)/Steam/steam.exe\n\
-                         - {}/drive_c/Program Files (x86)/Steam/steam.exe",
-                        master_prefix.display(),
-                        master_prefix.display(),
-                        master_prefix.display(),
-                    );
+                    return Err(LaunchError::new(
+                        LaunchErrorKind::Environment,
+                        format!(
+                            "use_steam_runtime is enabled but steam.exe was not found in {}.\n\
+                             Go to Settings → 'Install / Manage Windows Steam Runtime' first.",
+                            master_prefix.display()
+                        )
+                    ).with_context("master_prefix", master_prefix.to_string_lossy()));
                 }
                 Some(master_steam_dir) => {
                     let master_wineprefix_original = crate::utils::resolve_master_wineprefix();
@@ -137,12 +136,12 @@ impl Runner for WineTkgRunner {
                         } else {
                             ctx.proton_path.as_deref()
                                 .filter(|p| !p.is_empty())
-                                .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
+                                .ok_or_else(|| LaunchError::new(LaunchErrorKind::Environment, "proton path is required for Windows launch"))?
                         };
                         let active_runner = crate::utils::resolve_runner(proton, &library_root);
 
                         let mut steam_cmd = crate::utils::build_runner_command(&active_runner)
-                            .with_context(|| format!("Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.", active_runner.display()))?;
+                            .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Compatibility Layer path: {}", active_runner.display())).with_source(e))?;
                         steam_cmd.current_dir(&prefix_steam_dir);
                         steam_cmd
                             .arg("C:\\Program Files (x86)\\Steam\\steam.exe")
@@ -167,7 +166,7 @@ impl Runner for WineTkgRunner {
                         println!("--------------------------");
 
                         let mut steam_process =
-                            steam_cmd.spawn().context("Failed to spawn background Steam")?;
+                            steam_cmd.spawn().map_err(|e| LaunchError::new(LaunchErrorKind::Process, "Failed to spawn background Steam").with_source(anyhow!(e)))?;
 
                         println!("Waiting for Steam to initialise (max 30s)...");
 
@@ -223,7 +222,7 @@ impl Runner for WineTkgRunner {
                         };
 
                         if !ready {
-                            bail!("Background Steam crashed before the game could start");
+                                    return Err(LaunchError::new(LaunchErrorKind::Process, "Background Steam crashed before the game could start"));
                         }
                     }
                 }
@@ -234,7 +233,7 @@ impl Runner for WineTkgRunner {
         let install_dir = PathBuf::from(
             ctx.app.install_path
                 .clone()
-                .ok_or_else(|| anyhow!("game {} is not installed", ctx.app.app_id))?,
+                .ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, format!("game {} is not installed", ctx.app.app_id)))?,
         );
         let executable = install_dir.join(&ctx.launch_info.executable.replace('\\', "/"));
         let game_working_dir: PathBuf = ctx.launch_info.workingdir
@@ -251,7 +250,7 @@ impl Runner for WineTkgRunner {
         Ok(())
     }
 
-    fn build_env(&self, ctx: &LaunchContext) -> Result<HashMap<String, String>> {
+    fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, LaunchError> {
         let mut env = HashMap::new();
         let app_id_str = ctx.app.app_id.to_string();
 
@@ -287,7 +286,7 @@ impl Runner for WineTkgRunner {
         let install_dir = PathBuf::from(
             ctx.app.install_path
                 .clone()
-                .ok_or_else(|| anyhow!("game {} is not installed", ctx.app.app_id))?,
+                .ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, format!("game {} is not installed", ctx.app.app_id)))?,
         );
         let executable = install_dir.join(&ctx.launch_info.executable.replace('\\', "/"));
         let game_working_dir: PathBuf = ctx.launch_info.workingdir
@@ -308,7 +307,9 @@ impl Runner for WineTkgRunner {
 
         env.insert("WINEPATH".to_string(), "C:\\Program Files (x86)\\Steam".to_string());
 
-        let fake_env = crate::utils::setup_fake_steam_trap(&crate::config::config_dir()?)?;
+        let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
+        let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
+            .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, "failed to setup fake steam trap").with_source(e))?;
         env.insert("STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(), fake_env.to_string_lossy().to_string());
 
         if let Ok(display) = std::env::var("DISPLAY") {
@@ -367,7 +368,7 @@ impl Runner for WineTkgRunner {
         Ok(env)
     }
 
-    fn build_command(&self, ctx: &LaunchContext) -> Result<CommandSpec> {
+    fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
         let proton = if let Some(forced) = ctx.launcher_config
@@ -379,7 +380,7 @@ impl Runner for WineTkgRunner {
         } else {
             ctx.proton_path.as_deref()
                 .filter(|p| !p.is_empty())
-                .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
+                .ok_or_else(|| LaunchError::new(LaunchErrorKind::Environment, "proton path is required for Windows launch"))?
         };
         let active_runner = crate::utils::resolve_runner(proton, &library_root);
 
@@ -387,14 +388,14 @@ impl Runner for WineTkgRunner {
 
         // Build the base command (handles 'proton run' wrapper and directory resolution)
         let base_cmd = crate::utils::build_runner_command(&active_runner)
-            .with_context(|| format!("Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.", active_runner.display()))?;
+            .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Compatibility Layer path: {}", active_runner.display())).with_source(e))?;
         spec.program = base_cmd.get_program().into();
         spec.args = base_cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
         let install_dir = PathBuf::from(
             ctx.app.install_path
                 .clone()
-                .ok_or_else(|| anyhow!("game {} is not installed", ctx.app.app_id))?,
+                .ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, format!("game {} is not installed", ctx.app.app_id)))?,
         );
         let executable = install_dir.join(&ctx.launch_info.executable.replace('\\', "/"));
         let game_working_dir: PathBuf = ctx.launch_info.workingdir
@@ -424,7 +425,7 @@ impl Runner for WineTkgRunner {
         Ok(spec)
     }
 
-    fn launch(&self, spec: &CommandSpec) -> Result<std::process::Child> {
+    fn launch(&self, spec: &CommandSpec) -> std::result::Result<std::process::Child, LaunchError> {
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args);
         if let Some(cwd) = &spec.cwd {
@@ -454,7 +455,7 @@ impl Runner for WineTkgRunner {
         println!("Working Dir: {:?}", cmd.get_current_dir());
         println!("-------------------------");
 
-        cmd.spawn().context("failed to spawn runner process")
+        cmd.spawn().map_err(|e| LaunchError::new(LaunchErrorKind::Process, "failed to spawn runner process").with_source(anyhow!(e)))
     }
 }
 

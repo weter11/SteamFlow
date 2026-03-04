@@ -1,13 +1,12 @@
-use anyhow::Result;
 use async_trait::async_trait;
-use crate::launch::pipeline::{PipelineStage, PipelineContext};
+use crate::launch::pipeline::{PipelineStage, PipelineContext, LaunchError, LaunchErrorKind};
 
 pub struct ResolveComponentsStage;
 
 #[async_trait]
 impl PipelineStage for ResolveComponentsStage {
     fn name(&self) -> &str { "ResolveComponents" }
-    async fn execute(&self, ctx: &mut PipelineContext) -> Result<()> {
+    async fn execute(&self, ctx: &mut PipelineContext) -> std::result::Result<(), LaunchError> {
         use crate::infra::runners::WineTkgRunner;
         use crate::steam_client::LaunchTarget;
 
@@ -21,6 +20,8 @@ impl PipelineStage for ResolveComponentsStage {
                         ctx.runner = Some(Box::new(WineTkgRunner));
                     }
                 }
+            } else {
+                 return Err(LaunchError::new(LaunchErrorKind::Validation, "LaunchInfo missing in ResolveComponentsStage"));
             }
         }
         Ok(())
