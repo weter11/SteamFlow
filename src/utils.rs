@@ -365,11 +365,14 @@ fn read_adjacent_version_file(dll: &Path) -> Option<String> {
 }
 
 fn dll_contains_string(path: &Path, needle: &str) -> bool {
+    let needle_lower = needle.to_ascii_lowercase();
     std::fs::read(path)
         .map(|bytes| {
-            bytes
-                .windows(needle.len())
-                .any(|w| w == needle.as_bytes())
+            bytes.windows(needle.len()).any(|w| {
+                w.iter()
+                    .zip(needle_lower.bytes())
+                    .all(|(b, n)| b.to_ascii_lowercase() == n)
+            })
         })
         .unwrap_or(false)
 }
@@ -446,13 +449,17 @@ pub fn find_layer_source(layer: &GraphicsLayer) -> Option<(PathBuf, Option<PathB
     let x32_candidates = match layer {
         GraphicsLayer::Dxvk => vec![
             "/usr/share/dxvk/x32",
+            "/usr/lib32/dxvk",                      // Arch multilib
             "/usr/lib/dxvk/x32",
-            "/usr/lib/i386-linux-gnu/dxvk",
+            "/usr/lib/i386-linux-gnu/dxvk",          // Debian/Ubuntu
             "/usr/local/share/dxvk/x32",
+            "/usr/lib/dxvk",                         // some Fedora layouts put both here
         ],
         GraphicsLayer::Vkd3dProton => vec![
             "/usr/share/vkd3d-proton/x86",
+            "/usr/lib32/vkd3d-proton",               // Arch multilib
             "/usr/lib/vkd3d-proton/x86",
+            "/usr/lib/i386-linux-gnu/vkd3d-proton",
             "/usr/local/share/vkd3d-proton/x86",
         ],
         GraphicsLayer::Vkd3d => vec![
@@ -533,6 +540,12 @@ pub fn install_layer_into_prefix(layer: &GraphicsLayer, wineprefix: &Path) -> Re
                 std::fs::copy(&src, &dst).with_context(|| format!("failed copying {} to syswow64", dll_name))?;
             }
         }
+    } else {
+        tracing::warn!(
+            "No 32-bit DLLs found for {:?} — 32-bit games (Batman, etc.) will not use this layer",
+            layer
+        );
+        installed.push("(WARNING: no x32 DLLs found — 32-bit games unaffected)".to_string());
     }
 
     if installed.is_empty() {
@@ -628,6 +641,27 @@ pub fn build_dll_overrides(
     overrides.join(";")
 }
 
+/// Detects the actual WINEPREFIX layout for the master Steam install.
+/// Handles both master_steam_prefix/pfx/drive_c and master_steam_prefix/drive_c layouts.
+pub fn resolve_master_wineprefix() -> PathBuf {
+    let base = crate::config::config_dir()
+        .unwrap_or_default()
+        .join("master_steam_prefix");
+
+    // Check direct layout first (drive_c directly under base) — this wins
+    // if Steam was installed with WINEPREFIX=master_steam_prefix (no /pfx).
+    // Only fall back to /pfx if drive_c genuinely lives there.
+    if base.join("drive_c").exists() {
+        return base;
+    }
+    if base.join("pfx/drive_c").exists() {
+        return base.join("pfx");
+    }
+
+    // Fresh install default — Proton-style nesting
+    base.join("pfx")
+}
+
 pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,
@@ -639,12 +673,12 @@ pub fn steam_wineprefix_for_game(
         .unwrap_or_default();
 
     match mode {
-        crate::models::SteamPrefixMode::Shared => crate::config::config_dir()
-            .unwrap_or_default()
-            .join("master_steam_prefix/pfx"),
-        crate::models::SteamPrefixMode::PerGame => std::path::PathBuf::from(&config.steam_library_path)
-            .join("steamapps/compatdata")
-            .join(app_id.to_string())
-            .join("pfx"),
+        crate::models::SteamPrefixMode::Shared => resolve_master_wineprefix(),
+        crate::models::SteamPrefixMode::PerGame => {
+            std::path::PathBuf::from(&config.steam_library_path)
+                .join("steamapps/compatdata")
+                .join(app_id.to_string())
+                .join("pfx")
+        }
     }
 }

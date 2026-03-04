@@ -2341,12 +2341,7 @@ NoSavePersonalInfo=1
                             );
                         }
                         Some(master_steam_dir) => {
-                            // Determine Master's original WINEPREFIX by walking up from steam.exe
-                            let master_wineprefix_original = master_steam_dir
-                                .ancestors()
-                                .find(|p| p.join("drive_c").exists())
-                                .map(|p| p.to_path_buf())
-                                .unwrap_or_else(|| master_prefix.join("pfx"));
+                            let master_wineprefix_original = crate::utils::resolve_master_wineprefix();
 
                             let prefix_steam_dir = match steam_prefix_mode {
                                 crate::models::SteamPrefixMode::Shared => {
@@ -2570,6 +2565,7 @@ NoSavePersonalInfo=1
                     no_overlay,
                     Some(&game_working_dir), // pass game dir so we skip overriding local DLLs
                 );
+                println!("WINEDLLOVERRIDES: {}", dll_overrides);
                 cmd.env("WINEDLLOVERRIDES", &dll_overrides);
 
                 cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
@@ -2621,8 +2617,26 @@ NoSavePersonalInfo=1
                 println!("Working Dir: {:?}", cmd.get_current_dir());
                 println!("-------------------------");
 
+                // Wine debug log — captures load errors, missing DLLs, crash reasons
+                let log_dir = crate::config::config_dir()
+                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                    .join("logs");
+                std::fs::create_dir_all(&log_dir).ok();
+                let log_path = log_dir.join(format!("wine_{}.log", app.app_id));
+
+                cmd.env("WINEDEBUG", "err+all,warn+module,warn+loaddll");
+                cmd.env("WINE_LOG_OUTPUT", &log_path);
+
+                // Redirect stderr to the log file so wine errors are captured
+                if let Ok(log_file) = std::fs::File::create(&log_path) {
+                    cmd.stderr(log_file);
+                } else {
+                    cmd.stderr(std::process::Stdio::inherit());
+                }
+
+                println!("Wine log: {}", log_path.display());
+
                 cmd.stdout(std::process::Stdio::inherit());
-                cmd.stderr(std::process::Stdio::inherit());
                 cmd.spawn().context("failed to spawn proton game")
             }
         }
