@@ -210,6 +210,7 @@ impl LaunchPipeline {
         pipeline.add_stage(Box::new(crate::launch::stages::prepare_prefix::PreparePrefixStage));
         pipeline.add_stage(Box::new(crate::launch::stages::build_environment::BuildEnvironmentStage));
         pipeline.add_stage(Box::new(crate::launch::stages::build_command::BuildCommandStage));
+        pipeline.add_stage(Box::new(crate::launch::stages::preflight::PreflightStage));
         pipeline.add_stage(Box::new(crate::launch::stages::spawn_process::SpawnProcessStage));
         pipeline.add_stage(Box::new(crate::launch::stages::finalize::FinalizeStage));
 
