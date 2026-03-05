@@ -7,12 +7,14 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
 directories = "5"
 eframe = { version = "0.33", default-features = true }
 egui = "0.33"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 keyvalues-serde = "0.2" # Used for text VDF deserialization into structs
 prost = "0.13"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,6 +38,9 @@ regex = "1"
 
 [patch.crates-io]
 steam-cdn = { path = "vendor/steam-cdn" }
+
+[dev-dependencies]
+tempfile = "3"
 
 [package.metadata.deb]
 name = "steamflow"

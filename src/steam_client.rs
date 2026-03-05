@@ -1,7 +1,7 @@
 use crate::cloud_sync::{default_cloud_root, CloudClient};
 use crate::cm_list::get_cm_endpoints;
 use crate::config::{
-    config_dir, delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
+    delete_session, library_cache_path, load_launcher_config, load_library_cache, load_session,
     save_library_cache, save_session,
 };
 use crate::depot_browser::{self, DepotInfo as BrowserDepotInfo, ManifestFileEntry};
@@ -1593,7 +1593,7 @@ impl SteamClient {
         }
 
         let mut child =
-            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config)?;
+            self.spawn_game_process(app, &launch_info, chosen_proton_path, &launcher_config, user_config).await?;
         child
             .wait()
             .context("failed waiting for game process exit")?;
@@ -1616,7 +1616,7 @@ impl SteamClient {
         user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<()> {
         let launcher_config = load_launcher_config().await.unwrap_or_default();
-        self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config)?;
+        self.spawn_game_process(app, launch_info, proton_path, &launcher_config, user_config).await?;
         Ok(())
     }
 
@@ -2130,7 +2130,7 @@ impl SteamClient {
     }
 
     /// Scans /proc to find a wine process running steam.exe inside the given WINEPREFIX.
-    fn is_steam_running_in_prefix(wineprefix: &Path) -> bool {
+    pub fn is_steam_running_in_prefix(wineprefix: &Path) -> bool {
         #[cfg(unix)]
         {
             let prefix_str = wineprefix.to_string_lossy().to_string();
@@ -2182,7 +2182,7 @@ impl SteamClient {
     }
 
     /// Writes a steam.cfg into the Steam directory that minimises UI on startup.
-    fn write_headless_steam_cfg(steam_dir: &Path) {
+    pub fn write_headless_steam_cfg(steam_dir: &Path) {
         let cfg_path = steam_dir.join("steam.cfg");
         // Only write if not already present to avoid overwriting user config
         if cfg_path.exists() {
@@ -2196,12 +2196,50 @@ NoSavePersonalInfo=1
         let _ = std::fs::write(&cfg_path, content);
     }
 
-    pub(crate) fn spawn_game_process(
+    /// The single canonical entry point for launching a game process.
+    /// This function orchestrates the launch via a staged pipeline and the appropriate runner.
+    /// Bypassing this for production launches is strictly forbidden.
+    pub(crate) async fn spawn_game_process(
         &self,
         app: &LibraryGame,
         launch_info: &LaunchInfo,
         proton_path: Option<&str>,
         launcher_config: &crate::config::LauncherConfig,
+        user_config: Option<&crate::models::UserAppConfig>,
+    ) -> Result<std::process::Child> {
+        use crate::launch::pipeline::{LaunchPipeline, PipelineContext};
+        use crate::infra::logging::{LaunchSession, EventLogger};
+
+        let mut ctx = PipelineContext::new(app.app_id);
+        ctx.app = Some(app.clone());
+        ctx.launch_info = Some(launch_info.clone());
+        ctx.launcher_config = Some(launcher_config.clone());
+        ctx.user_config = user_config.cloned();
+        ctx.proton_path = proton_path.map(|s| s.to_string());
+
+        if let Ok(config_dir) = crate::config::config_dir() {
+            let session = LaunchSession::new(&config_dir.join("logs"));
+            if let Ok(logger) = EventLogger::new(&session) {
+                ctx.session = Some(session);
+                ctx.logger = Some(logger);
+            }
+        }
+
+        let pipeline = LaunchPipeline::with_default_stages();
+        pipeline.run(&mut ctx).await
+            .map_err(|e| anyhow!(e))?;
+
+        ctx.child.ok_or_else(|| anyhow!("Pipeline finished without spawning a process"))
+    }
+
+    /// Internal legacy ad-hoc launch path.
+    /// TODO: Remove once NativeRunner is implemented. (Ref: issue #1)
+    pub(crate) fn internal_legacy_launch_adhoc(
+        &self,
+        app: &LibraryGame,
+        launch_info: &LaunchInfo,
+        _proton_path: Option<&str>,
+        _launcher_config: &crate::config::LauncherConfig,
         user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<std::process::Child> {
         let install_dir = PathBuf::from(
@@ -2272,372 +2310,7 @@ NoSavePersonalInfo=1
                 cmd.spawn().context("failed to spawn native linux game")
             }
             LaunchTarget::WindowsProton => {
-                let library_root = PathBuf::from(&launcher_config.steam_library_path);
-                let use_steam_runtime = user_config.map(|c| c.use_steam_runtime).unwrap_or(false);
-                let steam_prefix_mode = user_config
-                    .map(|c| c.steam_prefix_mode.clone())
-                    .unwrap_or(launcher_config.steam_prefix_mode.clone());
-
-                // Runner is ALWAYS wine/proton — forced per-game, or global default
-                let proton = if let Some(forced) = launcher_config
-                    .game_configs
-                    .get(&app.app_id)
-                    .and_then(|c| c.forced_proton_version.as_ref())
-                {
-                    forced.as_str()
-                } else {
-                    proton_path
-                        .filter(|p| !p.is_empty())
-                        .ok_or_else(|| anyhow!("proton path is required for Windows launch"))?
-                };
-                let mut active_runner = crate::utils::resolve_runner(proton, &library_root);
-
-                if active_runner.is_dir() {
-                    if active_runner.join("proton").exists() {
-                        active_runner.push("proton");
-                    } else if active_runner.join("bin/wine").exists() {
-                        active_runner.push("bin/wine");
-                    } else if active_runner.join("bin/wine64").exists() {
-                        active_runner.push("bin/wine64");
-                    }
-                }
-
-                if !active_runner.exists() && !active_runner.is_absolute() {
-                    bail!(
-                        "Invalid Compatibility Layer path: {}. Please select a Compatibility Layer in the game properties.",
-                        active_runner.display()
-                    );
-                }
-
-                let compat_data_path = library_root
-                    .join("steamapps")
-                    .join("compatdata")
-                    .join(app.app_id.to_string());
-                let target_prefix_path = compat_data_path.join("pfx");
-                std::fs::create_dir_all(&target_prefix_path)
-                    .with_context(|| format!("failed creating {}", target_prefix_path.display()))?;
-
-                let mut game_wineprefix = target_prefix_path.clone();
-                let mut steam_wineprefix = target_prefix_path.clone();
-
-                // 1. BACKGROUND STEAM — only if use_steam_runtime is checked
-                if use_steam_runtime {
-                    let base_config = config_dir()?;
-                    let master_prefix = base_config.join("master_steam_prefix");
-
-                    tracing::info!("Looking for Master Steam in: {}", master_prefix.display());
-
-                    match find_master_steam_dir(&master_prefix) {
-                        None => {
-                            bail!(
-                                "use_steam_runtime is enabled but steam.exe was not found in {}.\n\
-                                 Go to Settings → 'Install / Manage Windows Steam Runtime' first.\n\
-                                 Expected locations checked:\n\
-                                 - {}/pfx/drive_c/Program Files (x86)/Steam/steam.exe\n\
-                                 - {}/drive_c/Program Files (x86)/Steam/steam.exe",
-                                master_prefix.display(),
-                                master_prefix.display(),
-                                master_prefix.display(),
-                            );
-                        }
-                        Some(master_steam_dir) => {
-                            let master_wineprefix_original = crate::utils::resolve_master_wineprefix();
-
-                            let prefix_steam_dir = match steam_prefix_mode {
-                                crate::models::SteamPrefixMode::Shared => {
-                                    game_wineprefix = master_wineprefix_original.clone();
-                                    steam_wineprefix = master_wineprefix_original.clone();
-                                    master_steam_dir.clone()
-                                }
-                                crate::models::SteamPrefixMode::PerGame => {
-                                    let target_steam_dir = target_prefix_path
-                                        .join("drive_c/Program Files (x86)/Steam");
-
-                                    tracing::info!(
-                                        "Linking/Cloning {} → {}",
-                                        master_steam_dir.display(),
-                                        target_steam_dir.display()
-                                    );
-                                    let _ = std::fs::create_dir_all(target_steam_dir.parent().unwrap());
-                                    #[cfg(unix)]
-                                    {
-                                        if !target_steam_dir.exists() {
-                                            if let Err(e) =
-                                                std::os::unix::fs::symlink(&master_steam_dir, &target_steam_dir)
-                                            {
-                                                tracing::warn!("Symlink failed, falling back to copy: {}", e);
-                                                let _ = crate::utils::copy_dir_all(
-                                                    &master_steam_dir,
-                                                    &target_steam_dir,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    #[cfg(not(unix))]
-                                    {
-                                        let _ = crate::utils::copy_dir_all(
-                                            &master_steam_dir,
-                                            &target_steam_dir,
-                                        );
-                                    }
-                                    target_steam_dir
-                                }
-                            };
-
-                            println!("--- STEAM LAUNCH DEBUG ---");
-                            println!("Prefix Steam dir : {}", prefix_steam_dir.display());
-                            println!("Steam WINEPREFIX : {}", steam_wineprefix.display());
-
-                            Self::write_headless_steam_cfg(&prefix_steam_dir);
-
-                            let slc = user_config
-                                .map(|c| c.steam_launch_config.clone())
-                                .unwrap_or_default();
-
-                            let mut steam_args = vec![
-                                "-silent".to_string(),
-                                "-tcp".to_string(),
-                                "-noverifyfiles".to_string(),
-                                "-noreactlogin".to_string(),
-                                "-cef-disable-gpu".to_string(),
-                                "-cef-disable-sandbox".to_string(),
-                            ];
-
-                            if slc.no_friends_ui {
-                                steam_args.push("-nofriendsui".to_string());
-                            }
-                            if slc.no_chat_ui {
-                                steam_args.push("-nochatui".to_string());
-                            }
-                            if slc.no_browser {
-                                steam_args.push("-no-browser".to_string());
-                            }
-                            if slc.no_overlay {
-                                steam_args.push("-disable-overlay".to_string());
-                            }
-                            if slc.no_vr {
-                                steam_args.push("-noopenvr".to_string());
-                            }
-                            if slc.big_picture {
-                                steam_args.push("-bigpicture".to_string());
-                            }
-
-                            if Self::is_steam_running_in_prefix(&steam_wineprefix) {
-                                println!("✅ Steam already running in prefix — skipping spawn");
-                            } else {
-                                let mut steam_cmd = crate::utils::build_runner_command(&active_runner)?;
-                                steam_cmd.current_dir(&prefix_steam_dir);
-                                steam_cmd
-                                    .arg("C:\\Program Files (x86)\\Steam\\steam.exe")
-                                    .args(&steam_args);
-                                steam_cmd
-                                    .env("WINEPREFIX", &steam_wineprefix)
-                                    .env(
-                                        "WINEDLLOVERRIDES",
-                                        "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;\
-                                         steam_api=n;steam_api64=n;lsteamclient=;\
-                                         GameOverlayRenderer=n;GameOverlayRenderer64=n",
-                                    )
-                                    .env("WINEPATH", "C:\\Program Files (x86)\\Steam")
-                                    .env("STEAM_DISABLE_BROWSER", "1")
-                                    .env("STEAM_NO_BROWSER", "1")
-                                    .env("STEAMCMD", "1") // tells Steam it's running as a cmd tool
-                                    .stdout(std::process::Stdio::null()) // silence CEF log spam
-                                    .stderr(std::process::Stdio::null());
-
-                                println!("Program: {:?}", steam_cmd.get_program());
-                                println!("Args: {:?}", steam_cmd.get_args().collect::<Vec<_>>());
-                                println!("--------------------------");
-
-                                let mut steam_process =
-                                    steam_cmd.spawn().context("Failed to spawn background Steam")?;
-
-                                println!("Waiting for Steam to initialise (max 30s)...");
-
-                                let steam_pid_path = prefix_steam_dir.join("steam.pid");
-                                let steam_pipe     = steam_wineprefix.join("drive_c/windows/temp/.steampath");
-                                let steam_config_vdf = prefix_steam_dir.join("config/config.vdf");
-                                let steam_logs_dir   = prefix_steam_dir.join("logs");
-
-                                let ready = 'wait: {
-                                    for i in 0..30 {
-                                        std::thread::sleep(std::time::Duration::from_secs(1));
-
-                                        // Crash detection — bail immediately
-                                        if let Ok(Some(status)) = steam_process.try_wait() {
-                                            println!("❌ FATAL: Background Steam exited after {}s with: {}", i + 1, status);
-                                            break 'wait false;
-                                        }
-
-                                        // Signal 1: pid file (some Wine/Steam combos do write this)
-                                        if steam_pid_path.exists() {
-                                            println!("✅ Steam ready after {}s (steam.pid found)", i + 1);
-                                            break 'wait true;
-                                        }
-
-                                        // Signal 2: .steampath in temp (Proton-style)
-                                        if steam_pipe.exists() {
-                                            println!("✅ Steam ready after {}s (.steampath found)", i + 1);
-                                            break 'wait true;
-                                        }
-
-                                        // Signal 3: config.vdf written — Steam has finished early init
-                                        if steam_config_vdf.exists() {
-                                            println!("✅ Steam ready after {}s (config.vdf found)", i + 1);
-                                            break 'wait true;
-                                        }
-
-                                        // Signal 4: logs dir has multiple entries — Steam's subsystems are running
-                                        let log_count = std::fs::read_dir(&steam_logs_dir)
-                                            .map(|d| d.count())
-                                            .unwrap_or(0);
-                                        if log_count >= 2 {
-                                            println!("✅ Steam ready after {}s ({} log files found)", i + 1, log_count);
-                                            break 'wait true;
-                                        }
-
-                                        println!("  Waiting... {}s", i + 1);
-                                    }
-                                    println!("⚠️ Steam did not signal ready after 30s, launching game anyway");
-                                    true
-                                };
-
-                                if !ready {
-                                    bail!("Background Steam crashed before the game could start");
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 2. WRITE APPID
-                let app_id_str = app.app_id.to_string();
-                let game_working_dir: PathBuf = launch_info.workingdir
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .map(|wd| install_dir.join(wd.replace('\\', "/")))
-                    .or_else(|| executable.parent().map(|p| p.to_path_buf()))
-                    .unwrap_or_else(|| install_dir.clone());
-                let app_id_path = game_working_dir.join("steam_appid.txt");
-                let _ = std::fs::write(&app_id_path, &app_id_str);
-
-                // 3. LAUNCH GAME
-                let user_launch_args: Vec<String> = user_config
-                    .map(|c| split_args(&c.launch_options))
-                    .unwrap_or_default()
-                    .into_iter()
-                    // Filter meta-flags that are not real game arguments
-                    .filter(|a| a != "-mangohud" && a != "--mangohud")
-                    .collect();
-
-                let wants_mangohud = user_config
-                    .map(|c| {
-                        c.env_variables.contains_key("MANGOHUD")
-                            || c.launch_options
-                                .split_whitespace()
-                                .any(|a| a == "-mangohud" || a == "--mangohud")
-                    })
-                    .unwrap_or(false);
-
-                println!("--- GAME LAUNCH DEBUG ---");
-                let mut cmd = crate::utils::build_runner_command(&active_runner)?;
-                cmd.current_dir(&game_working_dir);
-                cmd.arg(&executable);
-                cmd.args(&args); // args from launch_info (game's own args)
-                cmd.args(&user_launch_args); // user's extra args, de-duped and filtered
-
-                cmd.env("SteamAppId", &app_id_str);
-                cmd.env("SteamGameId", &app_id_str);
-                cmd.env("WINEPREFIX", &game_wineprefix);
-                cmd.env("STEAM_COMPAT_DATA_PATH", &compat_data_path);
-
-                let glc = user_config
-                    .map(|c| c.graphics_layers.clone())
-                    .unwrap_or_default();
-                let no_overlay = user_config
-                    .map(|c| c.steam_launch_config.no_overlay)
-                    .unwrap_or(true);
-
-                let dll_overrides = crate::utils::build_dll_overrides(
-                    glc.dxvk_enabled,
-                    glc.vkd3d_proton_enabled,
-                    glc.vkd3d_enabled,
-                    no_overlay,
-                    Some(&game_working_dir), // pass game dir so we skip overriding local DLLs
-                );
-                println!("WINEDLLOVERRIDES: {}", dll_overrides);
-                cmd.env("WINEDLLOVERRIDES", &dll_overrides);
-
-                cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
-
-                let fake_env = crate::utils::setup_fake_steam_trap(&config_dir()?)?;
-                cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
-
-                if let Ok(display) = std::env::var("DISPLAY") {
-                    cmd.env("DISPLAY", display);
-                }
-                if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
-                    cmd.env("WAYLAND_DISPLAY", wayland);
-                }
-                if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
-                    cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
-                }
-
-                // Apply user env vars (MANGOHUD=1 etc.)
-                if let Some(config) = user_config {
-                    for (key, val) in &config.env_variables {
-                        cmd.env(key, val);
-                    }
-                }
-
-                // MangoHud via LD_PRELOAD — works with wine-tkg where command wrapping doesn't
-                if wants_mangohud {
-                    let lib_path = Self::find_mangohud_lib();
-                    match lib_path {
-                        Some(lib) => {
-                            let existing = std::env::var("LD_PRELOAD").unwrap_or_default();
-                            let new_preload = if existing.is_empty() {
-                                lib.to_string_lossy().to_string()
-                            } else {
-                                format!("{}:{}", lib.to_string_lossy(), existing)
-                            };
-                            cmd.env("LD_PRELOAD", new_preload);
-                            cmd.env("MANGOHUD", "1");
-                            cmd.env("MANGOHUD_DLSYM", "1"); // required for wine translation layers
-                            println!("MangoHud: injecting via LD_PRELOAD ({})", lib.display());
-                        }
-                        None => {
-                            println!("⚠️  MangoHud requested but libMangoHud.so not found — skipping");
-                        }
-                    }
-                }
-
-                println!("Program: {:?}", cmd.get_program());
-                println!("Args: {:?}", cmd.get_args().collect::<Vec<_>>());
-                println!("Working Dir: {:?}", cmd.get_current_dir());
-                println!("-------------------------");
-
-                // Wine debug log — captures load errors, missing DLLs, crash reasons
-                let log_dir = crate::config::config_dir()
-                    .unwrap_or_else(|_| PathBuf::from("/tmp"))
-                    .join("logs");
-                std::fs::create_dir_all(&log_dir).ok();
-                let log_path = log_dir.join(format!("wine_{}.log", app.app_id));
-
-                cmd.env("WINEDEBUG", "err+all,warn+module,warn+loaddll");
-                cmd.env("WINE_LOG_OUTPUT", &log_path);
-
-                // Redirect stderr to the log file so wine errors are captured
-                if let Ok(log_file) = std::fs::File::create(&log_path) {
-                    cmd.stderr(log_file);
-                } else {
-                    cmd.stderr(std::process::Stdio::inherit());
-                }
-
-                println!("Wine log: {}", log_path.display());
-
-                cmd.stdout(std::process::Stdio::inherit());
-                cmd.spawn().context("failed to spawn proton game")
+                bail!("WindowsProton targets must be launched via the Pipeline and Runner abstraction. Ad-hoc bypass is prohibited.");
             }
         }
     }
@@ -3271,6 +2944,51 @@ fn extract_quoted_values(line: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_legacy_path_blocks_windows_proton() {
+        let client = SteamClient::new().unwrap();
+        let app = LibraryGame {
+            app_id: 123,
+            name: "Test Game".to_string(),
+            install_path: Some("/tmp/test_game".to_string()),
+            is_installed: true,
+            playtime_forever_minutes: Some(0),
+            active_branch: "public".to_string(),
+            update_available: false,
+            update_queued: false,
+            local_manifest_ids: HashMap::new(),
+        };
+        let launch_info = LaunchInfo {
+            app_id: 123,
+            id: "0".to_string(),
+            description: "Test".to_string(),
+            executable: "test.exe".to_string(),
+            arguments: "".to_string(),
+            workingdir: None,
+            target: LaunchTarget::WindowsProton,
+        };
+        let config = crate::config::LauncherConfig::default();
+
+        let result = client.internal_legacy_launch_adhoc(&app, &launch_info, None, &config, None);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Ad-hoc bypass is prohibited"));
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_integration_scaffolding() {
+        // Passing no app causes ResolveGame to fail early.
+        let mut ctx = crate::launch::pipeline::PipelineContext::new(999999);
+        let pipeline = crate::launch::pipeline::LaunchPipeline::with_default_stages();
+
+        let result = pipeline.run(&mut ctx).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.stage_name, "ResolveGame");
+        assert!(err.inner.to_string().contains("App context missing"));
+    }
+
     #[test]
     fn parses_linux_launch_section_from_vdf() {
         let raw = r#""appinfo"
@@ -3302,32 +3020,9 @@ fn split_args(args: &str) -> Vec<String> {
     args.split_whitespace().map(ToString::to_string).collect()
 }
 
-fn find_master_steam_exe(prefix: &Path) -> Option<PathBuf> {
-    let candidates = [
-        "pfx/drive_c/Program Files (x86)/Steam/steam.exe",
-        "pfx/drive_c/Program Files/Steam/steam.exe",
-        "drive_c/Program Files (x86)/Steam/steam.exe",
-        "drive_c/Program Files/Steam/steam.exe",
-    ];
-
-    for rel_path in candidates {
-        let full_path = prefix.join(rel_path);
-        tracing::info!("Probing for steam.exe: {}", full_path.display());
-        if full_path.exists() {
-            tracing::info!("Found steam.exe at: {}", full_path.display());
-            return Some(full_path);
-        }
-    }
-
-    None
-}
-
-fn find_master_steam_dir(prefix: &Path) -> Option<PathBuf> {
-    find_master_steam_exe(prefix).and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-}
 
 impl SteamClient {
-    fn find_mangohud_lib() -> Option<PathBuf> {
+    pub fn find_mangohud_lib() -> Option<PathBuf> {
         // Common install locations across distros
         let candidates = [
             "/usr/lib/mangohud/libMangoHud.so",

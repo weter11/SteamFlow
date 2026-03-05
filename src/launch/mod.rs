@@ -1,3 +1,7 @@
+pub mod pipeline;
+pub mod stages;
+pub mod validators;
+
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context, anyhow};
 use crate::config::{config_dir, LauncherConfig};

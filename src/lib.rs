@@ -8,3 +8,4 @@ pub mod launch;
 pub mod steam_client;
 pub mod ui;
 pub mod utils;
+pub mod infra;
