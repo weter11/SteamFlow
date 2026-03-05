@@ -52,14 +52,14 @@ mod tests {
         assert_eq!(spec.env.get("WINEPREFIX").unwrap(), "/tmp/prefix");
     }
 
-    #[test]
-    fn test_wine_tkg_runner_stubs() {
+    #[tokio::test]
+    async fn test_wine_tkg_runner_stubs() {
         // We can only test stubs that don't hit the filesystem hard or expect real Proton/Wine
         let runner = WineTkgRunner;
         let ctx = mock_context();
 
         // build_env should succeed without real filesystem
-        let env = runner.build_env(&ctx).unwrap();
+        let env = runner.build_env(&ctx).await.unwrap();
         assert_eq!(env.get("SteamAppId").unwrap(), "123");
     }
 }

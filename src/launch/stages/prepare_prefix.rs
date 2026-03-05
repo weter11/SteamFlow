@@ -20,7 +20,7 @@ impl PipelineStage for PreparePrefixStage {
                 user_config: ctx.user_config.clone(),
                 proton_path: ctx.proton_path.clone(),
             };
-            runner.prepare_prefix(&runner_ctx)?;
+            runner.prepare_prefix(&runner_ctx).await?;
         }
         Ok(())
     }

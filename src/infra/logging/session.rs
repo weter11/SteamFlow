@@ -35,6 +35,8 @@ pub struct LaunchSummary {
     pub total_duration_ms: u128,
     pub stage_durations_ms: HashMap<String, u128>,
     pub timestamp: u64,
+    #[serde(default)]
+    pub warnings: Vec<crate::launch::pipeline::CompatibilityWarning>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

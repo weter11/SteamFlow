@@ -8,6 +8,13 @@ use crate::steam_client::LaunchInfo;
 use crate::infra::runners::{Runner, CommandSpec};
 use crate::infra::logging::{LaunchSession, EventLogger};
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompatibilityWarning {
+    pub code: String,
+    pub message: String,
+    pub context: HashMap<String, String>,
+}
+
 pub struct PipelineContext {
     pub app_id: u32,
     pub app: Option<LibraryGame>,
@@ -22,6 +29,7 @@ pub struct PipelineContext {
 
     pub session: Option<LaunchSession>,
     pub logger: Option<EventLogger>,
+    pub warnings: Vec<CompatibilityWarning>,
 }
 
 impl PipelineContext {
@@ -38,7 +46,25 @@ impl PipelineContext {
             child: None,
             session: None,
             logger: None,
+            warnings: Vec::new(),
         }
+    }
+
+    pub fn add_warning(&mut self, code: impl Into<String>, message: impl Into<String>) {
+        let warning = CompatibilityWarning {
+            code: code.into(),
+            message: message.into(),
+            context: HashMap::new(),
+        };
+
+        if let Some(logger) = &self.logger {
+            let mut metadata = HashMap::new();
+            metadata.insert("warning_code".to_string(), warning.code.clone());
+            metadata.insert("warning_message".to_string(), warning.message.clone());
+            let _ = logger.log(crate::infra::logging::LogLevel::Warn, "compatibility_warning", warning.message.clone(), None, metadata);
+        }
+
+        self.warnings.push(warning);
     }
 }
 
@@ -157,15 +183,23 @@ pub trait PipelineStage: Send + Sync {
 
 pub struct LaunchPipeline {
     stages: Vec<Box<dyn PipelineStage>>,
+    validators: Vec<Box<dyn crate::launch::validators::LaunchValidator>>,
 }
 
 impl LaunchPipeline {
     pub fn new() -> Self {
-        Self { stages: Vec::new() }
+        Self {
+            stages: Vec::new(),
+            validators: Vec::new(),
+        }
     }
 
     pub fn add_stage(&mut self, stage: Box<dyn PipelineStage>) {
         self.stages.push(stage);
+    }
+
+    pub fn add_validator(&mut self, validator: Box<dyn crate::launch::validators::LaunchValidator>) {
+        self.validators.push(validator);
     }
 
     pub fn with_default_stages() -> Self {
@@ -178,6 +212,9 @@ impl LaunchPipeline {
         pipeline.add_stage(Box::new(crate::launch::stages::build_command::BuildCommandStage));
         pipeline.add_stage(Box::new(crate::launch::stages::spawn_process::SpawnProcessStage));
         pipeline.add_stage(Box::new(crate::launch::stages::finalize::FinalizeStage));
+
+        pipeline.add_validator(Box::new(crate::launch::validators::overrides::OverrideConflictValidator));
+
         pipeline
     }
 
@@ -198,6 +235,11 @@ impl LaunchPipeline {
         }
 
         let mut final_result = LaunchResult::Success;
+
+        // Run validators before starting stages
+        for validator in &self.validators {
+            validator.validate(ctx);
+        }
 
         for stage in &self.stages {
             let stage_name = stage.name().to_string();
@@ -275,6 +317,7 @@ impl LaunchPipeline {
                 total_duration_ms,
                 stage_durations_ms,
                 timestamp,
+                warnings: ctx.warnings.clone(),
             };
 
             let _ = session.write_summary(&summary);

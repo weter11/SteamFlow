@@ -20,7 +20,7 @@ impl PipelineStage for BuildCommandStage {
                 user_config: ctx.user_config.clone(),
                 proton_path: ctx.proton_path.clone(),
             };
-            let spec = runner.build_command(&runner_ctx)?;
+            let spec = runner.build_command(&runner_ctx).await?;
             ctx.command_spec = Some(spec);
         }
         Ok(())

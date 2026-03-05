@@ -8,9 +8,10 @@ use crate::launch::pipeline::{LaunchError, LaunchErrorKind};
 
 pub struct WineTkgRunner;
 
+#[async_trait::async_trait]
 impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
-    fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
+    async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
         let use_steam_runtime = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
         let steam_prefix_mode = ctx.user_config.as_ref()
@@ -178,10 +179,7 @@ impl Runner for WineTkgRunner {
 
                         let ready = 'wait: {
                             for i in 0..30 {
-                                        // Note: We use std::thread::sleep here because Runner::prepare_prefix
-                                        // is currently synchronous. In a future iteration where Runner methods
-                                        // are async, this should be converted to tokio::time::sleep.
-                                std::thread::sleep(std::time::Duration::from_secs(1));
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
                                 // Crash detection — bail immediately
                                 if let Ok(Some(status)) = steam_process.try_wait() {
@@ -251,7 +249,7 @@ impl Runner for WineTkgRunner {
         Ok(())
     }
 
-    fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, LaunchError> {
+    async fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, LaunchError> {
         let mut env = HashMap::new();
         let app_id_str = ctx.app.app_id.to_string();
 
@@ -369,7 +367,7 @@ impl Runner for WineTkgRunner {
         Ok(env)
     }
 
-    fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
+    async fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
         let proton = if let Some(forced) = ctx.launcher_config
@@ -421,7 +419,7 @@ impl Runner for WineTkgRunner {
             .filter(|a| a != "-mangohud" && a != "--mangohud");
         spec.args.extend(user_launch_args);
 
-        spec.env = self.build_env(ctx)?;
+        spec.env = self.build_env(ctx).await?;
 
         Ok(spec)
     }

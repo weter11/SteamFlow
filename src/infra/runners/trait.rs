@@ -21,10 +21,11 @@ pub struct CommandSpec {
     pub env: HashMap<String, String>,
 }
 
+#[async_trait::async_trait]
 pub trait Runner: Send + Sync {
     fn name(&self) -> &str;
-    fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), crate::launch::pipeline::LaunchError>;
-    fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, crate::launch::pipeline::LaunchError>;
-    fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, crate::launch::pipeline::LaunchError>;
+    async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), crate::launch::pipeline::LaunchError>;
+    async fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, crate::launch::pipeline::LaunchError>;
+    async fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, crate::launch::pipeline::LaunchError>;
     fn launch(&self, spec: &CommandSpec) -> std::result::Result<std::process::Child, crate::launch::pipeline::LaunchError>;
 }
