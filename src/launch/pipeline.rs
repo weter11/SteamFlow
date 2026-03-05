@@ -269,7 +269,7 @@ impl LaunchPipeline {
                     let _ = logger.error("launch_end", "Launch failed".to_string(), None, metadata);
                 }
 
-                self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
+                self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations.clone());
 
                 return Err(PipelineError {
                     stage_name,
@@ -295,12 +295,46 @@ impl LaunchPipeline {
 
     fn write_summary_if_possible(
         &self,
-        ctx: &PipelineContext,
+        ctx: &mut PipelineContext,
         result: crate::infra::logging::LaunchResult,
         failing_stage: Option<String>,
         total_duration_ms: u128,
         stage_durations_ms: HashMap<String, u128>,
     ) {
+        let (sanity_warnings, env_snapshot) = if let Some(spec) = &ctx.command_spec {
+            let runner_name = ctx
+                .runner
+                .as_ref()
+                .map(|r| r.name().to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let warnings = crate::infra::logging::check_environment_sanity(
+                &spec.env,
+                &runner_name,
+                ctx.user_config.as_ref(),
+            );
+
+            let env_snapshot = crate::infra::logging::EffectiveEnv {
+                runner_name,
+                profile_id: ctx.launch_info.as_ref().map(|l| l.id.clone()),
+                profile_name: ctx.launch_info.as_ref().map(|l| l.description.clone()),
+                wine_dll_overrides: spec.env.get("WINEDLLOVERRIDES").cloned(),
+                env_vars: spec.env.clone(),
+            };
+
+            (warnings, Some(env_snapshot))
+        } else {
+            (Vec::new(), None)
+        };
+
+        for warning in sanity_warnings {
+            ctx.add_warning(warning.code, warning.message);
+        }
+
+        if let (Some(session), Some(env)) = (&ctx.session, env_snapshot) {
+            let _ = session.write_effective_env(&env);
+        }
+
         if let Some(session) = &ctx.session {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

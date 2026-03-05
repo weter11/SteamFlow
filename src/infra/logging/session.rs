@@ -45,6 +45,15 @@ pub enum LaunchResult {
     Failure,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EffectiveEnv {
+    pub runner_name: String,
+    pub profile_id: Option<String>,
+    pub profile_name: Option<String>,
+    pub wine_dll_overrides: Option<String>,
+    pub env_vars: HashMap<String, String>,
+}
+
 pub struct LaunchSession {
     pub id: LaunchSessionId,
     pub created_at: SystemTime,
@@ -72,6 +81,10 @@ impl LaunchSession {
         self.log_dir.join("summary.json")
     }
 
+    pub fn effective_env_path(&self) -> PathBuf {
+        self.log_dir.join("effective_env.json")
+    }
+
     pub fn stdout_path(&self) -> PathBuf {
         self.log_dir.join("stdout.log")
     }
@@ -86,4 +99,112 @@ impl LaunchSession {
         std::fs::write(self.summary_path(), content)?;
         Ok(())
     }
+
+    pub fn write_effective_env(&self, env: &EffectiveEnv) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.log_dir)?;
+        let mut redacted_env = env.clone();
+        redacted_env.env_vars = redact_environment(redacted_env.env_vars);
+
+        let content = serde_json::to_string_pretty(&redacted_env)?;
+        std::fs::write(self.effective_env_path(), content)?;
+        Ok(())
+    }
+}
+
+pub fn redact_environment(mut env: HashMap<String, String>) -> HashMap<String, String> {
+    let sensitive_keys = [
+        "STEAM_TOKEN",
+        "STEAM_PASSWORD",
+        "TOKEN",
+        "PASSWORD",
+        "REFRESH_TOKEN",
+        "SESSION_TOKEN",
+        "SECRET",
+    ];
+    for (key, value) in env.iter_mut() {
+        let upper_key = key.to_uppercase();
+        if sensitive_keys.iter().any(|&sk| upper_key.contains(sk)) {
+            *value = "[REDACTED]".to_string();
+        }
+    }
+    env
+}
+
+pub fn check_environment_sanity(
+    env_vars: &HashMap<String, String>,
+    runner_name: &str,
+    user_config: Option<&crate::models::UserAppConfig>,
+) -> Vec<crate::launch::pipeline::CompatibilityWarning> {
+    let mut warnings = Vec::new();
+
+    // 1. Check for forced D3D defaults in WINEDLLOVERRIDES when they shouldn't be there
+    if let Some(overrides) = env_vars.get("WINEDLLOVERRIDES") {
+        let d3d_dlls = ["d3d9", "d3d11", "dxgi", "d3d12"];
+        let is_baseline = user_config
+            .map(|c| {
+                !c.graphics_layers.dxvk_enabled
+                    && !c.graphics_layers.vkd3d_proton_enabled
+                    && !c.graphics_layers.vkd3d_enabled
+            })
+            .unwrap_or(true);
+
+        if is_baseline {
+            for dll in d3d_dlls {
+                if overrides.contains(&format!("{}=n", dll)) {
+                    warnings.push(crate::launch::pipeline::CompatibilityWarning {
+                        code: "SANITY_UNEXPECTED_OVERRIDE".to_string(),
+                        message: format!(
+                            "WINEDLLOVERRIDES contains forced native override for '{}' in baseline mode. This may prevent the game from starting.",
+                            dll
+                        ),
+                        context: [
+                            ("dll".to_string(), dll.to_string()),
+                            ("overrides".to_string(), overrides.clone()),
+                        ].into_iter().collect(),
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Note if DXVK/VKD3D-related vars are absent when profile expects them
+    if let Some(config) = user_config {
+        if config.graphics_layers.dxvk_enabled {
+            if !env_vars.contains_key("DXVK_LOG_LEVEL") && !env_vars.contains_key("DXVK_HUD") {
+                warnings.push(crate::launch::pipeline::CompatibilityWarning {
+                    code: "SANITY_DXVK_NO_DIAGNOSTICS".to_string(),
+                    message: "DXVK is enabled but no DXVK diagnostic variables (DXVK_LOG_LEVEL, DXVK_HUD) are set. Troubleshooting may be difficult if issues occur.".to_string(),
+                    context: HashMap::new(),
+                });
+            }
+            if let Some(overrides) = env_vars.get("WINEDLLOVERRIDES") {
+                if !overrides.contains("d3d11=n") && !overrides.contains("dxgi=n") {
+                     warnings.push(crate::launch::pipeline::CompatibilityWarning {
+                        code: "SANITY_MISSING_DXVK_OVERRIDE".to_string(),
+                        message: "DXVK is enabled but WINEDLLOVERRIDES does not appear to contain native overrides for D3D11/DXGI.".to_string(),
+                        context: [("overrides".to_string(), overrides.clone())].into_iter().collect(),
+                    });
+                }
+            } else {
+                 warnings.push(crate::launch::pipeline::CompatibilityWarning {
+                    code: "SANITY_MISSING_OVERRIDES_ENV".to_string(),
+                    message: "DXVK is enabled but WINEDLLOVERRIDES environment variable is missing.".to_string(),
+                    context: HashMap::new(),
+                });
+            }
+        }
+    }
+
+    // 3. Proton specific checks
+    if runner_name.to_lowercase().contains("proton") {
+        if !env_vars.contains_key("STEAM_COMPAT_DATA_PATH") {
+             warnings.push(crate::launch::pipeline::CompatibilityWarning {
+                code: "SANITY_MISSING_PROTON_DATA_PATH".to_string(),
+                message: "Proton runner detected but STEAM_COMPAT_DATA_PATH is missing.".to_string(),
+                context: HashMap::new(),
+            });
+        }
+    }
+
+    warnings
 }
