@@ -325,6 +325,18 @@ impl Runner for WineTkgRunner {
             for (key, val) in &config.env_variables {
                 env.insert(key.clone(), val.clone());
             }
+
+            // Add debug toggles
+            if config.graphics_layers.dxvk_enabled {
+                if !env.contains_key("DXVK_HUD") {
+                    env.insert("DXVK_HUD".to_string(), "compiler".to_string());
+                }
+            }
+            if config.graphics_layers.vkd3d_proton_enabled || config.graphics_layers.vkd3d_enabled {
+                 if !env.contains_key("VKD3D_DEBUG") {
+                    env.insert("VKD3D_DEBUG".to_string(), "warn".to_string());
+                }
+            }
         }
 
         let wants_mangohud = ctx.user_config.as_ref()

@@ -98,6 +98,23 @@ mod tests {
     }
 
     #[test]
+    fn test_graphics_evidence_classification() {
+        use crate::infra::logging::wine_capture::classify_graphics_evidence;
+
+        let dxvk_line = "info:  DXVK: v2.3.1";
+        assert!(classify_graphics_evidence(dxvk_line).unwrap().contains("DXVK Detected"));
+
+        let vkd3d_line = "info:  VKD3D-Proton: v2.10";
+        assert!(classify_graphics_evidence(vkd3d_line).unwrap().contains("VKD3D-Proton Detected"));
+
+        let wined3d_line = "err:   wined3d: v8.0";
+        assert!(classify_graphics_evidence(wined3d_line).unwrap().contains("WineD3D Fallback"));
+
+        let random_line = "some random log";
+        assert!(classify_graphics_evidence(random_line).is_none());
+    }
+
+    #[test]
     fn test_environment_sanity_checks() {
         use crate::infra::logging::check_environment_sanity;
         use crate::models::{UserAppConfig, GraphicsLayerConfig};

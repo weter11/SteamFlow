@@ -21,6 +21,14 @@ pub struct DuplicateInstanceInfo {
     pub source: String, // "lockfile" | "pid" | "guard" | "none"
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct GraphicsStackInfo {
+    pub graphics_stack_expected: String,           // e.g. "DXVK v2.3, VKD3D-Proton v2.10"
+    pub graphics_stack_evidence: Vec<String>,      // e.g. ["DXVK: v2.3.1"]
+    pub graphics_stack_confidence: String,         // "low" | "medium" | "high"
+    pub override_policy: String,                   // e.g. "Native-only"
+}
+
 pub struct PipelineContext {
     pub app_id: u32,
     pub app: Option<LibraryGame>,
@@ -36,6 +44,7 @@ pub struct PipelineContext {
     pub session: Option<LaunchSession>,
     pub logger: Option<EventLogger>,
     pub warnings: Vec<CompatibilityWarning>,
+    pub graphics_stack: GraphicsStackInfo,
 }
 
 impl PipelineContext {
@@ -53,6 +62,7 @@ impl PipelineContext {
             session: None,
             logger: None,
             warnings: Vec::new(),
+            graphics_stack: GraphicsStackInfo::default(),
         }
     }
 
@@ -315,6 +325,9 @@ impl LaunchPipeline {
     }
 
     pub async fn run(&self, ctx: &mut PipelineContext) -> std::result::Result<(), PipelineError> {
+        // Record expected stack info before starting
+        self.populate_expected_graphics_stack(ctx);
+
         use crate::infra::logging::LaunchResult;
 
         let total_start = std::time::Instant::now();
@@ -384,9 +397,69 @@ impl LaunchPipeline {
             let _ = logger.info("launch_end", "Launch successful".to_string(), None, HashMap::new());
         }
 
+        // After stages are complete (or failed), scan logs for evidence
+        self.scan_logs_for_graphics_evidence(ctx);
+
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
 
         Ok(())
+    }
+
+    fn populate_expected_graphics_stack(&self, ctx: &mut PipelineContext) {
+        if let Some(config) = &ctx.user_config {
+            let mut expected = Vec::new();
+            if config.graphics_layers.dxvk_enabled {
+                expected.push("DXVK");
+            }
+            if config.graphics_layers.vkd3d_proton_enabled {
+                expected.push("VKD3D-Proton");
+            }
+            if config.graphics_layers.vkd3d_enabled {
+                expected.push("VKD3D");
+            }
+
+            if expected.is_empty() {
+                ctx.graphics_stack.graphics_stack_expected = "WineD3D (Baseline)".to_string();
+                ctx.graphics_stack.override_policy = "Builtin-only".to_string();
+            } else {
+                ctx.graphics_stack.graphics_stack_expected = expected.join(", ");
+                ctx.graphics_stack.override_policy = "Native-preferred".to_string();
+            }
+        }
+    }
+
+    fn scan_logs_for_graphics_evidence(&self, ctx: &mut PipelineContext) {
+        if let Some(session) = &ctx.session {
+            let stderr_path = session.stderr_path();
+            if stderr_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&stderr_path) {
+                    for line in content.lines() {
+                        if let Some(evidence) = crate::infra::logging::classify_graphics_evidence(line) {
+                            if !ctx.graphics_stack.graphics_stack_evidence.contains(&evidence) {
+                                ctx.graphics_stack.graphics_stack_evidence.push(evidence);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update confidence based on evidence vs expectation
+            if ctx.graphics_stack.graphics_stack_evidence.is_empty() {
+                ctx.graphics_stack.graphics_stack_confidence = "low".to_string();
+            } else {
+                let has_expected = if ctx.user_config.as_ref().map(|c| c.graphics_layers.dxvk_enabled).unwrap_or(false) {
+                    ctx.graphics_stack.graphics_stack_evidence.iter().any(|e| e.contains("DXVK"))
+                } else {
+                    true
+                };
+
+                if has_expected {
+                    ctx.graphics_stack.graphics_stack_confidence = "high".to_string();
+                } else {
+                    ctx.graphics_stack.graphics_stack_confidence = "medium".to_string();
+                }
+            }
+        }
     }
 
     fn write_summary_if_possible(
@@ -454,6 +527,7 @@ impl LaunchPipeline {
                 stage_durations_ms,
                 timestamp,
                 warnings: ctx.warnings.clone(),
+                graphics_stack: Some(ctx.graphics_stack.clone()),
             };
 
             let _ = session.write_summary(&summary);

@@ -37,6 +37,8 @@ pub struct LaunchSummary {
     pub timestamp: u64,
     #[serde(default)]
     pub warnings: Vec<crate::launch::pipeline::CompatibilityWarning>,
+    #[serde(default)]
+    pub graphics_stack: Option<crate::launch::pipeline::GraphicsStackInfo>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
