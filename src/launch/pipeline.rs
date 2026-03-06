@@ -418,11 +418,12 @@ impl LaunchPipeline {
                 expected.push("VKD3D");
             }
 
+            let policy = format!("{:?}", config.graphics_layers.graphics_backend_policy);
             if expected.is_empty() {
-                ctx.graphics_stack.graphics_stack_expected = "WineD3D (Baseline)".to_string();
+                ctx.graphics_stack.graphics_stack_expected = format!("WineD3D (Baseline) [Policy: {}]", policy);
                 ctx.graphics_stack.override_policy = "Builtin-only".to_string();
             } else {
-                ctx.graphics_stack.graphics_stack_expected = expected.join(", ");
+                ctx.graphics_stack.graphics_stack_expected = format!("{} [Policy: {}]", expected.join(", "), policy);
                 ctx.graphics_stack.override_policy = "Native-preferred".to_string();
             }
         }

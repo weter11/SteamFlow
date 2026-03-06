@@ -44,6 +44,15 @@ impl Default for SteamLaunchConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum GraphicsBackendPolicy {
+    #[default]
+    Auto,
+    WineD3D,
+    DXVK,
+    VKD3D,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GraphicsLayerConfig {
     #[serde(default)]
@@ -52,6 +61,8 @@ pub struct GraphicsLayerConfig {
     pub vkd3d_proton_enabled: bool,
     #[serde(default)]
     pub vkd3d_enabled: bool,
+    #[serde(default)]
+    pub graphics_backend_policy: GraphicsBackendPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

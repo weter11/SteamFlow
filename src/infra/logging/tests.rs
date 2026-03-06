@@ -128,6 +128,7 @@ mod tests {
             dxvk_enabled: false,
             vkd3d_proton_enabled: false,
             vkd3d_enabled: false,
+            graphics_backend_policy: crate::models::GraphicsBackendPolicy::WineD3D,
         };
 
         let warnings = check_environment_sanity(&env, "Wine", Some(&config));
