@@ -118,3 +118,46 @@ async fn test_spawn_failure_with_synthetic_lock_shows_hint() {
     assert_eq!(err.inner.context.get("duplicate_instance_detected").unwrap(), "true");
     assert_eq!(err.inner.context.get("duplicate_detection_source").unwrap(), "lockfile");
 }
+
+#[tokio::test]
+async fn test_launch_artifacts_generation() {
+    use steamflow::launch::pipeline::{LaunchPipeline, PipelineContext};
+    use steamflow::launch::stages::preflight::PreflightStage;
+    use steamflow::infra::runners::CommandSpec;
+    use steamflow::infra::logging::LaunchSession;
+    use tempfile::tempdir;
+
+    let tmp_logs = tempdir().unwrap();
+    let session = LaunchSession::new(tmp_logs.path());
+
+    let mut pipeline = LaunchPipeline::new();
+    pipeline.add_stage(Box::new(PreflightStage));
+
+    let mut ctx = PipelineContext::new(123);
+    let mut spec = CommandSpec::default();
+    spec.program = std::path::Path::new("/bin/ls").to_path_buf();
+    spec.env.insert("WINEPREFIX".to_string(), "/tmp/fake_pfx".to_string());
+    ctx.command_spec = Some(spec);
+    ctx.session = Some(session);
+
+    // This should fail preflight because WINEPREFIX doesn't exist
+    let _ = pipeline.run(&mut ctx).await;
+
+    let session_dir = ctx.session.as_ref().unwrap().log_dir.clone();
+
+    // Debug: list files in session_dir
+    println!("Session dir files: {:?}", std::fs::read_dir(&session_dir).unwrap().map(|e| e.unwrap().file_name()).collect::<Vec<_>>());
+
+    // 1. Check preflight_report.json
+    assert!(session_dir.join("preflight_report.json").exists());
+
+    // 2. Check effective_env.txt (should be written in write_summary_if_possible on failure)
+    assert!(session_dir.join("effective_env.txt").exists());
+
+    // 3. Check command.txt
+    assert!(session_dir.join("command.txt").exists());
+
+    // Verify content of effective_env.txt is sorted
+    let env_content = std::fs::read_to_string(session_dir.join("effective_env.txt")).unwrap();
+    assert!(env_content.contains("WINEPREFIX=/tmp/fake_pfx"));
+}

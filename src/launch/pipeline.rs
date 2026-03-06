@@ -427,8 +427,14 @@ impl LaunchPipeline {
             ctx.add_warning(warning.code, warning.message);
         }
 
-        if let (Some(session), Some(env)) = (&ctx.session, env_snapshot) {
-            let _ = session.write_effective_env(&env);
+        if let Some(session) = &ctx.session {
+            if let Some(env) = env_snapshot {
+                let _ = session.write_effective_env(&env);
+                let _ = session.write_effective_env_txt(&env.env_vars);
+            }
+            if let Some(spec) = &ctx.command_spec {
+                let _ = session.write_command_artifact(spec);
+            }
         }
 
         if let Some(session) = &ctx.session {

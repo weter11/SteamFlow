@@ -85,6 +85,18 @@ impl LaunchSession {
         self.log_dir.join("effective_env.json")
     }
 
+    pub fn effective_env_txt_path(&self) -> PathBuf {
+        self.log_dir.join("effective_env.txt")
+    }
+
+    pub fn command_path(&self) -> PathBuf {
+        self.log_dir.join("command.txt")
+    }
+
+    pub fn preflight_report_path(&self) -> PathBuf {
+        self.log_dir.join("preflight_report.json")
+    }
+
     pub fn stdout_path(&self) -> PathBuf {
         self.log_dir.join("stdout.log")
     }
@@ -107,6 +119,38 @@ impl LaunchSession {
 
         let content = serde_json::to_string_pretty(&redacted_env)?;
         std::fs::write(self.effective_env_path(), content)?;
+        Ok(())
+    }
+
+    pub fn write_effective_env_txt(&self, env: &HashMap<String, String>) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.log_dir)?;
+        let redacted = redact_environment(env.clone());
+        let mut keys: Vec<_> = redacted.keys().collect();
+        keys.sort();
+
+        let mut content = String::new();
+        for key in keys {
+            content.push_str(&format!("{}={}\n", key, redacted.get(key).unwrap()));
+        }
+        std::fs::write(self.effective_env_txt_path(), content)?;
+        Ok(())
+    }
+
+    pub fn write_command_artifact(&self, spec: &crate::infra::runners::CommandSpec) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.log_dir)?;
+        let mut content = format!("Program: {}\n", spec.program.display());
+        content.push_str(&format!("Args   : {}\n", spec.args.join(" ")));
+        if let Some(cwd) = &spec.cwd {
+            content.push_str(&format!("CWD    : {}\n", cwd.display()));
+        }
+        std::fs::write(self.command_path(), content)?;
+        Ok(())
+    }
+
+    pub fn write_preflight_report<T: serde::Serialize>(&self, report: &T) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.log_dir)?;
+        let content = serde_json::to_string_pretty(report)?;
+        std::fs::write(self.preflight_report_path(), content)?;
         Ok(())
     }
 }
