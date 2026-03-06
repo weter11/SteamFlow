@@ -104,7 +104,7 @@ impl LaunchErrorKind {
             Self::Permission => "Check filesystem permissions for the library and prefix folders.",
             Self::Runner => "Try a different Proton/Wine version.",
             Self::GameData => "Verify integrity of game files or reinstall the game.",
-            Self::Process => "Ensure no other instance of the game is running.",
+            Self::Process => "Check if the game is already running or if files are locked.",
             Self::Dependency => "Install missing system dependencies.",
             Self::Unknown => "Check the detailed logs for more information.",
         }
@@ -150,6 +150,10 @@ impl std::error::Error for LaunchError {}
 
 pub fn map_anyhow_error(err: anyhow::Error) -> LaunchError {
     let msg = err.to_string();
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        return map_io_error(io_err);
+    }
+
     if msg.contains("Permission denied") || msg.contains("EACCES") {
         LaunchError::new(LaunchErrorKind::Permission, msg).with_source(err)
     } else if msg.contains("not found") || msg.contains("No such file or directory") {
@@ -159,6 +163,41 @@ pub fn map_anyhow_error(err: anyhow::Error) -> LaunchError {
     } else {
         LaunchError::new(LaunchErrorKind::Unknown, msg).with_source(err)
     }
+}
+
+pub fn map_io_error(err: &std::io::Error) -> LaunchError {
+    use std::io::ErrorKind;
+
+    let kind = match err.kind() {
+        ErrorKind::NotFound => LaunchErrorKind::GameData,
+        ErrorKind::PermissionDenied => LaunchErrorKind::Permission,
+        ErrorKind::InvalidInput => LaunchErrorKind::Validation,
+        ErrorKind::AlreadyExists => LaunchErrorKind::Process,
+        _ => LaunchErrorKind::Process,
+    };
+
+    let mut message = match err.kind() {
+        ErrorKind::NotFound => "The game executable or runner was not found.".to_string(),
+        ErrorKind::PermissionDenied => "Access denied while attempting to start the game. Check file permissions.".to_string(),
+        ErrorKind::InvalidInput => "Invalid launch configuration or malformed path.".to_string(),
+        ErrorKind::AlreadyExists => "A lock file or another instance of the game was detected.".to_string(),
+        _ => format!("Process spawn failed: {}", err),
+    };
+
+    // Special case for lock condition if detected in generic error string
+    let err_str = err.to_string();
+    if err_str.contains("locked") || err_str.contains("Resource busy") {
+        message = "Game files are locked by another process. Ensure no other instance is running.".to_string();
+    }
+
+    let mut launch_err = LaunchError::new(kind, message)
+        .with_context("io_kind", format!("{:?}", err.kind()));
+
+    if let Some(code) = err.raw_os_error() {
+        launch_err = launch_err.with_context("os_errno", code.to_string());
+    }
+
+    launch_err
 }
 
 #[derive(Debug)]
@@ -455,6 +494,32 @@ mod tests {
         assert!(content.contains("test_stage"));
         assert!(content.contains("stage_success"));
         assert!(content.contains("launch_end"));
+    }
+
+    #[test]
+    fn test_map_io_error_not_found() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let mapped = map_io_error(&err);
+        assert_eq!(mapped.kind, LaunchErrorKind::GameData);
+        assert!(mapped.message.contains("not found"));
+        assert_eq!(mapped.context.get("io_kind").unwrap(), "NotFound");
+    }
+
+    #[test]
+    fn test_map_io_error_permission_denied() {
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let mapped = map_io_error(&err);
+        assert_eq!(mapped.kind, LaunchErrorKind::Permission);
+        assert!(mapped.message.contains("Access denied"));
+    }
+
+    #[test]
+    fn test_map_io_error_lock_detected() {
+        // Simulating a "Resource busy" or "locked" error which often maps to 'Other' or 'WouldBlock' in std::io
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "file is locked by another process");
+        let mapped = map_io_error(&err);
+        assert_eq!(mapped.kind, LaunchErrorKind::Process);
+        assert!(mapped.message.contains("locked by another process"));
     }
 
     #[tokio::test]
