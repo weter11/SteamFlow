@@ -154,7 +154,19 @@ impl SteamLauncher {
         let (operation_tx, operation_rx) = mpsc::channel();
         let authenticated = client.is_authenticated();
         let launcher_config = runtime.block_on(load_launcher_config()).unwrap_or_default();
-        let user_configs = runtime.block_on(crate::config::load_user_configs()).unwrap_or_default();
+        let mut user_configs = runtime.block_on(crate::config::load_user_configs()).unwrap_or_default();
+
+        // Migration logic: Map legacy DXVK/VKD3D toggles to GraphicsBackendPolicy
+        for cfg in user_configs.values_mut() {
+            if cfg.graphics_layers.graphics_backend_policy == crate::models::GraphicsBackendPolicy::Auto {
+                 if cfg.graphics_layers.dxvk_enabled {
+                     cfg.graphics_layers.graphics_backend_policy = crate::models::GraphicsBackendPolicy::DXVK;
+                 } else if cfg.graphics_layers.vkd3d_proton_enabled {
+                     cfg.graphics_layers.graphics_backend_policy = crate::models::GraphicsBackendPolicy::VKD3D;
+                 }
+            }
+        }
+
         let (steam_protons, custom_protons) = scan_proton_runtimes();
         let user_profile = runtime
             .block_on(client.get_user_profile(library.len()))
@@ -1217,6 +1229,28 @@ impl SteamLauncher {
             let glc = &mut user_cfg_gl.graphics_layers;
             let mut gl_changed = false;
 
+            ui.horizontal(|ui| {
+                ui.label("Graphics Backend Policy:");
+                egui::ComboBox::from_id_salt("graphics_backend_policy_selector")
+                    .selected_text(format!("{:?}", glc.graphics_backend_policy))
+                    .show_ui(ui, |ui| {
+                        use crate::models::GraphicsBackendPolicy;
+                        if ui.selectable_value(&mut glc.graphics_backend_policy, GraphicsBackendPolicy::Auto, "Auto (Recommended)").clicked() {
+                            gl_changed = true;
+                        }
+                        if ui.selectable_value(&mut glc.graphics_backend_policy, GraphicsBackendPolicy::WineD3D, "WineD3D (OpenGL)").clicked() {
+                            gl_changed = true;
+                        }
+                        if ui.selectable_value(&mut glc.graphics_backend_policy, GraphicsBackendPolicy::DXVK, "DXVK (Vulkan)").clicked() {
+                            gl_changed = true;
+                        }
+                        if ui.selectable_value(&mut glc.graphics_backend_policy, GraphicsBackendPolicy::VKD3D, "VKD3D (Vulkan/DX12)").clicked() {
+                            gl_changed = true;
+                        }
+                    });
+            });
+            ui.add_space(8.0);
+
             // Detect what's already in the prefix for status display
             let dxvk_in_prefix = game_prefix.join("drive_c/windows/system32/d3d11.dll").exists();
             let vkd3d_in_prefix = game_prefix.join("drive_c/windows/system32/d3d12.dll").exists();
@@ -1283,9 +1317,9 @@ impl SteamLauncher {
                     // Override toggle (independent of install status)
                     ui.label("");
                     if ui
-                        .checkbox(&mut glc.dxvk_enabled, "Enable WINEDLLOVERRIDES for DXVK")
+                        .checkbox(&mut glc.dxvk_enabled, "Manual DXVK Overrides (advanced)")
                         .on_hover_text(
-                            "Sets d3d9=n,b d3d11=n,b dxgi=n,b — requires DLLs to be installed above",
+                            "Forces d3d9=n,b d3d11=n,b dxgi=n,b regardless of policy choice. Requires DLLs to be installed above.",
                         )
                         .changed()
                     {
@@ -1359,9 +1393,9 @@ impl SteamLauncher {
                     if ui
                         .checkbox(
                             &mut glc.vkd3d_proton_enabled,
-                            "Enable WINEDLLOVERRIDES for VKD3D-Proton",
+                            "Manual VKD3D Overrides (advanced)",
                         )
-                        .on_hover_text("Sets d3d12=n,b — required for DX12 games on wine-tkg")
+                        .on_hover_text("Forces d3d12=n,b regardless of policy choice. Required for DX12 games on wine-tkg.")
                         .changed()
                     {
                         gl_changed = true;
