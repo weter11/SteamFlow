@@ -31,6 +31,7 @@ mod tests {
             launcher_config: LauncherConfig::default(),
             user_config: None,
             proton_path: Some("/tmp/proton".to_string()),
+            dll_resolutions: Vec::new(),
         }
     }
 
@@ -55,7 +56,7 @@ mod tests {
     #[tokio::test]
     async fn test_wine_tkg_runner_graphics_policy_autodetect() {
         use crate::infra::runners::wine_tkg::WineTkgRunner;
-        use crate::models::{GraphicsBackendPolicy, GraphicsLayerConfig};
+        use crate::models::GraphicsBackendPolicy;
         use crate::config::LauncherConfig;
         use crate::steam_client::{LaunchInfo, LaunchTarget};
         use crate::models::{LibraryGame, UserAppConfig};
@@ -107,6 +108,7 @@ mod tests {
             launcher_config: config,
             user_config: Some(user_config),
             proton_path: Some(runner_path.to_string_lossy().to_string()),
+            dll_resolutions: Vec::new(),
         };
 
         let runner = WineTkgRunner;

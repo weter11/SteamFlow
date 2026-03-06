@@ -1,6 +1,7 @@
 pub mod resolve_game;
 pub mod resolve_profile;
 pub mod resolve_components;
+pub mod resolve_dll_providers;
 pub mod prepare_prefix;
 pub mod build_environment;
 pub mod build_command;

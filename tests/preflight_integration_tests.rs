@@ -157,6 +157,9 @@ async fn test_launch_artifacts_generation() {
     // 3. Check command.txt
     assert!(session_dir.join("command.txt").exists());
 
+    // 4. Check dll_resolution.json
+    assert!(session_dir.join("dll_resolution.json").exists());
+
     // Verify content of effective_env.txt is sorted
     let env_content = std::fs::read_to_string(session_dir.join("effective_env.txt")).unwrap();
     assert!(env_content.contains("WINEPREFIX=/tmp/fake_pfx"));

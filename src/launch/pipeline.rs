@@ -27,6 +27,7 @@ pub struct GraphicsStackInfo {
     pub graphics_stack_evidence: Vec<String>,      // e.g. ["DXVK: v2.3.1"]
     pub graphics_stack_confidence: String,         // "low" | "medium" | "high"
     pub override_policy: String,                   // e.g. "Native-only"
+    pub dll_providers: HashMap<String, String>,    // e.g. {"d3d11": "Runner", "d3d9": "GameLocal"}
 }
 
 pub struct PipelineContext {
@@ -45,6 +46,7 @@ pub struct PipelineContext {
     pub logger: Option<EventLogger>,
     pub warnings: Vec<CompatibilityWarning>,
     pub graphics_stack: GraphicsStackInfo,
+    pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
 }
 
 impl PipelineContext {
@@ -63,6 +65,7 @@ impl PipelineContext {
             logger: None,
             warnings: Vec::new(),
             graphics_stack: GraphicsStackInfo::default(),
+            dll_resolutions: Vec::new(),
         }
     }
 
@@ -312,6 +315,7 @@ impl LaunchPipeline {
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_game::ResolveGameStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_profile::ResolveProfileStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_components::ResolveComponentsStage));
+        pipeline.add_stage(Box::new(crate::launch::stages::resolve_dll_providers::ResolveDllProvidersStage));
         pipeline.add_stage(Box::new(crate::launch::stages::prepare_prefix::PreparePrefixStage));
         pipeline.add_stage(Box::new(crate::launch::stages::build_environment::BuildEnvironmentStage));
         pipeline.add_stage(Box::new(crate::launch::stages::build_command::BuildCommandStage));
@@ -398,6 +402,7 @@ impl LaunchPipeline {
         }
 
         // After stages are complete (or failed), scan logs for evidence
+        self.record_dll_provider_diagnostics(ctx);
         self.scan_logs_for_graphics_evidence(ctx);
 
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
@@ -426,6 +431,12 @@ impl LaunchPipeline {
                 ctx.graphics_stack.graphics_stack_expected = format!("{} [Policy: {}]", expected.join(", "), policy);
                 ctx.graphics_stack.override_policy = "Native-preferred".to_string();
             }
+        }
+    }
+
+    fn record_dll_provider_diagnostics(&self, ctx: &mut PipelineContext) {
+        for res in &ctx.dll_resolutions {
+            ctx.graphics_stack.dll_providers.insert(res.name.clone(), format!("{:?}", res.chosen_provider));
         }
     }
 
@@ -509,6 +520,7 @@ impl LaunchPipeline {
             if let Some(spec) = &ctx.command_spec {
                 let _ = session.write_command_artifact(spec);
             }
+            let _ = session.write_dll_resolution_artifact(&ctx.dll_resolutions);
         }
 
         if let Some(session) = &ctx.session {

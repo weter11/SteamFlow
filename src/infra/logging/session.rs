@@ -155,6 +155,14 @@ impl LaunchSession {
         std::fs::write(self.preflight_report_path(), content)?;
         Ok(())
     }
+
+    pub fn write_dll_resolution_artifact(&self, resolutions: &[crate::launch::dll_provider_resolver::DllResolution]) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.log_dir)?;
+        let content = serde_json::to_string_pretty(resolutions)?;
+        let path = self.log_dir.join("dll_resolution.json");
+        std::fs::write(path, content)?;
+        Ok(())
+    }
 }
 
 pub fn redact_environment(mut env: HashMap<String, String>) -> HashMap<String, String> {

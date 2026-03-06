@@ -326,13 +326,24 @@ impl Runner for WineTkgRunner {
             }
         }
 
-        let dll_overrides = crate::utils::build_dll_overrides(
+        let mut dll_overrides = crate::utils::build_dll_overrides(
             glc.dxvk_enabled,
             glc.vkd3d_proton_enabled,
             glc.vkd3d_enabled,
             no_overlay,
             Some(&game_working_dir),
         );
+
+        // Enhance overrides with resolved DLL providers
+        for res in &ctx.dll_resolutions {
+            if let crate::launch::dll_provider_resolver::DllProvider::GameLocal = res.chosen_provider {
+                // Ensure native wins for game-local DLLs
+                if !dll_overrides.contains(&format!("{}=n", res.name)) {
+                     dll_overrides.push_str(&format!(";{}=n", res.name));
+                }
+            }
+        }
+
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
 
         env.insert("WINEPATH".to_string(), "C:\\Program Files (x86)\\Steam".to_string());
