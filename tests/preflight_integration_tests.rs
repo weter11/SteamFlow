@@ -73,3 +73,48 @@ async fn test_spawn_process_failure_diagnostics() {
     assert!(err.inner.message.contains("not found"));
     assert_eq!(err.inner.context.get("io_kind").unwrap(), "NotFound");
 }
+
+#[tokio::test]
+async fn test_spawn_failure_with_synthetic_lock_shows_hint() {
+    use steamflow::launch::pipeline::{LaunchPipeline, PipelineContext, LaunchErrorKind};
+    use steamflow::launch::stages::spawn_process::SpawnProcessStage;
+    use steamflow::infra::runners::CommandSpec;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let lockfile = tmp.path().join(".steamflow_launch.lock");
+    std::fs::write(&lockfile, "").unwrap();
+
+    let mut pipeline = LaunchPipeline::new();
+    pipeline.add_stage(Box::new(SpawnProcessStage));
+
+    let mut ctx = PipelineContext::new(123);
+    let mut spec = CommandSpec::default();
+    spec.program = std::path::Path::new("/bin/ls").to_path_buf(); // valid exe
+    spec.cwd = Some(tmp.path().to_path_buf());
+
+    struct FailingRunner;
+    #[async_trait::async_trait]
+    impl steamflow::infra::runners::Runner for FailingRunner {
+        fn name(&self) -> &str { "FailingRunner" }
+        async fn prepare_prefix(&self, _: &steamflow::infra::runners::LaunchContext) -> Result<(), steamflow::launch::pipeline::LaunchError> { Ok(()) }
+        async fn build_env(&self, _: &steamflow::infra::runners::LaunchContext) -> Result<std::collections::HashMap<String, String>, steamflow::launch::pipeline::LaunchError> { Ok(std::collections::HashMap::new()) }
+        async fn build_command(&self, _: &steamflow::infra::runners::LaunchContext) -> Result<CommandSpec, steamflow::launch::pipeline::LaunchError> { Ok(CommandSpec::default()) }
+        fn launch(&self, _: &CommandSpec) -> Result<std::process::Child, steamflow::launch::pipeline::LaunchError> {
+            // Force a generic spawn failure
+            Err(steamflow::launch::pipeline::LaunchError::new(LaunchErrorKind::Process, "generic spawn failure")
+                .with_source(anyhow::anyhow!(std::io::Error::new(std::io::ErrorKind::Other, "something went wrong"))))
+        }
+    }
+
+    ctx.runner = Some(Box::new(FailingRunner));
+    ctx.command_spec = Some(spec);
+
+    let result = pipeline.run(&mut ctx).await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.stage_name, "SpawnProcess");
+    assert!(err.inner.message.contains("Ensure no other instance is running"));
+    assert_eq!(err.inner.context.get("duplicate_instance_detected").unwrap(), "true");
+    assert_eq!(err.inner.context.get("duplicate_detection_source").unwrap(), "lockfile");
+}

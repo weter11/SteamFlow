@@ -22,7 +22,8 @@ impl PipelineStage for SpawnProcessStage {
                 let child = runner.launch(spec).map_err(|e| {
                     if let Some(source) = &e.source {
                         if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-                            return crate::launch::pipeline::map_io_error(io_err);
+                            let dup_info = crate::launch::pipeline::detect_duplicate_instance(ctx);
+                            return crate::launch::pipeline::map_io_error(io_err, Some(&dup_info));
                         }
                     }
                     e
@@ -46,7 +47,8 @@ impl PipelineStage for SpawnProcessStage {
                 ctx.user_config.as_ref()
             ).map_err(|e| {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    crate::launch::pipeline::map_io_error(io_err)
+                    let dup_info = crate::launch::pipeline::detect_duplicate_instance(ctx);
+                    crate::launch::pipeline::map_io_error(io_err, Some(&dup_info))
                 } else {
                     LaunchError::new(LaunchErrorKind::Process, "failed to spawn adhoc process").with_source(e)
                 }

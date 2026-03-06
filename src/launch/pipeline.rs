@@ -15,6 +15,12 @@ pub struct CompatibilityWarning {
     pub context: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateInstanceInfo {
+    pub detected: bool,
+    pub source: String, // "lockfile" | "pid" | "guard" | "none"
+}
+
 pub struct PipelineContext {
     pub app_id: u32,
     pub app: Option<LibraryGame>,
@@ -151,7 +157,7 @@ impl std::error::Error for LaunchError {}
 pub fn map_anyhow_error(err: anyhow::Error) -> LaunchError {
     let msg = err.to_string();
     if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-        return map_io_error(io_err);
+        return map_io_error(io_err, None);
     }
 
     if msg.contains("Permission denied") || msg.contains("EACCES") {
@@ -165,7 +171,7 @@ pub fn map_anyhow_error(err: anyhow::Error) -> LaunchError {
     }
 }
 
-pub fn map_io_error(err: &std::io::Error) -> LaunchError {
+pub fn map_io_error(err: &std::io::Error, dup_info: Option<&DuplicateInstanceInfo>) -> LaunchError {
     use std::io::ErrorKind;
 
     let kind = match err.kind() {
@@ -184,10 +190,16 @@ pub fn map_io_error(err: &std::io::Error) -> LaunchError {
         _ => format!("Process spawn failed: {}", err),
     };
 
-    // Special case for lock condition if detected in generic error string
+    // ONLY show duplicate instance hint if explicitly detected or AlreadyExists kind
     let err_str = err.to_string();
-    if err_str.contains("locked") || err_str.contains("Resource busy") {
-        message = "Game files are locked by another process. Ensure no other instance is running.".to_string();
+    let lock_msg = "Game files are locked by another process. Ensure no other instance is running.";
+
+    if let Some(info) = dup_info {
+        if info.detected {
+            message = lock_msg.to_string();
+        }
+    } else if err.kind() == ErrorKind::AlreadyExists || err_str.contains("locked") || err_str.contains("Resource busy") {
+        message = lock_msg.to_string();
     }
 
     let mut launch_err = LaunchError::new(kind, message)
@@ -197,7 +209,51 @@ pub fn map_io_error(err: &std::io::Error) -> LaunchError {
         launch_err = launch_err.with_context("os_errno", code.to_string());
     }
 
+    if let Some(info) = dup_info {
+        launch_err = launch_err.with_context("duplicate_instance_detected", info.detected.to_string());
+        launch_err = launch_err.with_context("duplicate_detection_source", info.source.clone());
+    } else {
+        launch_err = launch_err.with_context("duplicate_instance_detected", "false");
+        launch_err = launch_err.with_context("duplicate_detection_source", "none");
+    }
+
     launch_err
+}
+
+pub fn detect_duplicate_instance(ctx: &PipelineContext) -> DuplicateInstanceInfo {
+    // 1. Check for explicit lockfile in the game directory or prefix
+    if let Some(spec) = &ctx.command_spec {
+        if let Some(cwd) = &spec.cwd {
+            let lockfile = cwd.join(".steamflow_launch.lock");
+            if lockfile.exists() {
+                return DuplicateInstanceInfo {
+                    detected: true,
+                    source: "lockfile".to_string(),
+                };
+            }
+        }
+    }
+
+    // 2. Check for tracked PID if we had a mechanism to store it
+    // For now, check if steam.pid exists in the prefix (if applicable)
+    if let Some(spec) = &ctx.command_spec {
+        if let Some(prefix) = spec.env.get("WINEPREFIX") {
+            let pid_path = std::path::Path::new(prefix).join("steam.pid");
+            if pid_path.exists() {
+                 // Note: Ideally we'd check if the PID is still alive,
+                 // but existence of the file in WINEPREFIX is a strong hint.
+                 return DuplicateInstanceInfo {
+                     detected: true,
+                     source: "pid".to_string(),
+                 };
+            }
+        }
+    }
+
+    DuplicateInstanceInfo {
+        detected: false,
+        source: "none".to_string(),
+    }
 }
 
 #[derive(Debug)]
@@ -499,7 +555,7 @@ mod tests {
     #[test]
     fn test_map_io_error_not_found() {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
-        let mapped = map_io_error(&err);
+        let mapped = map_io_error(&err, None);
         assert_eq!(mapped.kind, LaunchErrorKind::GameData);
         assert!(mapped.message.contains("not found"));
         assert_eq!(mapped.context.get("io_kind").unwrap(), "NotFound");
@@ -508,7 +564,7 @@ mod tests {
     #[test]
     fn test_map_io_error_permission_denied() {
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        let mapped = map_io_error(&err);
+        let mapped = map_io_error(&err, None);
         assert_eq!(mapped.kind, LaunchErrorKind::Permission);
         assert!(mapped.message.contains("Access denied"));
     }
@@ -517,9 +573,39 @@ mod tests {
     fn test_map_io_error_lock_detected() {
         // Simulating a "Resource busy" or "locked" error which often maps to 'Other' or 'WouldBlock' in std::io
         let err = std::io::Error::new(std::io::ErrorKind::Other, "file is locked by another process");
-        let mapped = map_io_error(&err);
+        let mapped = map_io_error(&err, None);
         assert_eq!(mapped.kind, LaunchErrorKind::Process);
         assert!(mapped.message.contains("locked by another process"));
+    }
+
+    #[test]
+    fn test_map_io_error_with_explicit_dup_info() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "generic error");
+        let info = DuplicateInstanceInfo {
+            detected: true,
+            source: "lockfile".to_string(),
+        };
+        let mapped = map_io_error(&err, Some(&info));
+        assert_eq!(mapped.kind, LaunchErrorKind::Process);
+        assert!(mapped.message.contains("Ensure no other instance is running"));
+        assert_eq!(mapped.context.get("duplicate_instance_detected").unwrap(), "true");
+        assert_eq!(mapped.context.get("duplicate_detection_source").unwrap(), "lockfile");
+    }
+
+    #[test]
+    fn test_detect_duplicate_instance_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile = tmp.path().join(".steamflow_launch.lock");
+        std::fs::write(&lockfile, "").unwrap();
+
+        let mut ctx = PipelineContext::new(123);
+        let mut spec = CommandSpec::default();
+        spec.cwd = Some(tmp.path().to_path_buf());
+        ctx.command_spec = Some(spec);
+
+        let info = detect_duplicate_instance(&ctx);
+        assert!(info.detected);
+        assert_eq!(info.source, "lockfile");
     }
 
     #[tokio::test]
