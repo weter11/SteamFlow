@@ -232,10 +232,10 @@ pub fn check_environment_sanity(
                 });
             }
             if let Some(overrides) = env_vars.get("WINEDLLOVERRIDES") {
-                if !overrides.contains("d3d11=n") && !overrides.contains("dxgi=n") {
+                if !overrides.contains("d3d11=n") && !overrides.contains("dxgi=n") && !overrides.contains("d3d9=n") {
                      warnings.push(crate::launch::pipeline::CompatibilityWarning {
                         code: "SANITY_MISSING_DXVK_OVERRIDE".to_string(),
-                        message: "DXVK is enabled but WINEDLLOVERRIDES does not appear to contain native overrides for D3D11/DXGI.".to_string(),
+                        message: "DXVK is enabled but WINEDLLOVERRIDES does not appear to contain native overrides for D3D11/DXGI/D3D9.".to_string(),
                         context: [("overrides".to_string(), overrides.clone())].into_iter().collect(),
                     });
                 }
@@ -245,6 +245,25 @@ pub fn check_environment_sanity(
                     message: "DXVK is enabled but WINEDLLOVERRIDES environment variable is missing.".to_string(),
                     context: HashMap::new(),
                 });
+            }
+        }
+
+        if config.graphics_layers.vkd3d_proton_enabled || config.graphics_layers.vkd3d_enabled {
+            if !env_vars.contains_key("VKD3D_DEBUG") && !env_vars.contains_key("VKD3D_CONFIG") {
+                warnings.push(crate::launch::pipeline::CompatibilityWarning {
+                    code: "SANITY_VKD3D_NO_DIAGNOSTICS".to_string(),
+                    message: "VKD3D is enabled but no VKD3D diagnostic variables (VKD3D_DEBUG, VKD3D_CONFIG) are set.".to_string(),
+                    context: HashMap::new(),
+                });
+            }
+            if let Some(overrides) = env_vars.get("WINEDLLOVERRIDES") {
+                if !overrides.contains("d3d12=n") {
+                     warnings.push(crate::launch::pipeline::CompatibilityWarning {
+                        code: "SANITY_MISSING_VKD3D_OVERRIDE".to_string(),
+                        message: "VKD3D is enabled but WINEDLLOVERRIDES does not appear to contain native overrides for D3D12.".to_string(),
+                        context: [("overrides".to_string(), overrides.clone())].into_iter().collect(),
+                    });
+                }
             }
         }
     }
