@@ -569,11 +569,13 @@ impl SteamClient {
 
         let cfg = load_launcher_config().await?;
         let library_root = cfg.steam_library_path.clone();
-        let game_name = self.resolve_install_game_name(appid).await;
+        let (game_name, pics_installdir) = self.resolve_install_game_info(appid).await;
+        let installdir = pics_installdir.unwrap_or_else(|| sanitize_install_dir(&game_name));
+
         let install_dir = Path::new(&library_root)
             .join("steamapps")
             .join("common")
-            .join(&game_name);
+            .join(&installdir);
         std::fs::create_dir_all(&install_dir)
             .with_context(|| format!("failed creating {}", install_dir.display()))?;
         let manifest_path = Path::new(&library_root)
@@ -950,6 +952,7 @@ impl SteamClient {
                     &manifest_path,
                     appid,
                     &game_name,
+                    &installdir,
                     successful_depots,
                 ) {
                     tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
@@ -1879,9 +1882,11 @@ impl SteamClient {
                     state.status_text = "Operation complete".to_string();
                 }
 
-                let game_name: String = client_clone.resolve_install_game_name(appid).await;
+                let (game_name, pics_installdir) = client_clone.resolve_install_game_info(appid).await;
+                let installdir = pics_installdir.unwrap_or_else(|| sanitize_install_dir(&game_name));
+
                 if let Err(err) =
-                    SteamClient::write_appmanifest(&manifest_path, appid, &game_name, successful_depots)
+                    SteamClient::write_appmanifest(&manifest_path, appid, &game_name, &installdir, successful_depots)
                 {
                     tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
                 }
@@ -1938,17 +1943,54 @@ impl SteamClient {
             let raw = std::fs::read_to_string(&manifest_path)
                 .with_context(|| format!("failed reading {}", manifest_path.display()))?;
             if let Some(installdir) = parse_installdir_from_acf(&raw) {
-                return Ok(steamapps.join("common").join(installdir));
+                let p = steamapps.join("common").join(&installdir);
+                if p.exists() {
+                    return Ok(p);
+                }
+
+                // Fallback: search for app id markers if the specified installdir doesn't exist
+                if let Some(fallback) = self.probe_install_dir_by_appid(&steamapps, appid) {
+                    tracing::info!("Found fallback install dir for app {appid}: {:?}", fallback);
+                    return Ok(fallback);
+                }
+
+                // Even if it doesn't exist, we return the path it *should* be at
+                return Ok(p);
             }
         }
 
-        Ok(PathBuf::from(
-            load_launcher_config().await?
-                .steam_library_path,
-        )
-        .join("steamapps")
-        .join("common")
-        .join(appid.to_string()))
+        // Final fallback if no manifest or installdir
+        Ok(PathBuf::from(load_launcher_config().await?.steam_library_path)
+            .join("steamapps")
+            .join("common")
+            .join(appid.to_string()))
+    }
+
+    fn probe_install_dir_by_appid(&self, steamapps: &Path, appid: u32) -> Option<PathBuf> {
+        let common = steamapps.join("common");
+        if !common.exists() {
+            return None;
+        }
+
+        let appid_str = appid.to_string();
+
+        if let Ok(entries) = std::fs::read_dir(common) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Check for steam_appid.txt
+                    let appid_txt = path.join("steam_appid.txt");
+                    if appid_txt.exists() {
+                        if let Ok(content) = std::fs::read_to_string(appid_txt) {
+                            if content.trim() == appid_str {
+                                return Some(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     async fn remote_manifest_ids_static(
@@ -2022,33 +2064,66 @@ impl SteamClient {
         Some(AppMetadata { name, header_image })
     }
 
+    pub async fn resolve_install_game_info(&self, appid: u32) -> (String, Option<String>) {
+        let mut display_name = format!("App {appid}");
+        let mut installdir = None;
+
+        // Try to get info from PICS first as it's authoritative
+        let mut request = CMsgClientPICSProductInfoRequest::new();
+        request
+            .apps
+            .push(cmsg_client_picsproduct_info_request::AppInfo {
+                appid: Some(appid),
+                ..Default::default()
+            });
+
+        if let Some(conn) = self.connection.as_ref() {
+            let res: Result<CMsgClientPICSProductInfoResponse, _> = conn.job(request).await;
+            if let Ok(response) = res {
+                if let Some(app) = response.apps.iter().find(|entry| entry.appid() == appid) {
+                    if let Ok(raw_vdf) = String::from_utf8(app.buffer().to_vec()) {
+                        if let Ok(parsed) = parse_appinfo(&raw_vdf) {
+                            let common = parsed
+                                .appinfo
+                                .as_ref()
+                                .and_then(|a| a.common.as_ref())
+                                .or(parsed.common.as_ref());
+                            if let Some(common) = common {
+                                if let Some(name) = &common.name {
+                                    display_name = name.clone();
+                                }
+                                if let Some(dir) = &common.installdir {
+                                    installdir = Some(dir.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if installdir.is_none() || display_name.starts_with("App ") {
+            if let Ok(games) = load_library_cache().await {
+                if let Some(game) = games.iter().find(|g| g.app_id == appid) {
+                    if display_name.starts_with("App ") && !game.name.is_empty() && !game.name.starts_with("App ") {
+                        display_name = game.name.clone();
+                    }
+                }
+            }
+        }
+
+        (display_name, installdir)
+    }
+
     async fn resolve_install_game_name(&self, appid: u32) -> String {
-        if let Ok(games) = load_library_cache().await {
-            if let Some(game) = games.iter().find(|g| g.app_id == appid) {
-                if !game.name.is_empty() && !game.name.starts_with("App ") {
-                    return game.name.clone();
-                }
-            }
-        }
-
-        if let Some(metadata) = self.fetch_app_metadata(appid).await {
-            // Update cache with new name if we have it
-            if let Ok(mut games) = load_library_cache().await {
-                if let Some(game) = games.iter_mut().find(|g| g.app_id == appid) {
-                    game.name = metadata.name.clone();
-                    let _ = save_library_cache(&games).await;
-                }
-            }
-            return metadata.name;
-        }
-
-        format!("App {appid}")
+        self.resolve_install_game_info(appid).await.0
     }
 
     pub fn write_appmanifest(
         path: &Path,
         appid: u32,
         game_name: &str,
+        installdir: &str,
         installed_depots: Vec<(u32, u64, u64)>,
     ) -> Result<()> {
         if let Some(parent) = path.parent() {
@@ -2056,7 +2131,6 @@ impl SteamClient {
                 .with_context(|| format!("failed creating {}", parent.display()))?;
         }
 
-        let installdir = sanitize_install_dir(game_name);
         let game_name = game_name.replace('"', "");
 
         let mut content = format!(
@@ -2234,7 +2308,7 @@ NoSavePersonalInfo=1
 
     /// Internal legacy ad-hoc launch path.
     /// TODO: Remove once NativeRunner is implemented. (Ref: issue #1)
-    pub(crate) fn internal_legacy_launch_adhoc(
+    pub async fn internal_legacy_launch_adhoc(
         &self,
         app: &LibraryGame,
         launch_info: &LaunchInfo,
@@ -2242,11 +2316,16 @@ NoSavePersonalInfo=1
         _launcher_config: &crate::config::LauncherConfig,
         user_config: Option<&crate::models::UserAppConfig>,
     ) -> Result<std::process::Child> {
-        let install_dir = PathBuf::from(
-            app.install_path
-                .clone()
-                .ok_or_else(|| anyhow!("game {} is not installed", app.app_id))?,
-        );
+        let install_dir = if let Some(p) = &app.install_path {
+            let p = PathBuf::from(p);
+            if p.exists() {
+                p
+            } else {
+                self.install_root_for_app(app.app_id).await?
+            }
+        } else {
+            self.install_root_for_app(app.app_id).await?
+        };
 
         // Steam VDF stores Windows paths with backslashes; normalize for Linux
         let exe_relative = launch_info.executable.replace('\\', "/");
@@ -2316,11 +2395,13 @@ NoSavePersonalInfo=1
     }
 }
 
-fn sanitize_install_dir(name: &str) -> String {
+pub fn sanitize_install_dir(name: &str) -> String {
     let sanitized: String = name
         .chars()
         .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            #[cfg(target_os = "windows")]
+            ':' => '_',
             _ => c,
         })
         .collect();
@@ -2969,7 +3050,7 @@ mod tests {
         };
         let config = crate::config::LauncherConfig::default();
 
-        let result = client.internal_legacy_launch_adhoc(&app, &launch_info, None, &config, None);
+        let result = client.internal_legacy_launch_adhoc(&app, &launch_info, None, &config, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Ad-hoc bypass is prohibited"));

@@ -144,6 +144,7 @@ pub struct SteamLauncher {
     env_vars_edit_buffer: String,
     runner_components: Option<crate::utils::RunnerComponents>,
     last_scanned_runner: PathBuf,
+    last_scanned_appid: Option<u32>,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -171,6 +172,12 @@ impl SteamLauncher {
         let user_profile = runtime
             .block_on(client.get_user_profile(library.len()))
             .ok();
+
+        // Initial component scan for default runner
+        let library_root = PathBuf::from(&launcher_config.steam_library_path);
+        let resolved = crate::utils::resolve_runner(&launcher_config.proton_version, &library_root);
+        let runner_components = Some(crate::utils::detect_runner_components(&resolved, None));
+
         Self {
             runtime,
             client,
@@ -219,8 +226,9 @@ impl SteamLauncher {
             is_verifying: false,
             user_configs,
             env_vars_edit_buffer: String::new(),
-            runner_components: None,
-            last_scanned_runner: PathBuf::new(),
+            runner_components,
+            last_scanned_runner: resolved,
+            last_scanned_appid: None,
             operation_tx,
             operation_rx,
         }
@@ -1877,10 +1885,12 @@ impl SteamLauncher {
     }
 
     fn refresh_runner_components(&mut self, runner_path: &Path, app_id: u32) {
-        if self.last_scanned_runner == runner_path {
-            return; // already up to date
+        if self.last_scanned_runner == runner_path && self.last_scanned_appid == Some(app_id) {
+            return;
         }
+
         self.last_scanned_runner = runner_path.to_path_buf();
+        self.last_scanned_appid = Some(app_id);
 
         // Use the same prefix that will actually be used at launch
         let user_cfg = self.user_configs.get(&app_id).cloned().unwrap_or_default();
@@ -2448,20 +2458,30 @@ impl eframe::App for SteamLauncher {
                                 }
                             });
 
-                        // Runner components for selected game
-                        let selected_game = self.selected_game().cloned();
-                        if let Some(game) = selected_game {
-                            let active_runner_name = self
-                                .launcher_config
+                        // Runner components for selected game OR default runner
+                        let active_runner_name = if let Some(game) = self.selected_game() {
+                             self.launcher_config
                                 .game_configs
                                 .get(&game.app_id)
                                 .and_then(|c| c.forced_proton_version.as_ref())
                                 .cloned()
-                                .unwrap_or_else(|| self.launcher_config.proton_version.clone());
+                                .unwrap_or_else(|| self.launcher_config.proton_version.clone())
+                        } else {
+                            self.launcher_config.proton_version.clone()
+                        };
 
-                            let library_root = PathBuf::from(&self.launcher_config.steam_library_path);
-                            let resolved = crate::utils::resolve_runner(&active_runner_name, &library_root);
-                            self.refresh_runner_components(&resolved, game.app_id);
+                        let library_root = PathBuf::from(&self.launcher_config.steam_library_path);
+                        let resolved = crate::utils::resolve_runner(&active_runner_name, &library_root);
+
+                        if let Some(game) = self.selected_game() {
+                             self.refresh_runner_components(&resolved, game.app_id);
+                        } else {
+                             // No game selected, just scan runner root (no prefix)
+                             if self.last_scanned_runner != resolved || self.last_scanned_appid.is_some() {
+                                 self.last_scanned_runner = resolved.clone();
+                                 self.last_scanned_appid = None;
+                                 self.runner_components = Some(crate::utils::detect_runner_components(&resolved, None));
+                             }
                         }
 
                         if let Some(components) = &self.runner_components {
@@ -2479,9 +2499,14 @@ impl eframe::App for SteamLauncher {
                                                 match info {
                                                     Some(c) => {
                                                         ui.colored_label(egui::Color32::GREEN, &c.version);
+                                                        let source_text = if c.source == crate::utils::ComponentSource::BundledWithRunner {
+                                                            "bundled".to_string()
+                                                        } else {
+                                                            format!("{}", c.source)
+                                                        };
                                                         ui.colored_label(
                                                             egui::Color32::GRAY,
-                                                            format!("({})", c.source),
+                                                            format!("({})", source_text),
                                                         );
                                                     }
                                                     None => {
