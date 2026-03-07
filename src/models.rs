@@ -53,6 +53,14 @@ pub enum GraphicsBackendPolicy {
     VKD3D,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum D3D12ProviderPolicy {
+    #[default]
+    Auto,
+    Vkd3dProton,
+    Vkd3dWine,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GraphicsLayerConfig {
     #[serde(default)]
@@ -63,6 +71,8 @@ pub struct GraphicsLayerConfig {
     pub vkd3d_enabled: bool,
     #[serde(default)]
     pub graphics_backend_policy: GraphicsBackendPolicy,
+    #[serde(default)]
+    pub d3d12_policy: D3D12ProviderPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

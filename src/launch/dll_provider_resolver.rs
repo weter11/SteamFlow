@@ -49,10 +49,11 @@ impl DllProviderResolver {
         game_exe_dir: &Path,
         runner_path: &Path,
         runner_components: &crate::utils::RunnerComponents,
+        d3d12_policy: &crate::models::D3D12ProviderPolicy,
     ) -> Vec<DllResolution> {
         self.target_dlls
             .iter()
-            .map(|dll| self.resolve_single(dll, game_exe_dir, runner_path, runner_components))
+            .map(|dll| self.resolve_single(dll, game_exe_dir, runner_path, runner_components, d3d12_policy))
             .collect()
     }
 
@@ -62,6 +63,7 @@ impl DllProviderResolver {
         game_exe_dir: &Path,
         runner_path: &Path,
         runner_components: &crate::utils::RunnerComponents,
+        d3d12_policy: &crate::models::D3D12ProviderPolicy,
     ) -> DllResolution {
         let mut candidates = Vec::new();
         let dll_filename = format!("{}.dll", dll_name);
@@ -83,7 +85,7 @@ impl DllProviderResolver {
         });
 
         // 2. Runner Priority
-        if let Some(path) = self.get_runner_dll_path(dll_name, runner_path, runner_components) {
+        if let Some(path) = self.get_runner_dll_path(dll_name, runner_path, runner_components, d3d12_policy) {
             candidates.push(DllCandidate {
                 provider: DllProvider::Runner,
                 path: path.clone(),
@@ -124,7 +126,13 @@ impl DllProviderResolver {
         }
     }
 
-    fn get_runner_dll_path(&self, dll_name: &str, runner_path: &Path, components: &crate::utils::RunnerComponents) -> Option<PathBuf> {
+    fn get_runner_dll_path(
+        &self,
+        dll_name: &str,
+        runner_path: &Path,
+        components: &crate::utils::RunnerComponents,
+        d3d12_policy: &crate::models::D3D12ProviderPolicy,
+    ) -> Option<PathBuf> {
         let runner_root = if runner_path.is_file() {
             runner_path.parent()?.parent()?.to_path_buf()
         } else {
@@ -148,17 +156,37 @@ impl DllProviderResolver {
             }
         }
 
-        let is_vkd3d = matches!(dll_name, "d3d12" | "d3d12core");
-        if is_vkd3d && components.vkd3d_proton.is_some() {
-            let relative_paths = [
-                "files/lib/wine/vkd3d-proton",
-                "dist/lib/wine/vkd3d-proton",
-                "lib/wine/vkd3d-proton",
-                "lib64/wine/vkd3d-proton",
-            ];
-            for rel in relative_paths {
-                let p = runner_root.join(rel).join(&dll_filename);
-                if p.exists() { return Some(p); }
+        let is_vkd3d_any = matches!(dll_name, "d3d12" | "d3d12core");
+        if is_vkd3d_any {
+            let use_proton = match d3d12_policy {
+                crate::models::D3D12ProviderPolicy::Auto => true,
+                crate::models::D3D12ProviderPolicy::Vkd3dProton => true,
+                crate::models::D3D12ProviderPolicy::Vkd3dWine => false,
+            };
+
+            if use_proton && components.vkd3d_proton.is_some() {
+                let relative_paths = [
+                    "files/lib/wine/vkd3d-proton",
+                    "dist/lib/wine/vkd3d-proton",
+                    "lib/wine/vkd3d-proton",
+                    "lib64/wine/vkd3d-proton",
+                ];
+                for rel in relative_paths {
+                    let p = runner_root.join(rel).join(&dll_filename);
+                    if p.exists() { return Some(p); }
+                }
+            }
+
+            if (!use_proton || d3d12_policy == &crate::models::D3D12ProviderPolicy::Auto) && components.vkd3d.is_some() {
+                let relative_paths = [
+                    "files/lib/wine/vkd3d",
+                    "dist/lib/wine/vkd3d",
+                    "lib/wine/vkd3d",
+                ];
+                for rel in relative_paths {
+                    let p = runner_root.join(rel).join(&dll_filename);
+                    if p.exists() { return Some(p); }
+                }
             }
         }
 
@@ -182,7 +210,8 @@ mod tests {
         let resolver = DllProviderResolver::new();
         let runner_path = Path::new("/tmp/fake_runner");
         let components = crate::utils::RunnerComponents::default();
-        let resolutions = resolver.resolve(&game_dir, runner_path, &components);
+        let d3d12_policy = crate::models::D3D12ProviderPolicy::Auto;
+        let resolutions = resolver.resolve(&game_dir, runner_path, &components, &d3d12_policy);
 
         let d3d9_res = resolutions.iter().find(|r| r.name == "d3d9").unwrap();
         assert_eq!(d3d9_res.chosen_provider, DllProvider::GameLocal);
@@ -199,7 +228,8 @@ mod tests {
         let resolver = DllProviderResolver::new();
         let runner_path = Path::new("/tmp/fake_runner");
         let components = crate::utils::RunnerComponents::default();
-        let resolutions = resolver.resolve(&game_dir, runner_path, &components);
+        let d3d12_policy = crate::models::D3D12ProviderPolicy::Auto;
+        let resolutions = resolver.resolve(&game_dir, runner_path, &components, &d3d12_policy);
 
         for res in resolutions {
             if res.chosen_provider == DllProvider::System {
@@ -208,5 +238,48 @@ mod tests {
                 assert_eq!(res.chosen_provider, DllProvider::None);
             }
         }
+    }
+
+    #[test]
+    fn test_d3d12_provider_selection() {
+        let tmp = tempdir().unwrap();
+        let runner_root = tmp.path().to_path_buf();
+        let proton_dir = runner_root.join("files/lib/wine/vkd3d-proton");
+        let wine_dir = runner_root.join("files/lib/wine/vkd3d");
+        fs::create_dir_all(&proton_dir).unwrap();
+        fs::create_dir_all(&wine_dir).unwrap();
+
+        let proton_dll = proton_dir.join("d3d12.dll");
+        let wine_dll = wine_dir.join("d3d12.dll");
+        fs::write(&proton_dll, "proton").unwrap();
+        fs::write(&wine_dll, "wine").unwrap();
+
+        let mut components = crate::utils::RunnerComponents::default();
+        components.vkd3d_proton = Some(crate::utils::ComponentInfo {
+            version: "2.10".into(),
+            source: crate::utils::ComponentSource::BundledWithRunner,
+        });
+        components.vkd3d = Some(crate::utils::ComponentInfo {
+            version: "1.8".into(),
+            source: crate::utils::ComponentSource::BundledWithRunner,
+        });
+
+        let resolver = DllProviderResolver::new();
+        let game_dir = Path::new("/tmp/game");
+
+        // Case 1: Auto (Prefer Proton)
+        let res = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Auto);
+        let d3d12 = res.iter().find(|r| r.name == "d3d12").unwrap();
+        assert_eq!(d3d12.chosen_path.as_ref().unwrap(), &proton_dll);
+
+        // Case 2: Explicit Wine
+        let res = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Vkd3dWine);
+        let d3d12 = res.iter().find(|r| r.name == "d3d12").unwrap();
+        assert_eq!(d3d12.chosen_path.as_ref().unwrap(), &wine_dll);
+
+        // Case 3: Explicit Proton
+        let res = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Vkd3dProton);
+        let d3d12 = res.iter().find(|r| r.name == "d3d12").unwrap();
+        assert_eq!(d3d12.chosen_path.as_ref().unwrap(), &proton_dll);
     }
 }

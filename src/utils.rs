@@ -209,6 +209,18 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
         "lib/wine/vkd3d-proton/d3d12.dll",
         "lib64/wine/vkd3d-proton/d3d12.dll",
     ];
+    // VKD3D-Proton requires both d3d12.dll and d3d12core.dll for modern titles
+    let core_bundled_dlls = [
+        "files/lib/wine/vkd3d-proton/d3d12core.dll",
+        "dist/lib/wine/vkd3d-proton/d3d12core.dll",
+        "lib/wine/vkd3d-proton/d3d12core.dll",
+        "lib64/wine/vkd3d-proton/d3d12core.dll",
+    ];
+
+    if !core_bundled_dlls.iter().any(|rel| root.join(rel).exists()) {
+        tracing::debug!("VKD3D-Proton partial: d3d12core.dll missing in bundled paths");
+    }
+
     if let Some(info) = check_bundled(
         root,
         &bundled_dlls,
@@ -253,7 +265,11 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
 // ── VKD3D (upstream) ─────────────────────────────────────────────────────────
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // Upstream Wine VKD3D uses libvkd3d.dll/libvkd3d-1.dll and libvkd3d-shader.dll
     let bundled_dlls = [
+        "files/lib/wine/vkd3d/libvkd3d-1.dll",
+        "dist/lib/wine/vkd3d/libvkd3d-1.dll",
+        "lib/wine/vkd3d/libvkd3d-1.dll",
         "files/lib/wine/vkd3d/d3d12.dll",
         "dist/lib/wine/vkd3d/d3d12.dll",
         "lib/wine/vkd3d/d3d12.dll",

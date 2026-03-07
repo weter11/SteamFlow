@@ -47,8 +47,9 @@ impl PipelineStage for ResolveDllProvidersStage {
         };
 
         let components = crate::utils::detect_runner_components(&resolved_runner, wineprefix.as_deref());
+        let d3d12_policy = ctx.user_config.as_ref().map(|c| c.graphics_layers.d3d12_policy.clone()).unwrap_or_default();
 
-        ctx.dll_resolutions = resolver.resolve(&game_exe_dir, &resolved_runner, &components);
+        ctx.dll_resolutions = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy);
 
         if let Some(logger) = &ctx.logger {
             for res in &ctx.dll_resolutions {
