@@ -143,7 +143,10 @@ impl std::fmt::Display for ComponentSource {
     }
 }
 
-pub fn detect_runner_components(runner_path: &Path, wineprefix: Option<&Path>) -> RunnerComponents {
+pub fn detect_runner_components(
+    runner_path: &Path,
+    wineprefix: Option<&Path>,
+) -> RunnerComponents {
     let root = if runner_path.is_file() {
         runner_path
             .parent()
@@ -154,27 +157,40 @@ pub fn detect_runner_components(runner_path: &Path, wineprefix: Option<&Path>) -
         runner_path.to_path_buf()
     };
 
+    let (dxvk, vkd3d_proton, vkd3d) = (
+        detect_dxvk(&root, wineprefix),
+        detect_vkd3d_proton(&root, wineprefix),
+        detect_vkd3d(&root, wineprefix),
+    );
+
+
     RunnerComponents {
-        dxvk: detect_dxvk(&root, wineprefix),
-        vkd3d_proton: detect_vkd3d_proton(&root, wineprefix),
-        vkd3d: detect_vkd3d(&root, wineprefix),
+        dxvk,
+        vkd3d_proton,
+        vkd3d,
     }
 }
 
 // ── DXVK ────────────────────────────────────────────────────────────────────
 
 fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    // 1. Bundled inside runner (Proton-style)
+    // 1. Bundled inside runner (Proton & Wine-TKG styles)
     let bundled_dlls = [
         "files/lib/wine/dxvk/d3d11.dll",
+        "files/lib64/wine/dxvk/d3d11.dll",
         "dist/lib/wine/dxvk/d3d11.dll",
+        "dist/lib64/wine/dxvk/d3d11.dll",
         "lib/wine/dxvk/d3d11.dll",
         "lib64/wine/dxvk/d3d11.dll",
     ];
     if let Some(info) = check_bundled(
         root,
         &bundled_dlls,
-        &["files/share/dxvk/version", "dist/share/dxvk/version"],
+        &[
+            "files/share/dxvk/version",
+            "dist/share/dxvk/version",
+            "share/dxvk/version",
+        ],
     ) {
         return Some(info);
     }
@@ -205,14 +221,18 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     let bundled_dlls = [
         "files/lib/wine/vkd3d-proton/d3d12.dll",
+        "files/lib64/wine/vkd3d-proton/d3d12.dll",
         "dist/lib/wine/vkd3d-proton/d3d12.dll",
+        "dist/lib64/wine/vkd3d-proton/d3d12.dll",
         "lib/wine/vkd3d-proton/d3d12.dll",
         "lib64/wine/vkd3d-proton/d3d12.dll",
     ];
     // VKD3D-Proton requires both d3d12.dll and d3d12core.dll for modern titles
     let core_bundled_dlls = [
         "files/lib/wine/vkd3d-proton/d3d12core.dll",
+        "files/lib64/wine/vkd3d-proton/d3d12core.dll",
         "dist/lib/wine/vkd3d-proton/d3d12core.dll",
+        "dist/lib64/wine/vkd3d-proton/d3d12core.dll",
         "lib/wine/vkd3d-proton/d3d12core.dll",
         "lib64/wine/vkd3d-proton/d3d12core.dll",
     ];
@@ -227,6 +247,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
         &[
             "files/share/vkd3d-proton/version",
             "dist/share/vkd3d-proton/version",
+            "share/vkd3d-proton/version",
         ],
     ) {
         return Some(info);
@@ -268,16 +289,25 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     // Upstream Wine VKD3D uses libvkd3d.dll/libvkd3d-1.dll and libvkd3d-shader.dll
     let bundled_dlls = [
         "files/lib/wine/vkd3d/libvkd3d-1.dll",
+        "files/lib64/wine/vkd3d/libvkd3d-1.dll",
+        "files/lib/vkd3d/libvkd3d-1.dll",
         "dist/lib/wine/vkd3d/libvkd3d-1.dll",
         "lib/wine/vkd3d/libvkd3d-1.dll",
+        "lib64/wine/vkd3d/libvkd3d-1.dll",
         "files/lib/wine/vkd3d/d3d12.dll",
+        "files/lib64/wine/vkd3d/d3d12.dll",
+        "files/lib/vkd3d/d3d12.dll",
         "dist/lib/wine/vkd3d/d3d12.dll",
         "lib/wine/vkd3d/d3d12.dll",
     ];
     if let Some(info) = check_bundled(
         root,
         &bundled_dlls,
-        &["files/share/vkd3d/version", "dist/share/vkd3d/version"],
+        &[
+            "files/share/vkd3d/version",
+            "dist/share/vkd3d/version",
+            "share/vkd3d/version",
+        ],
     ) {
         return Some(info);
     }
@@ -310,16 +340,26 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 fn check_bundled(root: &Path, dll_candidates: &[&str], version_files: &[&str]) -> Option<ComponentInfo> {
-    let dll_exists = dll_candidates.iter().any(|rel| root.join(rel).exists());
-    if !dll_exists {
+    let found_dll = dll_candidates.iter().find(|rel| root.join(rel).exists());
+    if let Some(rel) = found_dll {
+        tracing::debug!("Found bundled component DLL at: {}", root.join(rel).display());
+    } else {
         return None;
     }
 
     let version = version_files
         .iter()
-        .filter_map(|rel| std::fs::read_to_string(root.join(rel)).ok())
-        .map(|s| s.trim().to_string())
-        .find(|s| !s.is_empty())
+        .filter_map(|rel| {
+            let p = root.join(rel);
+            if p.exists() {
+                tracing::debug!("Found version file: {}", p.display());
+                std::fs::read_to_string(p).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| parse_short_version(&s))
+        .find(|s| s != "unknown")
         .or_else(|| {
             dll_candidates
                 .iter()
@@ -376,8 +416,47 @@ fn read_adjacent_version_file(dll: &Path) -> Option<String> {
     let version_file = parent.join("version");
     std::fs::read_to_string(version_file)
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| parse_short_version(&s))
         .filter(|s| !s.is_empty())
+}
+
+pub fn parse_short_version(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return "unknown".to_string();
+    }
+
+    // Try to find content inside parentheses first
+    let v = if let (Some(start), Some(end)) = (s.find('('), s.rfind(')')) {
+        if start < end {
+            &s[start + 1..end]
+        } else {
+            s
+        }
+    } else {
+        s
+    };
+
+    let mut v = v.trim();
+
+    // Strip leading 'v'
+    if v.starts_with('v') && v.len() > 1 && v.as_bytes()[1].is_ascii_digit() {
+        v = &v[1..];
+    }
+
+    // Strip trailing git hash suffix: -g[0-9a-f]{7,10}
+    if let Some(hyphen_idx) = v.rfind("-g") {
+        let suffix = &v[hyphen_idx + 2..];
+        if !suffix.is_empty()
+            && suffix.len() >= 7
+            && suffix.len() <= 10
+            && suffix.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return v[..hyphen_idx].to_string();
+        }
+    }
+
+    v.to_string()
 }
 
 fn dll_contains_string(path: &Path, needle: &str) -> bool {

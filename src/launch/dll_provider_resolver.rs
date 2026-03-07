@@ -158,7 +158,9 @@ impl DllProviderResolver {
         if is_dxvk && components.dxvk.is_some() {
             let relative_paths = [
                 "files/lib/wine/dxvk",
+                "files/lib64/wine/dxvk",
                 "dist/lib/wine/dxvk",
+                "dist/lib64/wine/dxvk",
                 "lib/wine/dxvk",
                 "lib64/wine/dxvk",
             ];
@@ -179,7 +181,9 @@ impl DllProviderResolver {
             if use_proton && components.vkd3d_proton.is_some() {
                 let relative_paths = [
                     "files/lib/wine/vkd3d-proton",
+                    "files/lib64/wine/vkd3d-proton",
                     "dist/lib/wine/vkd3d-proton",
+                    "dist/lib64/wine/vkd3d-proton",
                     "lib/wine/vkd3d-proton",
                     "lib64/wine/vkd3d-proton",
                 ];
@@ -192,8 +196,11 @@ impl DllProviderResolver {
             if (!use_proton || d3d12_policy == &crate::models::D3D12ProviderPolicy::Auto) && components.vkd3d.is_some() {
                 let relative_paths = [
                     "files/lib/wine/vkd3d",
+                    "files/lib64/wine/vkd3d",
+                    "files/lib/vkd3d",
                     "dist/lib/wine/vkd3d",
                     "lib/wine/vkd3d",
+                    "lib64/wine/vkd3d",
                     "files/lib/wine",
                     "dist/lib/wine",
                     "lib/wine",
