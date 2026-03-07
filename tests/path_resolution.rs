@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::tempdir;
-use steamflow::steam_client::{SteamClient, LaunchInfo, LaunchTarget};
+use steamflow::steam_client::{SteamClient, LaunchInfo, LaunchTarget, sanitize_install_dir};
 use steamflow::models::LibraryGame;
 use steamflow::config::LauncherConfig;
 use std::collections::HashMap;
@@ -88,7 +88,7 @@ async fn test_colon_preservation_on_linux() {
     assert!(resolved_name.contains("App 123"));
     assert!(pics_dir.is_none());
 
-    let result_dir = steamflow::steam_client::sanitize_install_dir(game_name);
+    let result_dir = sanitize_install_dir(game_name);
 
     #[cfg(not(target_os = "windows"))]
     assert_eq!(result_dir, "Game: With Colon");

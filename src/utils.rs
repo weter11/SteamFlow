@@ -143,19 +143,26 @@ impl std::fmt::Display for ComponentSource {
     }
 }
 
+pub fn derive_runner_root(binary_path: &Path) -> PathBuf {
+    let parent = if binary_path.is_file() {
+        binary_path.parent().unwrap_or(binary_path)
+    } else {
+        binary_path
+    };
+    // If it's in a 'bin' directory (like wine-tkg), the root is one level up
+    if parent.file_name().map(|n| n == "bin").unwrap_or(false) {
+        return parent.parent().unwrap_or(parent).to_path_buf();
+    }
+
+    // Otherwise (like proton script), the root is the parent directory
+    parent.to_path_buf()
+}
+
 pub fn detect_runner_components(
     runner_path: &Path,
     wineprefix: Option<&Path>,
 ) -> RunnerComponents {
-    let root = if runner_path.is_file() {
-        runner_path
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(runner_path)
-            .to_path_buf()
-    } else {
-        runner_path.to_path_buf()
-    };
+    let root = derive_runner_root(runner_path);
 
     let (dxvk, vkd3d_proton, vkd3d) = (
         detect_dxvk(&root, wineprefix),

@@ -2499,9 +2499,14 @@ impl eframe::App for SteamLauncher {
                                                 match info {
                                                     Some(c) => {
                                                         ui.colored_label(egui::Color32::GREEN, &c.version);
+                                                        let source_text = if c.source == crate::utils::ComponentSource::BundledWithRunner {
+                                                            "bundled".to_string()
+                                                        } else {
+                                                            format!("{}", c.source)
+                                                        };
                                                         ui.colored_label(
                                                             egui::Color32::GRAY,
-                                                            format!("({})", c.source),
+                                                            format!("({})", source_text),
                                                         );
                                                     }
                                                     None => {

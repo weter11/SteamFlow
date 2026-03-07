@@ -49,9 +49,21 @@ impl PipelineStage for ResolveDllProvidersStage {
         let components = crate::utils::detect_runner_components(&resolved_runner, wineprefix.as_deref());
         let d3d12_policy = ctx.user_config.as_ref().map(|c| c.graphics_layers.d3d12_policy.clone()).unwrap_or_default();
 
-        ctx.dll_resolutions = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy);
+        let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy);
+        ctx.dll_resolutions = resolutions;
+
+        if let Some(session) = &ctx.session {
+            let scan_report_path = session.log_dir.join("component_scan.json");
+            if let Ok(content) = serde_json::to_string_pretty(&scan_report) {
+                let _ = std::fs::write(scan_report_path, content);
+            }
+        }
 
         if let Some(logger) = &ctx.logger {
+            if scan_report.warnings.is_empty() && scan_report.scan_roots.is_empty() {
+                let _ = logger.log(crate::infra::logging::LogLevel::Warn, "zero_runner_roots", "Zero Runner roots derived from runner path".into(), Some("ResolveDllProviders".into()), std::collections::HashMap::new());
+            }
+
             for res in &ctx.dll_resolutions {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("dll".into(), res.name.clone());
@@ -59,6 +71,15 @@ impl PipelineStage for ResolveDllProvidersStage {
                 if let Some(path) = &res.chosen_path {
                     metadata.insert("path".into(), path.to_string_lossy().to_string());
                 }
+
+                let game_local_count = res.candidates.iter().filter(|c| c.provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal && c.exists).count();
+                let runner_count = res.candidates.iter().filter(|c| c.provider == crate::launch::dll_provider_resolver::DllProvider::Runner && c.exists).count();
+                let system_count = res.candidates.iter().filter(|c| c.provider == crate::launch::dll_provider_resolver::DllProvider::System && c.exists).count();
+
+                metadata.insert("count_gamelocal".into(), game_local_count.to_string());
+                metadata.insert("count_runner".into(), runner_count.to_string());
+                metadata.insert("count_system".into(), system_count.to_string());
+
                 let _ = logger.info("dll_resolved", format!("Resolved {} to {:?}", res.name, res.chosen_provider), Some("ResolveDllProviders".into()), metadata);
             }
         }
