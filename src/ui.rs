@@ -1294,7 +1294,7 @@ impl SteamLauncher {
                 .spacing([8.0, 6.0])
                 .show(ui, |ui| {
                     // ── DXVK ──────────────────────────────────────────────
-                    ui.label("DXVK (DX9-11):");
+                    ui.label("DXVK (DX8-11):");
                     let dxvk_avail =
                         crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Dxvk).is_some();
 
