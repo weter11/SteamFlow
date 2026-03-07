@@ -124,6 +124,7 @@ pub struct RunnerComponents {
 pub struct ComponentInfo {
     pub version: String,
     pub source: ComponentSource,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,13 +187,13 @@ pub fn get_runner_layout_roots(runner_root: &Path) -> Vec<PathBuf> {
 
 pub fn detect_runner_components(
     runner_path: &Path,
-    wineprefix: Option<&Path>,
+    _wineprefix_ignored: Option<&Path>,
 ) -> RunnerComponents {
     let root = derive_runner_root(runner_path);
 
-    let dxvk = detect_dxvk(&root, wineprefix);
-    let vkd3d_proton = detect_vkd3d_proton(&root, wineprefix);
-    let vkd3d = detect_vkd3d(&root, wineprefix);
+    let dxvk = detect_dxvk(&root);
+    let vkd3d_proton = detect_vkd3d_proton(&root);
+    let vkd3d = detect_vkd3d(&root);
 
     RunnerComponents {
         dxvk,
@@ -203,7 +204,7 @@ pub fn detect_runner_components(
 
 // ── DXVK ────────────────────────────────────────────────────────────────────
 
-fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+fn detect_dxvk(root: &Path) -> Option<ComponentInfo> {
     // 1. Bundled inside runner
     let layout_roots = get_runner_layout_roots(root);
     let mut dll_candidates = Vec::new();
@@ -223,18 +224,7 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
         return Some(info);
     }
 
-    // 2. Installed into WINEPREFIX (winetricks / manual)
-    if let Some(pfx) = prefix {
-        let prefix_dlls = [
-            "drive_c/windows/system32/d3d11.dll",
-            "drive_c/windows/syswow64/d3d11.dll",
-        ];
-        if let Some(info) = check_prefix(pfx, &prefix_dlls, "DXVK") {
-            return Some(info);
-        }
-    }
-
-    // 3. System-wide (package manager install)
+    // 2. System-wide (package manager install)
     let system_paths = [
         "/usr/share/dxvk/x64/d3d11.dll",
         "/usr/lib/dxvk/d3d11.dll",
@@ -246,7 +236,7 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 
 // ── VKD3D-Proton ─────────────────────────────────────────────────────────────
 
-fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+fn detect_vkd3d_proton(root: &Path) -> Option<ComponentInfo> {
     // 1. Bundled inside runner
     let layout_roots = get_runner_layout_roots(root);
     let mut dll_candidates = Vec::new();
@@ -263,32 +253,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
     ];
 
     if let Some(info) = check_bundled_v2(root, &dll_candidates, &version_files) {
-        // Additional check for VKD3D-Proton specifically: look for the string marker in the DLL
-        // But since we are looking at bundled paths, we can rely on path names for now.
-        // If we want to be more robust, we'd check if it's actually Proton flavor.
         return Some(info);
-    }
-
-    // VKD3D-Proton replaces d3d12.dll — check prefix for it
-    // Distinguish from plain vkd3d by scanning for "vkd3d-proton" string in DLL
-    if let Some(pfx) = prefix {
-        let prefix_dlls = [
-            "drive_c/windows/system32/d3d12.dll",
-            "drive_c/windows/syswow64/d3d12.dll",
-        ];
-        for rel in prefix_dlls {
-            let p = pfx.join(rel);
-            if p.exists() {
-                // Check binary for "vkd3d-proton" marker to distinguish from plain vkd3d
-                if dll_contains_string(&p, "vkd3d-proton") {
-                    let version = extract_version_from_dll(&p).unwrap_or_else(|| "unknown".to_string());
-                    return Some(ComponentInfo {
-                        version,
-                        source: ComponentSource::InstalledInPrefix,
-                    });
-                }
-            }
-        }
     }
 
     let system_paths = [
@@ -301,7 +266,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
 
 // ── VKD3D (upstream) ─────────────────────────────────────────────────────────
 
-fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+fn detect_vkd3d(root: &Path) -> Option<ComponentInfo> {
     // 1. Bundled inside runner
     let layout_roots = get_runner_layout_roots(root);
     let mut dll_candidates = Vec::new();
@@ -320,23 +285,6 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 
     if let Some(info) = check_bundled_v2(root, &dll_candidates, &version_files) {
         return Some(info);
-    }
-
-    if let Some(pfx) = prefix {
-        let prefix_dlls = [
-            "drive_c/windows/system32/d3d12.dll",
-            "drive_c/windows/syswow64/d3d12.dll",
-        ];
-        for rel in prefix_dlls {
-            let p = pfx.join(rel);
-            if p.exists() && !dll_contains_string(&p, "vkd3d-proton") {
-                let version = extract_version_from_dll(&p).unwrap_or_else(|| "unknown".to_string());
-                return Some(ComponentInfo {
-                    version,
-                    source: ComponentSource::InstalledInPrefix,
-                });
-            }
-        }
     }
 
     let system_paths = [
@@ -381,28 +329,10 @@ fn check_bundled_v2(root: &Path, dll_paths: &[PathBuf], version_files: &[&str]) 
     Some(ComponentInfo {
         version,
         source: ComponentSource::BundledWithRunner,
+        path: Some(found_dll.unwrap().to_path_buf()),
     })
 }
 
-fn check_prefix(prefix: &Path, dll_candidates: &[&str], _name: &str) -> Option<ComponentInfo> {
-    for rel in dll_candidates {
-        let p = prefix.join(rel);
-        if p.exists() {
-            // Exclude Wine's own built-in wined3d stubs (very small, < 50KB)
-            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            if size < 51_200 {
-                continue;
-            }
-
-            let version = extract_version_from_dll(&p).unwrap_or_else(|| "unknown".to_string());
-            return Some(ComponentInfo {
-                version,
-                source: ComponentSource::InstalledInPrefix,
-            });
-        }
-    }
-    None
-}
 
 fn check_system(paths: &[&str]) -> Option<ComponentInfo> {
     for path in paths {
@@ -414,6 +344,7 @@ fn check_system(paths: &[&str]) -> Option<ComponentInfo> {
             return Some(ComponentInfo {
                 version,
                 source: ComponentSource::SystemWide,
+                path: Some(p.to_path_buf()),
             });
         }
     }
@@ -468,18 +399,6 @@ pub fn parse_short_version(s: &str) -> String {
     v.to_string()
 }
 
-fn dll_contains_string(path: &Path, needle: &str) -> bool {
-    let needle_lower = needle.to_ascii_lowercase();
-    std::fs::read(path)
-        .map(|bytes| {
-            bytes.windows(needle.len()).any(|w| {
-                w.iter()
-                    .zip(needle_lower.bytes())
-                    .all(|(b, n)| b.to_ascii_lowercase() == n)
-            })
-        })
-        .unwrap_or(false)
-}
 
 fn extract_version_from_dll(dll_path: &Path) -> Option<String> {
     let data = std::fs::read(dll_path).ok()?;

@@ -295,22 +295,22 @@ impl Runner for WineTkgRunner {
             .or_else(|| executable.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| install_dir.clone());
 
-        // Resolve graphics backend policy
+        // Resolve graphics backend policy using resolved DLL providers (authoritative)
         match glc.graphics_backend_policy {
             crate::models::GraphicsBackendPolicy::Auto => {
-                let components = crate::utils::detect_runner_components(
-                    &crate::utils::resolve_runner(
-                        ctx.proton_path.as_deref().unwrap_or("wine"),
-                        &library_root
-                    ),
-                    Some(&game_wineprefix)
-                );
-
-                if components.dxvk.is_some() {
-                    glc.dxvk_enabled = true;
-                }
-                if components.vkd3d_proton.is_some() {
-                    glc.vkd3d_proton_enabled = true;
+                for res in &ctx.dll_resolutions {
+                    if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner {
+                        if matches!(res.name.as_str(), "d3d11" | "d3d9" | "dxgi" | "d3d8") {
+                            glc.dxvk_enabled = true;
+                        }
+                        if res.name == "d3d12" {
+                             if res.chosen_path.as_ref().map(|p| p.to_string_lossy().contains("vkd3d-proton")).unwrap_or(false) {
+                                 glc.vkd3d_proton_enabled = true;
+                             } else {
+                                 glc.vkd3d_enabled = true;
+                             }
+                        }
+                    }
                 }
             }
             crate::models::GraphicsBackendPolicy::WineD3D => {
@@ -322,7 +322,21 @@ impl Runner for WineTkgRunner {
                 glc.dxvk_enabled = true;
             }
             crate::models::GraphicsBackendPolicy::VKD3D => {
-                glc.vkd3d_proton_enabled = true;
+                // Ensure we pick the right flavor if it was resolved to Runner
+                let mut found_d12 = false;
+                for res in &ctx.dll_resolutions {
+                    if res.name == "d3d12" && res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner {
+                         found_d12 = true;
+                         if res.chosen_path.as_ref().map(|p| p.to_string_lossy().contains("vkd3d-proton")).unwrap_or(false) {
+                             glc.vkd3d_proton_enabled = true;
+                         } else {
+                             glc.vkd3d_enabled = true;
+                         }
+                    }
+                }
+                if !found_d12 {
+                    glc.vkd3d_proton_enabled = true;
+                }
             }
         }
 

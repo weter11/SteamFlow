@@ -6,6 +6,7 @@ use crate::models::{
     SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
+use crate::launch::dll_provider_resolver::{DllProvider, ComponentScanReport};
 use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
@@ -143,6 +144,7 @@ pub struct SteamLauncher {
     user_configs: crate::models::UserConfigStore,
     env_vars_edit_buffer: String,
     runner_components: Option<crate::utils::RunnerComponents>,
+    component_scan_report: Option<ComponentScanReport>,
     last_scanned_runner: PathBuf,
     last_scanned_appid: Option<u32>,
     operation_tx: Sender<AsyncOp>,
@@ -176,7 +178,10 @@ impl SteamLauncher {
         // Initial component scan for default runner
         let library_root = PathBuf::from(&launcher_config.steam_library_path);
         let resolved = crate::utils::resolve_runner(&launcher_config.proton_version, &library_root);
-        let runner_components = Some(crate::utils::detect_runner_components(&resolved, None));
+        let runner_components_val = crate::utils::detect_runner_components(&resolved, None);
+
+        let resolver = crate::launch::dll_provider_resolver::DllProviderResolver::new();
+        let (_resolutions, report) = resolver.resolve(Path::new("/tmp"), &resolved, &runner_components_val, &crate::models::D3D12ProviderPolicy::Auto);
 
         Self {
             runtime,
@@ -226,7 +231,8 @@ impl SteamLauncher {
             is_verifying: false,
             user_configs,
             env_vars_edit_buffer: String::new(),
-            runner_components,
+            runner_components: Some(runner_components_val),
+            component_scan_report: Some(report),
             last_scanned_runner: resolved,
             last_scanned_appid: None,
             operation_tx,
@@ -1884,38 +1890,34 @@ impl SteamLauncher {
         });
     }
 
-    fn refresh_runner_components(&mut self, runner_path: &Path, app_id: u32) {
-        if self.last_scanned_runner == runner_path && self.last_scanned_appid == Some(app_id) {
+    fn refresh_runner_components(&mut self, runner_path: &Path, app_id: Option<u32>) {
+        if self.last_scanned_runner == runner_path && self.last_scanned_appid == app_id {
             return;
         }
 
         self.last_scanned_runner = runner_path.to_path_buf();
-        self.last_scanned_appid = Some(app_id);
+        self.last_scanned_appid = app_id;
 
-        // Use the same prefix that will actually be used at launch
-        let user_cfg = self.user_configs.get(&app_id).cloned().unwrap_or_default();
-        let effective_prefix = if user_cfg.use_steam_runtime {
-            crate::utils::steam_wineprefix_for_game(
-                &self.launcher_config,
-                app_id,
-                &self.user_configs,
-            )
-        } else {
-            std::path::PathBuf::from(&self.launcher_config.steam_library_path)
-                .join("steamapps/compatdata")
-                .join(app_id.to_string())
-                .join("pfx")
-        };
+        let components = crate::utils::detect_runner_components(runner_path, None);
+        self.runner_components = Some(components.clone());
 
-        let wineprefix = if effective_prefix.exists() {
-            Some(effective_prefix)
-        } else {
-            None
-        };
-        self.runner_components = Some(crate::utils::detect_runner_components(
-            runner_path,
-            wineprefix.as_deref(),
-        ));
+        let mut game_exe_dir = PathBuf::from("/tmp");
+        let mut d3d12_policy = crate::models::D3D12ProviderPolicy::Auto;
+
+        if let Some(id) = app_id {
+            let user_cfg = self.user_configs.get(&id).cloned().unwrap_or_default();
+            d3d12_policy = user_cfg.graphics_layers.d3d12_policy.clone();
+
+            if let Some(game) = self.library.iter().find(|g| g.app_id == id) {
+                 if let Some(path) = &game.install_path {
+                      game_exe_dir = PathBuf::from(path);
+                 }
+            }
+        }
+
+        let resolver = crate::launch::dll_provider_resolver::DllProviderResolver::new();
+        let (_resolutions, report) = resolver.resolve(&game_exe_dir, runner_path, &components, &d3d12_policy);
+        self.component_scan_report = Some(report);
     }
 
     fn draw_uninstall_modal(&mut self, ctx: &egui::Context) {
@@ -2474,14 +2476,9 @@ impl eframe::App for SteamLauncher {
                         let resolved = crate::utils::resolve_runner(&active_runner_name, &library_root);
 
                         if let Some(game) = self.selected_game() {
-                             self.refresh_runner_components(&resolved, game.app_id);
+                             self.refresh_runner_components(&resolved, Some(game.app_id));
                         } else {
-                             // No game selected, just scan runner root (no prefix)
-                             if self.last_scanned_runner != resolved || self.last_scanned_appid.is_some() {
-                                 self.last_scanned_runner = resolved.clone();
-                                 self.last_scanned_appid = None;
-                                 self.runner_components = Some(crate::utils::detect_runner_components(&resolved, None));
-                             }
+                             self.refresh_runner_components(&resolved, None);
                         }
 
                         if let Some(components) = &self.runner_components {
@@ -2493,17 +2490,30 @@ impl eframe::App for SteamLauncher {
                                     .num_columns(3)
                                     .spacing([16.0, 4.0])
                                     .show(ui, |ui| {
+                                        let report = self.component_scan_report.as_ref();
                                         let mut row =
-                                            |label: &str, info: &Option<crate::utils::ComponentInfo>| {
+                                            |label: &str, dll_key: &str, info: &Option<crate::utils::ComponentInfo>| {
                                                 ui.label(label);
                                                 match info {
                                                     Some(c) => {
                                                         ui.colored_label(egui::Color32::GREEN, &c.version);
-                                                        let source_text = match c.source {
+
+                                                        let mut source_text = match c.source {
                                                             crate::utils::ComponentSource::BundledWithRunner => "bundled".to_string(),
                                                             crate::utils::ComponentSource::InstalledInPrefix => "in prefix".to_string(),
                                                             crate::utils::ComponentSource::SystemWide => "system".to_string(),
                                                         };
+
+                                                        if let Some(r) = report {
+                                                             if let Some(sum) = r.resolution_summary.get(dll_key) {
+                                                                 if sum.chosen_provider == DllProvider::GameLocal {
+                                                                     source_text = "local override".to_string();
+                                                                 } else if sum.chosen_provider == DllProvider::System && c.source != crate::utils::ComponentSource::SystemWide {
+                                                                     source_text = "system fallback".to_string();
+                                                                 }
+                                                             }
+                                                        }
+
                                                         ui.colored_label(
                                                             egui::Color32::GRAY,
                                                             format!("({})", source_text),
@@ -2517,9 +2527,9 @@ impl eframe::App for SteamLauncher {
                                                 ui.end_row();
                                             };
                                         let c = components.clone();
-                                        row("DXVK:", &c.dxvk);
-                                        row("VKD3D-Proton:", &c.vkd3d_proton);
-                                        row("VKD3D:", &c.vkd3d);
+                                        row("DXVK:", "d3d11", &c.dxvk);
+                                        row("VKD3D-Proton:", "d3d12", &c.vkd3d_proton);
+                                        row("VKD3D (Wine):", "d3d12", &c.vkd3d);
                                     });
                             });
                         }

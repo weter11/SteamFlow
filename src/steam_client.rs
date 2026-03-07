@@ -2068,7 +2068,18 @@ impl SteamClient {
         let mut display_name = format!("App {appid}");
         let mut installdir = None;
 
-        // Try to get info from PICS first as it's authoritative
+        // 0. Check appmanifest first for local authoritative info
+        if let Ok(path) = self.appmanifest_path(appid).await {
+            if path.exists() {
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    if let Some(dir) = parse_installdir_from_acf(&raw) {
+                         installdir = Some(dir);
+                    }
+                }
+            }
+        }
+
+        // 1. Try to get info from PICS first as it's authoritative
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
             .apps

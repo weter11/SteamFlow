@@ -44,9 +44,11 @@ fn test_path_discovery_roots() {
     let dxvk = components.dxvk.unwrap();
     assert_eq!(dxvk.version, "2.3");
     assert_eq!(dxvk.source, ComponentSource::BundledWithRunner);
+    assert!(dxvk.path.unwrap().to_string_lossy().contains("d3d11.dll"));
 
     assert!(components.vkd3d.is_some());
     let vkd3d = components.vkd3d.unwrap();
     assert_eq!(vkd3d.version, "1.10");
     assert_eq!(vkd3d.source, ComponentSource::BundledWithRunner);
+    assert!(vkd3d.path.unwrap().to_string_lossy().contains("libvkd3d-1.dll"));
 }

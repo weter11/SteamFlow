@@ -9,6 +9,16 @@ pub struct ComponentScanReport {
     pub scan_roots: Vec<PathBuf>,
     pub components_found: HashMap<String, ComponentFoundInfo>,
     pub warnings: Vec<String>,
+    pub resolution_summary: HashMap<String, DllResolutionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DllResolutionSummary {
+    pub chosen_provider: DllProvider,
+    pub count_gamelocal: usize,
+    pub count_runner: usize,
+    pub count_system: usize,
+    pub count_runner_total: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +92,7 @@ impl DllProviderResolver {
             scan_roots: Vec::new(),
             components_found: HashMap::new(),
             warnings: Vec::new(),
+            resolution_summary: HashMap::new(),
         };
 
         if runner_root == PathBuf::from(".") || runner_root.to_string_lossy().is_empty() {
@@ -126,6 +137,14 @@ impl DllProviderResolver {
             let system_count = res.candidates.iter().filter(|c| c.provider == DllProvider::System && c.exists).count();
 
             let runner_total = res.candidates.iter().filter(|c| c.provider == DllProvider::Runner).count();
+
+            report.resolution_summary.insert(res.name.clone(), DllResolutionSummary {
+                chosen_provider: res.chosen_provider,
+                count_gamelocal: game_local_count,
+                count_runner: runner_count,
+                count_system: system_count,
+                count_runner_total: runner_total,
+            });
 
             tracing::debug!(
                 "DLL {}: chosen={:?} (candidates: GameLocal={}, Runner={}/{}, System={})",
@@ -233,57 +252,46 @@ impl DllProviderResolver {
         let dll_filename = format!("{}.dll", dll_name);
         let mut candidates = Vec::new();
 
-        let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi");
+        let mut layout_roots = crate::utils::get_runner_layout_roots(&runner_root);
         let is_vkd3d_any = matches!(dll_name, "d3d12" | "d3d12core" | "libvkd3d-1" | "libvkd3d-shader-1");
 
-        if is_dxvk || is_vkd3d_any {
-            let mut layout_roots = crate::utils::get_runner_layout_roots(&runner_root);
+        // Reorder roots based on policy to ensure preferred one is chosen if multiple exist
+        if is_vkd3d_any {
+            layout_roots.sort_by_key(|r| {
+                let s = r.to_string_lossy();
+                let is_proton_path = s.contains("vkd3d-proton");
+                let is_bundled = s.contains("/files/") || s.contains("/dist/");
 
-            // Reorder roots based on policy to ensure preferred one is chosen if multiple exist
-            if is_vkd3d_any {
-                layout_roots.sort_by_key(|r| {
-                    let s = r.to_string_lossy();
-                    let is_proton_path = s.contains("vkd3d-proton");
-                    let is_bundled = s.contains("/files/") || s.contains("/dist/");
-
-                    match d3d12_policy {
-                        crate::models::D3D12ProviderPolicy::Vkd3dWine => {
-                            // Prefer non-proton, then non-bundled
-                            match (is_proton_path, is_bundled) {
-                                (false, false) => 0,
-                                (false, true) => 1,
-                                (true, false) => 2,
-                                (true, true) => 3,
-                            }
-                        }
-                        _ => {
-                            // Auto/Vkd3dProton: Prefer proton, then bundled
-                            match (is_proton_path, is_bundled) {
-                                (true, true) => 0,
-                                (true, false) => 1,
-                                (false, true) => 2,
-                                (false, false) => 3,
-                            }
+                match d3d12_policy {
+                    crate::models::D3D12ProviderPolicy::Vkd3dWine => {
+                        // Prefer non-proton, then non-bundled
+                        match (is_proton_path, is_bundled) {
+                            (false, false) => 0,
+                            (false, true) => 1,
+                            (true, false) => 2,
+                            (true, true) => 3,
                         }
                     }
-                });
-            }
-
-            for root in layout_roots {
-                let s = root.to_string_lossy();
-                let is_dxvk_root = s.contains("dxvk");
-                let is_vkd3d_root = s.contains("vkd3d");
-
-                // If it's a generic root (lib/wine, etc.) or matches the component family, add it
-                if (!is_dxvk_root && !is_vkd3d_root) || (is_dxvk && is_dxvk_root) || (is_vkd3d_any && is_vkd3d_root) {
-                    let path = root.join(&dll_filename);
-                    candidates.push(DllCandidate {
-                        provider: DllProvider::Runner,
-                        exists: path.exists(),
-                        path,
-                    });
+                    _ => {
+                        // Auto/Vkd3dProton: Prefer proton, then bundled
+                        match (is_proton_path, is_bundled) {
+                            (true, true) => 0,
+                            (true, false) => 1,
+                            (false, true) => 2,
+                            (false, false) => 3,
+                        }
+                    }
                 }
-            }
+            });
+        }
+
+        for root in layout_roots {
+            let path = root.join(&dll_filename);
+            candidates.push(DllCandidate {
+                provider: DllProvider::Runner,
+                exists: path.exists(),
+                path,
+            });
         }
 
         candidates
@@ -356,10 +364,12 @@ mod tests {
         components.vkd3d_proton = Some(crate::utils::ComponentInfo {
             version: "2.10".into(),
             source: crate::utils::ComponentSource::BundledWithRunner,
+            path: None,
         });
         components.vkd3d = Some(crate::utils::ComponentInfo {
             version: "1.8".into(),
             source: crate::utils::ComponentSource::BundledWithRunner,
+            path: None,
         });
 
         let resolver = DllProviderResolver::new();
