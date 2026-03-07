@@ -45,7 +45,7 @@ impl PipelineStage for SpawnProcessStage {
                 ctx.proton_path.as_deref(),
                 launcher_config,
                 ctx.user_config.as_ref()
-            ).map_err(|e| {
+            ).await.map_err(|e| {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                     let dup_info = crate::launch::pipeline::detect_duplicate_instance(ctx);
                     crate::launch::pipeline::map_io_error(io_err, Some(&dup_info))

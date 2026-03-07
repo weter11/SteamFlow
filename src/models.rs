@@ -291,6 +291,8 @@ pub struct CommonNode {
     pub name: Option<String>,
     #[serde(default)]
     pub dlc: HashMap<String, String>,
+    #[serde(default)]
+    pub installdir: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
