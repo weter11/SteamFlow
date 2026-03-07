@@ -87,23 +87,7 @@ impl DllProviderResolver {
         if runner_root == PathBuf::from(".") || runner_root.to_string_lossy().is_empty() {
              report.warnings.push("Runner root derivation failed or resulted in empty path".into());
         } else {
-             // Derive all potential runner scan roots
-             let mut roots = Vec::new();
-             let subdirs = [
-                 "files/lib/wine/dxvk",
-                 "files/lib/wine/vkd3d",
-                 "files/lib64/wine/dxvk",
-                 "files/lib64/wine/vkd3d",
-                 "files/lib/vkd3d",
-                 "dist/lib/wine/dxvk",
-                 "dist/lib/wine/vkd3d",
-                 "lib/wine/dxvk",
-                 "lib/wine/vkd3d",
-                 "lib64/wine/dxvk",
-                 "lib64/wine/vkd3d",
-             ];
-             for s in subdirs { roots.push(runner_root.join(s)); }
-             report.scan_roots = roots;
+             report.scan_roots = crate::utils::get_runner_layout_roots(&runner_root);
         }
 
         let resolutions: Vec<DllResolution> = self.target_dlls
@@ -141,9 +125,11 @@ impl DllProviderResolver {
             let runner_count = res.candidates.iter().filter(|c| c.provider == DllProvider::Runner && c.exists).count();
             let system_count = res.candidates.iter().filter(|c| c.provider == DllProvider::System && c.exists).count();
 
+            let runner_total = res.candidates.iter().filter(|c| c.provider == DllProvider::Runner).count();
+
             tracing::debug!(
-                "DLL {}: chosen={:?} (candidates: GameLocal={}, Runner={}, System={})",
-                res.name, res.chosen_provider, game_local_count, runner_count, system_count
+                "DLL {}: chosen={:?} (candidates: GameLocal={}, Runner={}/{}, System={})",
+                res.name, res.chosen_provider, game_local_count, runner_count, runner_total, system_count
             );
 
             if res.chosen_provider == DllProvider::Runner {
@@ -192,13 +178,8 @@ impl DllProviderResolver {
         });
 
         // 2. Runner Priority
-        if let Some(path) = self.get_runner_dll_path(dll_name, runner_path, runner_components, d3d12_policy) {
-            candidates.push(DllCandidate {
-                provider: DllProvider::Runner,
-                path: path.clone(),
-                exists: path.exists(),
-            });
-        }
+        let runner_candidates = self.generate_runner_candidates(dll_name, runner_path, runner_components, d3d12_policy);
+        candidates.extend(runner_candidates);
 
         // 3. System Priority
         // For now, we use a simplified check for system paths
@@ -241,89 +222,71 @@ impl DllProviderResolver {
         }
     }
 
-    fn get_runner_dll_path(
+    fn generate_runner_candidates(
         &self,
         dll_name: &str,
         runner_path: &Path,
-        components: &crate::utils::RunnerComponents,
+        _components: &crate::utils::RunnerComponents,
         d3d12_policy: &crate::models::D3D12ProviderPolicy,
-    ) -> Option<PathBuf> {
+    ) -> Vec<DllCandidate> {
         let runner_root = crate::utils::derive_runner_root(runner_path);
-
         let dll_filename = format!("{}.dll", dll_name);
+        let mut candidates = Vec::new();
 
-        // Match DLL to component and look for it in runner root
         let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi");
-        if is_dxvk && components.dxvk.is_some() {
-            let relative_paths = [
-                "files/lib/wine/dxvk",
-                "files/lib64/wine/dxvk",
-                "dist/lib/wine/dxvk",
-                "dist/lib64/wine/dxvk",
-                "lib/wine/dxvk",
-                "lib64/wine/dxvk",
-            ];
-            for rel in relative_paths {
-                let root = runner_root.join(rel);
-                let p = root.join(&dll_filename);
-                if p.exists() {
-                    tracing::trace!("Found runner component DLL at: {}", p.display());
-                    return Some(p);
-                }
-            }
-        }
-
         let is_vkd3d_any = matches!(dll_name, "d3d12" | "d3d12core" | "libvkd3d-1" | "libvkd3d-shader-1");
-        if is_vkd3d_any {
-            let use_proton = match d3d12_policy {
-                crate::models::D3D12ProviderPolicy::Auto => true,
-                crate::models::D3D12ProviderPolicy::Vkd3dProton => true,
-                crate::models::D3D12ProviderPolicy::Vkd3dWine => false,
-            };
 
-            if use_proton && components.vkd3d_proton.is_some() {
-                let relative_paths = [
-                    "files/lib/wine/vkd3d-proton",
-                    "files/lib64/wine/vkd3d-proton",
-                    "dist/lib/wine/vkd3d-proton",
-                    "dist/lib64/wine/vkd3d-proton",
-                    "lib/wine/vkd3d-proton",
-                    "lib64/wine/vkd3d-proton",
-                ];
-                for rel in relative_paths {
-                    let root = runner_root.join(rel);
-                    let p = root.join(&dll_filename);
-                    if p.exists() {
-                        tracing::trace!("Found runner component DLL at: {}", p.display());
-                        return Some(p);
+        if is_dxvk || is_vkd3d_any {
+            let mut layout_roots = crate::utils::get_runner_layout_roots(&runner_root);
+
+            // Reorder roots based on policy to ensure preferred one is chosen if multiple exist
+            if is_vkd3d_any {
+                layout_roots.sort_by_key(|r| {
+                    let s = r.to_string_lossy();
+                    let is_proton_path = s.contains("vkd3d-proton");
+                    let is_bundled = s.contains("/files/") || s.contains("/dist/");
+
+                    match d3d12_policy {
+                        crate::models::D3D12ProviderPolicy::Vkd3dWine => {
+                            // Prefer non-proton, then non-bundled
+                            match (is_proton_path, is_bundled) {
+                                (false, false) => 0,
+                                (false, true) => 1,
+                                (true, false) => 2,
+                                (true, true) => 3,
+                            }
+                        }
+                        _ => {
+                            // Auto/Vkd3dProton: Prefer proton, then bundled
+                            match (is_proton_path, is_bundled) {
+                                (true, true) => 0,
+                                (true, false) => 1,
+                                (false, true) => 2,
+                                (false, false) => 3,
+                            }
+                        }
                     }
-                }
+                });
             }
 
-            if (!use_proton || d3d12_policy == &crate::models::D3D12ProviderPolicy::Auto) && components.vkd3d.is_some() {
-                let relative_paths = [
-                    "files/lib/wine/vkd3d",
-                    "files/lib64/wine/vkd3d",
-                    "files/lib/vkd3d",
-                    "dist/lib/wine/vkd3d",
-                    "lib/wine/vkd3d",
-                    "lib64/wine/vkd3d",
-                    "files/lib/wine",
-                    "dist/lib/wine",
-                    "lib/wine",
-                ];
-                for rel in relative_paths {
-                    let root = runner_root.join(rel);
-                    let p = root.join(&dll_filename);
-                    if p.exists() {
-                        tracing::trace!("Found runner component DLL at: {}", p.display());
-                        return Some(p);
-                    }
+            for root in layout_roots {
+                let s = root.to_string_lossy();
+                let is_dxvk_root = s.contains("dxvk");
+                let is_vkd3d_root = s.contains("vkd3d");
+
+                // If it's a generic root (lib/wine, etc.) or matches the component family, add it
+                if (!is_dxvk_root && !is_vkd3d_root) || (is_dxvk && is_dxvk_root) || (is_vkd3d_any && is_vkd3d_root) {
+                    let path = root.join(&dll_filename);
+                    candidates.push(DllCandidate {
+                        provider: DllProvider::Runner,
+                        exists: path.exists(),
+                        path,
+                    });
                 }
             }
         }
 
-        None
+        candidates
     }
 }
 
@@ -377,7 +340,9 @@ mod tests {
     fn test_d3d12_provider_selection() {
         let tmp = tempdir().unwrap();
         let runner_root = tmp.path().to_path_buf();
-        let proton_dir = runner_root.join("files/lib/wine/vkd3d-proton");
+
+        // Use standard layout paths that get_runner_layout_roots understands
+        let proton_dir = runner_root.join("files/lib64/wine/vkd3d-proton");
         let wine_dir = runner_root.join("files/lib/wine/vkd3d");
         fs::create_dir_all(&proton_dir).unwrap();
         fs::create_dir_all(&wine_dir).unwrap();
@@ -401,6 +366,8 @@ mod tests {
         let game_dir = Path::new("/tmp/game");
 
         // Case 1: Auto (Prefer Proton)
+        // Since we now generate ALL candidates and priority is first-found-exists,
+        // and we scan vkd3d-proton before vkd3d in our root list, it should work.
         let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Auto);
         let d3d12 = res.iter().find(|r| r.name == "d3d12").unwrap();
         assert_eq!(d3d12.chosen_path.as_ref().unwrap(), &proton_dll);

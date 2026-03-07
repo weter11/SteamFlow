@@ -158,18 +158,41 @@ pub fn derive_runner_root(binary_path: &Path) -> PathBuf {
     parent.to_path_buf()
 }
 
+pub fn get_runner_layout_roots(runner_root: &Path) -> Vec<PathBuf> {
+    let subdirs = [
+        "lib/wine/dxvk",
+        "lib/wine/vkd3d",
+        "lib/wine/vkd3d-proton",
+        "lib64/wine/dxvk",
+        "lib64/wine/vkd3d",
+        "lib64/wine/vkd3d-proton",
+        "files/lib/wine/dxvk",
+        "files/lib/wine/vkd3d",
+        "files/lib/wine/vkd3d-proton",
+        "files/lib64/wine/dxvk",
+        "files/lib64/wine/vkd3d",
+        "files/lib64/wine/vkd3d-proton",
+        "files/lib/vkd3d",
+        "files/lib/vkd3d-proton",
+        "dist/lib/wine/dxvk",
+        "dist/lib/wine/vkd3d",
+        "dist/lib/wine/vkd3d-proton",
+        "dist/lib64/wine/dxvk",
+        "dist/lib64/wine/vkd3d",
+        "dist/lib64/wine/vkd3d-proton",
+    ];
+    subdirs.iter().map(|s| runner_root.join(s)).collect()
+}
+
 pub fn detect_runner_components(
     runner_path: &Path,
     wineprefix: Option<&Path>,
 ) -> RunnerComponents {
     let root = derive_runner_root(runner_path);
 
-    let (dxvk, vkd3d_proton, vkd3d) = (
-        detect_dxvk(&root, wineprefix),
-        detect_vkd3d_proton(&root, wineprefix),
-        detect_vkd3d(&root, wineprefix),
-    );
-
+    let dxvk = detect_dxvk(&root, wineprefix);
+    let vkd3d_proton = detect_vkd3d_proton(&root, wineprefix);
+    let vkd3d = detect_vkd3d(&root, wineprefix);
 
     RunnerComponents {
         dxvk,
@@ -181,24 +204,22 @@ pub fn detect_runner_components(
 // ── DXVK ────────────────────────────────────────────────────────────────────
 
 fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    // 1. Bundled inside runner (Proton & Wine-TKG styles)
-    let bundled_dlls = [
-        "files/lib/wine/dxvk/d3d11.dll",
-        "files/lib64/wine/dxvk/d3d11.dll",
-        "dist/lib/wine/dxvk/d3d11.dll",
-        "dist/lib64/wine/dxvk/d3d11.dll",
-        "lib/wine/dxvk/d3d11.dll",
-        "lib64/wine/dxvk/d3d11.dll",
+    // 1. Bundled inside runner
+    let layout_roots = get_runner_layout_roots(root);
+    let mut dll_candidates = Vec::new();
+    for lr in &layout_roots {
+        if lr.to_string_lossy().contains("dxvk") || (!lr.to_string_lossy().contains("vkd3d")) {
+            dll_candidates.push(lr.join("d3d11.dll"));
+        }
+    }
+
+    let version_files = [
+        "files/share/dxvk/version",
+        "dist/share/dxvk/version",
+        "share/dxvk/version",
     ];
-    if let Some(info) = check_bundled(
-        root,
-        &bundled_dlls,
-        &[
-            "files/share/dxvk/version",
-            "dist/share/dxvk/version",
-            "share/dxvk/version",
-        ],
-    ) {
+
+    if let Some(info) = check_bundled_v2(root, &dll_candidates, &version_files) {
         return Some(info);
     }
 
@@ -226,37 +247,25 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 // ── VKD3D-Proton ─────────────────────────────────────────────────────────────
 
 fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    let bundled_dlls = [
-        "files/lib/wine/vkd3d-proton/d3d12.dll",
-        "files/lib64/wine/vkd3d-proton/d3d12.dll",
-        "dist/lib/wine/vkd3d-proton/d3d12.dll",
-        "dist/lib64/wine/vkd3d-proton/d3d12.dll",
-        "lib/wine/vkd3d-proton/d3d12.dll",
-        "lib64/wine/vkd3d-proton/d3d12.dll",
-    ];
-    // VKD3D-Proton requires both d3d12.dll and d3d12core.dll for modern titles
-    let core_bundled_dlls = [
-        "files/lib/wine/vkd3d-proton/d3d12core.dll",
-        "files/lib64/wine/vkd3d-proton/d3d12core.dll",
-        "dist/lib/wine/vkd3d-proton/d3d12core.dll",
-        "dist/lib64/wine/vkd3d-proton/d3d12core.dll",
-        "lib/wine/vkd3d-proton/d3d12core.dll",
-        "lib64/wine/vkd3d-proton/d3d12core.dll",
-    ];
-
-    if !core_bundled_dlls.iter().any(|rel| root.join(rel).exists()) {
-        tracing::debug!("VKD3D-Proton partial: d3d12core.dll missing in bundled paths");
+    // 1. Bundled inside runner
+    let layout_roots = get_runner_layout_roots(root);
+    let mut dll_candidates = Vec::new();
+    for lr in &layout_roots {
+        if lr.to_string_lossy().contains("vkd3d-proton") || lr.to_string_lossy().contains("vkd3d") {
+            dll_candidates.push(lr.join("d3d12.dll"));
+        }
     }
 
-    if let Some(info) = check_bundled(
-        root,
-        &bundled_dlls,
-        &[
-            "files/share/vkd3d-proton/version",
-            "dist/share/vkd3d-proton/version",
-            "share/vkd3d-proton/version",
-        ],
-    ) {
+    let version_files = [
+        "files/share/vkd3d-proton/version",
+        "dist/share/vkd3d-proton/version",
+        "share/vkd3d-proton/version",
+    ];
+
+    if let Some(info) = check_bundled_v2(root, &dll_candidates, &version_files) {
+        // Additional check for VKD3D-Proton specifically: look for the string marker in the DLL
+        // But since we are looking at bundled paths, we can rely on path names for now.
+        // If we want to be more robust, we'd check if it's actually Proton flavor.
         return Some(info);
     }
 
@@ -293,29 +302,23 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
 // ── VKD3D (upstream) ─────────────────────────────────────────────────────────
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    // Upstream Wine VKD3D uses libvkd3d.dll/libvkd3d-1.dll and libvkd3d-shader.dll
-    let bundled_dlls = [
-        "files/lib/wine/vkd3d/libvkd3d-1.dll",
-        "files/lib64/wine/vkd3d/libvkd3d-1.dll",
-        "files/lib/vkd3d/libvkd3d-1.dll",
-        "dist/lib/wine/vkd3d/libvkd3d-1.dll",
-        "lib/wine/vkd3d/libvkd3d-1.dll",
-        "lib64/wine/vkd3d/libvkd3d-1.dll",
-        "files/lib/wine/vkd3d/d3d12.dll",
-        "files/lib64/wine/vkd3d/d3d12.dll",
-        "files/lib/vkd3d/d3d12.dll",
-        "dist/lib/wine/vkd3d/d3d12.dll",
-        "lib/wine/vkd3d/d3d12.dll",
+    // 1. Bundled inside runner
+    let layout_roots = get_runner_layout_roots(root);
+    let mut dll_candidates = Vec::new();
+    for lr in &layout_roots {
+        if lr.to_string_lossy().contains("vkd3d") {
+            dll_candidates.push(lr.join("libvkd3d-1.dll"));
+            dll_candidates.push(lr.join("d3d12.dll"));
+        }
+    }
+
+    let version_files = [
+        "files/share/vkd3d/version",
+        "dist/share/vkd3d/version",
+        "share/vkd3d/version",
     ];
-    if let Some(info) = check_bundled(
-        root,
-        &bundled_dlls,
-        &[
-            "files/share/vkd3d/version",
-            "dist/share/vkd3d/version",
-            "share/vkd3d/version",
-        ],
-    ) {
+
+    if let Some(info) = check_bundled_v2(root, &dll_candidates, &version_files) {
         return Some(info);
     }
 
@@ -346,10 +349,10 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-fn check_bundled(root: &Path, dll_candidates: &[&str], version_files: &[&str]) -> Option<ComponentInfo> {
-    let found_dll = dll_candidates.iter().find(|rel| root.join(rel).exists());
-    if let Some(rel) = found_dll {
-        tracing::debug!("Found bundled component DLL at: {}", root.join(rel).display());
+fn check_bundled_v2(root: &Path, dll_paths: &[PathBuf], version_files: &[&str]) -> Option<ComponentInfo> {
+    let found_dll = dll_paths.iter().find(|p| p.exists());
+    if let Some(p) = found_dll {
+        tracing::debug!("Found bundled component DLL at: {}", p.display());
     } else {
         return None;
     }
@@ -368,11 +371,10 @@ fn check_bundled(root: &Path, dll_candidates: &[&str], version_files: &[&str]) -
         .map(|s| parse_short_version(&s))
         .find(|s| s != "unknown")
         .or_else(|| {
-            dll_candidates
+            dll_paths
                 .iter()
-                .map(|rel| root.join(rel))
                 .find(|p| p.exists())
-                .and_then(|p| extract_version_from_dll(&p))
+                .and_then(|p| extract_version_from_dll(p))
         })
         .unwrap_or_else(|| "unknown".to_string());
 

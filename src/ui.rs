@@ -2499,10 +2499,10 @@ impl eframe::App for SteamLauncher {
                                                 match info {
                                                     Some(c) => {
                                                         ui.colored_label(egui::Color32::GREEN, &c.version);
-                                                        let source_text = if c.source == crate::utils::ComponentSource::BundledWithRunner {
-                                                            "bundled".to_string()
-                                                        } else {
-                                                            format!("{}", c.source)
+                                                        let source_text = match c.source {
+                                                            crate::utils::ComponentSource::BundledWithRunner => "bundled".to_string(),
+                                                            crate::utils::ComponentSource::InstalledInPrefix => "in prefix".to_string(),
+                                                            crate::utils::ComponentSource::SystemWide => "system".to_string(),
                                                         };
                                                         ui.colored_label(
                                                             egui::Color32::GRAY,
@@ -2510,7 +2510,7 @@ impl eframe::App for SteamLauncher {
                                                         );
                                                     }
                                                     None => {
-                                                        ui.colored_label(egui::Color32::GRAY, "not found");
+                                                        ui.colored_label(egui::Color32::GRAY, "not found (runner)");
                                                         ui.label("wined3d fallback");
                                                     }
                                                 }
