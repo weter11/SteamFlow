@@ -15,6 +15,21 @@ pub struct CompatibilityWarning {
     pub context: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DuplicateInstanceInfo {
+    pub detected: bool,
+    pub source: String, // "lockfile" | "pid" | "guard" | "none"
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct GraphicsStackInfo {
+    pub graphics_stack_expected: String,           // e.g. "DXVK v2.3, VKD3D-Proton v2.10"
+    pub graphics_stack_evidence: Vec<String>,      // e.g. ["DXVK: v2.3.1"]
+    pub graphics_stack_confidence: String,         // "low" | "medium" | "high"
+    pub override_policy: String,                   // e.g. "Native-only"
+    pub dll_providers: HashMap<String, String>,    // e.g. {"d3d11": "Runner", "d3d9": "GameLocal"}
+}
+
 pub struct PipelineContext {
     pub app_id: u32,
     pub app: Option<LibraryGame>,
@@ -30,6 +45,8 @@ pub struct PipelineContext {
     pub session: Option<LaunchSession>,
     pub logger: Option<EventLogger>,
     pub warnings: Vec<CompatibilityWarning>,
+    pub graphics_stack: GraphicsStackInfo,
+    pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
 }
 
 impl PipelineContext {
@@ -47,6 +64,8 @@ impl PipelineContext {
             session: None,
             logger: None,
             warnings: Vec::new(),
+            graphics_stack: GraphicsStackInfo::default(),
+            dll_resolutions: Vec::new(),
         }
     }
 
@@ -104,7 +123,7 @@ impl LaunchErrorKind {
             Self::Permission => "Check filesystem permissions for the library and prefix folders.",
             Self::Runner => "Try a different Proton/Wine version.",
             Self::GameData => "Verify integrity of game files or reinstall the game.",
-            Self::Process => "Ensure no other instance of the game is running.",
+            Self::Process => "Check if the game is already running or if files are locked.",
             Self::Dependency => "Install missing system dependencies.",
             Self::Unknown => "Check the detailed logs for more information.",
         }
@@ -150,6 +169,10 @@ impl std::error::Error for LaunchError {}
 
 pub fn map_anyhow_error(err: anyhow::Error) -> LaunchError {
     let msg = err.to_string();
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        return map_io_error(io_err, None);
+    }
+
     if msg.contains("Permission denied") || msg.contains("EACCES") {
         LaunchError::new(LaunchErrorKind::Permission, msg).with_source(err)
     } else if msg.contains("not found") || msg.contains("No such file or directory") {
@@ -158,6 +181,91 @@ pub fn map_anyhow_error(err: anyhow::Error) -> LaunchError {
         LaunchError::new(LaunchErrorKind::Runner, msg).with_source(err)
     } else {
         LaunchError::new(LaunchErrorKind::Unknown, msg).with_source(err)
+    }
+}
+
+pub fn map_io_error(err: &std::io::Error, dup_info: Option<&DuplicateInstanceInfo>) -> LaunchError {
+    use std::io::ErrorKind;
+
+    let kind = match err.kind() {
+        ErrorKind::NotFound => LaunchErrorKind::GameData,
+        ErrorKind::PermissionDenied => LaunchErrorKind::Permission,
+        ErrorKind::InvalidInput => LaunchErrorKind::Validation,
+        ErrorKind::AlreadyExists => LaunchErrorKind::Process,
+        _ => LaunchErrorKind::Process,
+    };
+
+    let mut message = match err.kind() {
+        ErrorKind::NotFound => "The game executable or runner was not found.".to_string(),
+        ErrorKind::PermissionDenied => "Access denied while attempting to start the game. Check file permissions.".to_string(),
+        ErrorKind::InvalidInput => "Invalid launch configuration or malformed path.".to_string(),
+        ErrorKind::AlreadyExists => "A lock file or another instance of the game was detected.".to_string(),
+        _ => format!("Process spawn failed: {}", err),
+    };
+
+    // ONLY show duplicate instance hint if explicitly detected or AlreadyExists kind
+    let err_str = err.to_string();
+    let lock_msg = "Game files are locked by another process. Ensure no other instance is running.";
+
+    if let Some(info) = dup_info {
+        if info.detected {
+            message = lock_msg.to_string();
+        }
+    } else if err.kind() == ErrorKind::AlreadyExists || err_str.contains("locked") || err_str.contains("Resource busy") {
+        message = lock_msg.to_string();
+    }
+
+    let mut launch_err = LaunchError::new(kind, message)
+        .with_context("io_kind", format!("{:?}", err.kind()));
+
+    if let Some(code) = err.raw_os_error() {
+        launch_err = launch_err.with_context("os_errno", code.to_string());
+    }
+
+    if let Some(info) = dup_info {
+        launch_err = launch_err.with_context("duplicate_instance_detected", info.detected.to_string());
+        launch_err = launch_err.with_context("duplicate_detection_source", info.source.clone());
+    } else {
+        launch_err = launch_err.with_context("duplicate_instance_detected", "false");
+        launch_err = launch_err.with_context("duplicate_detection_source", "none");
+    }
+
+    launch_err
+}
+
+pub fn detect_duplicate_instance(ctx: &PipelineContext) -> DuplicateInstanceInfo {
+    // 1. Check for explicit lockfile in the game directory or prefix
+    if let Some(spec) = &ctx.command_spec {
+        if let Some(cwd) = &spec.cwd {
+            let lockfile = cwd.join(".steamflow_launch.lock");
+            if lockfile.exists() {
+                return DuplicateInstanceInfo {
+                    detected: true,
+                    source: "lockfile".to_string(),
+                };
+            }
+        }
+    }
+
+    // 2. Check for tracked PID if we had a mechanism to store it
+    // For now, check if steam.pid exists in the prefix (if applicable)
+    if let Some(spec) = &ctx.command_spec {
+        if let Some(prefix) = spec.env.get("WINEPREFIX") {
+            let pid_path = std::path::Path::new(prefix).join("steam.pid");
+            if pid_path.exists() {
+                 // Note: Ideally we'd check if the PID is still alive,
+                 // but existence of the file in WINEPREFIX is a strong hint.
+                 return DuplicateInstanceInfo {
+                     detected: true,
+                     source: "pid".to_string(),
+                 };
+            }
+        }
+    }
+
+    DuplicateInstanceInfo {
+        detected: false,
+        source: "none".to_string(),
     }
 }
 
@@ -207,9 +315,11 @@ impl LaunchPipeline {
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_game::ResolveGameStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_profile::ResolveProfileStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_components::ResolveComponentsStage));
+        pipeline.add_stage(Box::new(crate::launch::stages::resolve_dll_providers::ResolveDllProvidersStage));
         pipeline.add_stage(Box::new(crate::launch::stages::prepare_prefix::PreparePrefixStage));
         pipeline.add_stage(Box::new(crate::launch::stages::build_environment::BuildEnvironmentStage));
         pipeline.add_stage(Box::new(crate::launch::stages::build_command::BuildCommandStage));
+        pipeline.add_stage(Box::new(crate::launch::stages::preflight::PreflightStage));
         pipeline.add_stage(Box::new(crate::launch::stages::spawn_process::SpawnProcessStage));
         pipeline.add_stage(Box::new(crate::launch::stages::finalize::FinalizeStage));
 
@@ -219,6 +329,9 @@ impl LaunchPipeline {
     }
 
     pub async fn run(&self, ctx: &mut PipelineContext) -> std::result::Result<(), PipelineError> {
+        // Record expected stack info before starting
+        self.populate_expected_graphics_stack(ctx);
+
         use crate::infra::logging::LaunchResult;
 
         let total_start = std::time::Instant::now();
@@ -269,7 +382,7 @@ impl LaunchPipeline {
                     let _ = logger.error("launch_end", "Launch failed".to_string(), None, metadata);
                 }
 
-                self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
+                self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations.clone());
 
                 return Err(PipelineError {
                     stage_name,
@@ -288,19 +401,128 @@ impl LaunchPipeline {
             let _ = logger.info("launch_end", "Launch successful".to_string(), None, HashMap::new());
         }
 
+        // After stages are complete (or failed), scan logs for evidence
+        self.record_dll_provider_diagnostics(ctx);
+        self.scan_logs_for_graphics_evidence(ctx);
+
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
 
         Ok(())
     }
 
+    fn populate_expected_graphics_stack(&self, ctx: &mut PipelineContext) {
+        if let Some(config) = &ctx.user_config {
+            let mut expected = Vec::new();
+            if config.graphics_layers.dxvk_enabled {
+                expected.push("DXVK");
+            }
+            if config.graphics_layers.vkd3d_proton_enabled {
+                expected.push("VKD3D-Proton");
+            }
+            if config.graphics_layers.vkd3d_enabled {
+                expected.push("VKD3D");
+            }
+
+            let policy = format!("{:?}", config.graphics_layers.graphics_backend_policy);
+            if expected.is_empty() {
+                ctx.graphics_stack.graphics_stack_expected = format!("WineD3D (Baseline) [Policy: {}]", policy);
+                ctx.graphics_stack.override_policy = "Builtin-only".to_string();
+            } else {
+                ctx.graphics_stack.graphics_stack_expected = format!("{} [Policy: {}]", expected.join(", "), policy);
+                ctx.graphics_stack.override_policy = "Native-preferred".to_string();
+            }
+        }
+    }
+
+    fn record_dll_provider_diagnostics(&self, ctx: &mut PipelineContext) {
+        for res in &ctx.dll_resolutions {
+            ctx.graphics_stack.dll_providers.insert(res.name.clone(), format!("{:?}", res.chosen_provider));
+        }
+    }
+
+    fn scan_logs_for_graphics_evidence(&self, ctx: &mut PipelineContext) {
+        if let Some(session) = &ctx.session {
+            let stderr_path = session.stderr_path();
+            if stderr_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&stderr_path) {
+                    for line in content.lines() {
+                        if let Some(evidence) = crate::infra::logging::classify_graphics_evidence(line) {
+                            if !ctx.graphics_stack.graphics_stack_evidence.contains(&evidence) {
+                                ctx.graphics_stack.graphics_stack_evidence.push(evidence);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update confidence based on evidence vs expectation
+            if ctx.graphics_stack.graphics_stack_evidence.is_empty() {
+                ctx.graphics_stack.graphics_stack_confidence = "low".to_string();
+            } else {
+                let has_expected = if ctx.user_config.as_ref().map(|c| c.graphics_layers.dxvk_enabled).unwrap_or(false) {
+                    ctx.graphics_stack.graphics_stack_evidence.iter().any(|e| e.contains("DXVK"))
+                } else {
+                    true
+                };
+
+                if has_expected {
+                    ctx.graphics_stack.graphics_stack_confidence = "high".to_string();
+                } else {
+                    ctx.graphics_stack.graphics_stack_confidence = "medium".to_string();
+                }
+            }
+        }
+    }
+
     fn write_summary_if_possible(
         &self,
-        ctx: &PipelineContext,
+        ctx: &mut PipelineContext,
         result: crate::infra::logging::LaunchResult,
         failing_stage: Option<String>,
         total_duration_ms: u128,
         stage_durations_ms: HashMap<String, u128>,
     ) {
+        let (sanity_warnings, env_snapshot) = if let Some(spec) = &ctx.command_spec {
+            let runner_name = ctx
+                .runner
+                .as_ref()
+                .map(|r| r.name().to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let warnings = crate::infra::logging::check_environment_sanity(
+                &spec.env,
+                &runner_name,
+                ctx.user_config.as_ref(),
+            );
+
+            let env_snapshot = crate::infra::logging::EffectiveEnv {
+                runner_name,
+                profile_id: ctx.launch_info.as_ref().map(|l| l.id.clone()),
+                profile_name: ctx.launch_info.as_ref().map(|l| l.description.clone()),
+                wine_dll_overrides: spec.env.get("WINEDLLOVERRIDES").cloned(),
+                env_vars: spec.env.clone(),
+            };
+
+            (warnings, Some(env_snapshot))
+        } else {
+            (Vec::new(), None)
+        };
+
+        for warning in sanity_warnings {
+            ctx.add_warning(warning.code, warning.message);
+        }
+
+        if let Some(session) = &ctx.session {
+            if let Some(env) = env_snapshot {
+                let _ = session.write_effective_env(&env);
+                let _ = session.write_effective_env_txt(&env.env_vars);
+            }
+            if let Some(spec) = &ctx.command_spec {
+                let _ = session.write_command_artifact(spec);
+            }
+            let _ = session.write_dll_resolution_artifact(&ctx.dll_resolutions);
+        }
+
         if let Some(session) = &ctx.session {
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -318,6 +540,7 @@ impl LaunchPipeline {
                 stage_durations_ms,
                 timestamp,
                 warnings: ctx.warnings.clone(),
+                graphics_stack: Some(ctx.graphics_stack.clone()),
             };
 
             let _ = session.write_summary(&summary);
@@ -420,6 +643,62 @@ mod tests {
         assert!(content.contains("test_stage"));
         assert!(content.contains("stage_success"));
         assert!(content.contains("launch_end"));
+    }
+
+    #[test]
+    fn test_map_io_error_not_found() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let mapped = map_io_error(&err, None);
+        assert_eq!(mapped.kind, LaunchErrorKind::GameData);
+        assert!(mapped.message.contains("not found"));
+        assert_eq!(mapped.context.get("io_kind").unwrap(), "NotFound");
+    }
+
+    #[test]
+    fn test_map_io_error_permission_denied() {
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let mapped = map_io_error(&err, None);
+        assert_eq!(mapped.kind, LaunchErrorKind::Permission);
+        assert!(mapped.message.contains("Access denied"));
+    }
+
+    #[test]
+    fn test_map_io_error_lock_detected() {
+        // Simulating a "Resource busy" or "locked" error which often maps to 'Other' or 'WouldBlock' in std::io
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "file is locked by another process");
+        let mapped = map_io_error(&err, None);
+        assert_eq!(mapped.kind, LaunchErrorKind::Process);
+        assert!(mapped.message.contains("locked by another process"));
+    }
+
+    #[test]
+    fn test_map_io_error_with_explicit_dup_info() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "generic error");
+        let info = DuplicateInstanceInfo {
+            detected: true,
+            source: "lockfile".to_string(),
+        };
+        let mapped = map_io_error(&err, Some(&info));
+        assert_eq!(mapped.kind, LaunchErrorKind::Process);
+        assert!(mapped.message.contains("Ensure no other instance is running"));
+        assert_eq!(mapped.context.get("duplicate_instance_detected").unwrap(), "true");
+        assert_eq!(mapped.context.get("duplicate_detection_source").unwrap(), "lockfile");
+    }
+
+    #[test]
+    fn test_detect_duplicate_instance_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile = tmp.path().join(".steamflow_launch.lock");
+        std::fs::write(&lockfile, "").unwrap();
+
+        let mut ctx = PipelineContext::new(123);
+        let mut spec = CommandSpec::default();
+        spec.cwd = Some(tmp.path().to_path_buf());
+        ctx.command_spec = Some(spec);
+
+        let info = detect_duplicate_instance(&ctx);
+        assert!(info.detected);
+        assert_eq!(info.source, "lockfile");
     }
 
     #[tokio::test]

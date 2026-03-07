@@ -19,7 +19,15 @@ impl PipelineStage for SpawnProcessStage {
                     let _ = logger.info("process_spawn_attempt", "Attempting to spawn process via runner".to_string(), Some("SpawnProcess".to_string()), metadata);
                 }
 
-                let child = runner.launch(spec)?;
+                let child = runner.launch(spec).map_err(|e| {
+                    if let Some(source) = &e.source {
+                        if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+                            let dup_info = crate::launch::pipeline::detect_duplicate_instance(ctx);
+                            return crate::launch::pipeline::map_io_error(io_err, Some(&dup_info));
+                        }
+                    }
+                    e
+                })?;
                 ctx.child = Some(child);
             }
         } else {
@@ -37,7 +45,14 @@ impl PipelineStage for SpawnProcessStage {
                 ctx.proton_path.as_deref(),
                 launcher_config,
                 ctx.user_config.as_ref()
-            ).map_err(|e| LaunchError::new(LaunchErrorKind::Process, "failed to spawn adhoc process").with_source(e))?;
+            ).map_err(|e| {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    let dup_info = crate::launch::pipeline::detect_duplicate_instance(ctx);
+                    crate::launch::pipeline::map_io_error(io_err, Some(&dup_info))
+                } else {
+                    LaunchError::new(LaunchErrorKind::Process, "failed to spawn adhoc process").with_source(e)
+                }
+            })?;
             ctx.child = Some(child);
         }
         Ok(())

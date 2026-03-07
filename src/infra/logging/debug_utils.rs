@@ -1,4 +1,4 @@
-use crate::infra::logging::LaunchSummary;
+use crate::infra::logging::{LaunchSummary, EffectiveEnv};
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -8,6 +8,14 @@ pub fn load_launch_summary(log_dir: &Path) -> Result<LaunchSummary> {
         .with_context(|| format!("Failed to read summary at {}", summary_path.display()))?;
     let summary: LaunchSummary = serde_json::from_str(&content)?;
     Ok(summary)
+}
+
+pub fn load_effective_env(log_dir: &Path) -> Result<EffectiveEnv> {
+    let env_path = log_dir.join("effective_env.json");
+    let content = std::fs::read_to_string(&env_path)
+        .with_context(|| format!("Failed to read effective env at {}", env_path.display()))?;
+    let env: EffectiveEnv = serde_json::from_str(&content)?;
+    Ok(env)
 }
 
 pub fn print_launch_summary(summary: &LaunchSummary) {
@@ -25,5 +33,27 @@ pub fn print_launch_summary(summary: &LaunchSummary) {
     for (stage, duration) in sorted_stages {
         println!("  - {}: {}ms", stage, duration);
     }
+    if !summary.warnings.is_empty() {
+        println!("Warnings      :");
+        for warning in &summary.warnings {
+            println!("  [{}] {}", warning.code, warning.message);
+        }
+    }
     println!("----------------------");
+}
+
+pub fn print_effective_env(env: &EffectiveEnv) {
+    println!("--- Effective Environment ---");
+    println!("Runner      : {}", env.runner_name);
+    if let Some(overrides) = &env.wine_dll_overrides {
+        println!("DLL Overrides: {}", overrides);
+    }
+    println!("Environment Variables:");
+    let mut sorted_keys: Vec<_> = env.env_vars.keys().collect();
+    sorted_keys.sort();
+
+    for key in sorted_keys {
+        println!("  {}={}", key, env.env_vars.get(key).unwrap());
+    }
+    println!("-----------------------------");
 }

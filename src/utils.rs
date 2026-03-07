@@ -209,6 +209,18 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
         "lib/wine/vkd3d-proton/d3d12.dll",
         "lib64/wine/vkd3d-proton/d3d12.dll",
     ];
+    // VKD3D-Proton requires both d3d12.dll and d3d12core.dll for modern titles
+    let core_bundled_dlls = [
+        "files/lib/wine/vkd3d-proton/d3d12core.dll",
+        "dist/lib/wine/vkd3d-proton/d3d12core.dll",
+        "lib/wine/vkd3d-proton/d3d12core.dll",
+        "lib64/wine/vkd3d-proton/d3d12core.dll",
+    ];
+
+    if !core_bundled_dlls.iter().any(|rel| root.join(rel).exists()) {
+        tracing::debug!("VKD3D-Proton partial: d3d12core.dll missing in bundled paths");
+    }
+
     if let Some(info) = check_bundled(
         root,
         &bundled_dlls,
@@ -253,7 +265,11 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
 // ── VKD3D (upstream) ─────────────────────────────────────────────────────────
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // Upstream Wine VKD3D uses libvkd3d.dll/libvkd3d-1.dll and libvkd3d-shader.dll
     let bundled_dlls = [
+        "files/lib/wine/vkd3d/libvkd3d-1.dll",
+        "dist/lib/wine/vkd3d/libvkd3d-1.dll",
+        "lib/wine/vkd3d/libvkd3d-1.dll",
         "files/lib/wine/vkd3d/d3d12.dll",
         "dist/lib/wine/vkd3d/d3d12.dll",
         "lib/wine/vkd3d/d3d12.dll",
@@ -507,6 +523,7 @@ pub fn install_layer_into_prefix(layer: &GraphicsLayer, wineprefix: &Path) -> Re
     let dlls_for = |layer: &GraphicsLayer| -> &[&str] {
         match layer {
             GraphicsLayer::Dxvk => &[
+                "d3d8.dll",
                 "d3d9.dll",
                 "d3d10.dll",
                 "d3d10_1.dll",
@@ -515,7 +532,7 @@ pub fn install_layer_into_prefix(layer: &GraphicsLayer, wineprefix: &Path) -> Re
                 "dxgi.dll",
             ],
             GraphicsLayer::Vkd3dProton => &["d3d12.dll", "d3d12core.dll"],
-            GraphicsLayer::Vkd3d => &["d3d12.dll"],
+            GraphicsLayer::Vkd3d => &["d3d12.dll", "libvkd3d-1.dll", "libvkd3d-shader-1.dll"],
         }
     };
 
@@ -580,6 +597,16 @@ pub fn remove_layer_from_prefix(layer: &GraphicsLayer, wineprefix: &Path) -> Res
                 std::fs::remove_file(&path).with_context(|| format!("failed removing {}", path.display()))?;
             }
         }
+        // Special case for Wine-style DLLs which might have been copied without .dll suffix
+        if dll.ends_with(".dll") {
+            let stem = &dll[..dll.len() - 4];
+            for dir in [&sys32, &sys64] {
+                let path = dir.join(stem);
+                if path.exists() && !path.is_dir() {
+                     let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
     }
 
     Ok(())
@@ -617,6 +644,7 @@ pub fn build_dll_overrides(
         let game_has = |dll: &str| -> bool { game_dir.map(|d| d.join(dll).exists()).unwrap_or(false) };
 
         for dll in &[
+            "d3d8.dll",
             "d3d9.dll",
             "d3d10.dll",
             "d3d10_1.dll",
@@ -636,6 +664,10 @@ pub fn build_dll_overrides(
     if vkd3d_proton_active || vkd3d_active {
         overrides.push("d3d12=n,b".into());
         overrides.push("d3d12core=n,b".into());
+        if vkd3d_active {
+             overrides.push("libvkd3d-1=n,b".into());
+             overrides.push("libvkd3d-shader-1=n,b".into());
+        }
     }
 
     overrides.join(";")

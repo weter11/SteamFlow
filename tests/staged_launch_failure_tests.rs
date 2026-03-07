@@ -81,5 +81,6 @@ async fn test_stage_execution_failure_adhoc() {
     assert_eq!(err.stage_name, "SpawnProcess");
     // It should fail either during client init or process spawn
     // In our mocked/limited environment, probably process spawn if it gets there.
-    assert!(matches!(err.inner.kind, LaunchErrorKind::Process | LaunchErrorKind::Environment));
+    // Update: 'NotFound' IO error now maps to LaunchErrorKind::GameData
+    assert!(matches!(err.inner.kind, LaunchErrorKind::Process | LaunchErrorKind::Environment | LaunchErrorKind::GameData));
 }

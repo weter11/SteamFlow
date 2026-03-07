@@ -31,6 +31,7 @@ mod tests {
             launcher_config: LauncherConfig::default(),
             user_config: None,
             proton_path: Some("/tmp/proton".to_string()),
+            dll_resolutions: Vec::new(),
         }
     }
 
@@ -50,6 +51,72 @@ mod tests {
         assert_eq!(spec.program, PathBuf::from("/usr/bin/wine"));
         assert_eq!(spec.args[0], "game.exe");
         assert_eq!(spec.env.get("WINEPREFIX").unwrap(), "/tmp/prefix");
+    }
+
+    #[tokio::test]
+    async fn test_wine_tkg_runner_graphics_policy_autodetect() {
+        use crate::infra::runners::wine_tkg::WineTkgRunner;
+        use crate::models::GraphicsBackendPolicy;
+        use crate::config::LauncherConfig;
+        use crate::steam_client::{LaunchInfo, LaunchTarget};
+        use crate::models::{LibraryGame, UserAppConfig};
+        use tempfile::tempdir;
+        use std::fs;
+        use std::collections::HashMap;
+
+        let tmp = tempdir().unwrap();
+        let lib = tmp.path().join("library");
+        let pfx = tmp.path().join("prefix");
+        fs::create_dir_all(&lib).unwrap();
+        fs::create_dir_all(&pfx).unwrap();
+
+        // Simulate DXVK existence in runner path
+        let runner_path = tmp.path().join("proton_8");
+        let dxvk_dll = runner_path.join("files/lib/wine/dxvk/d3d11.dll");
+        fs::create_dir_all(dxvk_dll.parent().unwrap()).unwrap();
+        fs::write(&dxvk_dll, "fake dll content").unwrap();
+
+        let app = LibraryGame {
+            app_id: 123,
+            name: "Test".to_string(),
+            install_path: Some(tmp.path().to_string_lossy().to_string()),
+            is_installed: true,
+            playtime_forever_minutes: None,
+            active_branch: "public".to_string(),
+            update_available: false,
+            update_queued: false,
+            local_manifest_ids: HashMap::new(),
+        };
+
+        let mut config = LauncherConfig::default();
+        config.steam_library_path = lib.to_string_lossy().to_string();
+
+        let mut user_config = UserAppConfig::default();
+        user_config.graphics_layers.graphics_backend_policy = GraphicsBackendPolicy::Auto;
+
+        let ctx = LaunchContext {
+            app,
+            launch_info: LaunchInfo {
+                app_id: 123,
+                id: "0".into(),
+                description: "Test".into(),
+                executable: "test.exe".into(),
+                arguments: "".into(),
+                workingdir: None,
+                target: LaunchTarget::WindowsProton,
+            },
+            launcher_config: config,
+            user_config: Some(user_config),
+            proton_path: Some(runner_path.to_string_lossy().to_string()),
+            dll_resolutions: Vec::new(),
+        };
+
+        let runner = WineTkgRunner;
+        let env = runner.build_env(&ctx).await.unwrap();
+
+        // Since we simulated DXVK, Auto should have enabled it
+        let overrides = env.get("WINEDLLOVERRIDES").unwrap();
+        assert!(overrides.contains("d3d11=n,b"));
     }
 
     #[tokio::test]

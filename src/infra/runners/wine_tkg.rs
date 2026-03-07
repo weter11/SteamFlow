@@ -275,7 +275,7 @@ impl Runner for WineTkgRunner {
         env.insert("WINEPREFIX".to_string(), game_wineprefix.to_string_lossy().to_string());
         env.insert("STEAM_COMPAT_DATA_PATH".to_string(), compat_data_path.to_string_lossy().to_string());
 
-        let glc = ctx.user_config.as_ref()
+        let mut glc = ctx.user_config.as_ref()
             .map(|c| c.graphics_layers.clone())
             .unwrap_or_default();
         let no_overlay = ctx.user_config.as_ref()
@@ -295,13 +295,55 @@ impl Runner for WineTkgRunner {
             .or_else(|| executable.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| install_dir.clone());
 
-        let dll_overrides = crate::utils::build_dll_overrides(
+        // Resolve graphics backend policy
+        match glc.graphics_backend_policy {
+            crate::models::GraphicsBackendPolicy::Auto => {
+                let components = crate::utils::detect_runner_components(
+                    &crate::utils::resolve_runner(
+                        ctx.proton_path.as_deref().unwrap_or("wine"),
+                        &library_root
+                    ),
+                    Some(&game_wineprefix)
+                );
+
+                if components.dxvk.is_some() {
+                    glc.dxvk_enabled = true;
+                }
+                if components.vkd3d_proton.is_some() {
+                    glc.vkd3d_proton_enabled = true;
+                }
+            }
+            crate::models::GraphicsBackendPolicy::WineD3D => {
+                glc.dxvk_enabled = false;
+                glc.vkd3d_proton_enabled = false;
+                glc.vkd3d_enabled = false;
+            }
+            crate::models::GraphicsBackendPolicy::DXVK => {
+                glc.dxvk_enabled = true;
+            }
+            crate::models::GraphicsBackendPolicy::VKD3D => {
+                glc.vkd3d_proton_enabled = true;
+            }
+        }
+
+        let mut dll_overrides = crate::utils::build_dll_overrides(
             glc.dxvk_enabled,
             glc.vkd3d_proton_enabled,
             glc.vkd3d_enabled,
             no_overlay,
             Some(&game_working_dir),
         );
+
+        // Enhance overrides with resolved DLL providers
+        for res in &ctx.dll_resolutions {
+            if let crate::launch::dll_provider_resolver::DllProvider::GameLocal = res.chosen_provider {
+                // Ensure native wins for game-local DLLs
+                if !dll_overrides.contains(&format!("{}=n", res.name)) {
+                     dll_overrides.push_str(&format!(";{}=n", res.name));
+                }
+            }
+        }
+
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
 
         env.insert("WINEPATH".to_string(), "C:\\Program Files (x86)\\Steam".to_string());
@@ -324,6 +366,18 @@ impl Runner for WineTkgRunner {
         if let Some(config) = &ctx.user_config {
             for (key, val) in &config.env_variables {
                 env.insert(key.clone(), val.clone());
+            }
+
+            // Add debug toggles
+            if config.graphics_layers.dxvk_enabled {
+                if !env.contains_key("DXVK_HUD") {
+                    env.insert("DXVK_HUD".to_string(), "compiler".to_string());
+                }
+            }
+            if config.graphics_layers.vkd3d_proton_enabled || config.graphics_layers.vkd3d_enabled {
+                 if !env.contains_key("VKD3D_DEBUG") {
+                    env.insert("VKD3D_DEBUG".to_string(), "warn".to_string());
+                }
             }
         }
 

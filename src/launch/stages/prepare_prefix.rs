@@ -19,6 +19,7 @@ impl PipelineStage for PreparePrefixStage {
                     .ok_or_else(|| LaunchError::new(LaunchErrorKind::Validation, "launcher_config missing"))?.clone(),
                 user_config: ctx.user_config.clone(),
                 proton_path: ctx.proton_path.clone(),
+                dll_resolutions: ctx.dll_resolutions.clone(),
             };
             runner.prepare_prefix(&runner_ctx).await?;
         }

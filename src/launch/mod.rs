@@ -1,6 +1,7 @@
 pub mod pipeline;
 pub mod stages;
 pub mod validators;
+pub mod dll_provider_resolver;
 
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context, anyhow};
