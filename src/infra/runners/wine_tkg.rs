@@ -312,38 +312,65 @@ impl Runner for WineTkgRunner {
         match glc.graphics_backend_policy {
             crate::models::GraphicsBackendPolicy::Auto => {
                 let components = crate::utils::detect_runner_components(
-                    &crate::utils::resolve_runner(
-                        proton,
-                        &library_root
-                    ),
-                    Some(&game_wineprefix)
+                    &crate::utils::resolve_runner(proton, &library_root),
+                    Some(&game_wineprefix),
                 );
 
                 if components.dxvk.is_some() {
                     glc.dxvk_enabled = true;
                 }
-                if components.vkd3d_proton.is_some() {
-                    glc.vkd3d_proton_enabled = true;
+                // Respect d3d12_policy when auto-detecting VKD3D variant
+                match glc.d3d12_policy {
+                    crate::models::D3D12ProviderPolicy::Vkd3dWine => {
+                        if components.vkd3d.is_some() {
+                            glc.vkd3d_enabled = true;
+                        }
+                    }
+                    _ => {
+                        // Auto or Vkd3dProton: prefer proton, fall back to wine VKD3D
+                        if components.vkd3d_proton.is_some() {
+                            glc.vkd3d_proton_enabled = true;
+                        } else if components.vkd3d.is_some() {
+                            glc.vkd3d_enabled = true;
+                        }
+                    }
                 }
             }
             crate::models::GraphicsBackendPolicy::WineD3D => {
                 glc.dxvk_enabled = false;
                 glc.vkd3d_proton_enabled = false;
                 glc.vkd3d_enabled = false;
+                // force_builtin_d3d handles the rest below
             }
             crate::models::GraphicsBackendPolicy::DXVK => {
                 glc.dxvk_enabled = true;
             }
             crate::models::GraphicsBackendPolicy::VKD3D => {
-                glc.vkd3d_proton_enabled = true;
+                // Consult d3d12_policy to select the right implementation
+                match glc.d3d12_policy {
+                    crate::models::D3D12ProviderPolicy::Vkd3dWine => {
+                        glc.vkd3d_enabled = true;
+                        glc.vkd3d_proton_enabled = false;
+                    }
+                    _ => {
+                        // Auto or Vkd3dProton
+                        glc.vkd3d_proton_enabled = true;
+                    }
+                }
             }
         }
+
+        let force_builtin_d3d = matches!(
+            glc.graphics_backend_policy,
+            crate::models::GraphicsBackendPolicy::WineD3D
+        );
 
         let mut dll_overrides = crate::utils::build_dll_overrides(
             glc.dxvk_enabled,
             glc.vkd3d_proton_enabled,
             glc.vkd3d_enabled,
             no_overlay,
+            force_builtin_d3d,
             Some(&game_working_dir),
         );
 
@@ -359,42 +386,52 @@ impl Runner for WineTkgRunner {
 
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
 
-        // Build WINEDLLPATH from runner's bundled DLL subdirectories
-        let runner_binary_path = crate::utils::resolve_runner(proton, &library_root);
-        let runner_root = crate::utils::derive_runner_root(&runner_binary_path);
+        // Translate Runner-resolved DLL paths into WINEDLLPATH so Wine can
+        // actually find the bundled DLLs (VKD3D-Proton, DXVK, etc.) in the runner.
+        // Without this, d3d12=n,b finds whatever is in the prefix's system32 instead.
+        let mut wine_dll_dirs: Vec<String> = Vec::new();
 
-        let dll_subdirs = [
-            "lib/wine/dxvk",              "lib64/wine/dxvk",
-            "lib/wine/vkd3d-proton",      "lib64/wine/vkd3d-proton",
-            "lib/wine/vkd3d",             "lib64/wine/vkd3d",
-            "files/lib/wine/dxvk",        "files/lib64/wine/dxvk",
-            "files/lib/wine/vkd3d-proton","files/lib64/wine/vkd3d-proton",
-            "dist/lib/wine/dxvk",         "dist/lib64/wine/dxvk",
-            "dist/lib/wine/vkd3d-proton", "dist/lib64/wine/vkd3d-proton",
-        ];
-
-        let mut wine_dll_path_entries: Vec<String> = dll_subdirs
-            .iter()
-            .map(|sub| runner_root.join(sub))
-            .filter(|p| p.exists())
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-
-        // Also include the runner's main lib dirs so Wine can find .so loader stubs
-        for sub in &["lib/wine", "lib64/wine", "files/lib/wine", "files/lib64/wine"] {
-            let p = runner_root.join(sub);
-            if p.exists() {
-                wine_dll_path_entries.push(p.to_string_lossy().to_string());
+        for res in &ctx.dll_resolutions {
+            if let crate::launch::dll_provider_resolver::DllProvider::Runner = res.chosen_provider {
+                if let Some(path) = &res.chosen_path {
+                    if let Some(parent) = path.parent() {
+                        let dir = parent.to_string_lossy().to_string();
+                        if !wine_dll_dirs.contains(&dir) {
+                            wine_dll_dirs.push(dir);
+                        }
+                    }
+                }
             }
         }
 
-        if !wine_dll_path_entries.is_empty() {
-            // Prepend to any existing WINEDLLPATH the user may have set
+        // Also add the runner's main lib/wine directories so Wine can find
+        // the .dll.so PE loader stubs it needs to bridge into native DLLs.
+        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let runner_root = crate::utils::derive_runner_root(&active_runner);
+        for lib_sub in &[
+            "lib/wine",
+            "lib64/wine",
+            "files/lib/wine",
+            "files/lib64/wine",
+            "dist/lib/wine",
+            "dist/lib64/wine",
+        ] {
+            let p = runner_root.join(lib_sub);
+            if p.exists() {
+                let s = p.to_string_lossy().to_string();
+                if !wine_dll_dirs.contains(&s) {
+                    wine_dll_dirs.push(s);
+                }
+            }
+        }
+
+        if !wine_dll_dirs.is_empty() {
+            // Preserve any WINEDLLPATH the user may have set in env_variables
             let existing = env.get("WINEDLLPATH").cloned().unwrap_or_default();
             let combined = if existing.is_empty() {
-                wine_dll_path_entries.join(":")
+                wine_dll_dirs.join(":")
             } else {
-                format!("{}:{}", wine_dll_path_entries.join(":"), existing)
+                format!("{}:{}", wine_dll_dirs.join(":"), existing)
             };
             env.insert("WINEDLLPATH".to_string(), combined);
         }
