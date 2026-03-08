@@ -145,6 +145,7 @@ pub struct SteamLauncher {
     runner_components: Option<crate::utils::RunnerComponents>,
     last_scanned_runner: PathBuf,
     last_scanned_appid: Option<u32>,
+    available_gpus: Vec<crate::utils::DetectedGpu>,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -162,8 +163,6 @@ impl SteamLauncher {
             if cfg.graphics_layers.graphics_backend_policy == crate::models::GraphicsBackendPolicy::Auto {
                  if cfg.graphics_layers.dxvk_enabled {
                      cfg.graphics_layers.graphics_backend_policy = crate::models::GraphicsBackendPolicy::DXVK;
-                 } else if cfg.graphics_layers.vkd3d_proton_enabled {
-                     cfg.graphics_layers.graphics_backend_policy = crate::models::GraphicsBackendPolicy::VKD3D;
                  }
             }
         }
@@ -229,6 +228,7 @@ impl SteamLauncher {
             runner_components,
             last_scanned_runner: resolved,
             last_scanned_appid: None,
+            available_gpus: crate::utils::list_available_gpus(),
             operation_tx,
             operation_rx,
         }
@@ -1150,6 +1150,45 @@ impl SteamLauncher {
                 });
             }
 
+            if !self.available_gpus.is_empty() {
+                ui.add_space(16.0);
+                ui.heading("Graphics Device");
+                let mut user_cfg = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
+                let mut gpu_changed = false;
+
+                let selected_text = user_cfg.gpu_preference.clone().unwrap_or_else(|| {
+                    if self.available_gpus.len() > 1 {
+                        "Auto (System Default)".to_string()
+                    } else {
+                        self.available_gpus[0].name.clone()
+                    }
+                });
+
+                egui::ComboBox::from_id_salt("gpu_selector")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        if self.available_gpus.len() > 1 {
+                            if ui.selectable_value(&mut user_cfg.gpu_preference, None, "Auto (System Default)").clicked() {
+                                gpu_changed = true;
+                            }
+                        }
+                        for gpu in &self.available_gpus {
+                            let label = &gpu.name;
+                            if ui.selectable_value(&mut user_cfg.gpu_preference, Some(gpu.name.clone()), label).clicked() {
+                                gpu_changed = true;
+                            }
+                        }
+                    });
+
+                if gpu_changed {
+                    self.user_configs.insert(game.app_id, user_cfg);
+                    let store = self.user_configs.clone();
+                    self.runtime.spawn(async move {
+                        let _ = crate::config::save_user_configs(&store).await;
+                    });
+                }
+            }
+
             ui.add_space(16.0);
             ui.heading("Steam Features");
 
@@ -1208,37 +1247,22 @@ impl SteamLauncher {
 
             ui.add_space(8.0);
             ui.separator();
-            ui.heading("Graphics Layers (per-prefix)");
+            ui.heading("Graphics Rendering");
             ui.label(
                 egui::RichText::new(
-                    "Copies DLLs into this game's WINEPREFIX. Required for DX12 on wine-tkg.",
+                    "Configure how graphics APIs are translated to Vulkan or OpenGL.",
                 )
                 .weak()
                 .italics(),
             );
             ui.add_space(4.0);
 
-            let user_cfg_for_prefix = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
-            let game_prefix = if user_cfg_for_prefix.use_steam_runtime {
-                // Shared mode → master prefix; PerGame → game's own prefix
-                crate::utils::steam_wineprefix_for_game(
-                    &self.launcher_config,
-                    game.app_id,
-                    &self.user_configs,
-                )
-            } else {
-                std::path::PathBuf::from(&self.launcher_config.steam_library_path)
-                    .join("steamapps/compatdata")
-                    .join(game.app_id.to_string())
-                    .join("pfx")
-            };
-
             let mut user_cfg_gl = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
             let glc = &mut user_cfg_gl.graphics_layers;
             let mut gl_changed = false;
 
             ui.horizontal(|ui| {
-                ui.label("Graphics Backend Policy:");
+                ui.label("Graphics Backend Policy (DX8-11):");
                 egui::ComboBox::from_id_salt("graphics_backend_policy_selector")
                     .selected_text(format!("{:?}", glc.graphics_backend_policy))
                     .show_ui(ui, |ui| {
@@ -1252,15 +1276,12 @@ impl SteamLauncher {
                         if ui.selectable_value(&mut glc.graphics_backend_policy, GraphicsBackendPolicy::DXVK, "DXVK (Vulkan)").clicked() {
                             gl_changed = true;
                         }
-                        if ui.selectable_value(&mut glc.graphics_backend_policy, GraphicsBackendPolicy::VKD3D, "VKD3D (Vulkan/DX12)").clicked() {
-                            gl_changed = true;
-                        }
                     });
             });
 
-            if glc.graphics_backend_policy == crate::models::GraphicsBackendPolicy::Auto || glc.graphics_backend_policy == crate::models::GraphicsBackendPolicy::VKD3D {
+            {
                 ui.horizontal(|ui| {
-                    ui.label("D3D12 Provider Policy:");
+                    ui.label("D3D12 Provider Policy (DX12):");
                     egui::ComboBox::from_id_salt("d3d12_provider_policy_selector")
                         .selected_text(format!("{:?}", glc.d3d12_policy))
                         .show_ui(ui, |ui| {
@@ -1279,249 +1300,18 @@ impl SteamLauncher {
             }
 
             ui.add_space(8.0);
-
-            // Detect what's already in the prefix for status display
-            let dxvk_in_prefix = game_prefix.join("drive_c/windows/system32/d3d11.dll").exists();
-            let d3d12_dll = game_prefix.join("drive_c/windows/system32/d3d12.dll");
-            let mut vkd3dp_in_prefix = false;
-            let mut vkd3dw_in_prefix = false;
-
-            if d3d12_dll.exists() {
-                // This is a bit slow to do every frame, but fine for small DLLs
-                // In a real app we'd cache this.
-                let is_proton = crate::utils::detect_runner_components(&PathBuf::new(), Some(&game_prefix)).vkd3d_proton.is_some();
-                if is_proton {
-                    vkd3dp_in_prefix = true;
-                } else {
-                    vkd3dw_in_prefix = true;
+            ui.heading("Manual Overrides");
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut glc.dxvk_enabled, "Force DXVK").on_hover_text("Always use DXVK for DX8-11, ignoring policy.").changed() {
+                    gl_changed = true;
                 }
-            }
-
-            egui::Grid::new("graphics_layer_grid")
-                .num_columns(4)
-                .spacing([8.0, 6.0])
-                .show(ui, |ui| {
-                    // ── DXVK ──────────────────────────────────────────────
-                    ui.label("DXVK (DX8-11):");
-                    let dxvk_avail =
-                        crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Dxvk).is_some();
-
-                    if dxvk_in_prefix {
-                        ui.colored_label(egui::Color32::GREEN, "installed");
-                    } else {
-                        ui.colored_label(egui::Color32::GRAY, "not installed");
-                    }
-
-                    if ui
-                        .add_enabled(
-                            dxvk_avail && game_prefix.exists(),
-                            egui::Button::new(if dxvk_in_prefix { "Reinstall" } else { "Install" }),
-                        )
-                        .clicked()
-                    {
-                        match crate::utils::install_layer_into_prefix(
-                            &crate::utils::GraphicsLayer::Dxvk,
-                            &game_prefix,
-                        ) {
-                            Ok(dlls) => {
-                                self.status = format!("DXVK installed: {}", dlls.join(", "));
-                                glc.dxvk_enabled = true;
-                                gl_changed = true;
-                            }
-                            Err(e) => self.status = format!("DXVK install failed: {e}"),
-                        }
-                    }
-
-                    if ui.add_enabled(dxvk_in_prefix, egui::Button::new("Remove")).clicked() {
-                        match crate::utils::remove_layer_from_prefix(
-                            &crate::utils::GraphicsLayer::Dxvk,
-                            &game_prefix,
-                        ) {
-                            Ok(()) => {
-                                self.status = "DXVK removed".to_string();
-                                glc.dxvk_enabled = false;
-                                gl_changed = true;
-                            }
-                            Err(e) => self.status = format!("DXVK remove failed: {e}"),
-                        }
-                    }
-
-                    if !dxvk_avail {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            "(not found system-wide — install via package manager)",
-                        );
-                    } else {
-                        ui.label("");
-                    }
-                    ui.end_row();
-
-                    // Override toggle (independent of install status)
-                    ui.label("");
-                    if ui
-                        .checkbox(&mut glc.dxvk_enabled, "Manual DXVK Overrides (advanced)")
-                        .on_hover_text(
-                            "Forces d3d9=n,b d3d11=n,b dxgi=n,b regardless of policy choice. Requires DLLs to be installed above.",
-                        )
-                        .changed()
-                    {
-                        gl_changed = true;
-                    }
-                    ui.label("");
-                    ui.label("");
-                    ui.label("");
-                    ui.end_row();
-
-                    ui.add_space(4.0);
-                    ui.end_row();
-
-                    // ── VKD3D-Proton ───────────────────────────────────────
-                    ui.label("VKD3D-Proton (DX12):");
-                    let vkd3dp_avail =
-                        crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Vkd3dProton)
-                            .is_some();
-
-                    if vkd3dp_in_prefix {
-                        ui.colored_label(egui::Color32::GREEN, "installed");
-                    } else {
-                        ui.colored_label(egui::Color32::GRAY, "not installed");
-                    }
-
-                    if ui
-                        .add_enabled(
-                            vkd3dp_avail && game_prefix.exists(),
-                            egui::Button::new(if vkd3dp_in_prefix { "Reinstall" } else { "Install" }),
-                        )
-                        .clicked()
-                    {
-                        match crate::utils::install_layer_into_prefix(
-                            &crate::utils::GraphicsLayer::Vkd3dProton,
-                            &game_prefix,
-                        ) {
-                            Ok(dlls) => {
-                                self.status = format!("VKD3D-Proton installed: {}", dlls.join(", "));
-                                glc.vkd3d_proton_enabled = true;
-                                gl_changed = true;
-                            }
-                            Err(e) => self.status = format!("VKD3D-Proton install failed: {e}"),
-                        }
-                    }
-
-                    if ui.add_enabled(vkd3dp_in_prefix, egui::Button::new("Remove")).clicked() {
-                        match crate::utils::remove_layer_from_prefix(
-                            &crate::utils::GraphicsLayer::Vkd3dProton,
-                            &game_prefix,
-                        ) {
-                            Ok(()) => {
-                                self.status = "VKD3D-Proton removed".to_string();
-                                glc.vkd3d_proton_enabled = false;
-                                gl_changed = true;
-                            }
-                            Err(e) => self.status = format!("VKD3D-Proton remove failed: {e}"),
-                        }
-                    }
-
-                    if !vkd3dp_avail {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            "(not found — install vkd3d-proton via package manager)",
-                        );
-                    } else {
-                        ui.label("");
-                    }
-                    ui.end_row();
-
-                    ui.label("");
-                    if ui
-                        .checkbox(
-                            &mut glc.vkd3d_proton_enabled,
-                            "Manual VKD3D-Proton Overrides",
-                        )
-                        .on_hover_text("Forces d3d12=n,b regardless of policy choice. Required for DX12 games on wine-tkg.")
-                        .changed()
-                    {
-                        gl_changed = true;
-                    }
-                    ui.label("");
-                    ui.label("");
-                    ui.label("");
-                    ui.end_row();
-
-                    ui.add_space(4.0);
-                    ui.end_row();
-
-                    // ── VKD3D (Wine) ───────────────────────────────────────
-                    ui.label("VKD3D (Wine):");
-                    let vkd3dw_avail =
-                        crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Vkd3d)
-                            .is_some();
-
-                    if vkd3dw_in_prefix {
-                        ui.colored_label(egui::Color32::GREEN, "installed");
-                    } else {
-                        ui.colored_label(egui::Color32::GRAY, "not installed");
-                    }
-
-                    if ui
-                        .add_enabled(
-                            vkd3dw_avail && game_prefix.exists(),
-                            egui::Button::new(if vkd3dw_in_prefix { "Reinstall" } else { "Install" }),
-                        )
-                        .clicked()
-                    {
-                        match crate::utils::install_layer_into_prefix(
-                            &crate::utils::GraphicsLayer::Vkd3d,
-                            &game_prefix,
-                        ) {
-                            Ok(dlls) => {
-                                self.status = format!("VKD3D (Wine) installed: {}", dlls.join(", "));
-                                glc.vkd3d_enabled = true;
-                                gl_changed = true;
-                            }
-                            Err(e) => self.status = format!("VKD3D (Wine) install failed: {e}"),
-                        }
-                    }
-
-                    if ui.add_enabled(vkd3dw_in_prefix, egui::Button::new("Remove")).clicked() {
-                        match crate::utils::remove_layer_from_prefix(
-                            &crate::utils::GraphicsLayer::Vkd3d,
-                            &game_prefix,
-                        ) {
-                            Ok(()) => {
-                                self.status = "VKD3D (Wine) removed".to_string();
-                                glc.vkd3d_enabled = false;
-                                gl_changed = true;
-                            }
-                            Err(e) => self.status = format!("VKD3D (Wine) remove failed: {e}"),
-                        }
-                    }
-
-                    if !vkd3dw_avail {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            "(not found — install libvkd3d via package manager)",
-                        );
-                    } else {
-                        ui.label("");
-                    }
-                    ui.end_row();
-
-                    ui.label("");
-                    if ui
-                        .checkbox(
-                            &mut glc.vkd3d_enabled,
-                            "Manual VKD3D (Wine) Overrides",
-                        )
-                        .on_hover_text("Forces d3d12=n,b regardless of policy choice.")
-                        .changed()
-                    {
-                        gl_changed = true;
-                    }
-                    ui.label("");
-                    ui.label("");
-                    ui.label("");
-                    ui.end_row();
-                });
+                if ui.checkbox(&mut glc.vkd3d_proton_enabled, "Force VKD3D-Proton").on_hover_text("Always use VKD3D-Proton for DX12, ignoring policy.").changed() {
+                    gl_changed = true;
+                }
+                if ui.checkbox(&mut glc.vkd3d_enabled, "Force VKD3D (Wine)").on_hover_text("Always use upstream Wine VKD3D for DX12, ignoring policy.").changed() {
+                    gl_changed = true;
+                }
+            });
 
             if gl_changed {
                 self.user_configs.insert(game.app_id, user_cfg_gl);

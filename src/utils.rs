@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -217,10 +218,14 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     let bundled_dlls = [
         "files/lib/wine/dxvk/d3d11.dll",
         "files/lib64/wine/dxvk/d3d11.dll",
+        "files/lib/wine/x86_64-windows/d3d11.dll",
+        "files/lib/wine/i386-windows/d3d11.dll",
         "dist/lib/wine/dxvk/d3d11.dll",
         "dist/lib64/wine/dxvk/d3d11.dll",
         "lib/wine/dxvk/d3d11.dll",
         "lib64/wine/dxvk/d3d11.dll",
+        "lib/wine/x86_64-windows/d3d11.dll",
+        "lib/wine/i386-windows/d3d11.dll",
     ];
     if let Some(info) = check_bundled(
         root,
@@ -261,19 +266,23 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
     let bundled_dlls = [
         "files/lib/wine/vkd3d-proton/d3d12.dll",
         "files/lib64/wine/vkd3d-proton/d3d12.dll",
+        "files/lib/wine/x86_64-windows/d3d12.dll",
         "dist/lib/wine/vkd3d-proton/d3d12.dll",
         "dist/lib64/wine/vkd3d-proton/d3d12.dll",
         "lib/wine/vkd3d-proton/d3d12.dll",
         "lib64/wine/vkd3d-proton/d3d12.dll",
+        "lib/wine/x86_64-windows/d3d12.dll",
     ];
     // VKD3D-Proton requires both d3d12.dll and d3d12core.dll for modern titles
     let core_bundled_dlls = [
         "files/lib/wine/vkd3d-proton/d3d12core.dll",
         "files/lib64/wine/vkd3d-proton/d3d12core.dll",
+        "files/lib/wine/x86_64-windows/d3d12core.dll",
         "dist/lib/wine/vkd3d-proton/d3d12core.dll",
         "dist/lib64/wine/vkd3d-proton/d3d12core.dll",
         "lib/wine/vkd3d-proton/d3d12core.dll",
         "lib64/wine/vkd3d-proton/d3d12core.dll",
+        "lib/wine/x86_64-windows/d3d12core.dll",
     ];
 
     if !core_bundled_dlls.iter().any(|rel| root.join(rel).exists()) {
@@ -329,10 +338,12 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     let bundled_dlls = [
         "files/lib/wine/vkd3d/libvkd3d-1.dll",
         "files/lib64/wine/vkd3d/libvkd3d-1.dll",
+        "files/lib/wine/x86_64-windows/libvkd3d-1.dll",
         "files/lib/vkd3d/libvkd3d-1.dll",
         "dist/lib/wine/vkd3d/libvkd3d-1.dll",
         "lib/wine/vkd3d/libvkd3d-1.dll",
         "lib64/wine/vkd3d/libvkd3d-1.dll",
+        "lib/wine/x86_64-windows/libvkd3d-1.dll",
         "files/lib/wine/vkd3d/d3d12.dll",
         "files/lib64/wine/vkd3d/d3d12.dll",
         "files/lib/vkd3d/d3d12.dll",
@@ -627,109 +638,6 @@ fn layer_dir_has_dlls(dir: &Path, layer: &GraphicsLayer) -> bool {
     dir.join(sentinel).exists()
 }
 
-/// Installs a graphics layer into the given WINEPREFIX by copying DLLs
-/// into system32 (x64) and syswow64 (x32).
-pub fn install_layer_into_prefix(layer: &GraphicsLayer, wineprefix: &Path) -> Result<Vec<String>> {
-    let (x64_src, x32_src) =
-        find_layer_source(layer).context("could not find source DLLs for graphics layer")?;
-
-    let sys32 = wineprefix.join("drive_c/windows/system32");
-    let sys64 = wineprefix.join("drive_c/windows/syswow64");
-    std::fs::create_dir_all(&sys32)?;
-    std::fs::create_dir_all(&sys64)?;
-
-    let dlls_for = |layer: &GraphicsLayer| -> &[&str] {
-        match layer {
-            GraphicsLayer::Dxvk => &[
-                "d3d8.dll",
-                "d3d9.dll",
-                "d3d10.dll",
-                "d3d10_1.dll",
-                "d3d10core.dll",
-                "d3d11.dll",
-                "dxgi.dll",
-            ],
-            GraphicsLayer::Vkd3dProton => &["d3d12.dll", "d3d12core.dll"],
-            GraphicsLayer::Vkd3d => &["d3d12.dll", "libvkd3d-1.dll", "libvkd3d-shader-1.dll"],
-        }
-    };
-
-    let mut installed = Vec::new();
-
-    // x64 DLLs go into system32 (Wine's convention for 64-bit)
-    for dll_name in dlls_for(layer) {
-        let src = x64_src.join(dll_name);
-        if src.exists() {
-            let dst = sys32.join(dll_name);
-            std::fs::copy(&src, &dst).with_context(|| format!("failed copying {} to system32", dll_name))?;
-            installed.push(dll_name.to_string());
-        }
-    }
-
-    // x32 DLLs go into syswow64 (Wine's convention for 32-bit)
-    if let Some(x32) = x32_src {
-        for dll_name in dlls_for(layer) {
-            let src = x32.join(dll_name);
-            if src.exists() {
-                let dst = sys64.join(dll_name);
-                std::fs::copy(&src, &dst).with_context(|| format!("failed copying {} to syswow64", dll_name))?;
-            }
-        }
-    } else {
-        tracing::warn!(
-            "No 32-bit DLLs found for {:?} — 32-bit games (Batman, etc.) will not use this layer",
-            layer
-        );
-        installed.push("(WARNING: no x32 DLLs found — 32-bit games unaffected)".to_string());
-    }
-
-    if installed.is_empty() {
-        anyhow::bail!("no DLLs were copied — source directory may be empty");
-    }
-
-    Ok(installed)
-}
-
-/// Removes a graphics layer from the prefix, restoring Wine's builtins.
-pub fn remove_layer_from_prefix(layer: &GraphicsLayer, wineprefix: &Path) -> Result<()> {
-    let sys32 = wineprefix.join("drive_c/windows/system32");
-    let sys64 = wineprefix.join("drive_c/windows/syswow64");
-
-    let dlls: &[&str] = match layer {
-        GraphicsLayer::Dxvk => &[
-            "d3d9.dll",
-            "d3d10.dll",
-            "d3d10_1.dll",
-            "d3d10core.dll",
-            "d3d11.dll",
-            "dxgi.dll",
-        ],
-        GraphicsLayer::Vkd3dProton => &["d3d12.dll", "d3d12core.dll"],
-        GraphicsLayer::Vkd3d => &["d3d12.dll"],
-    };
-
-    for dll in dlls {
-        for dir in [&sys32, &sys64] {
-            let path = dir.join(dll);
-            if path.exists() {
-                std::fs::remove_file(&path).with_context(|| format!("failed removing {}", path.display()))?;
-            }
-        }
-        // Special case for Wine-style DLLs which might have been copied without .dll suffix
-        if dll.ends_with(".dll") {
-            let stem = &dll[..dll.len() - 4];
-            for dir in [&sys32, &sys64] {
-                let path = dir.join(stem);
-                if path.exists() && !path.is_dir() {
-                     let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Returns the WINEDLLOVERRIDES string needed to activate installed layers.
 pub fn build_dll_overrides(
     dxvk_active: bool,
@@ -831,6 +739,78 @@ pub fn resolve_master_wineprefix() -> PathBuf {
 
     // Fresh install default — Proton-style nesting
     base.join("pfx")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectedGpu {
+    pub name: String,
+    pub pci_id: Option<String>,
+    pub is_discrete: bool,
+}
+
+pub fn list_available_gpus() -> Vec<DetectedGpu> {
+    let mut gpus = Vec::new();
+
+    // Try scanning /sys/class/drm/card* to find GPUs
+    // This is more reliable than just checking /dev/dri/
+    let drm_path = Path::new("/sys/class/drm");
+    if let Ok(entries) = std::fs::read_dir(drm_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("card") && !name.contains('-') {
+                let card_path = entry.path();
+
+                // Read vendor and device IDs if available
+                let device_path = card_path.join("device");
+                let vendor = std::fs::read_to_string(device_path.join("vendor"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let device = std::fs::read_to_string(device_path.join("device"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+
+                let pci_id = if !vendor.is_empty() && !device.is_empty() {
+                    Some(format!("{}:{}", vendor.replace("0x", ""), device.replace("0x", "")))
+                } else {
+                    None
+                };
+
+                // Heuristic for discrete vs integrated
+                // This is a bit simplified, but often works on Linux
+                let is_discrete = pci_id.as_ref().map(|id| {
+                    // NVIDIA, AMD (discrete), etc.
+                    id.starts_with("10de") || id.starts_with("1002")
+                }).unwrap_or(false);
+
+                let gpu_name = match pci_id.as_deref() {
+                    Some(id) if id.starts_with("10de") => format!("NVIDIA GPU ({})", name),
+                    Some(id) if id.starts_with("1002") => format!("AMD GPU ({})", name),
+                    Some(id) if id.starts_with("8086") => format!("Intel GPU ({})", name),
+                    _ => format!("Unknown GPU ({})", name),
+                };
+
+                gpus.push(DetectedGpu {
+                    name: gpu_name,
+                    pci_id,
+                    is_discrete,
+                });
+            }
+        }
+    }
+
+    // Fallback if /sys scan failed but we have NVIDIA tools or similar
+    if gpus.is_empty() {
+        if Path::new("/dev/nvidia0").exists() {
+             gpus.push(DetectedGpu {
+                 name: "NVIDIA Discrete GPU".to_string(),
+                 pci_id: Some("10de:unknown".to_string()),
+                 is_discrete: true,
+             });
+        }
+    }
+
+    gpus.sort_by(|a, b| b.is_discrete.cmp(&a.is_discrete));
+    gpus
 }
 
 pub fn steam_wineprefix_for_game(

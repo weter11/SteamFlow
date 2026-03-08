@@ -50,7 +50,6 @@ pub enum GraphicsBackendPolicy {
     Auto,
     WineD3D,
     DXVK,
-    VKD3D,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -86,6 +85,8 @@ pub struct UserAppConfig {
     pub steam_launch_config: SteamLaunchConfig,
     #[serde(default)]
     pub graphics_layers: GraphicsLayerConfig,
+    #[serde(default)]
+    pub gpu_preference: Option<String>,
     pub hidden: bool,   // Future use
     pub favorite: bool, // Future use
 }

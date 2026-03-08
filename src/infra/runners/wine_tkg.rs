@@ -308,57 +308,37 @@ impl Runner for WineTkgRunner {
                 .unwrap_or("wine")
         };
 
-        // Resolve graphics backend policy
-        match glc.graphics_backend_policy {
-            crate::models::GraphicsBackendPolicy::Auto => {
-                let components = crate::utils::detect_runner_components(
-                    &crate::utils::resolve_runner(proton, &library_root),
-                    Some(&game_wineprefix),
-                );
+        let components = crate::utils::detect_runner_components(
+            &crate::utils::resolve_runner(proton, &library_root),
+            Some(&game_wineprefix),
+        );
 
-                if components.dxvk.is_some() {
-                    glc.dxvk_enabled = true;
-                }
-                // Respect d3d12_policy when auto-detecting VKD3D variant
-                match glc.d3d12_policy {
-                    crate::models::D3D12ProviderPolicy::Vkd3dWine => {
-                        if components.vkd3d.is_some() {
-                            glc.vkd3d_enabled = true;
-                        }
-                    }
-                    _ => {
-                        // Auto or Vkd3dProton: prefer proton, fall back to wine VKD3D
-                        if components.vkd3d_proton.is_some() {
-                            glc.vkd3d_proton_enabled = true;
-                        } else if components.vkd3d.is_some() {
-                            glc.vkd3d_enabled = true;
-                        }
-                    }
-                }
-            }
-            crate::models::GraphicsBackendPolicy::WineD3D => {
-                glc.dxvk_enabled = false;
-                glc.vkd3d_proton_enabled = false;
-                glc.vkd3d_enabled = false;
-                // force_builtin_d3d handles the rest below
-            }
-            crate::models::GraphicsBackendPolicy::DXVK => {
-                glc.dxvk_enabled = true;
-            }
-            crate::models::GraphicsBackendPolicy::VKD3D => {
-                // Consult d3d12_policy to select the right implementation
-                match glc.d3d12_policy {
-                    crate::models::D3D12ProviderPolicy::Vkd3dWine => {
-                        glc.vkd3d_enabled = true;
-                        glc.vkd3d_proton_enabled = false;
-                    }
-                    _ => {
-                        // Auto or Vkd3dProton
-                        glc.vkd3d_proton_enabled = true;
-                    }
+        // 1. Resolve DX8-11 policy (GraphicsBackendPolicy)
+        let policy_dxvk = match glc.graphics_backend_policy {
+            crate::models::GraphicsBackendPolicy::Auto => components.dxvk.is_some(),
+            crate::models::GraphicsBackendPolicy::WineD3D => false,
+            crate::models::GraphicsBackendPolicy::DXVK => true,
+        };
+        // Manual override takes precedence if enabled, otherwise use policy
+        glc.dxvk_enabled = glc.dxvk_enabled || policy_dxvk;
+
+        // 2. Resolve DX12 policy (D3D12ProviderPolicy)
+        let (policy_vkd3dp, policy_vkd3dw) = match glc.d3d12_policy {
+            crate::models::D3D12ProviderPolicy::Auto => {
+                if components.vkd3d_proton.is_some() {
+                    (true, false)
+                } else if components.vkd3d.is_some() {
+                    (false, true)
+                } else {
+                    (false, false)
                 }
             }
-        }
+            crate::models::D3D12ProviderPolicy::Vkd3dProton => (true, false),
+            crate::models::D3D12ProviderPolicy::Vkd3dWine => (false, true),
+        };
+        // Manual overrides take precedence
+        glc.vkd3d_proton_enabled = glc.vkd3d_proton_enabled || policy_vkd3dp;
+        glc.vkd3d_enabled = glc.vkd3d_enabled || policy_vkd3dw;
 
         let force_builtin_d3d = matches!(
             glc.graphics_backend_policy,
@@ -453,9 +433,39 @@ impl Runner for WineTkgRunner {
             env.insert("XDG_RUNTIME_DIR".to_string(), xdg_runtime);
         }
 
-        // Auto-inject PRIME/Optimus GPU selection (user env vars can still override below)
-        for (k, v) in crate::utils::detect_prime_env() {
-            env.entry(k).or_insert(v);
+        // Apply GPU preference if specified, otherwise fall back to auto-detecting PRIME/Optimus
+        if let Some(gpu_pref) = ctx.user_config.as_ref().and_then(|c| c.gpu_preference.as_ref()) {
+            let available_gpus = crate::utils::list_available_gpus();
+            if let Some(gpu) = available_gpus.iter().find(|g| &g.name == gpu_pref) {
+                if gpu.name.contains("NVIDIA") {
+                    env.insert("__NV_PRIME_RENDER_OFFLOAD".to_string(), "1".to_string());
+                    env.insert("__NV_PRIME_RENDER_OFFLOAD_PROVIDER".to_string(), "NVIDIA-G0".to_string());
+                    env.insert("__VK_LAYER_NV_optimus".to_string(), "NVIDIA_only".to_string());
+                    env.insert("__GLX_VENDOR_LIBRARY_NAME".to_string(), "nvidia".to_string());
+                } else if gpu.name.contains("AMD") || gpu.name.contains("Intel") {
+                    // Standard DRI_PRIME for non-NVIDIA discrete/specific GPUs
+                    // Try to find "cardN" and extract N
+                    let re = regex::Regex::new(r"card(\d+)").unwrap();
+                    if let Some(caps) = re.captures(&gpu.name) {
+                        if let Some(idx_match) = caps.get(1) {
+                            if let Ok(card_idx) = idx_match.as_str().parse::<u32>() {
+                                 // DRI_PRIME=1 is the most common way to select the second GPU
+                                 // For now we use the standard PRIME offload if it's not card0.
+                                 if card_idx > 0 {
+                                     env.insert("DRI_PRIME".to_string(), "1".to_string());
+                                 } else {
+                                     env.insert("DRI_PRIME".to_string(), "0".to_string());
+                                 }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Auto-inject PRIME/Optimus GPU selection
+            for (k, v) in crate::utils::detect_prime_env() {
+                env.entry(k).or_insert(v);
+            }
         }
 
         if let Some(config) = &ctx.user_config {

@@ -94,6 +94,8 @@ impl DllProviderResolver {
                  "files/lib/wine/vkd3d",
                  "files/lib64/wine/dxvk",
                  "files/lib64/wine/vkd3d",
+                 "files/lib/wine/x86_64-windows",
+                 "files/lib/wine/i386-windows",
                  "files/lib/vkd3d",
                  "dist/lib/wine/dxvk",
                  "dist/lib/wine/vkd3d",
@@ -101,6 +103,8 @@ impl DllProviderResolver {
                  "lib/wine/vkd3d",
                  "lib64/wine/dxvk",
                  "lib64/wine/vkd3d",
+                 "lib/wine/x86_64-windows",
+                 "lib/wine/i386-windows",
              ];
              for s in subdirs { roots.push(runner_root.join(s)); }
              report.scan_roots = roots;
@@ -258,10 +262,14 @@ impl DllProviderResolver {
             let relative_paths = [
                 "files/lib/wine/dxvk",
                 "files/lib64/wine/dxvk",
+                "files/lib/wine/x86_64-windows",
+                "files/lib/wine/i386-windows",
                 "dist/lib/wine/dxvk",
                 "dist/lib64/wine/dxvk",
                 "lib/wine/dxvk",
                 "lib64/wine/dxvk",
+                "lib/wine/x86_64-windows",
+                "lib/wine/i386-windows",
             ];
             for rel in relative_paths {
                 let root = runner_root.join(rel);
@@ -285,10 +293,12 @@ impl DllProviderResolver {
                 let relative_paths = [
                     "files/lib/wine/vkd3d-proton",
                     "files/lib64/wine/vkd3d-proton",
+                    "files/lib/wine/x86_64-windows",
                     "dist/lib/wine/vkd3d-proton",
                     "dist/lib64/wine/vkd3d-proton",
                     "lib/wine/vkd3d-proton",
                     "lib64/wine/vkd3d-proton",
+                    "lib/wine/x86_64-windows",
                 ];
                 for rel in relative_paths {
                     let root = runner_root.join(rel);
@@ -304,10 +314,12 @@ impl DllProviderResolver {
                 let relative_paths = [
                     "files/lib/wine/vkd3d",
                     "files/lib64/wine/vkd3d",
+                    "files/lib/wine/x86_64-windows",
                     "files/lib/vkd3d",
                     "dist/lib/wine/vkd3d",
                     "lib/wine/vkd3d",
                     "lib64/wine/vkd3d",
+                    "lib/wine/x86_64-windows",
                     "files/lib/wine",
                     "dist/lib/wine",
                     "lib/wine",
