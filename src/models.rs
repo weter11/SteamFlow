@@ -61,6 +61,16 @@ pub enum D3D12ProviderPolicy {
     Vkd3dWine,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum GpuSelection {
+    #[default]
+    Auto,
+    Manual {
+        index: usize,
+        name: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GraphicsLayerConfig {
     #[serde(default)]
@@ -73,6 +83,8 @@ pub struct GraphicsLayerConfig {
     pub graphics_backend_policy: GraphicsBackendPolicy,
     #[serde(default)]
     pub d3d12_policy: D3D12ProviderPolicy,
+    #[serde(default)]
+    pub gpu_selection: GpuSelection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

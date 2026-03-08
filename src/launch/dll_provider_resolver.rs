@@ -92,15 +92,20 @@ impl DllProviderResolver {
              let subdirs = [
                  "files/lib/wine/dxvk",
                  "files/lib/wine/vkd3d",
+                 "files/lib/wine/vkd3d-proton",
                  "files/lib64/wine/dxvk",
                  "files/lib64/wine/vkd3d",
+                 "files/lib64/wine/vkd3d-proton",
                  "files/lib/vkd3d",
                  "dist/lib/wine/dxvk",
                  "dist/lib/wine/vkd3d",
+                 "dist/lib/wine/vkd3d-proton",
                  "lib/wine/dxvk",
                  "lib/wine/vkd3d",
+                 "lib/wine/vkd3d-proton",
                  "lib64/wine/dxvk",
                  "lib64/wine/vkd3d",
+                 "lib64/wine/vkd3d-proton",
              ];
              for s in subdirs { roots.push(runner_root.join(s)); }
              report.scan_roots = roots;
@@ -391,10 +396,12 @@ mod tests {
         components.vkd3d_proton = Some(crate::utils::ComponentInfo {
             version: "2.10".into(),
             source: crate::utils::ComponentSource::BundledWithRunner,
+            path: None,
         });
         components.vkd3d = Some(crate::utils::ComponentInfo {
             version: "1.8".into(),
             source: crate::utils::ComponentSource::BundledWithRunner,
+            path: None,
         });
 
         let resolver = DllProviderResolver::new();
