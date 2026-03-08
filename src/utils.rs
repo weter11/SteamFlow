@@ -124,6 +124,7 @@ pub struct RunnerComponents {
 pub struct ComponentInfo {
     pub version: String,
     pub source: ComponentSource,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,6 +177,72 @@ pub fn detect_runner_components(
         vkd3d_proton,
         vkd3d,
     }
+}
+
+/// Discovers available GPUs on the system via DRI devices.
+pub fn list_available_gpus() -> Vec<(usize, String)> {
+    let mut gpus = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("renderD") {
+                if let Ok(index) = name.trim_start_matches("renderD").parse::<usize>() {
+                    let device_name = get_gpu_name_from_sysfs(index).unwrap_or_else(|| format!("GPU #{}", index - 128));
+                    gpus.push((index, device_name));
+                }
+            }
+        }
+    }
+    gpus.sort_by_key(|g| g.0);
+    gpus
+}
+
+fn get_gpu_name_from_sysfs(index: usize) -> Option<String> {
+    let base = format!("/sys/class/drm/renderD{}", index);
+    let vendor_path = format!("{}/device/vendor", base);
+    let device_path = format!("{}/device/device", base);
+
+    let vendor = std::fs::read_to_string(vendor_path).ok()?.trim().to_string();
+    let device = std::fs::read_to_string(device_path).ok()?.trim().to_string();
+
+    let vendor_name = match vendor.as_str() {
+        "0x10de" => "NVIDIA",
+        "0x1002" => "AMD",
+        "0x8086" => "Intel",
+        _ => "Unknown",
+    };
+
+    Some(format!("{} ({} {})", vendor_name, vendor, device))
+}
+
+pub fn get_gpu_selection_env(selection: &crate::models::GpuSelection) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+
+    match selection {
+        crate::models::GpuSelection::Auto => {
+            // Fallback to legacy prime detection
+            for (k, v) in detect_prime_env() {
+                env.insert(k, v);
+            }
+        }
+        crate::models::GpuSelection::Manual { index, name } => {
+            let dri_index = index.saturating_sub(128);
+            env.insert("DRI_PRIME".to_string(), dri_index.to_string());
+
+            if name.to_uppercase().contains("NVIDIA") {
+                env.insert("__NV_PRIME_RENDER_OFFLOAD".to_string(), "1".to_string());
+                env.insert("__NV_PRIME_RENDER_OFFLOAD_PROVIDER".to_string(), "NVIDIA-G0".to_string());
+                env.insert("__GLX_VENDOR_LIBRARY_NAME".to_string(), "nvidia".to_string());
+                env.insert("__VK_LAYER_NV_optimus".to_string(), "NVIDIA_only".to_string());
+            }
+
+            // MESA_VK_DEVICE_SELECT for Vulkan selection on Mesa drivers
+            // Format: vendor_id:device_id or just an index
+            env.insert("MESA_VK_DEVICE_SELECT".to_string(), dri_index.to_string());
+        }
+    }
+
+    env
 }
 
 /// Detects NVIDIA Optimus / hybrid graphics and returns the env vars needed
@@ -265,6 +332,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
         "dist/lib64/wine/vkd3d-proton/d3d12.dll",
         "lib/wine/vkd3d-proton/d3d12.dll",
         "lib64/wine/vkd3d-proton/d3d12.dll",
+        "files/lib/vkd3d/d3d12.dll", // Some vkd3d-proton builds use this
     ];
     // VKD3D-Proton requires both d3d12.dll and d3d12core.dll for modern titles
     let core_bundled_dlls = [
@@ -308,6 +376,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
                     return Some(ComponentInfo {
                         version,
                         source: ComponentSource::InstalledInPrefix,
+                        path: Some(p),
                     });
                 }
             }
@@ -363,6 +432,7 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
                 return Some(ComponentInfo {
                     version,
                     source: ComponentSource::InstalledInPrefix,
+                    path: Some(p),
                 });
             }
         }
@@ -379,12 +449,14 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
 fn check_bundled(root: &Path, dll_candidates: &[&str], version_files: &[&str]) -> Option<ComponentInfo> {
-    let found_dll = dll_candidates.iter().find(|rel| root.join(rel).exists());
-    if let Some(rel) = found_dll {
-        tracing::debug!("Found bundled component DLL at: {}", root.join(rel).display());
+    let found_rel = dll_candidates.iter().find(|rel| root.join(rel).exists());
+    let dll_path = if let Some(rel) = found_rel {
+        let p = root.join(rel);
+        tracing::debug!("Found bundled component DLL at: {}", p.display());
+        Some(p)
     } else {
         return None;
-    }
+    };
 
     let version = version_files
         .iter()
@@ -411,6 +483,7 @@ fn check_bundled(root: &Path, dll_candidates: &[&str], version_files: &[&str]) -
     Some(ComponentInfo {
         version,
         source: ComponentSource::BundledWithRunner,
+        path: dll_path,
     })
 }
 
@@ -428,6 +501,7 @@ fn check_prefix(prefix: &Path, dll_candidates: &[&str], _name: &str) -> Option<C
             return Some(ComponentInfo {
                 version,
                 source: ComponentSource::InstalledInPrefix,
+                path: Some(p),
             });
         }
     }
@@ -444,6 +518,7 @@ fn check_system(paths: &[&str]) -> Option<ComponentInfo> {
             return Some(ComponentInfo {
                 version,
                 source: ComponentSource::SystemWide,
+                path: Some(p.to_path_buf()),
             });
         }
     }

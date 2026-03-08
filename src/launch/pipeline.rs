@@ -27,6 +27,7 @@ pub struct GraphicsStackInfo {
     pub graphics_stack_evidence: Vec<String>,      // e.g. ["DXVK: v2.3.1"]
     pub graphics_stack_confidence: String,         // "low" | "medium" | "high"
     pub override_policy: String,                   // e.g. "Native-only"
+    pub gpu_selection: String,                     // e.g. "Manual: AMD (0x1002 0x73ff)"
     pub dll_providers: HashMap<String, String>,    // e.g. {"d3d11": "Runner", "d3d9": "GameLocal"}
 }
 
@@ -431,6 +432,11 @@ impl LaunchPipeline {
                 ctx.graphics_stack.graphics_stack_expected = format!("{} [Policy: {}]", expected.join(", "), policy);
                 ctx.graphics_stack.override_policy = "Native-preferred".to_string();
             }
+
+            ctx.graphics_stack.gpu_selection = match &config.graphics_layers.gpu_selection {
+                crate::models::GpuSelection::Auto => "Auto".to_string(),
+                crate::models::GpuSelection::Manual { index, name } => format!("Manual: {} (#{})", name, index),
+            };
         }
     }
 

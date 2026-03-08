@@ -308,30 +308,38 @@ impl Runner for WineTkgRunner {
                 .unwrap_or("wine")
         };
 
-        // Resolve graphics backend policy
+        // Resolve graphics backend policy using authoritative pipeline resolutions
         match glc.graphics_backend_policy {
             crate::models::GraphicsBackendPolicy::Auto => {
-                let components = crate::utils::detect_runner_components(
-                    &crate::utils::resolve_runner(proton, &library_root),
-                    Some(&game_wineprefix),
-                );
-
-                if components.dxvk.is_some() {
+                let has_dxvk = ctx.dll_resolutions.iter().any(|r| {
+                    matches!(r.name.as_str(), "d3d11" | "d3d9" | "dxgi") &&
+                    matches!(r.chosen_provider, crate::launch::dll_provider_resolver::DllProvider::Runner | crate::launch::dll_provider_resolver::DllProvider::GameLocal)
+                });
+                if has_dxvk {
                     glc.dxvk_enabled = true;
                 }
-                // Respect d3d12_policy when auto-detecting VKD3D variant
+
                 match glc.d3d12_policy {
                     crate::models::D3D12ProviderPolicy::Vkd3dWine => {
-                        if components.vkd3d.is_some() {
+                        let has_vkd3d_wine = ctx.dll_resolutions.iter().any(|r| {
+                            r.name == "d3d12" &&
+                            matches!(r.chosen_provider, crate::launch::dll_provider_resolver::DllProvider::Runner) &&
+                            r.chosen_path.as_ref().map(|p| !p.to_string_lossy().contains("vkd3d-proton")).unwrap_or(false)
+                        });
+                        if has_vkd3d_wine {
                             glc.vkd3d_enabled = true;
                         }
                     }
                     _ => {
-                        // Auto or Vkd3dProton: prefer proton, fall back to wine VKD3D
-                        if components.vkd3d_proton.is_some() {
-                            glc.vkd3d_proton_enabled = true;
-                        } else if components.vkd3d.is_some() {
-                            glc.vkd3d_enabled = true;
+                        let d3d12_res = ctx.dll_resolutions.iter().find(|r| r.name == "d3d12");
+                        if let Some(res) = d3d12_res {
+                            if matches!(res.chosen_provider, crate::launch::dll_provider_resolver::DllProvider::Runner | crate::launch::dll_provider_resolver::DllProvider::GameLocal) {
+                                if res.chosen_path.as_ref().map(|p| p.to_string_lossy().contains("vkd3d-proton")).unwrap_or(false) {
+                                    glc.vkd3d_proton_enabled = true;
+                                } else {
+                                    glc.vkd3d_enabled = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -340,20 +348,17 @@ impl Runner for WineTkgRunner {
                 glc.dxvk_enabled = false;
                 glc.vkd3d_proton_enabled = false;
                 glc.vkd3d_enabled = false;
-                // force_builtin_d3d handles the rest below
             }
             crate::models::GraphicsBackendPolicy::DXVK => {
                 glc.dxvk_enabled = true;
             }
             crate::models::GraphicsBackendPolicy::VKD3D => {
-                // Consult d3d12_policy to select the right implementation
                 match glc.d3d12_policy {
                     crate::models::D3D12ProviderPolicy::Vkd3dWine => {
                         glc.vkd3d_enabled = true;
                         glc.vkd3d_proton_enabled = false;
                     }
                     _ => {
-                        // Auto or Vkd3dProton
                         glc.vkd3d_proton_enabled = true;
                     }
                 }
@@ -453,8 +458,11 @@ impl Runner for WineTkgRunner {
             env.insert("XDG_RUNTIME_DIR".to_string(), xdg_runtime);
         }
 
-        // Auto-inject PRIME/Optimus GPU selection (user env vars can still override below)
-        for (k, v) in crate::utils::detect_prime_env() {
+        // Auto-inject GPU selection (user env vars can still override below)
+        let gpu_selection = ctx.user_config.as_ref()
+            .map(|c| c.graphics_layers.gpu_selection.clone())
+            .unwrap_or_default();
+        for (k, v) in crate::utils::get_gpu_selection_env(&gpu_selection) {
             env.entry(k).or_insert(v);
         }
 
