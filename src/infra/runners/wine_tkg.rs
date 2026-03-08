@@ -349,6 +349,8 @@ impl Runner for WineTkgRunner {
         );
 
         // Enhance overrides with resolved DLL providers
+        let mut runner_dll_paths = Vec::new();
+
         for res in ctx.effective_dll_bindings.values() {
             if let crate::launch::dll_provider_resolver::DllProvider::GameLocal = res.chosen_provider {
                 // Ensure native wins for game-local DLLs
@@ -356,9 +358,32 @@ impl Runner for WineTkgRunner {
                      dll_overrides.push_str(&format!(";{}=n", res.name));
                 }
             }
+
+            if let crate::launch::dll_provider_resolver::DllProvider::Runner = res.chosen_provider {
+                // For Runner provider, ensure native override is present
+                if !dll_overrides.contains(&format!("{}=n", res.name)) {
+                     dll_overrides.push_str(&format!(";{}=n", res.name));
+                }
+
+                if let Some(path) = &res.chosen_path {
+                     if let Some(parent) = path.parent() {
+                         if !runner_dll_paths.contains(&parent.to_path_buf()) {
+                             runner_dll_paths.push(parent.to_path_buf());
+                         }
+                     }
+                }
+            }
         }
 
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
+
+        if !runner_dll_paths.is_empty() {
+             let path_str = runner_dll_paths.iter()
+                 .map(|p| p.to_string_lossy().to_string())
+                 .collect::<Vec<_>>()
+                 .join(":");
+             env.insert("WINEDLLPATH".to_string(), path_str);
+        }
 
         env.insert("WINEPATH".to_string(), "C:\\Program Files (x86)\\Steam".to_string());
 

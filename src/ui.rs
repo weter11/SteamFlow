@@ -1286,22 +1286,52 @@ impl SteamLauncher {
 
             ui.add_space(8.0);
 
-            // Detect what's already in the prefix for status display
-            let dxvk_in_prefix = game_prefix.join("drive_c/windows/system32/d3d11.dll").exists();
-            let d3d12_dll = game_prefix.join("drive_c/windows/system32/d3d12.dll");
-            let mut vkd3dp_in_prefix = false;
-            let mut vkd3dw_in_prefix = false;
+            // ── Bundled Components ──────────────────────────────────────────
+            // Unified status grid consuming same authoritative report as Settings
+            if let Some(report) = &self.component_scan_report {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Bundled Components").strong());
+                    ui.add_space(4.0);
+                    egui::Grid::new("game_runner_components_grid")
+                        .num_columns(3)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            let mut row = |label: &str, dll_key: &str, family: &str| {
+                                ui.label(label);
+                                if let Some(info) = report.components_found.get(family) {
+                                    ui.colored_label(egui::Color32::GREEN, &info.version);
 
-            if d3d12_dll.exists() {
-                // This is a bit slow to do every frame, but fine for small DLLs
-                // In a real app we'd cache this.
-                let is_proton = crate::utils::detect_runner_components(&PathBuf::new(), Some(&game_prefix)).vkd3d_proton.is_some();
-                if is_proton {
-                    vkd3dp_in_prefix = true;
-                } else {
-                    vkd3dw_in_prefix = true;
-                }
+                                    let mut source_text = match info.source.as_str() {
+                                        "BundledWithRunner" => "bundled with runner".to_string(),
+                                        "InstalledInPrefix" => "in prefix".to_string(),
+                                        "SystemWide" => "system-wide".to_string(),
+                                        _ => "unknown".to_string(),
+                                    };
+
+                                    if let Some(sum) = report.resolution_summary.get(dll_key) {
+                                         if sum.chosen_provider == DllProvider::GameLocal {
+                                             source_text = "game-local override".to_string();
+                                         } else if sum.chosen_provider == DllProvider::System && info.source != "SystemWide" {
+                                             source_text = "system fallback".to_string();
+                                         }
+                                    }
+
+                                    ui.colored_label(egui::Color32::GRAY, format!("({})", source_text));
+                                } else {
+                                    ui.colored_label(egui::Color32::GRAY, "(not found)");
+                                    ui.label("wined3d fallback");
+                                }
+                                ui.end_row();
+                            };
+
+                            row("DXVK:", "d3d11", "dxvk");
+                            row("VKD3D-Proton:", "d3d12", "vkd3d-proton");
+                            row("VKD3D (Wine):", "d3d12", "vkd3d");
+                        });
+                });
             }
+
+            ui.add_space(8.0);
 
             egui::Grid::new("graphics_layer_grid")
                 .num_columns(4)
@@ -1309,6 +1339,7 @@ impl SteamLauncher {
                 .show(ui, |ui| {
                     // ── DXVK ──────────────────────────────────────────────
                     ui.label("DXVK (DX8-11):");
+                    let dxvk_in_prefix = game_prefix.join("drive_c/windows/system32/d3d11.dll").exists();
                     let dxvk_avail =
                         crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Dxvk).is_some();
 
@@ -1352,14 +1383,7 @@ impl SteamLauncher {
                         }
                     }
 
-                    if !dxvk_avail {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            "(not found system-wide — install via package manager)",
-                        );
-                    } else {
-                        ui.label("");
-                    }
+                    ui.label("");
                     ui.end_row();
 
                     // Override toggle (independent of install status)
@@ -1383,6 +1407,9 @@ impl SteamLauncher {
 
                     // ── VKD3D-Proton ───────────────────────────────────────
                     ui.label("VKD3D-Proton (DX12):");
+                    let vkd3dp_in_prefix = game_prefix.join("drive_c/windows/system32/d3d12.dll").exists() &&
+                                            crate::utils::detect_runner_components(&PathBuf::new(), Some(&game_prefix)).vkd3d_proton.is_some();
+
                     let vkd3dp_avail =
                         crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Vkd3dProton)
                             .is_some();
@@ -1427,14 +1454,7 @@ impl SteamLauncher {
                         }
                     }
 
-                    if !vkd3dp_avail {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            "(not found — install vkd3d-proton via package manager)",
-                        );
-                    } else {
-                        ui.label("");
-                    }
+                    ui.label("");
                     ui.end_row();
 
                     ui.label("");
@@ -1458,6 +1478,8 @@ impl SteamLauncher {
 
                     // ── VKD3D (Wine) ───────────────────────────────────────
                     ui.label("VKD3D (Wine):");
+                    let vkd3dw_in_prefix = game_prefix.join("drive_c/windows/system32/d3d12.dll").exists() &&
+                                            crate::utils::detect_runner_components(&PathBuf::new(), Some(&game_prefix)).vkd3d_proton.is_none();
                     let vkd3dw_avail =
                         crate::utils::find_layer_source(&crate::utils::GraphicsLayer::Vkd3d)
                             .is_some();
@@ -1502,14 +1524,7 @@ impl SteamLauncher {
                         }
                     }
 
-                    if !vkd3dw_avail {
-                        ui.colored_label(
-                            egui::Color32::YELLOW,
-                            "(not found — install libvkd3d via package manager)",
-                        );
-                    } else {
-                        ui.label("");
-                    }
+                    ui.label("");
                     ui.end_row();
 
                     ui.label("");
@@ -2506,15 +2521,15 @@ impl eframe::App for SteamLauncher {
                                                         ui.colored_label(egui::Color32::GREEN, &c.version);
 
                                                         let mut source_text = match c.source {
-                                                            crate::utils::ComponentSource::BundledWithRunner => "bundled".to_string(),
+                                                            crate::utils::ComponentSource::BundledWithRunner => "bundled with runner".to_string(),
                                                             crate::utils::ComponentSource::InstalledInPrefix => "in prefix".to_string(),
-                                                            crate::utils::ComponentSource::SystemWide => "system".to_string(),
+                                                            crate::utils::ComponentSource::SystemWide => "system-wide".to_string(),
                                                         };
 
                                                         if let Some(r) = report {
                                                              if let Some(sum) = r.resolution_summary.get(dll_key) {
                                                                  if sum.chosen_provider == DllProvider::GameLocal {
-                                                                     source_text = "local override".to_string();
+                                                                     source_text = "game-local override".to_string();
                                                                  } else if sum.chosen_provider == DllProvider::System && c.source != crate::utils::ComponentSource::SystemWide {
                                                                      source_text = "system fallback".to_string();
                                                                  }
@@ -2527,7 +2542,7 @@ impl eframe::App for SteamLauncher {
                                                         );
                                                     }
                                                     None => {
-                                                        ui.colored_label(egui::Color32::GRAY, "not found (runner)");
+                                                        ui.colored_label(egui::Color32::GRAY, "(not found)");
                                                         ui.label("wined3d fallback");
                                                     }
                                                 }

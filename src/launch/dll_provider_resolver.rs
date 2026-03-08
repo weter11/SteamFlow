@@ -54,6 +54,8 @@ pub struct DllCandidate {
     pub provider: DllProvider,
     pub path: PathBuf,
     pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
 }
 
 pub struct DllProviderResolver {
@@ -198,6 +200,7 @@ impl DllProviderResolver {
             provider: DllProvider::GameLocal,
             path: local_path.clone(),
             exists: local_path.exists(),
+            rejection_reason: None,
         });
 
         // Also check 'bin' subdir common in some games
@@ -206,6 +209,7 @@ impl DllProviderResolver {
             provider: DllProvider::GameLocal,
             path: bin_path.clone(),
             exists: bin_path.exists(),
+            rejection_reason: None,
         });
 
         // 2. Runner Priority
@@ -234,6 +238,7 @@ impl DllProviderResolver {
                 provider: DllProvider::System,
                 path: p.clone(),
                 exists: p.exists(),
+                rejection_reason: None,
             });
         }
 
@@ -308,6 +313,7 @@ impl DllProviderResolver {
                     provider: DllProvider::Runner,
                     exists: path.exists(),
                     path,
+                    rejection_reason: None,
                 });
             }
 
@@ -316,6 +322,7 @@ impl DllProviderResolver {
                 provider: DllProvider::Runner,
                 exists: path.exists(),
                 path,
+                rejection_reason: None,
             });
         }
 
@@ -422,6 +429,27 @@ mod tests {
         let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Vkd3dProton);
         let d3d12 = res.iter().find(|r| r.name == "d3d12").unwrap();
         assert_eq!(d3d12.chosen_path.as_ref().unwrap(), &proton_dll);
+    }
+
+    #[test]
+    fn test_dll_candidate_rejection_reason_serialization() {
+        let candidate = DllCandidate {
+            provider: DllProvider::Runner,
+            path: PathBuf::from("/tmp/test.dll"),
+            exists: false,
+            rejection_reason: Some("arch_mismatch".to_string()),
+        };
+        let json = serde_json::to_string(&candidate).unwrap();
+        assert!(json.contains("\"rejection_reason\":\"arch_mismatch\""));
+
+        let ok_candidate = DllCandidate {
+            provider: DllProvider::Runner,
+            path: PathBuf::from("/tmp/test.dll"),
+            exists: true,
+            rejection_reason: None,
+        };
+        let json = serde_json::to_string(&ok_candidate).unwrap();
+        assert!(!json.contains("rejection_reason"));
     }
 
     #[test]

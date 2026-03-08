@@ -128,10 +128,13 @@ pub enum DetectionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum Architecture {
     #[default]
     Unknown,
+    #[serde(rename = "x64")]
     X86_64,
+    #[serde(rename = "x86")]
     I386,
 }
 
@@ -188,6 +191,8 @@ mod tests {
         assert_eq!(parse_short_version("v2.10.1"), "2.10.1");
         assert_eq!(parse_short_version("2.3-dirty"), "2.3-dirty");
         assert_eq!(parse_short_version("vkd3d-proton (v2.11-1-g1234567)"), "2.11-1");
+        assert_eq!(parse_short_version("vkd3d-1.1-5004"), "1.1-5004");
+        assert_eq!(parse_short_version("dxvk v2.3"), "2.3");
         assert_eq!(parse_short_version(""), "unknown");
         assert_eq!(parse_short_version("   "), "unknown");
     }
@@ -538,26 +543,38 @@ pub fn parse_short_version(s: &str) -> String {
         return "unknown".to_string();
     }
 
-    // Try to find content inside parentheses first: dxvk (v2.7.1-404-g0bf876eb) -> v2.7.1-404-g0bf876eb
-    let v = if let (Some(start), Some(end)) = (s.find('('), s.rfind(')')) {
+    // Handle common prefixes like "dxvk", "vkd3d", "vkd3d-proton"
+    let mut v = s;
+    for prefix in &["dxvk", "vkd3d-proton", "vkd3d"] {
+        if v.to_lowercase().starts_with(prefix) {
+            v = v[prefix.len()..].trim();
+        }
+    }
+
+    // Try to find content inside parentheses: dxvk (v2.7.1-404-g0bf876eb) -> v2.7.1-404-g0bf876eb
+    v = if let (Some(start), Some(end)) = (v.find('('), v.rfind(')')) {
         if start < end {
-            &s[start + 1..end]
+            &v[start + 1..end]
         } else {
-            s
+            v
         }
     } else {
-        s
+        v
     };
 
     let mut v = v.trim();
 
-    // Strip leading 'v' if followed by a digit
-    if v.starts_with('v') && v.len() > 1 && v.as_bytes()[1].is_ascii_digit() {
+    // Strip leading 'v' or '-' if followed by a digit
+    if (v.starts_with('v') || v.starts_with('-')) && v.len() > 1 && v.as_bytes()[1].is_ascii_digit() {
         v = &v[1..];
     }
 
+    // Handle specific proton style tokens: vkd3d-1.1-5004 -> 1.1-5004
+    if v.to_lowercase().starts_with("vkd3d-") {
+         v = &v[6..];
+    }
+
     // Strip trailing git hash suffix: -g[0-9a-f]{7,10}
-    // We look for the LAST "-g" followed by exactly 7-10 hex digits
     if let Some(hyphen_idx) = v.rfind("-g") {
         let suffix = &v[hyphen_idx + 2..];
         if !suffix.is_empty()
@@ -844,6 +861,9 @@ pub fn build_dll_overrides(
     if vkd3d_proton_active || vkd3d_active {
         overrides.push("d3d12=n,b".into());
         overrides.push("d3d12core=n,b".into());
+        if vkd3d_proton_active {
+             overrides.push("dxgi=n,b".into());
+        }
         if vkd3d_active {
              overrides.push("libvkd3d-1=n,b".into());
              overrides.push("libvkd3d-shader-1=n,b".into());

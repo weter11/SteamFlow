@@ -80,12 +80,14 @@ impl PipelineStage for ResolveDllProvidersStage {
                     match target_arch {
                         crate::utils::Architecture::X86_64 => {
                             if is_x86 && !is_x64 {
-                                c.exists = false; // "Soft" delete for this resolution
+                                c.exists = false;
+                                c.rejection_reason = Some("arch_mismatch".to_string());
                             }
                         }
                         crate::utils::Architecture::I386 => {
                             if is_x64 {
                                 c.exists = false;
+                                c.rejection_reason = Some("arch_mismatch".to_string());
                             }
                         }
                         _ => {} // Unknown -> keep all

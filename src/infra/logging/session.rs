@@ -36,6 +36,8 @@ pub struct LaunchSummary {
     pub stage_durations_ms: HashMap<String, u128>,
     pub timestamp: u64,
     #[serde(default)]
+    pub target_process_arch: String,
+    #[serde(default)]
     pub warnings: Vec<crate::launch::pipeline::CompatibilityWarning>,
     #[serde(default)]
     pub graphics_stack: Option<crate::launch::pipeline::GraphicsStackInfo>,

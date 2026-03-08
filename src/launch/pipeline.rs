@@ -551,6 +551,7 @@ impl LaunchPipeline {
                 total_duration_ms,
                 stage_durations_ms,
                 timestamp,
+                target_process_arch: ctx.target_process_arch.to_string(),
                 warnings: ctx.warnings.clone(),
                 graphics_stack: Some(ctx.graphics_stack.clone()),
             };
@@ -633,6 +634,14 @@ mod tests {
         let err = anyhow::anyhow!("random error");
         let mapped = map_anyhow_error(err);
         assert_eq!(mapped.kind, LaunchErrorKind::Unknown);
+    }
+
+    #[test]
+    fn test_graphics_stack_info_arch_serialization() {
+        let mut info = GraphicsStackInfo::default();
+        info.target_process_arch = crate::utils::Architecture::X86_64;
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"target_process_arch\":\"x64\""));
     }
 
     #[tokio::test]
