@@ -295,12 +295,25 @@ impl Runner for WineTkgRunner {
             .or_else(|| executable.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| install_dir.clone());
 
+        // Resolve proton version for component detection and DLL path building
+        let proton = if let Some(forced) = ctx.launcher_config
+            .game_configs
+            .get(&ctx.app.app_id)
+            .and_then(|c| c.forced_proton_version.as_ref())
+        {
+            forced.as_str()
+        } else {
+            ctx.proton_path.as_deref()
+                .filter(|p| !p.is_empty())
+                .unwrap_or("wine")
+        };
+
         // Resolve graphics backend policy
         match glc.graphics_backend_policy {
             crate::models::GraphicsBackendPolicy::Auto => {
                 let components = crate::utils::detect_runner_components(
                     &crate::utils::resolve_runner(
-                        ctx.proton_path.as_deref().unwrap_or("wine"),
+                        proton,
                         &library_root
                     ),
                     Some(&game_wineprefix)
@@ -346,6 +359,46 @@ impl Runner for WineTkgRunner {
 
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
 
+        // Build WINEDLLPATH from runner's bundled DLL subdirectories
+        let runner_binary_path = crate::utils::resolve_runner(proton, &library_root);
+        let runner_root = crate::utils::derive_runner_root(&runner_binary_path);
+
+        let dll_subdirs = [
+            "lib/wine/dxvk",              "lib64/wine/dxvk",
+            "lib/wine/vkd3d-proton",      "lib64/wine/vkd3d-proton",
+            "lib/wine/vkd3d",             "lib64/wine/vkd3d",
+            "files/lib/wine/dxvk",        "files/lib64/wine/dxvk",
+            "files/lib/wine/vkd3d-proton","files/lib64/wine/vkd3d-proton",
+            "dist/lib/wine/dxvk",         "dist/lib64/wine/dxvk",
+            "dist/lib/wine/vkd3d-proton", "dist/lib64/wine/vkd3d-proton",
+        ];
+
+        let mut wine_dll_path_entries: Vec<String> = dll_subdirs
+            .iter()
+            .map(|sub| runner_root.join(sub))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        // Also include the runner's main lib dirs so Wine can find .so loader stubs
+        for sub in &["lib/wine", "lib64/wine", "files/lib/wine", "files/lib64/wine"] {
+            let p = runner_root.join(sub);
+            if p.exists() {
+                wine_dll_path_entries.push(p.to_string_lossy().to_string());
+            }
+        }
+
+        if !wine_dll_path_entries.is_empty() {
+            // Prepend to any existing WINEDLLPATH the user may have set
+            let existing = env.get("WINEDLLPATH").cloned().unwrap_or_default();
+            let combined = if existing.is_empty() {
+                wine_dll_path_entries.join(":")
+            } else {
+                format!("{}:{}", wine_dll_path_entries.join(":"), existing)
+            };
+            env.insert("WINEDLLPATH".to_string(), combined);
+        }
+
         env.insert("WINEPATH".to_string(), "C:\\Program Files (x86)\\Steam".to_string());
 
         let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
@@ -361,6 +414,11 @@ impl Runner for WineTkgRunner {
         }
         if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
             env.insert("XDG_RUNTIME_DIR".to_string(), xdg_runtime);
+        }
+
+        // Auto-inject PRIME/Optimus GPU selection (user env vars can still override below)
+        for (k, v) in crate::utils::detect_prime_env() {
+            env.entry(k).or_insert(v);
         }
 
         if let Some(config) = &ctx.user_config {
