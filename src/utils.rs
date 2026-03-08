@@ -120,14 +120,30 @@ pub struct RunnerComponents {
     pub vkd3d: Option<ComponentInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DetectionState {
+    Found,
+    Partial,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Architecture {
+    X86_64,
+    I386,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ComponentInfo {
     pub version: String,
     pub source: ComponentSource,
     pub path: Option<PathBuf>,
+    pub state: DetectionState,
+    pub arches: Vec<Architecture>,
+    pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ComponentSource {
     BundledWithRunner,
     InstalledInPrefix,
@@ -141,6 +157,21 @@ impl std::fmt::Display for ComponentSource {
             Self::InstalledInPrefix => write!(f, "in prefix"),
             Self::SystemWide => write!(f, "system"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_short_version() {
+        assert_eq!(parse_short_version("dxvk (v2.7.1-404-g0bf876eb)"), "2.7.1-404");
+        assert_eq!(parse_short_version("v2.10.1"), "2.10.1");
+        assert_eq!(parse_short_version("2.3-dirty"), "2.3-dirty");
+        assert_eq!(parse_short_version("vkd3d-proton (v2.11-1-g1234567)"), "2.11-1");
+        assert_eq!(parse_short_version(""), "unknown");
+        assert_eq!(parse_short_version("   "), "unknown");
     }
 }
 
@@ -182,12 +213,20 @@ pub fn get_runner_layout_roots(runner_root: &Path) -> Vec<PathBuf> {
         "dist/lib64/wine/vkd3d",
         "dist/lib64/wine/vkd3d-proton",
     ];
-    subdirs.iter().map(|s| runner_root.join(s)).collect()
+    let mut roots: Vec<PathBuf> = subdirs.iter().map(|s| runner_root.join(s)).collect();
+
+    // Proton often has multiple architectures in specialized subdirs under files/lib/vkd3d
+    // These are handled by check_arch_aware_bundled searching for x86_64-windows etc.
+    // but the root files/lib/vkd3d itself is already in the list above.
+
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 pub fn detect_runner_components(
     runner_path: &Path,
-    _wineprefix_ignored: Option<&Path>,
+    _prefix_ignored: Option<&Path>,
 ) -> RunnerComponents {
     let root = derive_runner_root(runner_path);
 
@@ -205,14 +244,9 @@ pub fn detect_runner_components(
 // ── DXVK ────────────────────────────────────────────────────────────────────
 
 fn detect_dxvk(root: &Path) -> Option<ComponentInfo> {
-    // 1. Bundled inside runner
-    let layout_roots = get_runner_layout_roots(root);
-    let mut dll_candidates = Vec::new();
-    for lr in &layout_roots {
-        if lr.to_string_lossy().contains("dxvk") || (!lr.to_string_lossy().contains("vkd3d")) {
-            dll_candidates.push(lr.join("d3d11.dll"));
-        }
-    }
+    let required_dlls = ["d3d11.dll", "dxgi.dll", "d3d9.dll"];
+    // Optional but expected: "d3d8.dll", "d3d10core.dll", etc.
+    let all_expected = ["d3d11.dll", "dxgi.dll", "d3d9.dll", "d3d8.dll", "d3d10core.dll", "d3d10.dll", "d3d10_1.dll"];
 
     let version_files = [
         "files/share/dxvk/version",
@@ -220,11 +254,12 @@ fn detect_dxvk(root: &Path) -> Option<ComponentInfo> {
         "share/dxvk/version",
     ];
 
-    if let Some(info) = check_bundled_v2(root, &dll_candidates, &version_files) {
+    // 1. Bundled
+    if let Some(info) = check_arch_aware_bundled(root, "dxvk", &required_dlls, &all_expected, &version_files) {
         return Some(info);
     }
 
-    // 2. System-wide (package manager install)
+    // 2. System-wide
     let system_paths = [
         "/usr/share/dxvk/x64/d3d11.dll",
         "/usr/lib/dxvk/d3d11.dll",
@@ -234,25 +269,15 @@ fn detect_dxvk(root: &Path) -> Option<ComponentInfo> {
     check_system(&system_paths)
 }
 
-// ── VKD3D-Proton ─────────────────────────────────────────────────────────────
-
 fn detect_vkd3d_proton(root: &Path) -> Option<ComponentInfo> {
-    // 1. Bundled inside runner
-    let layout_roots = get_runner_layout_roots(root);
-    let mut dll_candidates = Vec::new();
-    for lr in &layout_roots {
-        if lr.to_string_lossy().contains("vkd3d-proton") || lr.to_string_lossy().contains("vkd3d") {
-            dll_candidates.push(lr.join("d3d12.dll"));
-        }
-    }
-
+    let required_dlls = ["d3d12.dll", "d3d12core.dll"];
     let version_files = [
         "files/share/vkd3d-proton/version",
         "dist/share/vkd3d-proton/version",
         "share/vkd3d-proton/version",
     ];
 
-    if let Some(info) = check_bundled_v2(root, &dll_candidates, &version_files) {
+    if let Some(info) = check_arch_aware_bundled(root, "vkd3d-proton", &required_dlls, &required_dlls, &version_files) {
         return Some(info);
     }
 
@@ -264,26 +289,15 @@ fn detect_vkd3d_proton(root: &Path) -> Option<ComponentInfo> {
     check_system(&system_paths)
 }
 
-// ── VKD3D (upstream) ─────────────────────────────────────────────────────────
-
 fn detect_vkd3d(root: &Path) -> Option<ComponentInfo> {
-    // 1. Bundled inside runner
-    let layout_roots = get_runner_layout_roots(root);
-    let mut dll_candidates = Vec::new();
-    for lr in &layout_roots {
-        if lr.to_string_lossy().contains("vkd3d") {
-            dll_candidates.push(lr.join("libvkd3d-1.dll"));
-            dll_candidates.push(lr.join("d3d12.dll"));
-        }
-    }
-
+    let required_dlls = ["libvkd3d-1.dll", "libvkd3d-shader-1.dll"];
     let version_files = [
         "files/share/vkd3d/version",
         "dist/share/vkd3d/version",
         "share/vkd3d/version",
     ];
 
-    if let Some(info) = check_bundled_v2(root, &dll_candidates, &version_files) {
+    if let Some(info) = check_arch_aware_bundled(root, "vkd3d", &required_dlls, &required_dlls, &version_files) {
         return Some(info);
     }
 
@@ -295,22 +309,114 @@ fn detect_vkd3d(root: &Path) -> Option<ComponentInfo> {
     check_system(&system_paths)
 }
 
-// ── Shared helpers ────────────────────────────────────────────────────────────
+fn check_arch_aware_bundled(
+    root: &Path,
+    component_name: &str,
+    required_dlls: &[&str],
+    _all_expected: &[&str],
+    version_files: &[&str],
+) -> Option<ComponentInfo> {
+    let layout_roots = get_runner_layout_roots(root);
+    let mut arches_found = Vec::new();
+    let mut primary_path = None;
 
-fn check_bundled_v2(root: &Path, dll_paths: &[PathBuf], version_files: &[&str]) -> Option<ComponentInfo> {
-    let found_dll = dll_paths.iter().find(|p| p.exists());
-    if let Some(p) = found_dll {
-        tracing::debug!("Found bundled component DLL at: {}", p.display());
-    } else {
+    let search_arches = [
+        (Architecture::X86_64, "x86_64-windows"),
+        (Architecture::I386, "i386-windows"),
+    ];
+
+    for lr in &layout_roots {
+        let lr_s = lr.to_string_lossy();
+
+        // Skip layout roots that don't belong to this component
+        if component_name == "dxvk" {
+             if lr_s.contains("vkd3d") {
+                 continue;
+             }
+        } else if component_name == "vkd3d" {
+             if lr_s.contains("vkd3d-proton") {
+                 continue;
+             }
+             if !lr_s.contains("vkd3d") {
+                 continue;
+             }
+        } else if !lr_s.contains(component_name) {
+             continue;
+        }
+
+        let mut current_lr_arches = Vec::new();
+        for (arch, subdir) in &search_arches {
+            let arch_dir = lr.join(subdir);
+            if arch_dir.exists() {
+                let mut any_file_present = false;
+                for dll in required_dlls {
+                    if arch_dir.join(dll).exists() {
+                        any_file_present = true;
+                        break;
+                    }
+                }
+                if any_file_present {
+                    current_lr_arches.push(*arch);
+                    if primary_path.is_none() {
+                        // Find first existing dll to use as primary_path for version extraction
+                        for dll in required_dlls {
+                             let p = arch_dir.join(dll);
+                             if p.exists() {
+                                 primary_path = Some(p);
+                                 break;
+                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no arch subdirs, check the root itself for a flat layout
+        if current_lr_arches.is_empty() {
+             let mut any_file_present = false;
+             for dll in required_dlls {
+                 if lr.join(dll).exists() {
+                     any_file_present = true;
+                     break;
+                 }
+             }
+             if any_file_present {
+                 // Heuristic: assume x86_64 for flat layout
+                 current_lr_arches.push(Architecture::X86_64);
+                 if primary_path.is_none() {
+                     for dll in required_dlls {
+                         let p = lr.join(dll);
+                         if p.exists() {
+                             primary_path = Some(p);
+                             break;
+                         }
+                     }
+                 }
+             }
+        }
+
+        for a in current_lr_arches {
+            if !arches_found.contains(&a) {
+                arches_found.push(a);
+            }
+        }
+    }
+
+    if arches_found.is_empty() {
         return None;
     }
+
+    let state = if arches_found.len() == search_arches.len() {
+        DetectionState::Found
+    } else {
+        DetectionState::Partial
+    };
 
     let version = version_files
         .iter()
         .filter_map(|rel| {
             let p = root.join(rel);
             if p.exists() {
-                tracing::debug!("Found version file: {}", p.display());
                 std::fs::read_to_string(p).ok()
             } else {
                 None
@@ -319,20 +425,35 @@ fn check_bundled_v2(root: &Path, dll_paths: &[PathBuf], version_files: &[&str]) 
         .map(|s| parse_short_version(&s))
         .find(|s| s != "unknown")
         .or_else(|| {
-            dll_paths
-                .iter()
-                .find(|p| p.exists())
-                .and_then(|p| extract_version_from_dll(p))
+             primary_path.as_ref().and_then(|p| extract_version_from_dll(p))
         })
         .unwrap_or_else(|| "unknown".to_string());
+
+    let reason = match state {
+        DetectionState::Found => None,
+        DetectionState::Partial => {
+            if arches_found.len() < search_arches.len() {
+                Some(format!("Missing architectures. Found: {:?}", arches_found))
+            } else {
+                // Found both arches but maybe missing some optional DLLs?
+                // Actually DetectionState::Found currently only checks arches.
+                None
+            }
+        },
+        DetectionState::NotFound => Some("No required DLLs found in any searched layout".into()),
+    };
 
     Some(ComponentInfo {
         version,
         source: ComponentSource::BundledWithRunner,
-        path: Some(found_dll.unwrap().to_path_buf()),
+        path: primary_path,
+        state,
+        arches: arches_found,
+        reason,
     })
 }
 
+// ── Shared helpers ────────────────────────────────────────────────────────────
 
 fn check_system(paths: &[&str]) -> Option<ComponentInfo> {
     for path in paths {
@@ -345,6 +466,9 @@ fn check_system(paths: &[&str]) -> Option<ComponentInfo> {
                 version,
                 source: ComponentSource::SystemWide,
                 path: Some(p.to_path_buf()),
+                state: DetectionState::Found,
+                arches: vec![Architecture::X86_64],
+                reason: None,
             });
         }
     }
@@ -366,7 +490,7 @@ pub fn parse_short_version(s: &str) -> String {
         return "unknown".to_string();
     }
 
-    // Try to find content inside parentheses first
+    // Try to find content inside parentheses first: dxvk (v2.7.1-404-g0bf876eb) -> v2.7.1-404-g0bf876eb
     let v = if let (Some(start), Some(end)) = (s.find('('), s.rfind(')')) {
         if start < end {
             &s[start + 1..end]
@@ -379,12 +503,13 @@ pub fn parse_short_version(s: &str) -> String {
 
     let mut v = v.trim();
 
-    // Strip leading 'v'
+    // Strip leading 'v' if followed by a digit
     if v.starts_with('v') && v.len() > 1 && v.as_bytes()[1].is_ascii_digit() {
         v = &v[1..];
     }
 
     // Strip trailing git hash suffix: -g[0-9a-f]{7,10}
+    // We look for the LAST "-g" followed by exactly 7-10 hex digits
     if let Some(hyphen_idx) = v.rfind("-g") {
         let suffix = &v[hyphen_idx + 2..];
         if !suffix.is_empty()
@@ -699,6 +824,31 @@ pub fn resolve_master_wineprefix() -> PathBuf {
 
     // Fresh install default — Proton-style nesting
     base.join("pfx")
+}
+
+pub fn has_exe_binary(dir: &Path) -> bool {
+    if !dir.exists() {
+        return false;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name.ends_with(".exe") {
+                return true;
+            }
+            // Check one level deep for common 'bin' or 'launcher' folders
+            if entry.path().is_dir() {
+                if let Ok(sub) = std::fs::read_dir(entry.path()) {
+                    for sub_entry in sub.flatten() {
+                        if sub_entry.file_name().to_string_lossy().to_lowercase().ends_with(".exe") {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 pub fn steam_wineprefix_for_game(

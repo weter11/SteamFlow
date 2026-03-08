@@ -1550,7 +1550,7 @@ impl SteamLauncher {
             ui.add_space(16.0);
             ui.heading("Platform Preference");
             let current_platform = if game.is_installed {
-                let mut is_proton = game.active_branch.contains("experimental")
+                let mut is_windows = game.active_branch.contains("experimental")
                     || game
                         .install_path
                         .as_ref()
@@ -1559,11 +1559,18 @@ impl SteamLauncher {
 
                 if let Some(config) = self.launcher_config.game_configs.get(&game.app_id) {
                     if let Some(pref) = &config.platform_preference {
-                        is_proton = pref == "windows";
+                        is_windows = pref == "windows";
                     }
                 }
 
-                if is_proton {
+                // Authoritative check based on executable extension
+                if let Some(path) = &game.install_path {
+                    if crate::utils::has_exe_binary(Path::new(path)) {
+                        is_windows = true;
+                    }
+                }
+
+                if is_windows {
                     "Windows (Proton)"
                 } else {
                     "Linux Native"

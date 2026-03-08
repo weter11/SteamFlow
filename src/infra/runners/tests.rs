@@ -94,8 +94,12 @@ mod tests {
         let mut user_config = UserAppConfig::default();
         user_config.graphics_layers.graphics_backend_policy = GraphicsBackendPolicy::Auto;
 
+        let resolver = crate::launch::dll_provider_resolver::DllProviderResolver::new();
+        let (dll_resolutions, _) = resolver.resolve(tmp.path(), &runner_path, &crate::utils::detect_runner_components(&runner_path, None), &crate::models::D3D12ProviderPolicy::Auto);
+
         let ctx = LaunchContext {
             app,
+            dll_resolutions,
             launch_info: LaunchInfo {
                 app_id: 123,
                 id: "0".into(),
@@ -108,13 +112,13 @@ mod tests {
             launcher_config: config,
             user_config: Some(user_config),
             proton_path: Some(runner_path.to_string_lossy().to_string()),
-            dll_resolutions: Vec::new(),
         };
 
         let runner = WineTkgRunner;
         let env = runner.build_env(&ctx).await.unwrap();
 
-        // Since we simulated DXVK, Auto should have enabled it
+        // Auto should have enabled DXVK because it's detected in the runner paths.
+        // We ensure WINEDLLOVERRIDES contains native overrides.
         let overrides = env.get("WINEDLLOVERRIDES").unwrap();
         assert!(overrides.contains("d3d11=n,b"));
     }

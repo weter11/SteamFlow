@@ -2550,13 +2550,15 @@ fn parse_launch_info_from_vdf(
                 LaunchTarget::WindowsProton
             } // Default to Windows
         } else {
-            // No OS specified? Check Extension.
+            // No OS specified? Check Extension or scan directory if manifest is inconclusive
             if exe.ends_with(".exe") || exe.ends_with(".bat") {
                 LaunchTarget::WindowsProton
             } else if exe.contains("linux") || exe.ends_with(".sh") {
                 LaunchTarget::NativeLinux
             } else {
-                // Default behavior
+                // Last resort: scan the actual installation directory for .exe files
+                // This is performed later during profile/game resolution in the pipeline,
+                // but we can provide a default here.
                 #[cfg(target_os = "linux")]
                 {
                     LaunchTarget::NativeLinux

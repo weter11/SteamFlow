@@ -27,6 +27,9 @@ pub struct ComponentFoundInfo {
     pub version: String,
     pub source: String,
     pub matched_dll: Option<PathBuf>,
+    pub state: crate::utils::DetectionState,
+    pub arches: Vec<crate::utils::Architecture>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +115,9 @@ impl DllProviderResolver {
                 version: c.version.clone(),
                 source: format!("{:?}", c.source),
                 matched_dll: None,
+                state: c.state,
+                arches: c.arches.clone(),
+                reason: c.reason.clone(),
             });
         }
         if let Some(ref c) = runner_components.vkd3d_proton {
@@ -120,6 +126,9 @@ impl DllProviderResolver {
                 version: c.version.clone(),
                 source: format!("{:?}", c.source),
                 matched_dll: None,
+                state: c.state,
+                arches: c.arches.clone(),
+                reason: c.reason.clone(),
             });
         }
         if let Some(ref c) = runner_components.vkd3d {
@@ -128,6 +137,9 @@ impl DllProviderResolver {
                 version: c.version.clone(),
                 source: format!("{:?}", c.source),
                 matched_dll: None,
+                state: c.state,
+                arches: c.arches.clone(),
+                reason: c.reason.clone(),
             });
         }
 
@@ -285,7 +297,20 @@ impl DllProviderResolver {
             });
         }
 
+        // We scan both 64-bit and 32-bit directories.
+        // Order: x86_64-windows > i386-windows > root
+        let arch_subdirs = ["x86_64-windows", "i386-windows"];
+
         for root in layout_roots {
+            for subdir in arch_subdirs {
+                let path = root.join(subdir).join(&dll_filename);
+                candidates.push(DllCandidate {
+                    provider: DllProvider::Runner,
+                    exists: path.exists(),
+                    path,
+                });
+            }
+
             let path = root.join(&dll_filename);
             candidates.push(DllCandidate {
                 provider: DllProvider::Runner,
@@ -365,11 +390,17 @@ mod tests {
             version: "2.10".into(),
             source: crate::utils::ComponentSource::BundledWithRunner,
             path: None,
+            state: crate::utils::DetectionState::Found,
+            arches: vec![crate::utils::Architecture::X86_64, crate::utils::Architecture::I386],
+            reason: None,
         });
         components.vkd3d = Some(crate::utils::ComponentInfo {
             version: "1.8".into(),
             source: crate::utils::ComponentSource::BundledWithRunner,
             path: None,
+            state: crate::utils::DetectionState::Found,
+            arches: vec![crate::utils::Architecture::X86_64, crate::utils::Architecture::I386],
+            reason: None,
         });
 
         let resolver = DllProviderResolver::new();
