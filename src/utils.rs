@@ -178,6 +178,38 @@ pub fn detect_runner_components(
     }
 }
 
+/// Detects NVIDIA Optimus / hybrid graphics and returns the env vars needed
+/// to force the discrete NVIDIA GPU. Returns empty map on non-hybrid systems.
+pub fn detect_prime_env() -> std::collections::HashMap<String, String> {
+    let mut vars = std::collections::HashMap::new();
+
+    let has_nvidia_dev = std::path::Path::new("/dev/nvidia0").exists()
+        || std::path::Path::new("/proc/driver/nvidia").exists();
+    // Check for a second DRM device (the integrated one)
+    let has_igpu = std::path::Path::new("/dev/dri/card1").exists();
+
+    if has_nvidia_dev && has_igpu {
+        // Optimus: force discrete NVIDIA for both Vulkan and OpenGL
+        vars.insert("__NV_PRIME_RENDER_OFFLOAD".to_string(), "1".to_string());
+        vars.insert(
+            "__NV_PRIME_RENDER_OFFLOAD_PROVIDER".to_string(),
+            "NVIDIA-G0".to_string(),
+        );
+        vars.insert(
+            "__VK_LAYER_NV_optimus".to_string(),
+            "NVIDIA_only".to_string(),
+        );
+        vars.insert("__GLX_VENDOR_LIBRARY_NAME".to_string(), "nvidia".to_string());
+
+        // Also hint VKD3D-Proton via its own knob
+        if let Ok(val) = std::env::var("VKD3D_FEATURE_FLAGS") {
+            vars.insert("VKD3D_FEATURE_FLAGS".to_string(), val);
+        }
+    }
+
+    vars
+}
+
 // ── DXVK ────────────────────────────────────────────────────────────────────
 
 fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
@@ -704,6 +736,7 @@ pub fn build_dll_overrides(
     vkd3d_proton_active: bool,
     vkd3d_active: bool,
     no_overlay: bool,
+    force_builtin_d3d: bool, // NEW — for WineD3D policy
     game_dir: Option<&std::path::Path>, // check for game-local DLLs
 ) -> String {
     let mut overrides: Vec<String> = vec![
@@ -719,6 +752,26 @@ pub fn build_dll_overrides(
     if no_overlay {
         overrides.push("GameOverlayRenderer=n".into());
         overrides.push("GameOverlayRenderer64=n".into());
+    }
+
+    if force_builtin_d3d {
+        // Explicitly force Wine's own builtins for all D3D DLLs.
+        // This overrides any native DLL sitting in the prefix's system32
+        // from a previous DXVK/VKD3D install.
+        for dll in &[
+            "d3d8",
+            "d3d9",
+            "d3d10",
+            "d3d10_1",
+            "d3d10core",
+            "d3d11",
+            "dxgi",
+            "d3d12",
+            "d3d12core",
+        ] {
+            overrides.push(format!("{dll}=b"));
+        }
+        return overrides.join(";");
     }
 
     if dxvk_active {
@@ -751,8 +804,8 @@ pub fn build_dll_overrides(
         overrides.push("d3d12=n,b".into());
         overrides.push("d3d12core=n,b".into());
         if vkd3d_active {
-             overrides.push("libvkd3d-1=n,b".into());
-             overrides.push("libvkd3d-shader-1=n,b".into());
+            overrides.push("libvkd3d-1=n,b".into());
+            overrides.push("libvkd3d-shader-1=n,b".into());
         }
     }
 
