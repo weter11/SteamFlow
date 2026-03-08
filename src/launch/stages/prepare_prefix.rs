@@ -20,6 +20,8 @@ impl PipelineStage for PreparePrefixStage {
                 user_config: ctx.user_config.clone(),
                 proton_path: ctx.proton_path.clone(),
                 dll_resolutions: ctx.dll_resolutions.clone(),
+                target_process_arch: ctx.target_process_arch,
+                effective_dll_bindings: ctx.effective_dll_bindings.clone(),
             };
             runner.prepare_prefix(&runner_ctx).await?;
         }

@@ -127,10 +127,28 @@ pub enum DetectionState {
     NotFound,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub enum Architecture {
+    #[default]
+    Unknown,
     X86_64,
     I386,
+}
+
+impl Architecture {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::X86_64 => "x64",
+            Self::I386 => "x86",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for Architecture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -172,6 +190,36 @@ mod tests {
         assert_eq!(parse_short_version("vkd3d-proton (v2.11-1-g1234567)"), "2.11-1");
         assert_eq!(parse_short_version(""), "unknown");
         assert_eq!(parse_short_version("   "), "unknown");
+    }
+
+    #[test]
+    fn test_detect_exe_arch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe_path = tmp.path().join("test.exe");
+
+        // Mock a 64-bit PE header
+        let mut data = vec![0u8; 0x100];
+        data[0x3c] = 0x40; // PE offset
+        data[0x40] = 0x50; // 'P'
+        data[0x41] = 0x45; // 'E'
+        data[0x42] = 0x00;
+        data[0x43] = 0x00;
+        data[0x44] = 0x64; // x64 machine (0x8664 le)
+        data[0x45] = 0x86;
+        std::fs::write(&exe_path, data).unwrap();
+        assert_eq!(detect_exe_arch(&exe_path).unwrap(), Architecture::X86_64);
+
+        // Mock a 32-bit PE header
+        let mut data = vec![0u8; 0x100];
+        data[0x3c] = 0x40; // PE offset
+        data[0x40] = 0x50; // 'P'
+        data[0x41] = 0x45; // 'E'
+        data[0x42] = 0x00;
+        data[0x43] = 0x00;
+        data[0x44] = 0x4c; // x86 machine (0x014c le)
+        data[0x45] = 0x01;
+        std::fs::write(&exe_path, data).unwrap();
+        assert_eq!(detect_exe_arch(&exe_path).unwrap(), Architecture::I386);
     }
 }
 
@@ -849,6 +897,49 @@ pub fn has_exe_binary(dir: &Path) -> bool {
         }
     }
     false
+}
+
+pub fn detect_exe_arch(path: &Path) -> Result<Architecture> {
+    use std::io::{Read, Seek, SeekFrom};
+    if !path.exists() {
+        bail!("Executable not found: {}", path.display());
+    }
+    let mut file = std::fs::File::open(path)?;
+
+    // Read offset to PE header at 0x3C
+    let mut offset_buf = [0u8; 4];
+    if file.seek(SeekFrom::Start(0x3c)).is_err() {
+        return Ok(Architecture::Unknown);
+    }
+    if file.read_exact(&mut offset_buf).is_err() {
+        return Ok(Architecture::Unknown);
+    }
+    let pe_offset = u32::from_le_bytes(offset_buf);
+
+    // Seek to PE signature
+    if file.seek(SeekFrom::Start(pe_offset as u64)).is_err() {
+        return Ok(Architecture::Unknown);
+    }
+    let mut sig_buf = [0u8; 4];
+    if file.read_exact(&mut sig_buf).is_err() {
+        return Ok(Architecture::Unknown);
+    }
+    if sig_buf != [0x50, 0x45, 0x00, 0x00] {
+        return Ok(Architecture::Unknown);
+    }
+
+    // COFF File Header follows signature. Machine is first 2 bytes.
+    let mut machine_buf = [0u8; 2];
+    if file.read_exact(&mut machine_buf).is_err() {
+        return Ok(Architecture::Unknown);
+    }
+    let machine = u16::from_le_bytes(machine_buf);
+
+    match machine {
+        0x014c => Ok(Architecture::I386),
+        0x8664 => Ok(Architecture::X86_64),
+        _ => Ok(Architecture::Unknown),
+    }
 }
 
 pub fn steam_wineprefix_for_game(

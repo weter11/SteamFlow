@@ -28,6 +28,7 @@ pub struct GraphicsStackInfo {
     pub graphics_stack_confidence: String,         // "low" | "medium" | "high"
     pub override_policy: String,                   // e.g. "Native-only"
     pub dll_providers: HashMap<String, String>,    // e.g. {"d3d11": "Runner", "d3d9": "GameLocal"}
+    pub target_process_arch: crate::utils::Architecture,
 }
 
 pub struct PipelineContext {
@@ -47,6 +48,8 @@ pub struct PipelineContext {
     pub warnings: Vec<CompatibilityWarning>,
     pub graphics_stack: GraphicsStackInfo,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
+    pub target_process_arch: crate::utils::Architecture,
+    pub effective_dll_bindings: HashMap<String, crate::launch::dll_provider_resolver::DllResolution>,
 }
 
 impl PipelineContext {
@@ -66,6 +69,8 @@ impl PipelineContext {
             warnings: Vec::new(),
             graphics_stack: GraphicsStackInfo::default(),
             dll_resolutions: Vec::new(),
+            target_process_arch: crate::utils::Architecture::Unknown,
+            effective_dll_bindings: HashMap::new(),
         }
     }
 
@@ -482,6 +487,13 @@ impl LaunchPipeline {
         total_duration_ms: u128,
         stage_durations_ms: HashMap<String, u128>,
     ) {
+        if let Some(session) = &ctx.session {
+            let bindings_path = session.log_dir.join("effective_dll_bindings.json");
+            if let Ok(content) = serde_json::to_string_pretty(&ctx.effective_dll_bindings) {
+                 let _ = std::fs::write(bindings_path, content);
+            }
+        }
+
         let (sanity_warnings, env_snapshot) = if let Some(spec) = &ctx.command_spec {
             let runner_name = ctx
                 .runner

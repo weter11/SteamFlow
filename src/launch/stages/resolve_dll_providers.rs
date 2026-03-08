@@ -50,12 +50,73 @@ impl PipelineStage for ResolveDllProvidersStage {
         let d3d12_policy = ctx.user_config.as_ref().map(|c| c.graphics_layers.d3d12_policy.clone()).unwrap_or_default();
 
         let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy);
-        ctx.dll_resolutions = resolutions;
+        ctx.dll_resolutions = resolutions.clone();
+
+        // ── Architecture-Aware Binding ───────────────────────────────────────
+        // Filter and bind based on target_process_arch
+        let target_arch = ctx.target_process_arch;
+        tracing::info!("Applying arch-aware DLL binding for target: {}", target_arch);
+
+        for res in resolutions {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("dll".to_string(), res.name.clone());
+            metadata.insert("target_arch".to_string(), target_arch.to_string());
+
+            // Strategy: filter candidates that are definitely incompatible with target arch
+            // We only filter 'Runner' candidates for now as they have known paths.
+            // GameLocal is assumed compatible if it's in the game dir.
+            // System is assumed compatible (Wine will pick right arch from system paths).
+
+            let original_chosen = res.chosen_provider;
+            let mut bound_res = res.clone();
+
+            let filtered_candidates: Vec<_> = res.candidates.iter().map(|c| {
+                let mut c = c.clone();
+                if c.provider == crate::launch::dll_provider_resolver::DllProvider::Runner {
+                    let path_s = c.path.to_string_lossy().to_lowercase();
+                    let is_x64 = path_s.contains("x86_64-windows") || path_s.contains("lib64");
+                    let is_x86 = path_s.contains("i386-windows") || (path_s.contains("lib") && !is_x64);
+
+                    match target_arch {
+                        crate::utils::Architecture::X86_64 => {
+                            if is_x86 && !is_x64 {
+                                c.exists = false; // "Soft" delete for this resolution
+                            }
+                        }
+                        crate::utils::Architecture::I386 => {
+                            if is_x64 {
+                                c.exists = false;
+                            }
+                        }
+                        _ => {} // Unknown -> keep all
+                    }
+                }
+                c
+            }).collect();
+
+            bound_res.candidates = filtered_candidates;
+
+            // Re-resolve chosen based on filtered candidates
+            let chosen = bound_res.candidates.iter().find(|c| c.exists).cloned();
+            bound_res.chosen_provider = chosen.as_ref().map(|c| c.provider).unwrap_or(crate::launch::dll_provider_resolver::DllProvider::None);
+            bound_res.chosen_path = chosen.as_ref().map(|c| c.path.clone());
+
+            if bound_res.chosen_provider != original_chosen {
+                 tracing::info!("Arch-filter changed {} provider from {:?} to {:?}", res.name, original_chosen, bound_res.chosen_provider);
+            }
+
+            ctx.effective_dll_bindings.insert(res.name.clone(), bound_res);
+        }
 
         if let Some(session) = &ctx.session {
             let scan_report_path = session.log_dir.join("component_scan.json");
             if let Ok(content) = serde_json::to_string_pretty(&scan_report) {
                 let _ = std::fs::write(scan_report_path, content);
+            }
+
+            let bindings_path = session.log_dir.join("effective_dll_bindings.json");
+            if let Ok(content) = serde_json::to_string_pretty(&ctx.effective_dll_bindings) {
+                 let _ = std::fs::write(bindings_path, content);
             }
         }
 

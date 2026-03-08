@@ -298,7 +298,7 @@ impl Runner for WineTkgRunner {
         // Resolve graphics backend policy using resolved DLL providers (authoritative)
         match glc.graphics_backend_policy {
             crate::models::GraphicsBackendPolicy::Auto => {
-                for res in &ctx.dll_resolutions {
+                for res in ctx.effective_dll_bindings.values() {
                     if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner {
                         if matches!(res.name.as_str(), "d3d11" | "d3d9" | "dxgi" | "d3d8") {
                             glc.dxvk_enabled = true;
@@ -324,7 +324,7 @@ impl Runner for WineTkgRunner {
             crate::models::GraphicsBackendPolicy::VKD3D => {
                 // Ensure we pick the right flavor if it was resolved to Runner
                 let mut found_d12 = false;
-                for res in &ctx.dll_resolutions {
+                for res in ctx.effective_dll_bindings.values() {
                     if res.name == "d3d12" && res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner {
                          found_d12 = true;
                          if res.chosen_path.as_ref().map(|p| p.to_string_lossy().contains("vkd3d-proton")).unwrap_or(false) {
@@ -349,7 +349,7 @@ impl Runner for WineTkgRunner {
         );
 
         // Enhance overrides with resolved DLL providers
-        for res in &ctx.dll_resolutions {
+        for res in ctx.effective_dll_bindings.values() {
             if let crate::launch::dll_provider_resolver::DllProvider::GameLocal = res.chosen_provider {
                 // Ensure native wins for game-local DLLs
                 if !dll_overrides.contains(&format!("{}=n", res.name)) {

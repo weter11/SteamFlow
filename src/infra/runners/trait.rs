@@ -12,6 +12,8 @@ pub struct LaunchContext {
     pub user_config: Option<UserAppConfig>,
     pub proton_path: Option<String>,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
+    pub target_process_arch: crate::utils::Architecture,
+    pub effective_dll_bindings: HashMap<String, crate::launch::dll_provider_resolver::DllResolution>,
 }
 
 #[derive(Debug, Clone, Default)]

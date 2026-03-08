@@ -32,6 +32,8 @@ mod tests {
             user_config: None,
             proton_path: Some("/tmp/proton".to_string()),
             dll_resolutions: Vec::new(),
+            target_process_arch: crate::utils::Architecture::Unknown,
+            effective_dll_bindings: std::collections::HashMap::new(),
         }
     }
 
@@ -97,6 +99,11 @@ mod tests {
         let resolver = crate::launch::dll_provider_resolver::DllProviderResolver::new();
         let (dll_resolutions, _) = resolver.resolve(tmp.path(), &runner_path, &crate::utils::detect_runner_components(&runner_path, None), &crate::models::D3D12ProviderPolicy::Auto);
 
+        let mut effective_dll_bindings = HashMap::new();
+        for res in &dll_resolutions {
+            effective_dll_bindings.insert(res.name.clone(), res.clone());
+        }
+
         let ctx = LaunchContext {
             app,
             dll_resolutions,
@@ -112,6 +119,8 @@ mod tests {
             launcher_config: config,
             user_config: Some(user_config),
             proton_path: Some(runner_path.to_string_lossy().to_string()),
+            target_process_arch: crate::utils::Architecture::X86_64,
+            effective_dll_bindings,
         };
 
         let runner = WineTkgRunner;
