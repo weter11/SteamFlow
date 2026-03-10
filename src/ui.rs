@@ -1323,6 +1323,46 @@ impl SteamLauncher {
                 self.last_scanned_runner = PathBuf::new();
             }
 
+            ui.add_space(8.0);
+            if let Some(components) = &self.runner_components {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Detected Graphics Components").strong());
+                    ui.add_space(4.0);
+                    egui::Grid::new("game_runner_components_grid")
+                        .num_columns(3)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            let mut row =
+                                |label: &str, info: &Option<crate::utils::ComponentInfo>| {
+                                    ui.label(label);
+                                    match info {
+                                        Some(c) => {
+                                            ui.colored_label(egui::Color32::GREEN, &c.version);
+                                            let source_text = if c.source == crate::utils::ComponentSource::BundledWithRunner {
+                                                "bundled".to_string()
+                                            } else {
+                                                format!("{}", c.source)
+                                            };
+                                            ui.colored_label(
+                                                egui::Color32::GRAY,
+                                                format!("({})", source_text),
+                                            );
+                                        }
+                                        None => {
+                                            ui.colored_label(egui::Color32::GRAY, "not found");
+                                            ui.label("wined3d fallback");
+                                        }
+                                    }
+                                    ui.end_row();
+                                };
+                            let c = components.clone();
+                            row("DXVK:", &c.dxvk);
+                            row("VKD3D-Proton:", &c.vkd3d_proton);
+                            row("VKD3D:", &c.vkd3d);
+                        });
+                });
+            }
+
             if steam_cfg_changed {
                 self.user_configs.insert(game_app_id, user_cfg);
                 let store = self.user_configs.clone();

@@ -28,10 +28,9 @@ fn test_path_discovery_roots() {
     fs::create_dir_all(&share_dxvk).unwrap();
     fs::write(share_dxvk.join("version"), "dxvk (v2.3-g1234567)").unwrap();
 
-    // 2. Critical vkd3d layout (files/lib/vkd3d)
-    let vkd3d_dir = runner_root.join("files/lib/vkd3d");
+    // 2. Critical vkd3d layout (files/lib/wine/vkd3d)
+    let vkd3d_dir = runner_root.join("files/lib/wine/vkd3d");
     fs::create_dir_all(&vkd3d_dir).unwrap();
-    fs::write(vkd3d_dir.join("d3d12.dll"), "fake dll").unwrap();
     fs::write(vkd3d_dir.join("libvkd3d-1.dll"), "fake dll").unwrap();
 
     let share_vkd3d = runner_root.join("files/share/vkd3d");

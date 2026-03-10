@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -114,20 +114,20 @@ pub fn setup_fake_steam_trap(config_dir: &Path) -> Result<PathBuf> {
     Ok(trap_dir)
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunnerComponents {
     pub dxvk: Option<ComponentInfo>,
     pub vkd3d_proton: Option<ComponentInfo>,
     pub vkd3d: Option<ComponentInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentInfo {
     pub version: String,
     pub source: ComponentSource,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ComponentSource {
     BundledWithRunner,
     InstalledInPrefix,
@@ -214,18 +214,44 @@ pub fn detect_prime_env() -> std::collections::HashMap<String, String> {
 // ── DXVK ────────────────────────────────────────────────────────────────────
 
 fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    // 1. Bundled inside runner (Proton & Wine-TKG styles)
+    // 1. Bundled inside runner (Modern Wine-TKG layout)
+    let comp_subdirs = ["lib/wine/dxvk", "files/lib/wine/dxvk", "dist/lib/wine/dxvk"];
+    let required = ["d3d11.dll", "dxgi.dll", "d3d9.dll", "d3d8.dll", "d3d10core.dll"];
+
+    for subdir in comp_subdirs {
+        let comp_path = root.join(subdir);
+        if comp_path.is_dir() {
+            // Check arch subfolders
+            for arch in ["x86_64-windows", "i386-windows"] {
+                let arch_path = comp_path.join(arch);
+                if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                    let version = ["version", "../version"] // check in arch or component folder
+                        .iter()
+                        .filter_map(|v| {
+                            let p = arch_path.join(v);
+                            std::fs::read_to_string(p).ok()
+                        })
+                        .map(|s| parse_short_version(&s))
+                        .find(|s| s != "unknown")
+                        .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                    });
+                }
+            }
+        }
+    }
+
+    // Legacy/Proton fallback
     let bundled_dlls = [
-        "files/lib/wine/dxvk/d3d11.dll",
         "files/lib64/wine/dxvk/d3d11.dll",
-        "files/lib/wine/x86_64-windows/d3d11.dll",
-        "files/lib/wine/i386-windows/d3d11.dll",
-        "dist/lib/wine/dxvk/d3d11.dll",
+        "files/lib/wine/dxvk/d3d11.dll",
         "dist/lib64/wine/dxvk/d3d11.dll",
-        "lib/wine/dxvk/d3d11.dll",
+        "dist/lib/wine/dxvk/d3d11.dll",
         "lib64/wine/dxvk/d3d11.dll",
-        "lib/wine/x86_64-windows/d3d11.dll",
-        "lib/wine/i386-windows/d3d11.dll",
+        "lib/wine/dxvk/d3d11.dll",
     ];
     if let Some(info) = check_bundled(
         root,
@@ -263,32 +289,44 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 // ── VKD3D-Proton ─────────────────────────────────────────────────────────────
 
 fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    let bundled_dlls = [
-        "files/lib/wine/vkd3d-proton/d3d12.dll",
-        "files/lib64/wine/vkd3d-proton/d3d12.dll",
-        "files/lib/wine/x86_64-windows/d3d12.dll",
-        "dist/lib/wine/vkd3d-proton/d3d12.dll",
-        "dist/lib64/wine/vkd3d-proton/d3d12.dll",
-        "lib/wine/vkd3d-proton/d3d12.dll",
-        "lib64/wine/vkd3d-proton/d3d12.dll",
-        "lib/wine/x86_64-windows/d3d12.dll",
-    ];
-    // VKD3D-Proton requires both d3d12.dll and d3d12core.dll for modern titles
-    let core_bundled_dlls = [
-        "files/lib/wine/vkd3d-proton/d3d12core.dll",
-        "files/lib64/wine/vkd3d-proton/d3d12core.dll",
-        "files/lib/wine/x86_64-windows/d3d12core.dll",
-        "dist/lib/wine/vkd3d-proton/d3d12core.dll",
-        "dist/lib64/wine/vkd3d-proton/d3d12core.dll",
-        "lib/wine/vkd3d-proton/d3d12core.dll",
-        "lib64/wine/vkd3d-proton/d3d12core.dll",
-        "lib/wine/x86_64-windows/d3d12core.dll",
-    ];
+    // 1. Modern Wine-TKG layout
+    let comp_subdirs = ["lib/wine/vkd3d-proton", "files/lib/wine/vkd3d-proton", "dist/lib/wine/vkd3d-proton"];
+    let required = ["d3d12.dll", "d3d12core.dll"];
 
-    if !core_bundled_dlls.iter().any(|rel| root.join(rel).exists()) {
-        tracing::debug!("VKD3D-Proton partial: d3d12core.dll missing in bundled paths");
+    for subdir in comp_subdirs {
+        let comp_path = root.join(subdir);
+        if comp_path.is_dir() {
+            for arch in ["x86_64-windows", "i386-windows"] {
+                let arch_path = comp_path.join(arch);
+                if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                    let version = ["version", "../version"]
+                        .iter()
+                        .filter_map(|v| {
+                            let p = arch_path.join(v);
+                            std::fs::read_to_string(p).ok()
+                        })
+                        .map(|s| parse_short_version(&s))
+                        .find(|s| s != "unknown")
+                        .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                    });
+                }
+            }
+        }
     }
 
+    // Legacy/Proton fallback
+    let bundled_dlls = [
+        "files/lib64/wine/vkd3d-proton/d3d12.dll",
+        "files/lib/wine/vkd3d-proton/d3d12.dll",
+        "dist/lib64/wine/vkd3d-proton/d3d12.dll",
+        "dist/lib/wine/vkd3d-proton/d3d12.dll",
+        "lib64/wine/vkd3d-proton/d3d12.dll",
+        "lib/wine/vkd3d-proton/d3d12.dll",
+    ];
     if let Some(info) = check_bundled(
         root,
         &bundled_dlls,
@@ -302,7 +340,6 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
     }
 
     // VKD3D-Proton replaces d3d12.dll — check prefix for it
-    // Distinguish from plain vkd3d by scanning for "vkd3d-proton" string in DLL
     if let Some(pfx) = prefix {
         let prefix_dlls = [
             "drive_c/windows/system32/d3d12.dll",
@@ -311,7 +348,6 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
         for rel in prefix_dlls {
             let p = pfx.join(rel);
             if p.exists() {
-                // Check binary for "vkd3d-proton" marker to distinguish from plain vkd3d
                 if dll_contains_string(&p, "vkd3d-proton") {
                     let version = extract_version_from_dll(&p).unwrap_or_else(|| "unknown".to_string());
                     return Some(ComponentInfo {
@@ -334,21 +370,44 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
 // ── VKD3D (upstream) ─────────────────────────────────────────────────────────
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 1. Modern Wine-TKG layout
+    let comp_subdirs = ["lib/wine/vkd3d", "files/lib/wine/vkd3d", "dist/lib/wine/vkd3d"];
+    let required = ["libvkd3d-1.dll", "libvkd3d-shader-1.dll"];
+
+    for subdir in comp_subdirs {
+        let comp_path = root.join(subdir);
+        if comp_path.is_dir() {
+            for arch in ["x86_64-windows", "i386-windows"] {
+                let arch_path = comp_path.join(arch);
+                if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                    let version = ["version", "../version"]
+                        .iter()
+                        .filter_map(|v| {
+                            let p = arch_path.join(v);
+                            std::fs::read_to_string(p).ok()
+                        })
+                        .map(|s| parse_short_version(&s))
+                        .find(|s| s != "unknown")
+                        .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                    });
+                }
+            }
+        }
+    }
+
+    // Legacy/Proton fallback
     // Upstream Wine VKD3D uses libvkd3d.dll/libvkd3d-1.dll and libvkd3d-shader.dll
     let bundled_dlls = [
-        "files/lib/wine/vkd3d/libvkd3d-1.dll",
         "files/lib64/wine/vkd3d/libvkd3d-1.dll",
-        "files/lib/wine/x86_64-windows/libvkd3d-1.dll",
-        "files/lib/vkd3d/libvkd3d-1.dll",
+        "files/lib/wine/vkd3d/libvkd3d-1.dll",
+        "dist/lib64/wine/vkd3d/libvkd3d-1.dll",
         "dist/lib/wine/vkd3d/libvkd3d-1.dll",
-        "lib/wine/vkd3d/libvkd3d-1.dll",
         "lib64/wine/vkd3d/libvkd3d-1.dll",
-        "lib/wine/x86_64-windows/libvkd3d-1.dll",
-        "files/lib/wine/vkd3d/d3d12.dll",
-        "files/lib64/wine/vkd3d/d3d12.dll",
-        "files/lib/vkd3d/d3d12.dll",
-        "dist/lib/wine/vkd3d/d3d12.dll",
-        "lib/wine/vkd3d/d3d12.dll",
+        "lib/wine/vkd3d/libvkd3d-1.dll",
     ];
     if let Some(info) = check_bundled(
         root,
@@ -476,7 +535,7 @@ pub fn parse_short_version(s: &str) -> String {
         return "unknown".to_string();
     }
 
-    // Try to find content inside parentheses first
+    // Try to find content inside parentheses first (Wine-TKG style)
     let v = if let (Some(start), Some(end)) = (s.find('('), s.rfind(')')) {
         if start < end {
             &s[start + 1..end]
@@ -484,12 +543,26 @@ pub fn parse_short_version(s: &str) -> String {
             s
         }
     } else {
-        s
+        // If no parentheses, it might be a simple version string
+        // or a Wine-TKG style without () but with multiple space-separated parts.
+        if s.contains(' ') {
+            s.split_whitespace().last().unwrap_or(s)
+        } else {
+            s
+        }
     };
 
     let mut v = v.trim();
 
-    // Strip leading 'v'
+    // Strip component name prefixes (like 'dxvk-', 'vkd3d-proton-', 'vkd3d-')
+    for prefix in &["vkd3d-proton-", "vkd3d-", "dxvk-"] {
+        if v.starts_with(prefix) {
+            v = &v[prefix.len()..];
+            break;
+        }
+    }
+
+    // Strip leading 'v' if followed by a digit
     if v.starts_with('v') && v.len() > 1 && v.as_bytes()[1].is_ascii_digit() {
         v = &v[1..];
     }
@@ -567,75 +640,6 @@ pub enum GraphicsLayer {
     Dxvk,
     Vkd3dProton,
     Vkd3d,
-}
-
-/// Finds all source DLLs for a given layer from system paths.
-/// Returns (x64_dir, x32_dir) if found.
-pub fn find_layer_source(layer: &GraphicsLayer) -> Option<(PathBuf, Option<PathBuf>)> {
-    let x64_candidates = match layer {
-        GraphicsLayer::Dxvk => vec![
-            "/usr/share/dxvk/x64",
-            "/usr/lib/dxvk/x64",
-            "/usr/lib/x86_64-linux-gnu/dxvk",
-            "/usr/local/share/dxvk/x64",
-        ],
-        GraphicsLayer::Vkd3dProton => vec![
-            "/usr/share/vkd3d-proton/x64",
-            "/usr/lib/vkd3d-proton/x64",
-            "/usr/local/share/vkd3d-proton/x64",
-        ],
-        GraphicsLayer::Vkd3d => vec![
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib64",
-            "/usr/local/lib",
-        ],
-    };
-
-    let x32_candidates = match layer {
-        GraphicsLayer::Dxvk => vec![
-            "/usr/share/dxvk/x32",
-            "/usr/lib32/dxvk",                      // Arch multilib
-            "/usr/lib/dxvk/x32",
-            "/usr/lib/i386-linux-gnu/dxvk",          // Debian/Ubuntu
-            "/usr/local/share/dxvk/x32",
-            "/usr/lib/dxvk",                         // some Fedora layouts put both here
-        ],
-        GraphicsLayer::Vkd3dProton => vec![
-            "/usr/share/vkd3d-proton/x86",
-            "/usr/lib32/vkd3d-proton",               // Arch multilib
-            "/usr/lib/vkd3d-proton/x86",
-            "/usr/lib/i386-linux-gnu/vkd3d-proton",
-            "/usr/local/share/vkd3d-proton/x86",
-        ],
-        GraphicsLayer::Vkd3d => vec![
-            "/usr/lib/i386-linux-gnu",
-            "/usr/lib32",
-            "/usr/local/lib32",
-        ],
-    };
-
-    let x64 = x64_candidates
-        .iter()
-        .map(|p| Path::new(p))
-        .find(|p| p.exists() && layer_dir_has_dlls(p, layer))?
-        .to_path_buf();
-
-    let x32 = x32_candidates
-        .iter()
-        .map(|p| Path::new(p))
-        .find(|p| p.exists() && layer_dir_has_dlls(p, layer))
-        .map(|p| p.to_path_buf());
-
-    Some((x64, x32))
-}
-
-fn layer_dir_has_dlls(dir: &Path, layer: &GraphicsLayer) -> bool {
-    let sentinel = match layer {
-        GraphicsLayer::Dxvk => "d3d11.dll",
-        GraphicsLayer::Vkd3dProton => "d3d12.dll",
-        GraphicsLayer::Vkd3d => "d3d12.dll",
-    };
-    dir.join(sentinel).exists()
 }
 
 /// Returns the WINEDLLOVERRIDES string needed to activate installed layers.

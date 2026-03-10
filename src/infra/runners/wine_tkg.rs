@@ -314,13 +314,16 @@ impl Runner for WineTkgRunner {
         );
 
         // 1. Resolve DX8-11 policy (GraphicsBackendPolicy)
-        let policy_dxvk = match glc.graphics_backend_policy {
-            crate::models::GraphicsBackendPolicy::Auto => components.dxvk.is_some(),
-            crate::models::GraphicsBackendPolicy::WineD3D => false,
-            crate::models::GraphicsBackendPolicy::DXVK => true,
+        let (policy_dxvk, force_builtin) = match glc.graphics_backend_policy {
+            crate::models::GraphicsBackendPolicy::Auto => (components.dxvk.is_some(), false),
+            crate::models::GraphicsBackendPolicy::WineD3D => (false, true),
+            crate::models::GraphicsBackendPolicy::DXVK => (true, false),
         };
-        // Manual override takes precedence if enabled, otherwise use policy
+        // Manual override takes precedence if enabled
         glc.dxvk_enabled = glc.dxvk_enabled || policy_dxvk;
+
+        // If user explicitly selected WineD3D and didn't force DXVK, we use builtins.
+        let force_builtin_d3d = force_builtin && !glc.dxvk_enabled;
 
         // 2. Resolve DX12 policy (D3D12ProviderPolicy)
         let (policy_vkd3dp, policy_vkd3dw) = match glc.d3d12_policy {
@@ -339,11 +342,6 @@ impl Runner for WineTkgRunner {
         // Manual overrides take precedence
         glc.vkd3d_proton_enabled = glc.vkd3d_proton_enabled || policy_vkd3dp;
         glc.vkd3d_enabled = glc.vkd3d_enabled || policy_vkd3dw;
-
-        let force_builtin_d3d = matches!(
-            glc.graphics_backend_policy,
-            crate::models::GraphicsBackendPolicy::WineD3D
-        );
 
         let mut dll_overrides = crate::utils::build_dll_overrides(
             glc.dxvk_enabled,
@@ -378,6 +376,28 @@ impl Runner for WineTkgRunner {
                         let dir = parent.to_string_lossy().to_string();
                         if !wine_dll_dirs.contains(&dir) {
                             wine_dll_dirs.push(dir);
+                        }
+
+                        // For Wine-TKG and similar layouts, we must ensure both 64-bit and 32-bit
+                        // architecture folders are in WINEDLLPATH if they exist, so that both
+                        // architectures of a game find their respective native DLLs.
+                        let folder_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if folder_name == "x86_64-windows" {
+                            let sibling = parent.parent().unwrap().join("i386-windows");
+                            if sibling.exists() {
+                                let s = sibling.to_string_lossy().to_string();
+                                if !wine_dll_dirs.contains(&s) {
+                                    wine_dll_dirs.push(s);
+                                }
+                            }
+                        } else if folder_name == "i386-windows" {
+                            let sibling = parent.parent().unwrap().join("x86_64-windows");
+                            if sibling.exists() {
+                                let s = sibling.to_string_lossy().to_string();
+                                if !wine_dll_dirs.contains(&s) {
+                                    wine_dll_dirs.push(s);
+                                }
+                            }
                         }
                     }
                 }
