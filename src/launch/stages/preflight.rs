@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use crate::launch::pipeline::{PipelineStage, PipelineContext, LaunchError, LaunchErrorKind};
 
@@ -54,29 +54,58 @@ impl PipelineStage for PreflightStage {
             if let Some(game_exe) = spec.args.first() {
                 let mut check = PreflightCheck { name: "Game Executable Existence".into(), status: true, details: "OK".into() };
                 let game_exe_path = Path::new(game_exe);
+
+                // Populate diagnostics in context
+                if let Some(app) = &ctx.app {
+                    ctx.resolved_install_dir = app.install_path.as_ref().map(PathBuf::from);
+                }
+                ctx.resolved_executable_path = Some(game_exe_path.to_path_buf());
+
                 if game_exe_path.is_absolute() || (game_exe_path.components().count() > 1 && !game_exe.starts_with('-')) {
                      if !game_exe_path.exists() {
+                         let mut resolved_path = game_exe_path.to_path_buf();
                          let mut resolved = false;
+                         let mut fallback_used = false;
+
                          if let Some(app) = &ctx.app {
                              if let Some(install_path) = &app.install_path {
                                  let alt_path = Path::new(install_path).join(game_exe.replace('\\', "/"));
                                  if alt_path.exists() && alt_path.is_file() {
                                      resolved = true;
+                                     fallback_used = true;
+                                     resolved_path = alt_path;
                                  }
                              }
                          }
 
+                         ctx.executable_exists = resolved;
                          if !resolved {
                              check.status = false;
                              check.details = format!("Game executable not found: {}", game_exe);
-                             final_res = Err(LaunchError::new(LaunchErrorKind::GameData, format!("[Preflight] {}", check.details))
-                                .with_context("game_exe", game_exe.to_string()));
+
+                             let mut err = LaunchError::new(LaunchErrorKind::GameData, format!("[Preflight] {}", check.details))
+                                .with_context("app_id", ctx.app_id.to_string())
+                                .with_context("app_name", ctx.app.as_ref().map(|a| a.name.clone()).unwrap_or_default())
+                                .with_context("game_exe", game_exe.to_string())
+                                .with_context("resolved_path", game_exe_path.to_string_lossy())
+                                .with_context("fallback_used", fallback_used.to_string());
+
+                             if let Some(app) = &ctx.app {
+                                 err = err.with_context("steam_install_dir", app.install_path.clone().unwrap_or_default());
+                             }
+
+                             final_res = Err(err);
+                         } else {
+                             ctx.resolved_executable_path = Some(resolved_path);
                          }
                      } else if !game_exe_path.is_file() {
                           check.status = false;
                           check.details = format!("Game executable is not a file: {}", game_exe);
+                          ctx.executable_exists = false;
                           final_res = Err(LaunchError::new(LaunchErrorKind::GameData, format!("[Preflight] {}", check.details))
                             .with_context("game_exe", game_exe.to_string()));
+                     } else {
+                         ctx.executable_exists = true;
                      }
                 }
                 checks.push(check);

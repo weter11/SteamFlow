@@ -275,7 +275,7 @@ impl Runner for WineTkgRunner {
         env.insert("WINEPREFIX".to_string(), game_wineprefix.to_string_lossy().to_string());
         env.insert("STEAM_COMPAT_DATA_PATH".to_string(), compat_data_path.to_string_lossy().to_string());
 
-        let mut glc = ctx.user_config.as_ref()
+        let glc = ctx.user_config.as_ref()
             .map(|c| c.graphics_layers.clone())
             .unwrap_or_default();
         let no_overlay = ctx.user_config.as_ref()
@@ -319,11 +319,12 @@ impl Runner for WineTkgRunner {
             crate::models::GraphicsBackendPolicy::WineD3D => (false, true),
             crate::models::GraphicsBackendPolicy::DXVK => (true, false),
         };
+
         // Manual override takes precedence if enabled
-        glc.dxvk_enabled = glc.dxvk_enabled || policy_dxvk;
+        let effective_dxvk = glc.dxvk_enabled || policy_dxvk;
 
         // If user explicitly selected WineD3D and didn't force DXVK, we use builtins.
-        let force_builtin_d3d = force_builtin && !glc.dxvk_enabled;
+        let force_builtin_d3d = force_builtin && !effective_dxvk;
 
         // 2. Resolve DX12 policy (D3D12ProviderPolicy)
         let (policy_vkd3dp, policy_vkd3dw) = match glc.d3d12_policy {
@@ -340,13 +341,13 @@ impl Runner for WineTkgRunner {
             crate::models::D3D12ProviderPolicy::Vkd3dWine => (false, true),
         };
         // Manual overrides take precedence
-        glc.vkd3d_proton_enabled = glc.vkd3d_proton_enabled || policy_vkd3dp;
-        glc.vkd3d_enabled = glc.vkd3d_enabled || policy_vkd3dw;
+        let effective_vkd3d_proton = glc.vkd3d_proton_enabled || policy_vkd3dp;
+        let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
 
         let mut dll_overrides = crate::utils::build_dll_overrides(
-            glc.dxvk_enabled,
-            glc.vkd3d_proton_enabled,
-            glc.vkd3d_enabled,
+            effective_dxvk,
+            effective_vkd3d_proton,
+            effective_vkd3d,
             no_overlay,
             force_builtin_d3d,
             Some(&game_working_dir),
@@ -363,6 +364,10 @@ impl Runner for WineTkgRunner {
         }
 
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
+
+        // Track effective state for diagnostics (HACK: should ideally be done in a separate stage)
+        // This is safe because WineTkgRunner is currently the only one implementing this logic.
+        // We'll see if we can move it to PipelineContext later.
 
         // Translate Runner-resolved DLL paths into WINEDLLPATH so Wine can
         // actually find the bundled DLLs (VKD3D-Proton, DXVK, etc.) in the runner.
@@ -462,7 +467,7 @@ impl Runner for WineTkgRunner {
                     env.insert("__NV_PRIME_RENDER_OFFLOAD_PROVIDER".to_string(), "NVIDIA-G0".to_string());
                     env.insert("__VK_LAYER_NV_optimus".to_string(), "NVIDIA_only".to_string());
                     env.insert("__GLX_VENDOR_LIBRARY_NAME".to_string(), "nvidia".to_string());
-                } else if gpu.name.contains("AMD") || gpu.name.contains("Intel") {
+                } else if gpu.name.contains("AMD") || gpu.name.contains("Intel") || gpu.name.contains("Unknown") {
                     // Standard DRI_PRIME for non-NVIDIA discrete/specific GPUs
                     // Try to find "cardN" and extract N
                     let re = regex::Regex::new(r"card(\d+)").unwrap();

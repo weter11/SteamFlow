@@ -28,6 +28,13 @@ pub struct GraphicsStackInfo {
     pub graphics_stack_confidence: String,         // "low" | "medium" | "high"
     pub override_policy: String,                   // e.g. "Native-only"
     pub dll_providers: HashMap<String, String>,    // e.g. {"d3d11": "Runner", "d3d9": "GameLocal"}
+    pub requested_backend: String,
+    pub effective_backend: String,
+    pub requested_d3d12_provider: String,
+    pub effective_d3d12_provider: String,
+    pub requested_gpu: Option<String>,
+    pub effective_gpu: Option<String>,
+    pub fallback_reasons: HashMap<String, String>,
 }
 
 pub struct PipelineContext {
@@ -37,6 +44,10 @@ pub struct PipelineContext {
     pub launcher_config: Option<LauncherConfig>,
     pub user_config: Option<UserAppConfig>,
     pub proton_path: Option<String>,
+
+    pub resolved_install_dir: Option<std::path::PathBuf>,
+    pub resolved_executable_path: Option<std::path::PathBuf>,
+    pub executable_exists: bool,
 
     pub runner: Option<Box<dyn Runner>>,
     pub command_spec: Option<CommandSpec>,
@@ -58,6 +69,9 @@ impl PipelineContext {
             launcher_config: None,
             user_config: None,
             proton_path: None,
+            resolved_install_dir: None,
+            resolved_executable_path: None,
+            executable_exists: false,
             runner: None,
             command_spec: None,
             child: None,
@@ -324,6 +338,7 @@ impl LaunchPipeline {
         pipeline.add_stage(Box::new(crate::launch::stages::finalize::FinalizeStage));
 
         pipeline.add_validator(Box::new(crate::launch::validators::overrides::OverrideConflictValidator));
+        pipeline.add_validator(Box::new(crate::launch::validators::invariants::LaunchInvariantValidator));
 
         pipeline
     }
@@ -331,6 +346,11 @@ impl LaunchPipeline {
     pub async fn run(&self, ctx: &mut PipelineContext) -> std::result::Result<(), PipelineError> {
         // Record expected stack info before starting
         self.populate_expected_graphics_stack(ctx);
+
+        // After ResolveDllProvidersStage and BuildEnvironmentStage, we can populate effective state
+        // but for now we'll do it right before validators if possible or within validators.
+        // Actually, let's run validators twice: early and late.
+        // Or just let stages populate the context.
 
         use crate::infra::logging::LaunchResult;
 
@@ -405,14 +425,53 @@ impl LaunchPipeline {
         self.record_dll_provider_diagnostics(ctx);
         self.scan_logs_for_graphics_evidence(ctx);
 
+        // Populate effective graphics stack info from command spec/env if possible
+        self.populate_effective_graphics_stack(ctx);
+
+        // Run validators again on the final effective config
+        for validator in &self.validators {
+            validator.validate(ctx);
+        }
+
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
 
         Ok(())
     }
 
+    fn populate_effective_graphics_stack(&self, ctx: &mut PipelineContext) {
+        if let Some(spec) = &ctx.command_spec {
+             if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
+                 let has_dxvk = overrides.contains("d3d11=n") || overrides.contains("dxgi=n") || overrides.contains("d3d9=n");
+                 let has_vkd3dp = overrides.contains("d3d12=n");
+                 let has_vkd3dw = overrides.contains("libvkd3d-1=n");
+
+                 ctx.graphics_stack.effective_backend = if has_dxvk { "DXVK" } else { "WineD3D (Baseline)" }.to_string();
+                 ctx.graphics_stack.effective_d3d12_provider = if has_vkd3dp { "vkd3d-proton" } else if has_vkd3dw { "vkd3d" } else { "None" }.to_string();
+             }
+
+             // GPU Selection
+             if let Some(val) = spec.env.get("__NV_PRIME_RENDER_OFFLOAD") {
+                 if val == "1" {
+                     ctx.graphics_stack.effective_gpu = Some("NVIDIA Discrete GPU".to_string());
+                 }
+             } else if let Some(val) = spec.env.get("DRI_PRIME") {
+                 if val == "1" {
+                     ctx.graphics_stack.effective_gpu = Some("Secondary GPU (DRI_PRIME=1)".to_string());
+                 } else {
+                     ctx.graphics_stack.effective_gpu = Some("Primary GPU (DRI_PRIME=0)".to_string());
+                 }
+             }
+        }
+    }
+
     fn populate_expected_graphics_stack(&self, ctx: &mut PipelineContext) {
         if let Some(config) = &ctx.user_config {
             let mut expected = Vec::new();
+
+            ctx.graphics_stack.requested_backend = format!("{:?}", config.graphics_layers.graphics_backend_policy);
+            ctx.graphics_stack.requested_d3d12_provider = format!("{:?}", config.graphics_layers.d3d12_policy);
+            ctx.graphics_stack.requested_gpu = config.gpu_preference.clone();
+
             if config.graphics_layers.dxvk_enabled {
                 expected.push("DXVK");
             }
@@ -437,6 +496,9 @@ impl LaunchPipeline {
     fn record_dll_provider_diagnostics(&self, ctx: &mut PipelineContext) {
         for res in &ctx.dll_resolutions {
             ctx.graphics_stack.dll_providers.insert(res.name.clone(), format!("{:?}", res.chosen_provider));
+            if let Some(reason) = &res.fallback_reason {
+                ctx.graphics_stack.fallback_reasons.insert(res.name.clone(), reason.clone());
+            }
         }
     }
 
@@ -521,6 +583,63 @@ impl LaunchPipeline {
                 let _ = session.write_command_artifact(spec);
             }
             let _ = session.write_dll_resolution_artifact(&ctx.dll_resolutions);
+
+            // Write Effective Launch Config
+            if let Some(spec) = &ctx.command_spec {
+                 use crate::infra::logging::{EffectiveLaunchConfig, EffectiveGameConfig, EffectiveRunnerConfig, EffectiveSettingsConfig, EffectiveCommandConfig};
+                 let config = EffectiveLaunchConfig {
+                     session_id: session.id.to_string(),
+                     app_id: ctx.app_id,
+                     app_name: ctx.app.as_ref().map(|a| a.name.clone()),
+                     game: EffectiveGameConfig {
+                         install_dir: ctx.resolved_install_dir.clone(),
+                         executable_path: ctx.resolved_executable_path.clone(),
+                         executable_exists: ctx.executable_exists,
+                     },
+                     runner: EffectiveRunnerConfig {
+                         name: ctx.runner.as_ref().map(|r| r.name().to_string()),
+                         root: {
+                             let proton = if let Some(forced) = ctx.launcher_config.as_ref()
+                                 .and_then(|c| c.game_configs.get(&ctx.app_id))
+                                 .and_then(|c| c.forced_proton_version.as_ref())
+                             {
+                                 forced.as_str()
+                             } else {
+                                 ctx.proton_path.as_deref().unwrap_or("wine")
+                             };
+                             let library_root = ctx.launcher_config.as_ref().map(|c| std::path::PathBuf::from(&c.steam_library_path)).unwrap_or_default();
+                             let active_runner = crate::utils::resolve_runner(proton, &library_root);
+                             Some(crate::utils::derive_runner_root(&active_runner))
+                         },
+                     },
+                     settings: EffectiveSettingsConfig {
+                         requested_backend: ctx.graphics_stack.requested_backend.clone(),
+                         effective_backend: ctx.graphics_stack.effective_backend.clone(),
+                         requested_d3d12_provider: ctx.graphics_stack.requested_d3d12_provider.clone(),
+                         effective_d3d12_provider: ctx.graphics_stack.effective_d3d12_provider.clone(),
+                         requested_gpu: ctx.graphics_stack.requested_gpu.clone(),
+                         effective_gpu: ctx.graphics_stack.effective_gpu.clone(),
+                         dll_resolutions: ctx.dll_resolutions.clone(),
+                         wine_dll_overrides: spec.env.get("WINEDLLOVERRIDES").cloned(),
+                     },
+                     command: EffectiveCommandConfig {
+                         program: spec.program.clone(),
+                         args: spec.args.clone(),
+                         cwd: spec.cwd.clone(),
+                         env_subset: {
+                             let mut subset = HashMap::new();
+                             for key in &["DRI_PRIME", "__NV_PRIME_RENDER_OFFLOAD", "__NV_PRIME_RENDER_OFFLOAD_PROVIDER", "DXVK_HUD", "VKD3D_DEBUG"] {
+                                 if let Some(val) = spec.env.get(*key) {
+                                     subset.insert(key.to_string(), val.clone());
+                                 }
+                             }
+                             subset
+                         },
+                     },
+                     fallbacks: ctx.graphics_stack.fallback_reasons.clone(),
+                 };
+                 let _ = session.write_effective_launch_config(&config);
+            }
         }
 
         if let Some(session) = &ctx.session {
@@ -544,6 +663,26 @@ impl LaunchPipeline {
             };
 
             let _ = session.write_summary(&summary);
+
+            // Add concise summary block to events log
+            if let Some(logger) = &ctx.logger {
+                 let mut metadata = HashMap::new();
+                 if let Some(path) = &ctx.resolved_executable_path {
+                     metadata.insert("exe".to_string(), path.to_string_lossy().to_string());
+                 }
+                 metadata.insert("backend".to_string(), ctx.graphics_stack.effective_backend.clone());
+                 metadata.insert("d3d12_provider".to_string(), ctx.graphics_stack.effective_d3d12_provider.clone());
+                 metadata.insert("gpu".to_string(), ctx.graphics_stack.effective_gpu.clone().unwrap_or_else(|| "default".to_string()));
+                 if let Some(spec) = &ctx.command_spec {
+                     if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
+                         metadata.insert("overrides".to_string(), overrides.clone());
+                     }
+                 }
+                 metadata.insert("validation_passed".to_string(), ctx.warnings.is_empty().to_string());
+                 metadata.insert("fallback_occurred".to_string(), (!ctx.graphics_stack.fallback_reasons.is_empty()).to_string());
+
+                 let _ = logger.info("launch_summary_concise", "Concise launch summary recorded".to_string(), None, metadata);
+            }
         }
     }
 }
