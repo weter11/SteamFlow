@@ -275,7 +275,7 @@ impl Runner for WineTkgRunner {
         env.insert("WINEPREFIX".to_string(), game_wineprefix.to_string_lossy().to_string());
         env.insert("STEAM_COMPAT_DATA_PATH".to_string(), compat_data_path.to_string_lossy().to_string());
 
-        let mut glc = ctx.user_config.as_ref()
+        let glc = ctx.user_config.as_ref()
             .map(|c| c.graphics_layers.clone())
             .unwrap_or_default();
         let no_overlay = ctx.user_config.as_ref()
@@ -308,67 +308,41 @@ impl Runner for WineTkgRunner {
                 .unwrap_or("wine")
         };
 
-        // Resolve graphics backend policy
-        match glc.graphics_backend_policy {
-            crate::models::GraphicsBackendPolicy::Auto => {
-                let components = crate::utils::detect_runner_components(
-                    &crate::utils::resolve_runner(proton, &library_root),
-                    Some(&game_wineprefix),
-                );
-
-                if components.dxvk.is_some() {
-                    glc.dxvk_enabled = true;
-                }
-                // Respect d3d12_policy when auto-detecting VKD3D variant
-                match glc.d3d12_policy {
-                    crate::models::D3D12ProviderPolicy::Vkd3dWine => {
-                        if components.vkd3d.is_some() {
-                            glc.vkd3d_enabled = true;
-                        }
-                    }
-                    _ => {
-                        // Auto or Vkd3dProton: prefer proton, fall back to wine VKD3D
-                        if components.vkd3d_proton.is_some() {
-                            glc.vkd3d_proton_enabled = true;
-                        } else if components.vkd3d.is_some() {
-                            glc.vkd3d_enabled = true;
-                        }
-                    }
-                }
-            }
-            crate::models::GraphicsBackendPolicy::WineD3D => {
-                glc.dxvk_enabled = false;
-                glc.vkd3d_proton_enabled = false;
-                glc.vkd3d_enabled = false;
-                // force_builtin_d3d handles the rest below
-            }
-            crate::models::GraphicsBackendPolicy::DXVK => {
-                glc.dxvk_enabled = true;
-            }
-            crate::models::GraphicsBackendPolicy::VKD3D => {
-                // Consult d3d12_policy to select the right implementation
-                match glc.d3d12_policy {
-                    crate::models::D3D12ProviderPolicy::Vkd3dWine => {
-                        glc.vkd3d_enabled = true;
-                        glc.vkd3d_proton_enabled = false;
-                    }
-                    _ => {
-                        // Auto or Vkd3dProton
-                        glc.vkd3d_proton_enabled = true;
-                    }
-                }
-            }
-        }
-
-        let force_builtin_d3d = matches!(
-            glc.graphics_backend_policy,
-            crate::models::GraphicsBackendPolicy::WineD3D
+        let _components = crate::utils::detect_runner_components(
+            &crate::utils::resolve_runner(proton, &library_root),
+            Some(&game_wineprefix),
         );
 
+        // 1. Resolve DX8-11 policy (GraphicsBackendPolicy) - CONSERVATIVE
+        let (policy_dxvk, force_builtin) = match glc.graphics_backend_policy {
+            // Auto is now conservative: it does NOT automatically enable DXVK
+            // even if detected on disk. It prefers default Wine behavior.
+            crate::models::GraphicsBackendPolicy::Auto => (false, false),
+            crate::models::GraphicsBackendPolicy::WineD3D => (false, true),
+            crate::models::GraphicsBackendPolicy::DXVK => (true, false),
+        };
+
+        // Manual override takes precedence if enabled
+        let effective_dxvk = glc.dxvk_enabled || policy_dxvk;
+
+        // If user explicitly selected WineD3D and didn't force DXVK, we use builtins.
+        let force_builtin_d3d = force_builtin && !effective_dxvk;
+
+        // 2. Resolve DX12 policy (D3D12ProviderPolicy) - CONSERVATIVE
+        let (policy_vkd3dp, policy_vkd3dw) = match glc.d3d12_policy {
+            // Auto is now conservative: no forced D3D12 provider unless explicitly requested.
+            crate::models::D3D12ProviderPolicy::Auto => (false, false),
+            crate::models::D3D12ProviderPolicy::Vkd3dProton => (true, false),
+            crate::models::D3D12ProviderPolicy::Vkd3dWine => (false, true),
+        };
+        // Manual overrides take precedence
+        let effective_vkd3d_proton = glc.vkd3d_proton_enabled || policy_vkd3dp;
+        let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
+
         let mut dll_overrides = crate::utils::build_dll_overrides(
-            glc.dxvk_enabled,
-            glc.vkd3d_proton_enabled,
-            glc.vkd3d_enabled,
+            effective_dxvk,
+            effective_vkd3d_proton,
+            effective_vkd3d,
             no_overlay,
             force_builtin_d3d,
             Some(&game_working_dir),
@@ -386,18 +360,56 @@ impl Runner for WineTkgRunner {
 
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
 
+        // Track effective state for diagnostics (HACK: should ideally be done in a separate stage)
+        // This is safe because WineTkgRunner is currently the only one implementing this logic.
+        // We'll see if we can move it to PipelineContext later.
+
         // Translate Runner-resolved DLL paths into WINEDLLPATH so Wine can
         // actually find the bundled DLLs (VKD3D-Proton, DXVK, etc.) in the runner.
-        // Without this, d3d12=n,b finds whatever is in the prefix's system32 instead.
+        // WITHOUT THIS, d3d12=n,b finds whatever is in the prefix's system32 instead.
+        // CONSERVATIVE: only include paths for DLLs that are actually requested to be native.
         let mut wine_dll_dirs: Vec<String> = Vec::new();
 
         for res in &ctx.dll_resolutions {
             if let crate::launch::dll_provider_resolver::DllProvider::Runner = res.chosen_provider {
+                // Check if this DLL is actually selected for use by the current policy/overrides
+                let name = res.name.to_lowercase();
+                let is_dxvk_dll = matches!(name.as_str(), "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi");
+                let is_d3d12_dll = matches!(name.as_str(), "d3d12" | "d3d12core" | "libvkd3d-1" | "libvkd3d-shader-1");
+
+                let selected = (is_dxvk_dll && effective_dxvk) || (is_d3d12_dll && (effective_vkd3d_proton || effective_vkd3d));
+
+                if !selected {
+                    continue;
+                }
+
                 if let Some(path) = &res.chosen_path {
                     if let Some(parent) = path.parent() {
                         let dir = parent.to_string_lossy().to_string();
                         if !wine_dll_dirs.contains(&dir) {
                             wine_dll_dirs.push(dir);
+                        }
+
+                        // For Wine-TKG and similar layouts, we must ensure both 64-bit and 32-bit
+                        // architecture folders are in WINEDLLPATH if they exist, so that both
+                        // architectures of a game find their respective native DLLs.
+                        let folder_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if folder_name == "x86_64-windows" {
+                            let sibling = parent.parent().unwrap().join("i386-windows");
+                            if sibling.exists() {
+                                let s = sibling.to_string_lossy().to_string();
+                                if !wine_dll_dirs.contains(&s) {
+                                    wine_dll_dirs.push(s);
+                                }
+                            }
+                        } else if folder_name == "i386-windows" {
+                            let sibling = parent.parent().unwrap().join("x86_64-windows");
+                            if sibling.exists() {
+                                let s = sibling.to_string_lossy().to_string();
+                                if !wine_dll_dirs.contains(&s) {
+                                    wine_dll_dirs.push(s);
+                                }
+                            }
                         }
                     }
                 }
@@ -453,9 +465,34 @@ impl Runner for WineTkgRunner {
             env.insert("XDG_RUNTIME_DIR".to_string(), xdg_runtime);
         }
 
-        // Auto-inject PRIME/Optimus GPU selection (user env vars can still override below)
-        for (k, v) in crate::utils::detect_prime_env() {
-            env.entry(k).or_insert(v);
+        // Apply GPU preference if specified. CONSERVATIVE: No forced offload if unset.
+        if let Some(gpu_pref) = ctx.user_config.as_ref().and_then(|c| c.gpu_preference.as_ref()) {
+            let available_gpus = crate::utils::list_available_gpus();
+            if let Some(gpu) = available_gpus.iter().find(|g| &g.name == gpu_pref) {
+                if gpu.name.contains("NVIDIA") {
+                    env.insert("__NV_PRIME_RENDER_OFFLOAD".to_string(), "1".to_string());
+                    env.insert("__NV_PRIME_RENDER_OFFLOAD_PROVIDER".to_string(), "NVIDIA-G0".to_string());
+                    env.insert("__VK_LAYER_NV_optimus".to_string(), "NVIDIA_only".to_string());
+                    env.insert("__GLX_VENDOR_LIBRARY_NAME".to_string(), "nvidia".to_string());
+                } else if gpu.name.contains("AMD") || gpu.name.contains("Intel") || gpu.name.contains("Unknown") {
+                    // Standard DRI_PRIME for non-NVIDIA discrete/specific GPUs
+                    // Try to find "cardN" and extract N
+                    let re = regex::Regex::new(r"card(\d+)").unwrap();
+                    if let Some(caps) = re.captures(&gpu.name) {
+                        if let Some(idx_match) = caps.get(1) {
+                            if let Ok(card_idx) = idx_match.as_str().parse::<u32>() {
+                                 // DRI_PRIME=1 is the most common way to select the second GPU
+                                 // For now we use the standard PRIME offload if it's not card0.
+                                 if card_idx > 0 {
+                                     env.insert("DRI_PRIME".to_string(), "1".to_string());
+                                 } else {
+                                     env.insert("DRI_PRIME".to_string(), "0".to_string());
+                                 }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(config) = &ctx.user_config {
@@ -464,12 +501,12 @@ impl Runner for WineTkgRunner {
             }
 
             // Add debug toggles
-            if config.graphics_layers.dxvk_enabled {
+            if effective_dxvk {
                 if !env.contains_key("DXVK_HUD") {
                     env.insert("DXVK_HUD".to_string(), "compiler".to_string());
                 }
             }
-            if config.graphics_layers.vkd3d_proton_enabled || config.graphics_layers.vkd3d_enabled {
+            if effective_vkd3d_proton || effective_vkd3d {
                  if !env.contains_key("VKD3D_DEBUG") {
                     env.insert("VKD3D_DEBUG".to_string(), "warn".to_string());
                 }

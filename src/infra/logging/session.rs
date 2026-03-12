@@ -56,6 +56,53 @@ pub struct EffectiveEnv {
     pub env_vars: HashMap<String, String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EffectiveLaunchConfig {
+    pub session_id: String,
+    pub app_id: u32,
+    pub app_name: Option<String>,
+    pub game: EffectiveGameConfig,
+    pub runner: EffectiveRunnerConfig,
+    pub settings: EffectiveSettingsConfig,
+    pub command: EffectiveCommandConfig,
+    pub fallbacks: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EffectiveGameConfig {
+    pub install_dir: Option<PathBuf>,
+    pub executable_path: Option<PathBuf>,
+    pub executable_exists: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EffectiveRunnerConfig {
+    pub name: Option<String>,
+    pub root: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EffectiveSettingsConfig {
+    pub requested_backend: String,
+    pub effective_backend: String,
+    pub requested_d3d12_provider: String,
+    pub effective_d3d12_provider: String,
+    pub requested_gpu: Option<String>,
+    pub effective_gpu: Option<String>,
+    pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
+    pub wine_dll_overrides: Option<String>,
+    pub runtime_evidence: Option<crate::launch::pipeline::RuntimeEvidence>,
+    pub env_propagation: Option<HashMap<String, bool>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EffectiveCommandConfig {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env_subset: HashMap<String, String>,
+}
+
 pub struct LaunchSession {
     pub id: LaunchSessionId,
     pub created_at: SystemTime,
@@ -163,6 +210,13 @@ impl LaunchSession {
         std::fs::write(path, content)?;
         Ok(())
     }
+
+    pub fn write_effective_launch_config(&self, config: &EffectiveLaunchConfig) -> anyhow::Result<()> {
+        std::fs::create_dir_all(&self.log_dir)?;
+        let content = serde_json::to_string_pretty(config)?;
+        std::fs::write(self.log_dir.join("effective_launch_config.json"), content)?;
+        Ok(())
+    }
 }
 
 pub fn redact_environment(mut env: HashMap<String, String>) -> HashMap<String, String> {
@@ -196,7 +250,9 @@ pub fn check_environment_sanity(
         let d3d_dlls = ["d3d9", "d3d11", "dxgi", "d3d12"];
         let is_baseline = user_config
             .map(|c| {
-                !c.graphics_layers.dxvk_enabled
+                c.graphics_layers.graphics_backend_policy != crate::models::GraphicsBackendPolicy::DXVK
+                    && c.graphics_layers.d3d12_policy == crate::models::D3D12ProviderPolicy::Auto
+                    && !c.graphics_layers.dxvk_enabled
                     && !c.graphics_layers.vkd3d_proton_enabled
                     && !c.graphics_layers.vkd3d_enabled
             })

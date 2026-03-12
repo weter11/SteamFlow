@@ -106,7 +106,7 @@ mod tests {
                 target: LaunchTarget::WindowsProton,
             },
             launcher_config: config,
-            user_config: Some(user_config),
+            user_config: Some(user_config.clone()),
             proton_path: Some(runner_path.to_string_lossy().to_string()),
             dll_resolutions: Vec::new(),
         };
@@ -114,9 +114,18 @@ mod tests {
         let runner = WineTkgRunner;
         let env = runner.build_env(&ctx).await.unwrap();
 
-        // Since we simulated DXVK, Auto should have enabled it
+        // Auto is now CONSERVATIVE: it should NOT have enabled DXVK even if simulated on disk
         let overrides = env.get("WINEDLLOVERRIDES").unwrap();
-        assert!(overrides.contains("d3d11=n,b"));
+        assert!(!overrides.contains("d3d11=n,b"));
+
+        // Explicitly requesting DXVK should still enable it
+        let mut user_config_dxvk = user_config.clone();
+        user_config_dxvk.graphics_layers.graphics_backend_policy = GraphicsBackendPolicy::DXVK;
+        let mut ctx_dxvk = ctx.clone();
+        ctx_dxvk.user_config = Some(user_config_dxvk);
+        let env_dxvk = runner.build_env(&ctx_dxvk).await.unwrap();
+        let overrides_dxvk = env_dxvk.get("WINEDLLOVERRIDES").unwrap();
+        assert!(overrides_dxvk.contains("d3d11=n,b"));
     }
 
     #[tokio::test]

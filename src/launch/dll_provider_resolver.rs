@@ -90,17 +90,39 @@ impl DllProviderResolver {
              // Derive all potential runner scan roots
              let mut roots = Vec::new();
              let subdirs = [
+                 "files/lib/wine/dxvk/x86_64-windows",
+                 "files/lib/wine/dxvk/i386-windows",
+                 "files/lib/wine/vkd3d/x86_64-windows",
+                 "files/lib/wine/vkd3d/i386-windows",
+                 "files/lib/wine/vkd3d-proton/x86_64-windows",
+                 "files/lib/wine/vkd3d-proton/i386-windows",
                  "files/lib/wine/dxvk",
                  "files/lib/wine/vkd3d",
+                 "files/lib/wine/vkd3d-proton",
                  "files/lib64/wine/dxvk",
                  "files/lib64/wine/vkd3d",
-                 "files/lib/vkd3d",
+                 "files/lib64/wine/vkd3d-proton",
+                 "dist/lib/wine/dxvk/x86_64-windows",
+                 "dist/lib/wine/dxvk/i386-windows",
+                 "dist/lib/wine/vkd3d/x86_64-windows",
+                 "dist/lib/wine/vkd3d/i386-windows",
+                 "dist/lib/wine/vkd3d-proton/x86_64-windows",
+                 "dist/lib/wine/vkd3d-proton/i386-windows",
                  "dist/lib/wine/dxvk",
                  "dist/lib/wine/vkd3d",
+                 "dist/lib/wine/vkd3d-proton",
+                 "lib/wine/dxvk/x86_64-windows",
+                 "lib/wine/dxvk/i386-windows",
+                 "lib/wine/vkd3d/x86_64-windows",
+                 "lib/wine/vkd3d/i386-windows",
+                 "lib/wine/vkd3d-proton/x86_64-windows",
+                 "lib/wine/vkd3d-proton/i386-windows",
                  "lib/wine/dxvk",
                  "lib/wine/vkd3d",
+                 "lib/wine/vkd3d-proton",
                  "lib64/wine/dxvk",
                  "lib64/wine/vkd3d",
+                 "lib64/wine/vkd3d-proton",
              ];
              for s in subdirs { roots.push(runner_root.join(s)); }
              report.scan_roots = roots;
@@ -256,12 +278,18 @@ impl DllProviderResolver {
         let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi");
         if is_dxvk && components.dxvk.is_some() {
             let relative_paths = [
-                "files/lib/wine/dxvk",
-                "files/lib64/wine/dxvk",
-                "dist/lib/wine/dxvk",
-                "dist/lib64/wine/dxvk",
+                "lib/wine/dxvk/x86_64-windows",
+                "lib/wine/dxvk/i386-windows",
+                "files/lib/wine/dxvk/x86_64-windows",
+                "files/lib/wine/dxvk/i386-windows",
+                "dist/lib/wine/dxvk/x86_64-windows",
+                "dist/lib/wine/dxvk/i386-windows",
                 "lib/wine/dxvk",
+                "files/lib/wine/dxvk",
+                "dist/lib/wine/dxvk",
+                "files/lib64/wine/dxvk",
                 "lib64/wine/dxvk",
+                "dist/lib64/wine/dxvk",
             ];
             for rel in relative_paths {
                 let root = runner_root.join(rel);
@@ -283,12 +311,15 @@ impl DllProviderResolver {
 
             if use_proton && components.vkd3d_proton.is_some() {
                 let relative_paths = [
-                    "files/lib/wine/vkd3d-proton",
-                    "files/lib64/wine/vkd3d-proton",
-                    "dist/lib/wine/vkd3d-proton",
-                    "dist/lib64/wine/vkd3d-proton",
+                    "lib/wine/vkd3d-proton/x86_64-windows",
+                    "files/lib/wine/vkd3d-proton/x86_64-windows",
+                    "dist/lib/wine/vkd3d-proton/x86_64-windows",
                     "lib/wine/vkd3d-proton",
+                    "files/lib/wine/vkd3d-proton",
+                    "dist/lib/wine/vkd3d-proton",
                     "lib64/wine/vkd3d-proton",
+                    "files/lib64/wine/vkd3d-proton",
+                    "dist/lib64/wine/vkd3d-proton",
                 ];
                 for rel in relative_paths {
                     let root = runner_root.join(rel);
@@ -302,15 +333,15 @@ impl DllProviderResolver {
 
             if (!use_proton || d3d12_policy == &crate::models::D3D12ProviderPolicy::Auto) && components.vkd3d.is_some() {
                 let relative_paths = [
-                    "files/lib/wine/vkd3d",
-                    "files/lib64/wine/vkd3d",
-                    "files/lib/vkd3d",
-                    "dist/lib/wine/vkd3d",
+                    "lib/wine/vkd3d/x86_64-windows",
+                    "files/lib/wine/vkd3d/x86_64-windows",
+                    "dist/lib/wine/vkd3d/x86_64-windows",
                     "lib/wine/vkd3d",
+                    "files/lib/wine/vkd3d",
+                    "dist/lib/wine/vkd3d",
                     "lib64/wine/vkd3d",
-                    "files/lib/wine",
-                    "dist/lib/wine",
-                    "lib/wine",
+                    "files/lib64/wine/vkd3d",
+                    "dist/lib64/wine/vkd3d",
                 ];
                 for rel in relative_paths {
                     let root = runner_root.join(rel);
