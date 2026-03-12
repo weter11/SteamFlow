@@ -45,6 +45,17 @@ pub struct RuntimeEvidence {
     pub vkd3d_proton: EvidenceItem,
     pub vkd3d: EvidenceItem,
     pub wined3d: EvidenceItem,
+    pub scan_metadata: EvidenceScanMetadata,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct EvidenceScanMetadata {
+    pub log_path: String,
+    pub file_exists: bool,
+    pub file_size: u64,
+    pub line_count: usize,
+    pub scan_duration_ms: u128,
+    pub candidate_matches: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -53,6 +64,7 @@ pub struct EvidenceItem {
     pub evidence_found: bool,
     pub evidence: Vec<String>,
     pub diagnosis: String,
+    pub diagnostics_note: String,
 }
 
 pub struct PipelineContext {
@@ -544,11 +556,40 @@ impl LaunchPipeline {
     }
 
     fn scan_logs_for_graphics_evidence(&self, ctx: &mut PipelineContext) {
+        let scan_start = std::time::Instant::now();
         if let Some(session) = &ctx.session {
             let stderr_path = session.stderr_path();
+            ctx.graphics_stack.runtime_evidence.scan_metadata.log_path = stderr_path.to_string_lossy().to_string();
+
             if stderr_path.exists() {
+                ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = true;
+                if let Ok(metadata) = std::fs::metadata(&stderr_path) {
+                    ctx.graphics_stack.runtime_evidence.scan_metadata.file_size = metadata.len();
+                }
+
                 if let Ok(content) = std::fs::read_to_string(&stderr_path) {
-                    for line in content.lines() {
+                    let lines: Vec<&str> = content.lines().collect();
+                    ctx.graphics_stack.runtime_evidence.scan_metadata.line_count = lines.len();
+
+                    // Derive component paths from dll resolutions
+                    let mut component_paths = HashMap::new();
+                    for res in &ctx.dll_resolutions {
+                        if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner {
+                            if let Some(path) = &res.chosen_path {
+                                 if let Some(parent) = path.parent() {
+                                     let family = if res.name.contains("d3d12") || res.name.contains("vkd3d") {
+                                         if path.to_string_lossy().contains("vkd3d-proton") { "vkd3d_proton" } else { "vkd3d" }
+                                     } else {
+                                         "dxvk"
+                                     };
+                                     component_paths.insert(family, parent.to_string_lossy().to_string());
+                                 }
+                            }
+                        }
+                    }
+
+                    for line in lines {
+                        let mut line_matched = false;
                         if let Some(evidence) = crate::infra::logging::classify_graphics_evidence(line) {
                             if !ctx.graphics_stack.graphics_stack_evidence.contains(&evidence) {
                                 ctx.graphics_stack.graphics_stack_evidence.push(evidence.clone());
@@ -556,23 +597,95 @@ impl LaunchPipeline {
 
                             if evidence.contains("DXVK") {
                                 ctx.graphics_stack.runtime_evidence.dxvk.evidence_found = true;
-                                ctx.graphics_stack.runtime_evidence.dxvk.evidence.push(evidence.clone());
+                                if ctx.graphics_stack.runtime_evidence.dxvk.evidence.len() < 5 {
+                                    ctx.graphics_stack.runtime_evidence.dxvk.evidence.push(evidence.clone());
+                                }
                             }
                             if evidence.contains("VKD3D-Proton") {
                                 ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found = true;
-                                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.push(evidence.clone());
+                                if ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.len() < 5 {
+                                    ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.push(evidence.clone());
+                                }
                             }
                             if evidence.contains("VKD3D") && !evidence.contains("Proton") {
                                 ctx.graphics_stack.runtime_evidence.vkd3d.evidence_found = true;
-                                ctx.graphics_stack.runtime_evidence.vkd3d.evidence.push(evidence.clone());
+                                if ctx.graphics_stack.runtime_evidence.vkd3d.evidence.len() < 5 {
+                                    ctx.graphics_stack.runtime_evidence.vkd3d.evidence.push(evidence.clone());
+                                }
                             }
                             if evidence.contains("WineD3D") {
                                 ctx.graphics_stack.runtime_evidence.wined3d.evidence_found = true;
-                                ctx.graphics_stack.runtime_evidence.wined3d.evidence.push(evidence.clone());
+                                if ctx.graphics_stack.runtime_evidence.wined3d.evidence.len() < 5 {
+                                    ctx.graphics_stack.runtime_evidence.wined3d.evidence.push(evidence.clone());
+                                }
                             }
+                            line_matched = true;
+                        }
+
+                        // Robust Path & Module Matching
+                        let line_lower = line.to_lowercase();
+
+                        // DXVK Path Match
+                        if let Some(path) = component_paths.get("dxvk") {
+                            if line_lower.contains(&path.to_lowercase()) {
+                                ctx.graphics_stack.runtime_evidence.dxvk.evidence_found = true;
+                                if ctx.graphics_stack.runtime_evidence.dxvk.evidence.len() < 5 {
+                                    ctx.graphics_stack.runtime_evidence.dxvk.evidence.push(format!("Path match: {}", line.trim()));
+                                }
+                                line_matched = true;
+                            }
+                        }
+
+                        // VKD3D-Proton Path Match
+                        if let Some(path) = component_paths.get("vkd3d_proton") {
+                            if line_lower.contains(&path.to_lowercase()) {
+                                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found = true;
+                                if ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.len() < 5 {
+                                    ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.push(format!("Path match: {}", line.trim()));
+                                }
+                                line_matched = true;
+                            }
+                        }
+
+                        // Generic Module Loader matches for graphics DLLs
+                        if line_lower.contains("loaddll") || line_lower.contains("load_module") || line_lower.contains("import_dll") {
+                             let graphics_dlls = ["d3d9", "d3d11", "dxgi", "d3d12", "d3d8", "d3d10core", "libvkd3d"];
+                             for dll in graphics_dlls {
+                                 if line_lower.contains(dll) {
+                                     let is_failed = line_lower.contains("failed") || line_lower.contains("error");
+                                     let is_builtin = line_lower.contains("system32") || (line_lower.contains("builtin") && !line_lower.contains("native"));
+
+                                     let evidence_type = if is_failed {
+                                         "Module load FAILED"
+                                     } else if is_builtin {
+                                         "Module load (builtin/fallback)"
+                                     } else {
+                                         "Module load (likely native)"
+                                     };
+
+                                     let msg = format!("{}: {}", evidence_type, line.trim());
+                                     if !ctx.graphics_stack.graphics_stack_evidence.contains(&msg) {
+                                         ctx.graphics_stack.graphics_stack_evidence.push(msg.clone());
+
+                                         if is_builtin {
+                                             ctx.graphics_stack.runtime_evidence.wined3d.evidence_found = true;
+                                             if ctx.graphics_stack.runtime_evidence.wined3d.evidence.len() < 5 {
+                                                 ctx.graphics_stack.runtime_evidence.wined3d.evidence.push(msg);
+                                             }
+                                         }
+                                     }
+                                     line_matched = true;
+                                 }
+                             }
+                        }
+
+                        if line_matched {
+                            ctx.graphics_stack.runtime_evidence.scan_metadata.candidate_matches += 1;
                         }
                     }
                 }
+            } else {
+                ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = false;
             }
 
             // Populate expectations
@@ -582,24 +695,38 @@ impl LaunchPipeline {
             ctx.graphics_stack.runtime_evidence.wined3d.expected = ctx.graphics_stack.effective_backend == "WineD3D (Baseline)";
 
             // Build diagnosis
-            let diagnose = |item: &mut EvidenceItem, name: &str| {
+            let diagnose = |item: &mut EvidenceItem, name: &str, metadata: &EvidenceScanMetadata| {
+                if !metadata.file_exists {
+                    item.diagnosis = format!("{} requested; Wine log missing", name);
+                    item.diagnostics_note = "stderr.log was not found in session directory.".to_string();
+                    return;
+                }
+                if metadata.line_count == 0 {
+                    item.diagnosis = format!("{} requested; Wine log empty", name);
+                    item.diagnostics_note = "Log file exists but contains no lines. Process may have failed immediately or logging is disabled.".to_string();
+                    return;
+                }
+
                 if item.expected {
                     if item.evidence_found {
-                        item.diagnosis = format!("{} requested and runtime evidence found", name);
+                        item.diagnosis = format!("confirmed: {} likely loaded based on runtime evidence", name);
                     } else {
-                        item.diagnosis = format!("{} requested but no runtime evidence found", name);
+                        item.diagnosis = format!("inconclusive: {} requested but no runtime evidence found", name);
+                        item.diagnostics_note = format!("Scanned {} lines, found {} matches for graphics patterns, but none confirmed {} usage.",
+                            metadata.line_count, metadata.candidate_matches, name);
                     }
                 } else if item.evidence_found {
-                    item.diagnosis = format!("{} not requested but runtime evidence found (fallback suspected)", name);
+                    item.diagnosis = format!("suspected fallback: {} not requested but runtime evidence found", name);
                 } else {
-                    item.diagnosis = "Inconclusive".to_string();
+                    item.diagnosis = "neutral: inconclusive".to_string();
                 }
             };
 
-            diagnose(&mut ctx.graphics_stack.runtime_evidence.dxvk, "DXVK");
-            diagnose(&mut ctx.graphics_stack.runtime_evidence.vkd3d_proton, "VKD3D-Proton");
-            diagnose(&mut ctx.graphics_stack.runtime_evidence.vkd3d, "VKD3D");
-            diagnose(&mut ctx.graphics_stack.runtime_evidence.wined3d, "WineD3D");
+            let meta = ctx.graphics_stack.runtime_evidence.scan_metadata.clone();
+            diagnose(&mut ctx.graphics_stack.runtime_evidence.dxvk, "DXVK", &meta);
+            diagnose(&mut ctx.graphics_stack.runtime_evidence.vkd3d_proton, "VKD3D-Proton", &meta);
+            diagnose(&mut ctx.graphics_stack.runtime_evidence.vkd3d, "VKD3D", &meta);
+            diagnose(&mut ctx.graphics_stack.runtime_evidence.wined3d, "WineD3D", &meta);
 
             // Update confidence based on evidence vs expectation
             if ctx.graphics_stack.graphics_stack_evidence.is_empty() {
@@ -618,6 +745,7 @@ impl LaunchPipeline {
                 }
             }
         }
+        ctx.graphics_stack.runtime_evidence.scan_metadata.scan_duration_ms = scan_start.elapsed().as_millis();
     }
 
     fn write_summary_if_possible(

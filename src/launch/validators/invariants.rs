@@ -162,16 +162,20 @@ impl LaunchValidator for LaunchInvariantValidator {
 
         // Post-launch validation: Check for missing evidence after launch
         if ctx.graphics_stack.effective_backend == "DXVK" && !ctx.graphics_stack.runtime_evidence.dxvk.evidence_found {
+             let meta = &ctx.graphics_stack.runtime_evidence.scan_metadata;
+             let suffix = if !meta.file_exists { " (Wine log missing)" } else if meta.line_count == 0 { " (Wine log empty)" } else { "" };
              warnings.push((
                 "DIAGNOSTICS_MISSING_DXVK_EVIDENCE",
-                "DXVK was requested/effective but no runtime evidence of DXVK loading was found in logs.".to_string()
+                format!("DXVK was requested/effective but no runtime evidence was found in logs{}.", suffix)
             ));
         }
 
         if ctx.graphics_stack.effective_d3d12_provider == "vkd3d-proton" && !ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found {
+             let meta = &ctx.graphics_stack.runtime_evidence.scan_metadata;
+             let suffix = if !meta.file_exists { " (Wine log missing)" } else if meta.line_count == 0 { " (Wine log empty)" } else { "" };
              warnings.push((
                 "DIAGNOSTICS_MISSING_VKD3D_PROTON_EVIDENCE",
-                "VKD3D-Proton was requested/effective but no runtime evidence was found in logs.".to_string()
+                format!("VKD3D-Proton was requested/effective but no runtime evidence was found in logs{}.", suffix)
             ));
         }
 
