@@ -45,6 +45,7 @@ pub struct LaunchSummary {
 pub enum LaunchResult {
     Success,
     Failure,
+    Degraded, // Process spawned but policy was violated
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

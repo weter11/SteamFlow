@@ -477,6 +477,20 @@ impl LaunchPipeline {
             validator.validate(ctx);
         }
 
+        // Determine if policy was satisfied
+        let mut policy_satisfied = true;
+        if !ctx.graphics_stack.requested_backend.is_empty() && ctx.graphics_stack.requested_backend != "Auto" {
+            if ctx.graphics_stack.requested_backend == "DXVK" && ctx.graphics_stack.effective_backend != "DXVK" {
+                policy_satisfied = false;
+            } else if ctx.graphics_stack.requested_backend == "WineD3D" && ctx.graphics_stack.effective_backend != "WineD3D (Baseline)" {
+                policy_satisfied = false;
+            }
+        }
+
+        if !policy_satisfied && final_result == LaunchResult::Success {
+             final_result = LaunchResult::Degraded;
+        }
+
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
 
         Ok(())
@@ -558,16 +572,20 @@ impl LaunchPipeline {
     fn scan_logs_for_graphics_evidence(&self, ctx: &mut PipelineContext) {
         let scan_start = std::time::Instant::now();
         if let Some(session) = &ctx.session {
-            let stderr_path = session.stderr_path();
-            ctx.graphics_stack.runtime_evidence.scan_metadata.log_path = stderr_path.to_string_lossy().to_string();
+            let log_path = if let Some(spec) = &ctx.command_spec {
+                spec.env.get("WINE_LOG_OUTPUT").map(std::path::PathBuf::from).unwrap_or_else(|| session.stderr_path())
+            } else {
+                session.stderr_path()
+            };
+            ctx.graphics_stack.runtime_evidence.scan_metadata.log_path = log_path.to_string_lossy().to_string();
 
-            if stderr_path.exists() {
+            if log_path.exists() {
                 ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = true;
-                if let Ok(metadata) = std::fs::metadata(&stderr_path) {
+                if let Ok(metadata) = std::fs::metadata(&log_path) {
                     ctx.graphics_stack.runtime_evidence.scan_metadata.file_size = metadata.len();
                 }
 
-                if let Ok(content) = std::fs::read_to_string(&stderr_path) {
+                if let Ok(content) = std::fs::read_to_string(&log_path) {
                     let lines: Vec<&str> = content.lines().collect();
                     ctx.graphics_stack.runtime_evidence.scan_metadata.line_count = lines.len();
 
@@ -698,7 +716,7 @@ impl LaunchPipeline {
             let diagnose = |item: &mut EvidenceItem, name: &str, metadata: &EvidenceScanMetadata| {
                 if !metadata.file_exists {
                     item.diagnosis = format!("{} requested; Wine log missing", name);
-                    item.diagnostics_note = "stderr.log was not found in session directory.".to_string();
+                    item.diagnostics_note = format!("Log file was not found at {}.", metadata.log_path);
                     return;
                 }
                 if metadata.line_count == 0 {

@@ -121,8 +121,13 @@ impl LaunchValidator for LaunchInvariantValidator {
 
             if mismatch {
                 let reason = ctx.graphics_stack.fallback_reasons.get("graphics_backend").cloned().unwrap_or_else(|| "unknown".into());
+                let code = if req == "DXVK" || req == "WineD3D" {
+                    "STRICT_POLICY_VIOLATION"
+                } else {
+                    "INVARIANT_D_BACKEND_MISMATCH"
+                };
                 warnings.push((
-                    "INVARIANT_D_BACKEND_MISMATCH",
+                    code,
                     format!("Requested backend '{}' differs from effective '{}'. Reason: {}",
                         ctx.graphics_stack.requested_backend, ctx.graphics_stack.effective_backend, reason)
                 ));
@@ -164,9 +169,14 @@ impl LaunchValidator for LaunchInvariantValidator {
         if ctx.graphics_stack.effective_backend == "DXVK" && !ctx.graphics_stack.runtime_evidence.dxvk.evidence_found {
              let meta = &ctx.graphics_stack.runtime_evidence.scan_metadata;
              let suffix = if !meta.file_exists { " (Wine log missing)" } else if meta.line_count == 0 { " (Wine log empty)" } else { "" };
+             let code = if ctx.graphics_stack.requested_backend == "DXVK" {
+                 "STRICT_DXVK_EVIDENCE_MISSING"
+             } else {
+                 "DIAGNOSTICS_MISSING_DXVK_EVIDENCE"
+             };
              warnings.push((
-                "DIAGNOSTICS_MISSING_DXVK_EVIDENCE",
-                format!("DXVK was requested/effective but no runtime evidence was found in logs{}.", suffix)
+                code,
+                format!("DXVK was requested/effective but no runtime evidence was found in logs{}. This may indicate a silent fallback to WineD3D.", suffix)
             ));
         }
 

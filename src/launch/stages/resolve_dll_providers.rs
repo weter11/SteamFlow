@@ -52,6 +52,38 @@ impl PipelineStage for ResolveDllProvidersStage {
         let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy);
         ctx.dll_resolutions = resolutions;
 
+        // Strict Backend Policy Enforcement
+        if let Some(config) = &ctx.user_config {
+            let backend_policy = &config.graphics_layers.graphics_backend_policy;
+
+            if *backend_policy == crate::models::GraphicsBackendPolicy::DXVK {
+                let dxvk_dlls = ["d3d11", "dxgi", "d3d9", "d3d8"];
+                let mut missing = Vec::new();
+
+                for dll in dxvk_dlls {
+                    let resolved = ctx.dll_resolutions.iter().find(|r| r.name == dll);
+                    let has_native = resolved.map(|r| {
+                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner ||
+                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal ||
+                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::System
+                    }).unwrap_or(false);
+
+                    if !has_native {
+                        missing.push(dll);
+                    }
+                }
+
+                if !missing.is_empty() {
+                    return Err(LaunchError::new(
+                        LaunchErrorKind::Environment,
+                        format!("Explicit DXVK mode requested but required DLLs are missing: {}. \
+                                Ensure DXVK is bundled with your runner or present in the game directory.",
+                                missing.join(", "))
+                    ).with_context("missing_dlls", missing.join(",")));
+                }
+            }
+        }
+
         if let Some(session) = &ctx.session {
             let scan_report_path = session.log_dir.join("component_scan.json");
             if let Ok(content) = serde_json::to_string_pretty(&scan_report) {
