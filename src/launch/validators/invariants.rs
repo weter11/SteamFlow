@@ -9,28 +9,86 @@ impl LaunchValidator for LaunchInvariantValidator {
     fn validate(&self, ctx: &mut PipelineContext) {
         let mut warnings = Vec::new();
 
-        // 1. Invariant B: baseline/WineD3D must not keep forced native DXVK/VKD3D overrides
-        if ctx.graphics_stack.effective_backend == "WineD3D (Baseline)" {
+        // Invariant A: If effective GPU is unset/default, there must be no forced GPU-selection env vars.
+        if ctx.graphics_stack.effective_gpu.is_none() {
             if let Some(spec) = &ctx.command_spec {
-                if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
-                    let conflicts = ["d3d8", "d3d9", "d3d10", "d3d10_1", "d3d10core", "d3d11", "dxgi", "d3d12", "d3d12core"];
-                    for part in overrides.split(';') {
-                        if let Some((dll, mode)) = part.split_once('=') {
-                            let dll_trimmed = dll.trim().to_lowercase();
-                            if conflicts.contains(&dll_trimmed.as_str()) && mode.contains('n') {
-                                warnings.push((
-                                    "INVARIANT_B_CONFLICT",
-                                    format!("Forced native override '{dll}={mode}' found in baseline mode. Graphics may fail.")
-                                ));
-                            }
-                        }
+                for key in &[
+                    "DRI_PRIME",
+                    "__NV_PRIME_RENDER_OFFLOAD",
+                    "__NV_PRIME_RENDER_OFFLOAD_PROVIDER",
+                    "__GLX_VENDOR_LIBRARY_NAME",
+                    "__VK_LAYER_NV_optimus",
+                ] {
+                    if spec.env.contains_key(*key) {
+                        warnings.push((
+                            "INVARIANT_A_VIOLATION",
+                            format!("Effective GPU is unset but found GPU-forcing env var: {}", key),
+                        ));
                     }
                 }
             }
         }
 
-        // 2. Invariant C: effective D3D12 provider must match resolved provider paths
-        if !ctx.graphics_stack.effective_d3d12_provider.is_empty() {
+        // Invariant B: If effective backend is not DXVK, there must be no DXVK-forcing overrides or DXVK-only DLL path injection.
+        if ctx.graphics_stack.effective_backend != "DXVK" {
+            if let Some(spec) = &ctx.command_spec {
+                if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
+                    let dxvk_dlls = ["d3d8", "d3d9", "d3d10", "d3d10core", "d3d11", "dxgi"];
+                    for part in overrides.split(';') {
+                        if let Some((dll, mode)) = part.split_once('=') {
+                            let dll_trimmed = dll.trim().to_lowercase();
+                            if dxvk_dlls.contains(&dll_trimmed.as_str()) && mode.contains('n') {
+                                warnings.push((
+                                    "INVARIANT_B_VIOLATION",
+                                    format!("Effective backend is not DXVK but found native override for DXVK DLL: {}", dll),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(dll_path) = spec.env.get("WINEDLLPATH") {
+                    if dll_path.contains("dxvk") {
+                        warnings.push((
+                            "INVARIANT_B_VIOLATION",
+                            "Effective backend is not DXVK but WINEDLLPATH contains 'dxvk'".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Invariant C: If effective D3D12 provider is unset/default/not-selected, there must be no forced D3D12 provider injection.
+        if ctx.graphics_stack.effective_d3d12_provider == "None" {
+            if let Some(spec) = &ctx.command_spec {
+                if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
+                    let d3d12_dlls = ["d3d12", "d3d12core"];
+                    for part in overrides.split(';') {
+                        if let Some((dll, mode)) = part.split_once('=') {
+                            let dll_trimmed = dll.trim().to_lowercase();
+                            if d3d12_dlls.contains(&dll_trimmed.as_str()) && mode.contains('n') {
+                                warnings.push((
+                                    "INVARIANT_C_VIOLATION",
+                                    format!("Effective D3D12 provider is None but found native override for DLL: {}", dll),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if let Some(dll_path) = spec.env.get("WINEDLLPATH") {
+                    if dll_path.contains("vkd3d") {
+                        warnings.push((
+                            "INVARIANT_C_VIOLATION",
+                            "Effective D3D12 provider is None but WINEDLLPATH contains 'vkd3d'".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Detailed Invariant C: Effective D3D12 provider must match resolved provider paths if one is active.
+        // If effective is "vkd3d-proton", we expect to see it in the path.
+        // If effective is "vkd3d", we expect to see vkd3d but NOT vkd3d-proton in the path.
+        if ctx.graphics_stack.effective_d3d12_provider != "None" {
              let provider = &ctx.graphics_stack.effective_d3d12_provider;
              for res in &ctx.dll_resolutions {
                  if res.name == "d3d12" || res.name == "d3d12core" {
@@ -52,9 +110,15 @@ impl LaunchValidator for LaunchInvariantValidator {
              }
         }
 
-        // 3. Invariant D: explicit user setting must not be silently overwritten
+        // Invariant D: explicit user setting must not be silently overwritten
         if !ctx.graphics_stack.requested_backend.is_empty() && ctx.graphics_stack.requested_backend != "Auto" {
-            if ctx.graphics_stack.requested_backend != ctx.graphics_stack.effective_backend {
+            // requested_backend is likely Debug string of enum, e.g. "DXVK" or "WineD3D"
+            let req = &ctx.graphics_stack.requested_backend;
+            let eff = &ctx.graphics_stack.effective_backend;
+
+            let mismatch = (req == "DXVK" && eff != "DXVK") || (req == "WineD3D" && eff != "WineD3D (Baseline)");
+
+            if mismatch {
                 let reason = ctx.graphics_stack.fallback_reasons.get("graphics_backend").cloned().unwrap_or_else(|| "unknown".into());
                 warnings.push((
                     "INVARIANT_D_BACKEND_MISMATCH",
@@ -76,7 +140,15 @@ impl LaunchValidator for LaunchInvariantValidator {
         }
 
         if let Some(requested_gpu) = &ctx.graphics_stack.requested_gpu {
-            if ctx.graphics_stack.effective_gpu.as_ref() != Some(requested_gpu) {
+            let mut mismatch = true;
+            if let Some(effective_gpu) = &ctx.graphics_stack.effective_gpu {
+                 // Check for partial match since effective names are synthesized
+                 if effective_gpu.contains(requested_gpu) || requested_gpu.contains("NVIDIA") && effective_gpu.contains("NVIDIA") {
+                     mismatch = false;
+                 }
+            }
+
+            if mismatch {
                 let reason = ctx.graphics_stack.fallback_reasons.get("gpu").cloned().unwrap_or_else(|| "unknown".into());
                 warnings.push((
                     "INVARIANT_D_GPU_MISMATCH",

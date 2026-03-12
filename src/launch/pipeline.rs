@@ -447,9 +447,13 @@ impl LaunchPipeline {
 
                  ctx.graphics_stack.effective_backend = if has_dxvk { "DXVK" } else { "WineD3D (Baseline)" }.to_string();
                  ctx.graphics_stack.effective_d3d12_provider = if has_vkd3dp { "vkd3d-proton" } else if has_vkd3dw { "vkd3d" } else { "None" }.to_string();
+             } else {
+                 ctx.graphics_stack.effective_backend = "WineD3D (Baseline)".to_string();
+                 ctx.graphics_stack.effective_d3d12_provider = "None".to_string();
              }
 
              // GPU Selection
+             ctx.graphics_stack.effective_gpu = None;
              if let Some(val) = spec.env.get("__NV_PRIME_RENDER_OFFLOAD") {
                  if val == "1" {
                      ctx.graphics_stack.effective_gpu = Some("NVIDIA Discrete GPU".to_string());
@@ -457,7 +461,7 @@ impl LaunchPipeline {
              } else if let Some(val) = spec.env.get("DRI_PRIME") {
                  if val == "1" {
                      ctx.graphics_stack.effective_gpu = Some("Secondary GPU (DRI_PRIME=1)".to_string());
-                 } else {
+                 } else if val == "0" {
                      ctx.graphics_stack.effective_gpu = Some("Primary GPU (DRI_PRIME=0)".to_string());
                  }
              }
