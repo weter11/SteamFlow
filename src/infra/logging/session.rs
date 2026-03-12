@@ -91,6 +91,8 @@ pub struct EffectiveSettingsConfig {
     pub effective_gpu: Option<String>,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
     pub wine_dll_overrides: Option<String>,
+    pub runtime_evidence: Option<crate::launch::pipeline::RuntimeEvidence>,
+    pub env_propagation: Option<HashMap<String, bool>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

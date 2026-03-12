@@ -158,6 +158,21 @@ impl LaunchValidator for LaunchInvariantValidator {
             }
         }
 
+        // Post-launch validation: Check for missing evidence after launch
+        if ctx.graphics_stack.effective_backend == "DXVK" && !ctx.graphics_stack.runtime_evidence.dxvk.evidence_found {
+             warnings.push((
+                "DIAGNOSTICS_MISSING_DXVK_EVIDENCE",
+                "DXVK was requested/effective but no runtime evidence of DXVK loading was found in logs.".to_string()
+            ));
+        }
+
+        if ctx.graphics_stack.effective_d3d12_provider == "vkd3d-proton" && !ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found {
+             warnings.push((
+                "DIAGNOSTICS_MISSING_VKD3D_PROTON_EVIDENCE",
+                "VKD3D-Proton was requested/effective but no runtime evidence was found in logs.".to_string()
+            ));
+        }
+
         for (code, msg) in warnings {
             ctx.add_warning(code, msg);
         }

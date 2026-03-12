@@ -35,6 +35,24 @@ pub struct GraphicsStackInfo {
     pub requested_gpu: Option<String>,
     pub effective_gpu: Option<String>,
     pub fallback_reasons: HashMap<String, String>,
+    pub runtime_evidence: RuntimeEvidence,
+    pub env_propagation: HashMap<String, bool>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct RuntimeEvidence {
+    pub dxvk: EvidenceItem,
+    pub vkd3d_proton: EvidenceItem,
+    pub vkd3d: EvidenceItem,
+    pub wined3d: EvidenceItem,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct EvidenceItem {
+    pub expected: bool,
+    pub evidence_found: bool,
+    pub evidence: Vec<String>,
+    pub diagnosis: String,
 }
 
 pub struct PipelineContext {
@@ -347,6 +365,9 @@ impl LaunchPipeline {
         // Record expected stack info before starting
         self.populate_expected_graphics_stack(ctx);
 
+        // Initialize environment propagation tracking
+        ctx.graphics_stack.env_propagation = HashMap::new();
+
         // After ResolveDllProvidersStage and BuildEnvironmentStage, we can populate effective state
         // but for now we'll do it right before validators if possible or within validators.
         // Actually, let's run validators twice: early and late.
@@ -427,6 +448,15 @@ impl LaunchPipeline {
 
         // Populate effective graphics stack info from command spec/env if possible
         self.populate_effective_graphics_stack(ctx);
+
+        // Track environment propagation
+        if let Some(spec) = &ctx.command_spec {
+             for key in &["DXVK_HUD", "VKD3D_DEBUG", "DRI_PRIME", "__NV_PRIME_RENDER_OFFLOAD"] {
+                 if spec.env.contains_key(*key) {
+                     ctx.graphics_stack.env_propagation.insert(key.to_string(), true);
+                 }
+             }
+        }
 
         // Run validators again on the final effective config
         for validator in &self.validators {
@@ -514,19 +544,62 @@ impl LaunchPipeline {
                     for line in content.lines() {
                         if let Some(evidence) = crate::infra::logging::classify_graphics_evidence(line) {
                             if !ctx.graphics_stack.graphics_stack_evidence.contains(&evidence) {
-                                ctx.graphics_stack.graphics_stack_evidence.push(evidence);
+                                ctx.graphics_stack.graphics_stack_evidence.push(evidence.clone());
+                            }
+
+                            if evidence.contains("DXVK") {
+                                ctx.graphics_stack.runtime_evidence.dxvk.evidence_found = true;
+                                ctx.graphics_stack.runtime_evidence.dxvk.evidence.push(evidence.clone());
+                            }
+                            if evidence.contains("VKD3D-Proton") {
+                                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found = true;
+                                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.push(evidence.clone());
+                            }
+                            if evidence.contains("VKD3D") && !evidence.contains("Proton") {
+                                ctx.graphics_stack.runtime_evidence.vkd3d.evidence_found = true;
+                                ctx.graphics_stack.runtime_evidence.vkd3d.evidence.push(evidence.clone());
+                            }
+                            if evidence.contains("WineD3D") {
+                                ctx.graphics_stack.runtime_evidence.wined3d.evidence_found = true;
+                                ctx.graphics_stack.runtime_evidence.wined3d.evidence.push(evidence.clone());
                             }
                         }
                     }
                 }
             }
 
+            // Populate expectations
+            ctx.graphics_stack.runtime_evidence.dxvk.expected = ctx.graphics_stack.effective_backend == "DXVK";
+            ctx.graphics_stack.runtime_evidence.vkd3d_proton.expected = ctx.graphics_stack.effective_d3d12_provider == "vkd3d-proton";
+            ctx.graphics_stack.runtime_evidence.vkd3d.expected = ctx.graphics_stack.effective_d3d12_provider == "vkd3d";
+            ctx.graphics_stack.runtime_evidence.wined3d.expected = ctx.graphics_stack.effective_backend == "WineD3D (Baseline)";
+
+            // Build diagnosis
+            let diagnose = |item: &mut EvidenceItem, name: &str| {
+                if item.expected {
+                    if item.evidence_found {
+                        item.diagnosis = format!("{} requested and runtime evidence found", name);
+                    } else {
+                        item.diagnosis = format!("{} requested but no runtime evidence found", name);
+                    }
+                } else if item.evidence_found {
+                    item.diagnosis = format!("{} not requested but runtime evidence found (fallback suspected)", name);
+                } else {
+                    item.diagnosis = "Inconclusive".to_string();
+                }
+            };
+
+            diagnose(&mut ctx.graphics_stack.runtime_evidence.dxvk, "DXVK");
+            diagnose(&mut ctx.graphics_stack.runtime_evidence.vkd3d_proton, "VKD3D-Proton");
+            diagnose(&mut ctx.graphics_stack.runtime_evidence.vkd3d, "VKD3D");
+            diagnose(&mut ctx.graphics_stack.runtime_evidence.wined3d, "WineD3D");
+
             // Update confidence based on evidence vs expectation
             if ctx.graphics_stack.graphics_stack_evidence.is_empty() {
                 ctx.graphics_stack.graphics_stack_confidence = "low".to_string();
             } else {
-                let has_expected = if ctx.user_config.as_ref().map(|c| c.graphics_layers.dxvk_enabled).unwrap_or(false) {
-                    ctx.graphics_stack.graphics_stack_evidence.iter().any(|e| e.contains("DXVK"))
+                let has_expected = if ctx.graphics_stack.runtime_evidence.dxvk.expected {
+                    ctx.graphics_stack.runtime_evidence.dxvk.evidence_found
                 } else {
                     true
                 };
@@ -625,6 +698,8 @@ impl LaunchPipeline {
                          effective_gpu: ctx.graphics_stack.effective_gpu.clone(),
                          dll_resolutions: ctx.dll_resolutions.clone(),
                          wine_dll_overrides: spec.env.get("WINEDLLOVERRIDES").cloned(),
+                         runtime_evidence: Some(ctx.graphics_stack.runtime_evidence.clone()),
+                         env_propagation: Some(ctx.graphics_stack.env_propagation.clone()),
                      },
                      command: EffectiveCommandConfig {
                          program: spec.program.clone(),
