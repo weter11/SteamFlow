@@ -250,7 +250,9 @@ pub fn check_environment_sanity(
         let d3d_dlls = ["d3d9", "d3d11", "dxgi", "d3d12"];
         let is_baseline = user_config
             .map(|c| {
-                !c.graphics_layers.dxvk_enabled
+                c.graphics_layers.graphics_backend_policy != crate::models::GraphicsBackendPolicy::DXVK
+                    && c.graphics_layers.d3d12_policy == crate::models::D3D12ProviderPolicy::Auto
+                    && !c.graphics_layers.dxvk_enabled
                     && !c.graphics_layers.vkd3d_proton_enabled
                     && !c.graphics_layers.vkd3d_enabled
             })

@@ -111,7 +111,8 @@ impl LaunchValidator for LaunchInvariantValidator {
         }
 
         // Invariant D: explicit user setting must not be silently overwritten
-        if !ctx.graphics_stack.requested_backend.is_empty() && ctx.graphics_stack.requested_backend != "Auto" {
+        // ONLY RUN if effective backend is populated (non-empty)
+        if !ctx.graphics_stack.effective_backend.is_empty() && !ctx.graphics_stack.requested_backend.is_empty() && ctx.graphics_stack.requested_backend != "Auto" {
             // requested_backend is likely Debug string of enum, e.g. "DXVK" or "WineD3D"
             let req = &ctx.graphics_stack.requested_backend;
             let eff = &ctx.graphics_stack.effective_backend;
@@ -128,7 +129,7 @@ impl LaunchValidator for LaunchInvariantValidator {
             }
         }
 
-        if !ctx.graphics_stack.requested_d3d12_provider.is_empty() && ctx.graphics_stack.requested_d3d12_provider != "Auto" {
+        if !ctx.graphics_stack.effective_d3d12_provider.is_empty() && !ctx.graphics_stack.requested_d3d12_provider.is_empty() && ctx.graphics_stack.requested_d3d12_provider != "Auto" {
             if ctx.graphics_stack.requested_d3d12_provider != ctx.graphics_stack.effective_d3d12_provider {
                  let reason = ctx.graphics_stack.fallback_reasons.get("d3d12_provider").cloned().unwrap_or_else(|| "unknown".into());
                  warnings.push((
@@ -139,7 +140,8 @@ impl LaunchValidator for LaunchInvariantValidator {
             }
         }
 
-        if let Some(requested_gpu) = &ctx.graphics_stack.requested_gpu {
+        if let (Some(requested_gpu), Some(effective_gpu_val)) = (&ctx.graphics_stack.requested_gpu, &ctx.graphics_stack.effective_gpu) {
+            if effective_gpu_val.is_empty() { return; }
             let mut mismatch = true;
             if let Some(effective_gpu) = &ctx.graphics_stack.effective_gpu {
                  // Check for partial match since effective names are synthesized

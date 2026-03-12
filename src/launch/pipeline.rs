@@ -442,11 +442,11 @@ impl LaunchPipeline {
             let _ = logger.info("launch_end", "Launch successful".to_string(), None, HashMap::new());
         }
 
-        // After stages are complete (or failed), scan logs for evidence
+        // After stages are complete (or failed), populate effective stack and scan logs for evidence
         self.record_dll_provider_diagnostics(ctx);
-        self.scan_logs_for_graphics_evidence(ctx);
 
-        // Populate effective graphics stack info from command spec/env if possible
+        // Populate effective graphics stack info from command spec/env BEFORE scanning logs
+        // so that evidence expectations align with what was actually resolved.
         self.populate_effective_graphics_stack(ctx);
 
         // Track environment propagation
@@ -457,6 +457,8 @@ impl LaunchPipeline {
                  }
              }
         }
+
+        self.scan_logs_for_graphics_evidence(ctx);
 
         // Run validators again on the final effective config
         for validator in &self.validators {
@@ -471,15 +473,37 @@ impl LaunchPipeline {
     fn populate_effective_graphics_stack(&self, ctx: &mut PipelineContext) {
         if let Some(spec) = &ctx.command_spec {
              if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
-                 let has_dxvk = overrides.contains("d3d11=n") || overrides.contains("dxgi=n") || overrides.contains("d3d9=n");
+                 let has_dxvk = overrides.contains("d3d11=n") || overrides.contains("dxgi=n") || overrides.contains("d3d9=n") || overrides.contains("d3d8=n");
                  let has_vkd3dp = overrides.contains("d3d12=n");
                  let has_vkd3dw = overrides.contains("libvkd3d-1=n");
 
                  ctx.graphics_stack.effective_backend = if has_dxvk { "DXVK" } else { "WineD3D (Baseline)" }.to_string();
                  ctx.graphics_stack.effective_d3d12_provider = if has_vkd3dp { "vkd3d-proton" } else if has_vkd3dw { "vkd3d" } else { "None" }.to_string();
+
+                 if has_dxvk || has_vkd3dp || has_vkd3dw {
+                     ctx.graphics_stack.override_policy = "Native-preferred".to_string();
+                 } else {
+                     ctx.graphics_stack.override_policy = "Builtin-only".to_string();
+                 }
              } else {
                  ctx.graphics_stack.effective_backend = "WineD3D (Baseline)".to_string();
                  ctx.graphics_stack.effective_d3d12_provider = "None".to_string();
+                 ctx.graphics_stack.override_policy = "Builtin-only".to_string();
+             }
+
+             // Synchronize expected stack string with effective resolution
+             let mut stack_parts = Vec::new();
+             if ctx.graphics_stack.effective_backend == "DXVK" {
+                 stack_parts.push("DXVK");
+             }
+             if ctx.graphics_stack.effective_d3d12_provider != "None" {
+                 stack_parts.push(&ctx.graphics_stack.effective_d3d12_provider);
+             }
+
+             if stack_parts.is_empty() {
+                 ctx.graphics_stack.graphics_stack_expected = "WineD3D (Baseline)".to_string();
+             } else {
+                 ctx.graphics_stack.graphics_stack_expected = stack_parts.join(", ");
              }
 
              // GPU Selection
@@ -500,30 +524,13 @@ impl LaunchPipeline {
 
     fn populate_expected_graphics_stack(&self, ctx: &mut PipelineContext) {
         if let Some(config) = &ctx.user_config {
-            let mut expected = Vec::new();
-
             ctx.graphics_stack.requested_backend = format!("{:?}", config.graphics_layers.graphics_backend_policy);
             ctx.graphics_stack.requested_d3d12_provider = format!("{:?}", config.graphics_layers.d3d12_policy);
             ctx.graphics_stack.requested_gpu = config.gpu_preference.clone();
 
-            if config.graphics_layers.dxvk_enabled {
-                expected.push("DXVK");
-            }
-            if config.graphics_layers.vkd3d_proton_enabled {
-                expected.push("VKD3D-Proton");
-            }
-            if config.graphics_layers.vkd3d_enabled {
-                expected.push("VKD3D");
-            }
-
-            let policy = format!("{:?}", config.graphics_layers.graphics_backend_policy);
-            if expected.is_empty() {
-                ctx.graphics_stack.graphics_stack_expected = format!("WineD3D (Baseline) [Policy: {}]", policy);
-                ctx.graphics_stack.override_policy = "Builtin-only".to_string();
-            } else {
-                ctx.graphics_stack.graphics_stack_expected = format!("{} [Policy: {}]", expected.join(", "), policy);
-                ctx.graphics_stack.override_policy = "Native-preferred".to_string();
-            }
+            // Initial baseline assumption - will be overridden by populate_effective_graphics_stack
+            ctx.graphics_stack.graphics_stack_expected = "WineD3D (Baseline)".to_string();
+            ctx.graphics_stack.override_policy = "Builtin-only".to_string();
         }
     }
 
