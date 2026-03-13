@@ -34,6 +34,7 @@ pub struct GraphicsStackInfo {
     pub effective_d3d12_provider: String,
     pub requested_gpu: Option<String>,
     pub effective_gpu: Option<String>,
+    pub target_architecture: crate::models::ExecutableArchitecture,
     pub fallback_reasons: HashMap<String, String>,
     pub runtime_evidence: RuntimeEvidence,
     pub env_propagation: HashMap<String, bool>,
@@ -459,6 +460,9 @@ impl LaunchPipeline {
         // After stages are complete (or failed), populate effective stack and scan logs for evidence
         self.record_dll_provider_diagnostics(ctx);
 
+        // Sync architecture to diagnostics
+        ctx.graphics_stack.target_architecture = ctx.target_architecture;
+
         // Populate effective graphics stack info from command spec/env BEFORE scanning logs
         // so that evidence expectations align with what was actually resolved.
         self.populate_effective_graphics_stack(ctx);
@@ -851,6 +855,7 @@ impl LaunchPipeline {
                          effective_d3d12_provider: ctx.graphics_stack.effective_d3d12_provider.clone(),
                          requested_gpu: ctx.graphics_stack.requested_gpu.clone(),
                          effective_gpu: ctx.graphics_stack.effective_gpu.clone(),
+                         target_architecture: ctx.target_architecture,
                          dll_resolutions: ctx.dll_resolutions.clone(),
                          wine_dll_overrides: spec.env.get("WINEDLLOVERRIDES").cloned(),
                          runtime_evidence: Some(ctx.graphics_stack.runtime_evidence.clone()),
@@ -907,6 +912,7 @@ impl LaunchPipeline {
                  metadata.insert("backend".to_string(), ctx.graphics_stack.effective_backend.clone());
                  metadata.insert("d3d12_provider".to_string(), ctx.graphics_stack.effective_d3d12_provider.clone());
                  metadata.insert("gpu".to_string(), ctx.graphics_stack.effective_gpu.clone().unwrap_or_else(|| "default".to_string()));
+                 metadata.insert("arch".to_string(), format!("{:?}", ctx.target_architecture).to_lowercase());
                  if let Some(spec) = &ctx.command_spec {
                      if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
                          metadata.insert("overrides".to_string(), overrides.clone());

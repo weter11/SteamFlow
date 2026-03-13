@@ -49,9 +49,23 @@ impl PipelineStage for ResolveDllProvidersStage {
         let components = crate::utils::detect_runner_components(&resolved_runner, wineprefix.as_deref());
         let d3d12_policy = ctx.user_config.as_ref().map(|c| c.graphics_layers.d3d12_policy.clone()).unwrap_or_default();
 
-        // Detect architecture before resolution if we have a resolved executable path
-        if let Some(exe_path) = &ctx.resolved_executable_path {
-            ctx.target_architecture = crate::utils::detect_exe_architecture(exe_path);
+        // Detect architecture before resolution
+        let mut exe_path = PathBuf::from(install_path);
+        if let Some(info) = &ctx.launch_info {
+            exe_path = exe_path.join(info.executable.replace('\\', "/"));
+        }
+        if exe_path.exists() {
+            ctx.target_architecture = crate::utils::detect_exe_architecture(&exe_path);
+            // Pre-populate this so downstream stages can use it
+            ctx.resolved_executable_path = Some(exe_path.clone());
+
+            if let Some(logger) = &ctx.logger {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("exe_path".into(), exe_path.to_string_lossy().to_string());
+                metadata.insert("detected_arch".into(), format!("{:?}", ctx.target_architecture).to_lowercase());
+                metadata.insert("detection_method".into(), "PE header".to_string());
+                let _ = logger.info("arch_detected", "Target executable architecture determined".into(), Some("ResolveDllProviders".into()), metadata);
+            }
         }
 
         let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy, &ctx.target_architecture);
