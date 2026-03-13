@@ -45,6 +45,7 @@ pub struct LaunchSummary {
 pub enum LaunchResult {
     Success,
     Failure,
+    Degraded, // Process spawned but policy was violated
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -89,6 +90,7 @@ pub struct EffectiveSettingsConfig {
     pub effective_d3d12_provider: String,
     pub requested_gpu: Option<String>,
     pub effective_gpu: Option<String>,
+    pub target_architecture: crate::models::ExecutableArchitecture,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
     pub wine_dll_overrides: Option<String>,
     pub runtime_evidence: Option<crate::launch::pipeline::RuntimeEvidence>,

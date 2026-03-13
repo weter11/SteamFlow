@@ -49,8 +49,58 @@ impl PipelineStage for ResolveDllProvidersStage {
         let components = crate::utils::detect_runner_components(&resolved_runner, wineprefix.as_deref());
         let d3d12_policy = ctx.user_config.as_ref().map(|c| c.graphics_layers.d3d12_policy.clone()).unwrap_or_default();
 
-        let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy);
+        // Detect architecture before resolution
+        let mut exe_path = PathBuf::from(install_path);
+        if let Some(info) = &ctx.launch_info {
+            exe_path = exe_path.join(info.executable.replace('\\', "/"));
+        }
+        if exe_path.exists() {
+            ctx.target_architecture = crate::utils::detect_exe_architecture(&exe_path);
+            // Pre-populate this so downstream stages can use it
+            ctx.resolved_executable_path = Some(exe_path.clone());
+
+            if let Some(logger) = &ctx.logger {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("exe_path".into(), exe_path.to_string_lossy().to_string());
+                metadata.insert("detected_arch".into(), format!("{:?}", ctx.target_architecture).to_lowercase());
+                metadata.insert("detection_method".into(), "PE header".to_string());
+                let _ = logger.info("arch_detected", "Target executable architecture determined".into(), Some("ResolveDllProviders".into()), metadata);
+            }
+        }
+
+        let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy, &ctx.target_architecture);
         ctx.dll_resolutions = resolutions;
+
+        // Strict Backend Policy Enforcement
+        if let Some(config) = &ctx.user_config {
+            let backend_policy = &config.graphics_layers.graphics_backend_policy;
+
+            if *backend_policy == crate::models::GraphicsBackendPolicy::DXVK {
+                let dxvk_dlls = ["d3d11", "dxgi", "d3d9", "d3d8"];
+                let mut missing = Vec::new();
+
+                for dll in dxvk_dlls {
+                    let resolved = ctx.dll_resolutions.iter().find(|r| r.name == dll);
+                    let has_native = resolved.map(|r| {
+                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner ||
+                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal
+                    }).unwrap_or(false);
+
+                    if !has_native {
+                        missing.push(dll);
+                    }
+                }
+
+                if !missing.is_empty() {
+                    return Err(LaunchError::new(
+                        LaunchErrorKind::Environment,
+                        format!("Explicit DXVK mode requested but required DLLs are missing: {}. \
+                                Ensure DXVK is bundled with your runner or present in the game directory.",
+                                missing.join(", "))
+                    ).with_context("missing_dlls", missing.join(",")));
+                }
+            }
+        }
 
         if let Some(session) = &ctx.session {
             let scan_report_path = session.log_dir.join("component_scan.json");

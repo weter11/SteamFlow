@@ -817,6 +817,54 @@ pub fn list_available_gpus() -> Vec<DetectedGpu> {
     gpus
 }
 
+pub fn detect_exe_architecture(exe_path: &Path) -> crate::models::ExecutableArchitecture {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match std::fs::File::open(exe_path) {
+        Ok(f) => f,
+        Err(_) => return crate::models::ExecutableArchitecture::Unknown,
+    };
+
+    let mut mz_header = [0u8; 2];
+    if file.read_exact(&mut mz_header).is_err() || &mz_header != b"MZ" {
+        return crate::models::ExecutableArchitecture::Unknown;
+    }
+
+    // Offset 0x3C contains the offset to the PE header
+    if file.seek(SeekFrom::Start(0x3C)).is_err() {
+        return crate::models::ExecutableArchitecture::Unknown;
+    }
+
+    let mut pe_offset_buf = [0u8; 4];
+    if file.read_exact(&mut pe_offset_buf).is_err() {
+        return crate::models::ExecutableArchitecture::Unknown;
+    }
+    let pe_offset = u32::from_le_bytes(pe_offset_buf);
+
+    if file.seek(SeekFrom::Start(pe_offset as u64)).is_err() {
+        return crate::models::ExecutableArchitecture::Unknown;
+    }
+
+    let mut pe_signature = [0u8; 4];
+    if file.read_exact(&mut pe_signature).is_err() || &pe_signature != b"PE\0\0" {
+        return crate::models::ExecutableArchitecture::Unknown;
+    }
+
+    // COFF Header starts right after PE signature
+    // Machine is the first 2 bytes
+    let mut machine_buf = [0u8; 2];
+    if file.read_exact(&mut machine_buf).is_err() {
+        return crate::models::ExecutableArchitecture::Unknown;
+    }
+    let machine = u16::from_le_bytes(machine_buf);
+
+    match machine {
+        0x014c => crate::models::ExecutableArchitecture::X86,
+        0x8664 => crate::models::ExecutableArchitecture::X86_64,
+        _ => crate::models::ExecutableArchitecture::Unknown,
+    }
+}
+
 pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,

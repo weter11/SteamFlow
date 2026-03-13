@@ -27,7 +27,8 @@ fn test_dll_resolution_report_includes_runner_candidates() {
         tmp.path(),
         &proton_script,
         &components,
-        &D3D12ProviderPolicy::Auto
+        &D3D12ProviderPolicy::Auto,
+        &steamflow::models::ExecutableArchitecture::X86_64
     );
 
     let d3d11 = resolutions.iter().find(|r| r.name == "d3d11").unwrap();

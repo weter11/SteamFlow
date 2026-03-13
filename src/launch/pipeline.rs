@@ -34,6 +34,7 @@ pub struct GraphicsStackInfo {
     pub effective_d3d12_provider: String,
     pub requested_gpu: Option<String>,
     pub effective_gpu: Option<String>,
+    pub target_architecture: crate::models::ExecutableArchitecture,
     pub fallback_reasons: HashMap<String, String>,
     pub runtime_evidence: RuntimeEvidence,
     pub env_propagation: HashMap<String, bool>,
@@ -78,6 +79,7 @@ pub struct PipelineContext {
     pub resolved_install_dir: Option<std::path::PathBuf>,
     pub resolved_executable_path: Option<std::path::PathBuf>,
     pub executable_exists: bool,
+    pub target_architecture: crate::models::ExecutableArchitecture,
 
     pub runner: Option<Box<dyn Runner>>,
     pub command_spec: Option<CommandSpec>,
@@ -102,6 +104,7 @@ impl PipelineContext {
             resolved_install_dir: None,
             resolved_executable_path: None,
             executable_exists: false,
+            target_architecture: crate::models::ExecutableArchitecture::Unknown,
             runner: None,
             command_spec: None,
             child: None,
@@ -457,6 +460,9 @@ impl LaunchPipeline {
         // After stages are complete (or failed), populate effective stack and scan logs for evidence
         self.record_dll_provider_diagnostics(ctx);
 
+        // Sync architecture to diagnostics
+        ctx.graphics_stack.target_architecture = ctx.target_architecture;
+
         // Populate effective graphics stack info from command spec/env BEFORE scanning logs
         // so that evidence expectations align with what was actually resolved.
         self.populate_effective_graphics_stack(ctx);
@@ -475,6 +481,20 @@ impl LaunchPipeline {
         // Run validators again on the final effective config
         for validator in &self.validators {
             validator.validate(ctx);
+        }
+
+        // Determine if policy was satisfied
+        let mut policy_satisfied = true;
+        if !ctx.graphics_stack.requested_backend.is_empty() && ctx.graphics_stack.requested_backend != "Auto" {
+            if ctx.graphics_stack.requested_backend == "DXVK" && ctx.graphics_stack.effective_backend != "DXVK" {
+                policy_satisfied = false;
+            } else if ctx.graphics_stack.requested_backend == "WineD3D" && ctx.graphics_stack.effective_backend != "WineD3D (Baseline)" {
+                policy_satisfied = false;
+            }
+        }
+
+        if !policy_satisfied && final_result == LaunchResult::Success {
+             final_result = LaunchResult::Degraded;
         }
 
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
@@ -558,16 +578,20 @@ impl LaunchPipeline {
     fn scan_logs_for_graphics_evidence(&self, ctx: &mut PipelineContext) {
         let scan_start = std::time::Instant::now();
         if let Some(session) = &ctx.session {
-            let stderr_path = session.stderr_path();
-            ctx.graphics_stack.runtime_evidence.scan_metadata.log_path = stderr_path.to_string_lossy().to_string();
+            let log_path = if let Some(spec) = &ctx.command_spec {
+                spec.env.get("WINE_LOG_OUTPUT").map(std::path::PathBuf::from).unwrap_or_else(|| session.stderr_path())
+            } else {
+                session.stderr_path()
+            };
+            ctx.graphics_stack.runtime_evidence.scan_metadata.log_path = log_path.to_string_lossy().to_string();
 
-            if stderr_path.exists() {
+            if log_path.exists() {
                 ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = true;
-                if let Ok(metadata) = std::fs::metadata(&stderr_path) {
+                if let Ok(metadata) = std::fs::metadata(&log_path) {
                     ctx.graphics_stack.runtime_evidence.scan_metadata.file_size = metadata.len();
                 }
 
-                if let Ok(content) = std::fs::read_to_string(&stderr_path) {
+                if let Ok(content) = std::fs::read_to_string(&log_path) {
                     let lines: Vec<&str> = content.lines().collect();
                     ctx.graphics_stack.runtime_evidence.scan_metadata.line_count = lines.len();
 
@@ -698,7 +722,7 @@ impl LaunchPipeline {
             let diagnose = |item: &mut EvidenceItem, name: &str, metadata: &EvidenceScanMetadata| {
                 if !metadata.file_exists {
                     item.diagnosis = format!("{} requested; Wine log missing", name);
-                    item.diagnostics_note = "stderr.log was not found in session directory.".to_string();
+                    item.diagnostics_note = format!("Log file was not found at {}.", metadata.log_path);
                     return;
                 }
                 if metadata.line_count == 0 {
@@ -831,6 +855,7 @@ impl LaunchPipeline {
                          effective_d3d12_provider: ctx.graphics_stack.effective_d3d12_provider.clone(),
                          requested_gpu: ctx.graphics_stack.requested_gpu.clone(),
                          effective_gpu: ctx.graphics_stack.effective_gpu.clone(),
+                         target_architecture: ctx.target_architecture,
                          dll_resolutions: ctx.dll_resolutions.clone(),
                          wine_dll_overrides: spec.env.get("WINEDLLOVERRIDES").cloned(),
                          runtime_evidence: Some(ctx.graphics_stack.runtime_evidence.clone()),
@@ -887,6 +912,7 @@ impl LaunchPipeline {
                  metadata.insert("backend".to_string(), ctx.graphics_stack.effective_backend.clone());
                  metadata.insert("d3d12_provider".to_string(), ctx.graphics_stack.effective_d3d12_provider.clone());
                  metadata.insert("gpu".to_string(), ctx.graphics_stack.effective_gpu.clone().unwrap_or_else(|| "default".to_string()));
+                 metadata.insert("arch".to_string(), format!("{:?}", ctx.target_architecture).to_lowercase());
                  if let Some(spec) = &ctx.command_spec {
                      if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
                          metadata.insert("overrides".to_string(), overrides.clone());

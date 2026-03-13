@@ -13,7 +13,7 @@ pub struct PreflightCheck {
 pub struct PreflightReport {
     pub success: bool,
     pub checks: Vec<PreflightCheck>,
-    pub arch_hint: String,
+    pub target_architecture: crate::models::ExecutableArchitecture,
     pub runner_path: String,
 }
 
@@ -29,7 +29,6 @@ impl PipelineStage for PreflightStage {
 
         let mut checks = Vec::new();
         let runner_path = spec.program.to_string_lossy().to_string();
-        let arch_hint = if runner_path.contains("64") { "x64" } else { "x86/Unknown" }.to_string();
 
         let mut final_res: std::result::Result<(), LaunchError> = Ok(());
 
@@ -170,7 +169,7 @@ impl PipelineStage for PreflightStage {
         let report = PreflightReport {
             success: final_res.is_ok(),
             checks,
-            arch_hint,
+            target_architecture: ctx.target_architecture,
             runner_path,
         };
 
@@ -182,7 +181,7 @@ impl PipelineStage for PreflightStage {
         if let Some(logger) = &ctx.logger {
             let mut metadata = std::collections::HashMap::new();
             metadata.insert("runner_path".to_string(), report.runner_path.clone());
-            metadata.insert("arch_hint".to_string(), report.arch_hint.clone());
+            metadata.insert("target_architecture".to_string(), format!("{:?}", report.target_architecture).to_lowercase());
             metadata.insert("success".to_string(), report.success.to_string());
 
             let event_type = if report.success { "preflight_success" } else { "preflight_failure" };
