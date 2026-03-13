@@ -49,7 +49,12 @@ impl PipelineStage for ResolveDllProvidersStage {
         let components = crate::utils::detect_runner_components(&resolved_runner, wineprefix.as_deref());
         let d3d12_policy = ctx.user_config.as_ref().map(|c| c.graphics_layers.d3d12_policy.clone()).unwrap_or_default();
 
-        let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy);
+        // Detect architecture before resolution if we have a resolved executable path
+        if let Some(exe_path) = &ctx.resolved_executable_path {
+            ctx.target_architecture = crate::utils::detect_exe_architecture(exe_path);
+        }
+
+        let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy, &ctx.target_architecture);
         ctx.dll_resolutions = resolutions;
 
         // Strict Backend Policy Enforcement
@@ -64,8 +69,7 @@ impl PipelineStage for ResolveDllProvidersStage {
                     let resolved = ctx.dll_resolutions.iter().find(|r| r.name == dll);
                     let has_native = resolved.map(|r| {
                         r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner ||
-                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal ||
-                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::System
+                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal
                     }).unwrap_or(false);
 
                     if !has_native {

@@ -19,6 +19,7 @@ impl PipelineStage for BuildCommandStage {
                     .ok_or_else(|| LaunchError::new(LaunchErrorKind::Validation, "launcher_config missing"))?.clone(),
                 user_config: ctx.user_config.clone(),
                 proton_path: ctx.proton_path.clone(),
+                target_architecture: ctx.target_architecture,
                 dll_resolutions: ctx.dll_resolutions.clone(),
             };
             let spec = runner.build_command(&runner_ctx).await?;

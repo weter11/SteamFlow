@@ -178,6 +178,14 @@ pub enum LibraryFilter {
     Installed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ExecutableArchitecture {
+    #[default]
+    Unknown,
+    X86,
+    X86_64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DepotPlatform {
     Linux,

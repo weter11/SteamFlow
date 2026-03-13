@@ -31,6 +31,7 @@ mod tests {
             launcher_config: LauncherConfig::default(),
             user_config: None,
             proton_path: Some("/tmp/proton".to_string()),
+            target_architecture: crate::models::ExecutableArchitecture::X86_64,
             dll_resolutions: Vec::new(),
         }
     }
@@ -108,6 +109,7 @@ mod tests {
             launcher_config: config,
             user_config: Some(user_config.clone()),
             proton_path: Some(runner_path.to_string_lossy().to_string()),
+            target_architecture: crate::models::ExecutableArchitecture::X86_64,
             dll_resolutions: Vec::new(),
         };
 

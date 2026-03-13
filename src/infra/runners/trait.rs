@@ -11,6 +11,7 @@ pub struct LaunchContext {
     pub launcher_config: LauncherConfig,
     pub user_config: Option<UserAppConfig>,
     pub proton_path: Option<String>,
+    pub target_architecture: crate::models::ExecutableArchitecture,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
 }
 

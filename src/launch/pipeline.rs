@@ -78,6 +78,7 @@ pub struct PipelineContext {
     pub resolved_install_dir: Option<std::path::PathBuf>,
     pub resolved_executable_path: Option<std::path::PathBuf>,
     pub executable_exists: bool,
+    pub target_architecture: crate::models::ExecutableArchitecture,
 
     pub runner: Option<Box<dyn Runner>>,
     pub command_spec: Option<CommandSpec>,
@@ -102,6 +103,7 @@ impl PipelineContext {
             resolved_install_dir: None,
             resolved_executable_path: None,
             executable_exists: false,
+            target_architecture: crate::models::ExecutableArchitecture::Unknown,
             runner: None,
             command_spec: None,
             child: None,
