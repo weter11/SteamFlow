@@ -188,6 +188,35 @@ impl LaunchValidator for LaunchInvariantValidator {
             ));
         }
 
+        // Check for DLL Load Failures in strict mode
+        if !ctx.graphics_stack.requested_backend.is_empty() && ctx.graphics_stack.requested_backend != "Auto" {
+            for evidence in &ctx.graphics_stack.graphics_stack_evidence {
+                if evidence.contains("DLL Load Failure") || evidence.contains("DLL Dependency Missing") {
+                    let code = if ctx.graphics_stack.requested_backend == "DXVK" { "STRICT_DXVK_LOAD_FAILURE" } else { "STRICT_POLICY_LOAD_FAILURE" };
+
+                    // Try to extract DLL name for more precise error reporting
+                    let dll_name = if evidence.contains("L\"") {
+                         evidence.split("L\"").nth(1).and_then(|s| s.split('\"').next()).unwrap_or("unknown")
+                    } else if evidence.contains("Library ") {
+                         evidence.split("Library ").nth(1).and_then(|s| s.split(' ').next()).unwrap_or("unknown")
+                    } else {
+                         "unknown"
+                    };
+
+                    let stem = dll_name.trim_end_matches(".dll");
+                    let resolution = ctx.dll_resolutions.iter().find(|r| r.name == stem || r.name == dll_name);
+                    let provider = resolution.map(|r| format!("{:?}", r.chosen_provider)).unwrap_or_else(|| "Unknown".into());
+                    let path = resolution.and_then(|r| r.chosen_path.as_ref()).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "Unknown".into());
+
+                    warnings.push((
+                        code,
+                        format!("Strict policy violation: a required native DLL failed to load: {}. [DLL: {}, Provider: {}, Path: {}, Arch: {:?}]",
+                            evidence, dll_name, provider, path, ctx.graphics_stack.target_architecture),
+                    ));
+                }
+            }
+        }
+
         if ctx.graphics_stack.effective_d3d12_provider == "vkd3d-proton" && !ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found {
              let meta = &ctx.graphics_stack.runtime_evidence.scan_metadata;
              let suffix = if !meta.file_exists { " (Wine log missing)" } else if meta.line_count == 0 { " (Wine log empty)" } else { "" };

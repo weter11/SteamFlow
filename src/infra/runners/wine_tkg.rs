@@ -435,6 +435,19 @@ impl Runner for WineTkgRunner {
                 if !wine_dll_dirs.contains(&s) {
                     wine_dll_dirs.push(s);
                 }
+
+                // Ensure architecture-specific subdirectories are also in WINEDLLPATH.
+                // This is critical for PE-based runners where Wine expects DLLs in
+                // x86_64-windows or i386-windows folders even for the main runner libs.
+                for arch in &["x86_64-windows", "i386-windows"] {
+                    let arch_p = p.join(arch);
+                    if arch_p.exists() {
+                        let arch_s = arch_p.to_string_lossy().to_string();
+                        if !wine_dll_dirs.contains(&arch_s) {
+                            wine_dll_dirs.push(arch_s);
+                        }
+                    }
+                }
             }
         }
 
@@ -449,7 +462,12 @@ impl Runner for WineTkgRunner {
             env.insert("WINEDLLPATH".to_string(), combined);
         }
 
-        env.insert("WINEPATH".to_string(), "C:\\Program Files (x86)\\Steam".to_string());
+        let mut wine_path = vec!["C:\\Program Files (x86)\\Steam".to_string()];
+        // Append runner DLL directories to WINEPATH to aid native PE loading
+        for dir in &wine_dll_dirs {
+            wine_path.push(dir.clone());
+        }
+        env.insert("WINEPATH".to_string(), wine_path.join(";"));
 
         let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
         let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
