@@ -290,10 +290,10 @@ pub fn check_environment_sanity(
                 });
             }
             if let Some(overrides) = env_vars.get("WINEDLLOVERRIDES") {
-                if !overrides.contains("d3d11=n") && !overrides.contains("dxgi=n") && !overrides.contains("d3d9=n") {
+                if !overrides.contains("d3d11=n") && !overrides.contains("dxgi=n") && !overrides.contains("d3d9=n") && !overrides.contains("d3d8=n") && !overrides.contains("d3d10core=n") {
                      warnings.push(crate::launch::pipeline::CompatibilityWarning {
                         code: "SANITY_MISSING_DXVK_OVERRIDE".to_string(),
-                        message: "DXVK is enabled but WINEDLLOVERRIDES does not appear to contain native overrides for D3D11/DXGI/D3D9.".to_string(),
+                        message: "DXVK is enabled but WINEDLLOVERRIDES does not appear to contain native overrides for D3D11/DXGI/D3D9/D3D8/D3D10CORE.".to_string(),
                         context: [("overrides".to_string(), overrides.clone())].into_iter().collect(),
                     });
                 }

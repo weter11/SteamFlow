@@ -314,12 +314,12 @@ impl Runner for WineTkgRunner {
         );
 
         // 1. Resolve DX8-11 policy (GraphicsBackendPolicy) - CONSERVATIVE
-        let (policy_dxvk, force_builtin) = match glc.graphics_backend_policy {
+        let (policy_dxvk, force_builtin, strict_dxvk) = match glc.graphics_backend_policy {
             // Auto is now conservative: it does NOT automatically enable DXVK
             // even if detected on disk. It prefers default Wine behavior.
-            crate::models::GraphicsBackendPolicy::Auto => (false, false),
-            crate::models::GraphicsBackendPolicy::WineD3D => (false, true),
-            crate::models::GraphicsBackendPolicy::DXVK => (true, false),
+            crate::models::GraphicsBackendPolicy::Auto => (false, false, false),
+            crate::models::GraphicsBackendPolicy::WineD3D => (false, true, false),
+            crate::models::GraphicsBackendPolicy::DXVK => (true, false, true),
         };
 
         // Manual override takes precedence if enabled
@@ -346,6 +346,7 @@ impl Runner for WineTkgRunner {
             no_overlay,
             force_builtin_d3d,
             Some(&game_working_dir),
+            strict_dxvk,
         );
 
         // Enhance overrides with resolved DLL providers
@@ -434,6 +435,19 @@ impl Runner for WineTkgRunner {
                 if !wine_dll_dirs.contains(&s) {
                     wine_dll_dirs.push(s);
                 }
+
+                // Ensure architecture-specific subdirectories are also in WINEDLLPATH.
+                // This is critical for PE-based runners where Wine expects DLLs in
+                // x86_64-windows or i386-windows folders even for the main runner libs.
+                for arch in &["x86_64-windows", "i386-windows"] {
+                    let arch_p = p.join(arch);
+                    if arch_p.exists() {
+                        let arch_s = arch_p.to_string_lossy().to_string();
+                        if !wine_dll_dirs.contains(&arch_s) {
+                            wine_dll_dirs.push(arch_s);
+                        }
+                    }
+                }
             }
         }
 
@@ -448,7 +462,12 @@ impl Runner for WineTkgRunner {
             env.insert("WINEDLLPATH".to_string(), combined);
         }
 
-        env.insert("WINEPATH".to_string(), "C:\\Program Files (x86)\\Steam".to_string());
+        let mut wine_path = vec!["C:\\Program Files (x86)\\Steam".to_string()];
+        // Append runner DLL directories to WINEPATH to aid native PE loading
+        for dir in &wine_dll_dirs {
+            wine_path.push(dir.clone());
+        }
+        env.insert("WINEPATH".to_string(), wine_path.join(";"));
 
         let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
         let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)

@@ -76,28 +76,51 @@ impl PipelineStage for ResolveDllProvidersStage {
             let backend_policy = &config.graphics_layers.graphics_backend_policy;
 
             if *backend_policy == crate::models::GraphicsBackendPolicy::DXVK {
-                let dxvk_dlls = ["d3d11", "dxgi", "d3d9", "d3d8"];
-                let mut missing = Vec::new();
+                let mut missing_capabilities = Vec::new();
 
-                for dll in dxvk_dlls {
-                    let resolved = ctx.dll_resolutions.iter().find(|r| r.name == dll);
-                    let has_native = resolved.map(|r| {
-                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner ||
-                        r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal
-                    }).unwrap_or(false);
+                let has_dll = |name: &str| -> bool {
+                    ctx.dll_resolutions.iter()
+                        .find(|r| r.name == name)
+                        .map(|r| {
+                            r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner ||
+                            r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal
+                        })
+                        .unwrap_or(false)
+                };
 
-                    if !has_native {
-                        missing.push(dll);
+                let has_dx11_dxgi = has_dll("d3d11") && has_dll("dxgi");
+                let has_dx10 = has_dx11_dxgi && has_dll("d3d10core");
+                let has_dx9 = has_dll("d3d9");
+                let has_dx8 = has_dx9 && has_dll("d3d8");
+
+                if !has_dx11_dxgi {
+                    missing_capabilities.push("DX11/DXGI (requires d3d11.dll, dxgi.dll)");
+                }
+                if !has_dx10 {
+                    if has_dx11_dxgi {
+                        missing_capabilities.push("DX10/10.1 (requires d3d10core.dll)");
+                    } else {
+                        missing_capabilities.push("DX10/10.1 (requires d3d10core.dll and DX11/DXGI)");
+                    }
+                }
+                if !has_dx9 {
+                    missing_capabilities.push("DX9 (requires d3d9.dll)");
+                }
+                if !has_dx8 {
+                    if has_dx9 {
+                        missing_capabilities.push("DX8 (requires d3d8.dll)");
+                    } else {
+                        missing_capabilities.push("DX8 (requires d3d8.dll and DX9)");
                     }
                 }
 
-                if !missing.is_empty() {
+                if !missing_capabilities.is_empty() {
                     return Err(LaunchError::new(
                         LaunchErrorKind::Environment,
-                        format!("Explicit DXVK mode requested but required DLLs are missing: {}. \
-                                Ensure DXVK is bundled with your runner or present in the game directory.",
-                                missing.join(", "))
-                    ).with_context("missing_dlls", missing.join(",")));
+                        format!("Explicit DXVK mode requested but required capabilities are missing: {}. \
+                                Ensure a complete DXVK translation set for architecture {:?} is bundled with your runner or present in the game directory.",
+                                missing_capabilities.join("; "), ctx.target_architecture)
+                    ).with_context("missing_capabilities", missing_capabilities.join(",")));
                 }
             }
         }

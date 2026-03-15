@@ -21,5 +21,13 @@ pub fn classify_graphics_evidence(log_line: &str) -> Option<String> {
         return Some(format!("WineD3D Fallback Detected: {}", log_line.trim()));
     }
 
+    // DLL Load Failures
+    if line_lower.contains("failed to load module") && line_lower.contains("status=") {
+        return Some(format!("DLL Load Failure: {}", log_line.trim()));
+    }
+    if line_lower.contains("not found") && line_lower.contains("which is needed by") {
+        return Some(format!("DLL Dependency Missing: {}", log_line.trim()));
+    }
+
     None
 }
