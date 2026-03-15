@@ -650,6 +650,7 @@ pub fn build_dll_overrides(
     no_overlay: bool,
     force_builtin_d3d: bool, // NEW — for WineD3D policy
     game_dir: Option<&std::path::Path>, // check for game-local DLLs
+    strict_dxvk: bool,
 ) -> String {
     let mut overrides: Vec<String> = vec![
         "vstdlib_s=n".into(),
@@ -704,11 +705,13 @@ pub fn build_dll_overrides(
             "dxgi.dll",
         ] {
             let stem = dll.trim_end_matches(".dll");
-            if !game_has(dll) {
-                overrides.push(format!("{stem}=n,b"));
+            let mode = if strict_dxvk { "n" } else { "n,b" };
+
+            if strict_dxvk || !game_has(dll) {
+                overrides.push(format!("{stem}={mode}"));
             }
-            // If the game ships it locally, leave Wine's default search order
-            // alone — exe-dir native wins automatically.
+            // If the game ships it locally and we are not in strict mode,
+            // leave Wine's default search order alone — exe-dir native wins automatically.
         }
     }
 

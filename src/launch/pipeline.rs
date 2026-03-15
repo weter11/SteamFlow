@@ -494,7 +494,11 @@ impl LaunchPipeline {
         }
 
         if !policy_satisfied && final_result == LaunchResult::Success {
-             final_result = LaunchResult::Degraded;
+             if ctx.graphics_stack.requested_backend == "DXVK" {
+                 final_result = LaunchResult::Failure;
+             } else {
+                 final_result = LaunchResult::Degraded;
+             }
         }
 
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);

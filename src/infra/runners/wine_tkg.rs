@@ -314,12 +314,12 @@ impl Runner for WineTkgRunner {
         );
 
         // 1. Resolve DX8-11 policy (GraphicsBackendPolicy) - CONSERVATIVE
-        let (policy_dxvk, force_builtin) = match glc.graphics_backend_policy {
+        let (policy_dxvk, force_builtin, strict_dxvk) = match glc.graphics_backend_policy {
             // Auto is now conservative: it does NOT automatically enable DXVK
             // even if detected on disk. It prefers default Wine behavior.
-            crate::models::GraphicsBackendPolicy::Auto => (false, false),
-            crate::models::GraphicsBackendPolicy::WineD3D => (false, true),
-            crate::models::GraphicsBackendPolicy::DXVK => (true, false),
+            crate::models::GraphicsBackendPolicy::Auto => (false, false, false),
+            crate::models::GraphicsBackendPolicy::WineD3D => (false, true, false),
+            crate::models::GraphicsBackendPolicy::DXVK => (true, false, true),
         };
 
         // Manual override takes precedence if enabled
@@ -346,6 +346,7 @@ impl Runner for WineTkgRunner {
             no_overlay,
             force_builtin_d3d,
             Some(&game_working_dir),
+            strict_dxvk,
         );
 
         // Enhance overrides with resolved DLL providers

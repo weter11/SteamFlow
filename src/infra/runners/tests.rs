@@ -127,7 +127,9 @@ mod tests {
         ctx_dxvk.user_config = Some(user_config_dxvk);
         let env_dxvk = runner.build_env(&ctx_dxvk).await.unwrap();
         let overrides_dxvk = env_dxvk.get("WINEDLLOVERRIDES").unwrap();
-        assert!(overrides_dxvk.contains("d3d11=n,b"));
+        // Strict mode uses 'n', not 'n,b'
+        assert!(overrides_dxvk.contains("d3d11=n"));
+        assert!(!overrides_dxvk.contains("d3d11=n,b"));
     }
 
     #[tokio::test]

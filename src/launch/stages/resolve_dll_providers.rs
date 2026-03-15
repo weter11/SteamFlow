@@ -76,7 +76,7 @@ impl PipelineStage for ResolveDllProvidersStage {
             let backend_policy = &config.graphics_layers.graphics_backend_policy;
 
             if *backend_policy == crate::models::GraphicsBackendPolicy::DXVK {
-                let dxvk_dlls = ["d3d11", "dxgi", "d3d9", "d3d8"];
+                let dxvk_dlls = ["d3d11", "dxgi", "d3d9", "d3d8", "d3d10core"];
                 let mut missing = Vec::new();
 
                 for dll in dxvk_dlls {

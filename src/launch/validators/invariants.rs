@@ -180,6 +180,14 @@ impl LaunchValidator for LaunchInvariantValidator {
             ));
         }
 
+        // Additional check for WineD3D usage when DXVK was requested
+        if ctx.graphics_stack.requested_backend == "DXVK" && ctx.graphics_stack.runtime_evidence.wined3d.evidence_found {
+            warnings.push((
+                "STRICT_DXVK_POLICY_VIOLATION",
+                "DXVK was explicitly requested, but WineD3D usage was observed in logs.".into(),
+            ));
+        }
+
         if ctx.graphics_stack.effective_d3d12_provider == "vkd3d-proton" && !ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found {
              let meta = &ctx.graphics_stack.runtime_evidence.scan_metadata;
              let suffix = if !meta.file_exists { " (Wine log missing)" } else if meta.line_count == 0 { " (Wine log empty)" } else { "" };
