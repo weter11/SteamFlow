@@ -57,6 +57,8 @@ pub struct EvidenceScanMetadata {
     pub line_count: usize,
     pub scan_duration_ms: u128,
     pub candidate_matches: usize,
+    pub retries: usize,
+    pub process_running_during_scan: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -476,7 +478,7 @@ impl LaunchPipeline {
              }
         }
 
-        self.scan_logs_for_graphics_evidence(ctx);
+        self.scan_logs_for_graphics_evidence(ctx).await;
 
         // Run validators again on the final effective config
         for validator in &self.validators {
@@ -579,7 +581,7 @@ impl LaunchPipeline {
         }
     }
 
-    fn scan_logs_for_graphics_evidence(&self, ctx: &mut PipelineContext) {
+    async fn scan_logs_for_graphics_evidence(&self, ctx: &mut PipelineContext) {
         let scan_start = std::time::Instant::now();
         if let Some(session) = &ctx.session {
             let log_path = if let Some(spec) = &ctx.command_spec {
@@ -589,134 +591,163 @@ impl LaunchPipeline {
             };
             ctx.graphics_stack.runtime_evidence.scan_metadata.log_path = log_path.to_string_lossy().to_string();
 
-            if log_path.exists() {
-                ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = true;
-                if let Ok(metadata) = std::fs::metadata(&log_path) {
-                    ctx.graphics_stack.runtime_evidence.scan_metadata.file_size = metadata.len();
+            let mut retries = 0;
+            let max_retries = 3;
+            let mut content = String::new();
+
+            while retries <= max_retries {
+                if log_path.exists() {
+                    ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = true;
+                    if let Ok(metadata) = std::fs::metadata(&log_path) {
+                        ctx.graphics_stack.runtime_evidence.scan_metadata.file_size = metadata.len();
+                    }
+
+                    if let Ok(current_content) = std::fs::read_to_string(&log_path) {
+                        if !current_content.is_empty() || retries == max_retries {
+                            content = current_content;
+                            break;
+                        }
+                    }
                 }
 
-                if let Ok(content) = std::fs::read_to_string(&log_path) {
-                    let lines: Vec<&str> = content.lines().collect();
-                    ctx.graphics_stack.runtime_evidence.scan_metadata.line_count = lines.len();
+                let process_running = if let Some(child) = &mut ctx.child {
+                    child.try_wait().map(|s| s.is_none()).unwrap_or(false)
+                } else {
+                    false
+                };
+                ctx.graphics_stack.runtime_evidence.scan_metadata.process_running_during_scan = process_running;
 
-                    // Derive component paths from dll resolutions
-                    let mut component_paths = HashMap::new();
-                    for res in &ctx.dll_resolutions {
-                        if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner {
-                            if let Some(path) = &res.chosen_path {
-                                 if let Some(parent) = path.parent() {
-                                     let family = if res.name.contains("d3d12") || res.name.contains("vkd3d") {
-                                         if path.to_string_lossy().contains("vkd3d-proton") { "vkd3d_proton" } else { "vkd3d" }
-                                     } else {
-                                         "dxvk"
-                                     };
-                                     component_paths.insert(family, parent.to_string_lossy().to_string());
-                                 }
+                if !process_running && retries > 0 {
+                    break;
+                }
+
+                retries += 1;
+                ctx.graphics_stack.runtime_evidence.scan_metadata.retries = retries;
+                tokio::time::sleep(std::time::Duration::from_millis(200 * retries as u64)).await;
+            }
+
+            if !content.is_empty() {
+                let lines: Vec<&str> = content.lines().collect();
+                ctx.graphics_stack.runtime_evidence.scan_metadata.line_count = lines.len();
+
+                // Derive component paths from dll resolutions
+                let mut component_paths = HashMap::new();
+                for res in &ctx.dll_resolutions {
+                    if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner {
+                        if let Some(path) = &res.chosen_path {
+                            if let Some(parent) = path.parent() {
+                                let family = if res.name.contains("d3d12") || res.name.contains("vkd3d") {
+                                    if path.to_string_lossy().contains("vkd3d-proton") { "vkd3d_proton" } else { "vkd3d" }
+                                } else {
+                                    "dxvk"
+                                };
+                                component_paths.insert(family, parent.to_string_lossy().to_string());
                             }
                         }
                     }
+                }
 
-                    for line in lines {
-                        let mut line_matched = false;
-                        if let Some(evidence) = crate::infra::logging::classify_graphics_evidence(line) {
-                            if !ctx.graphics_stack.graphics_stack_evidence.contains(&evidence) {
-                                ctx.graphics_stack.graphics_stack_evidence.push(evidence.clone());
-                            }
+                for line in &lines {
+                    let mut line_matched = false;
+                    if let Some(evidence) = crate::infra::logging::classify_graphics_evidence(line) {
+                        if !ctx.graphics_stack.graphics_stack_evidence.contains(&evidence) {
+                            ctx.graphics_stack.graphics_stack_evidence.push(evidence.clone());
+                        }
 
-                            if evidence.contains("DXVK") {
-                                ctx.graphics_stack.runtime_evidence.dxvk.evidence_found = true;
-                                if ctx.graphics_stack.runtime_evidence.dxvk.evidence.len() < 5 {
-                                    ctx.graphics_stack.runtime_evidence.dxvk.evidence.push(evidence.clone());
-                                }
+                        if evidence.contains("DXVK") {
+                            ctx.graphics_stack.runtime_evidence.dxvk.evidence_found = true;
+                            if ctx.graphics_stack.runtime_evidence.dxvk.evidence.len() < 5 {
+                                ctx.graphics_stack.runtime_evidence.dxvk.evidence.push(evidence.clone());
                             }
-                            if evidence.contains("VKD3D-Proton") {
-                                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found = true;
-                                if ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.len() < 5 {
-                                    ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.push(evidence.clone());
-                                }
+                        }
+                        if evidence.contains("VKD3D-Proton") {
+                            ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found = true;
+                            if ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.len() < 5 {
+                                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.push(evidence.clone());
                             }
-                            if evidence.contains("VKD3D") && !evidence.contains("Proton") {
-                                ctx.graphics_stack.runtime_evidence.vkd3d.evidence_found = true;
-                                if ctx.graphics_stack.runtime_evidence.vkd3d.evidence.len() < 5 {
-                                    ctx.graphics_stack.runtime_evidence.vkd3d.evidence.push(evidence.clone());
-                                }
+                        }
+                        if evidence.contains("VKD3D") && !evidence.contains("Proton") {
+                            ctx.graphics_stack.runtime_evidence.vkd3d.evidence_found = true;
+                            if ctx.graphics_stack.runtime_evidence.vkd3d.evidence.len() < 5 {
+                                ctx.graphics_stack.runtime_evidence.vkd3d.evidence.push(evidence.clone());
                             }
-                            if evidence.contains("WineD3D") {
-                                ctx.graphics_stack.runtime_evidence.wined3d.evidence_found = true;
-                                if ctx.graphics_stack.runtime_evidence.wined3d.evidence.len() < 5 {
-                                    ctx.graphics_stack.runtime_evidence.wined3d.evidence.push(evidence.clone());
-                                }
+                        }
+                        if evidence.contains("WineD3D") {
+                            ctx.graphics_stack.runtime_evidence.wined3d.evidence_found = true;
+                            if ctx.graphics_stack.runtime_evidence.wined3d.evidence.len() < 5 {
+                                ctx.graphics_stack.runtime_evidence.wined3d.evidence.push(evidence.clone());
+                            }
+                        }
+                        line_matched = true;
+                    }
+
+                    // Robust Path & Module Matching
+                    let line_lower = line.to_lowercase();
+
+                    // DXVK Path Match
+                    if let Some(path) = component_paths.get("dxvk") {
+                        if line_lower.contains(&path.to_lowercase()) {
+                            ctx.graphics_stack.runtime_evidence.dxvk.evidence_found = true;
+                            if ctx.graphics_stack.runtime_evidence.dxvk.evidence.len() < 5 {
+                                ctx.graphics_stack.runtime_evidence.dxvk.evidence.push(format!("Path match: {}", line.trim()));
                             }
                             line_matched = true;
                         }
+                    }
 
-                        // Robust Path & Module Matching
-                        let line_lower = line.to_lowercase();
-
-                        // DXVK Path Match
-                        if let Some(path) = component_paths.get("dxvk") {
-                            if line_lower.contains(&path.to_lowercase()) {
-                                ctx.graphics_stack.runtime_evidence.dxvk.evidence_found = true;
-                                if ctx.graphics_stack.runtime_evidence.dxvk.evidence.len() < 5 {
-                                    ctx.graphics_stack.runtime_evidence.dxvk.evidence.push(format!("Path match: {}", line.trim()));
-                                }
-                                line_matched = true;
+                    // VKD3D-Proton Path Match
+                    if let Some(path) = component_paths.get("vkd3d_proton") {
+                        if line_lower.contains(&path.to_lowercase()) {
+                            ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found = true;
+                            if ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.len() < 5 {
+                                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.push(format!("Path match: {}", line.trim()));
                             }
-                        }
-
-                        // VKD3D-Proton Path Match
-                        if let Some(path) = component_paths.get("vkd3d_proton") {
-                            if line_lower.contains(&path.to_lowercase()) {
-                                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found = true;
-                                if ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.len() < 5 {
-                                    ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence.push(format!("Path match: {}", line.trim()));
-                                }
-                                line_matched = true;
-                            }
-                        }
-
-                        // Generic Module Loader matches for graphics DLLs
-                        if line_lower.contains("loaddll") || line_lower.contains("load_module") || line_lower.contains("import_dll") {
-                             let graphics_dlls = ["d3d9", "d3d11", "dxgi", "d3d12", "d3d8", "d3d10core", "libvkd3d"];
-                             for dll in graphics_dlls {
-                                 if line_lower.contains(dll) {
-                                     let is_failed = line_lower.contains("failed") || line_lower.contains("error");
-                                     let is_builtin = line_lower.contains("system32") || (line_lower.contains("builtin") && !line_lower.contains("native"));
-
-                                     let evidence_type = if is_failed {
-                                         "Module load FAILED"
-                                     } else if is_builtin {
-                                         "Module load (builtin/fallback)"
-                                     } else {
-                                         "Module load (likely native)"
-                                     };
-
-                                     let msg = format!("{}: {}", evidence_type, line.trim());
-                                     if !ctx.graphics_stack.graphics_stack_evidence.contains(&msg) {
-                                         ctx.graphics_stack.graphics_stack_evidence.push(msg.clone());
-
-                                         if is_builtin {
-                                             ctx.graphics_stack.runtime_evidence.wined3d.evidence_found = true;
-                                             if ctx.graphics_stack.runtime_evidence.wined3d.evidence.len() < 5 {
-                                                 ctx.graphics_stack.runtime_evidence.wined3d.evidence.push(msg);
-                                             }
-                                         }
-                                     }
-                                     line_matched = true;
-                                 }
-                             }
-                        }
-
-                        if line_matched {
-                            ctx.graphics_stack.runtime_evidence.scan_metadata.candidate_matches += 1;
+                            line_matched = true;
                         }
                     }
-                }
-            } else {
-                ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = false;
-            }
 
-            // Populate expectations
+                    // Generic Module Loader matches for graphics DLLs
+                    if line_lower.contains("loaddll") || line_lower.contains("load_module") || line_lower.contains("import_dll") {
+                        let graphics_dlls = ["d3d9", "d3d11", "dxgi", "d3d12", "d3d8", "d3d10core", "libvkd3d"];
+                        for dll in graphics_dlls {
+                            if line_lower.contains(dll) {
+                                let is_failed = line_lower.contains("failed") || line_lower.contains("error");
+                                let is_builtin = line_lower.contains("system32") || (line_lower.contains("builtin") && !line_lower.contains("native"));
+
+                                let evidence_type = if is_failed {
+                                    "Module load FAILED"
+                                } else if is_builtin {
+                                    "Module load (builtin/fallback)"
+                                } else {
+                                    "Module load (likely native)"
+                                };
+
+                                let msg = format!("{}: {}", evidence_type, line.trim());
+                                if !ctx.graphics_stack.graphics_stack_evidence.contains(&msg) {
+                                    ctx.graphics_stack.graphics_stack_evidence.push(msg.clone());
+
+                                    if is_builtin {
+                                        ctx.graphics_stack.runtime_evidence.wined3d.evidence_found = true;
+                                        if ctx.graphics_stack.runtime_evidence.wined3d.evidence.len() < 5 {
+                                            ctx.graphics_stack.runtime_evidence.wined3d.evidence.push(msg);
+                                        }
+                                    }
+                                }
+                                line_matched = true;
+                            }
+                        }
+                    }
+
+                    if line_matched {
+                        ctx.graphics_stack.runtime_evidence.scan_metadata.candidate_matches += 1;
+                    }
+                }
+            }
+        } else {
+            ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = false;
+        }
+
+        // Populate expectations
             ctx.graphics_stack.runtime_evidence.dxvk.expected = ctx.graphics_stack.effective_backend == "DXVK";
             ctx.graphics_stack.runtime_evidence.vkd3d_proton.expected = ctx.graphics_stack.effective_d3d12_provider == "vkd3d-proton";
             ctx.graphics_stack.runtime_evidence.vkd3d.expected = ctx.graphics_stack.effective_d3d12_provider == "vkd3d";
@@ -730,14 +761,19 @@ impl LaunchPipeline {
                     return;
                 }
                 if metadata.line_count == 0 {
-                    item.diagnosis = format!("{} requested; Wine log empty", name);
-                    item.diagnostics_note = "Log file exists but contains no lines. Process may have failed immediately or logging is disabled.".to_string();
+                    if metadata.process_running_during_scan {
+                        item.diagnosis = format!("{} requested; Wine log empty (early scan)", name);
+                        item.diagnostics_note = format!("Log file exists but is empty. Process is still running (retries: {}). Evidence may appear later.", metadata.retries);
+                    } else {
+                        item.diagnosis = format!("{} requested; Wine log empty", name);
+                        item.diagnostics_note = format!("Log file exists but contains no lines after {} retries. Process has exited. Logging may be disabled or failed to initialize.", metadata.retries);
+                    }
                     return;
                 }
 
                 if item.expected {
                     if item.evidence_found {
-                        item.diagnosis = format!("confirmed: {} likely loaded based on runtime evidence", name);
+                        item.diagnosis = format!("confirmed: {} loaded based on runtime evidence", name);
                     } else {
                         item.diagnosis = format!("inconclusive: {} requested but no runtime evidence found", name);
                         item.diagnostics_note = format!("Scanned {} lines, found {} matches for graphics patterns, but none confirmed {} usage.",
@@ -756,6 +792,21 @@ impl LaunchPipeline {
             diagnose(&mut ctx.graphics_stack.runtime_evidence.vkd3d, "VKD3D", &meta);
             diagnose(&mut ctx.graphics_stack.runtime_evidence.wined3d, "WineD3D", &meta);
 
+            // Refinement: Do not mark WineD3D fallback when primary components are confirmed
+            if (ctx.graphics_stack.runtime_evidence.dxvk.evidence_found ||
+                ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found ||
+                ctx.graphics_stack.runtime_evidence.vkd3d.evidence_found) &&
+               !ctx.graphics_stack.runtime_evidence.wined3d.expected
+            {
+                if ctx.graphics_stack.runtime_evidence.wined3d.evidence_found {
+                    let has_strong_wined3d = ctx.graphics_stack.runtime_evidence.wined3d.evidence.iter()
+                        .any(|e| e.contains("Fallback Detected"));
+                    if !has_strong_wined3d {
+                        ctx.graphics_stack.runtime_evidence.wined3d.diagnosis = "neutral: inconclusive (standard builtins loaded)".to_string();
+                    }
+                }
+            }
+
             // Update confidence based on evidence vs expectation
             if ctx.graphics_stack.graphics_stack_evidence.is_empty() {
                 ctx.graphics_stack.graphics_stack_confidence = "low".to_string();
@@ -772,7 +823,6 @@ impl LaunchPipeline {
                     ctx.graphics_stack.graphics_stack_confidence = "medium".to_string();
                 }
             }
-        }
         ctx.graphics_stack.runtime_evidence.scan_metadata.scan_duration_ms = scan_start.elapsed().as_millis();
     }
 
