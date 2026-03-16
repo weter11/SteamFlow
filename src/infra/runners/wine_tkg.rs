@@ -339,6 +339,7 @@ impl Runner for WineTkgRunner {
         let effective_vkd3d_proton = glc.vkd3d_proton_enabled || policy_vkd3dp;
         let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
 
+        let use_symlinks = glc.use_symlinks_in_prefix;
         let mut dll_overrides = crate::utils::build_dll_overrides(
             effective_dxvk,
             effective_vkd3d_proton,
@@ -351,8 +352,9 @@ impl Runner for WineTkgRunner {
 
         // Enhance overrides with resolved DLL providers
         for res in &ctx.dll_resolutions {
-            if let crate::launch::dll_provider_resolver::DllProvider::GameLocal = res.chosen_provider {
-                // Ensure native wins for game-local DLLs
+            if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal ||
+               (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Custom && !use_symlinks) {
+                // Ensure native wins for game-local or non-symlinked custom DLLs
                 if !dll_overrides.contains(&format!("{}=n", res.name)) {
                      dll_overrides.push_str(&format!(";{}=n", res.name));
                 }
@@ -370,9 +372,12 @@ impl Runner for WineTkgRunner {
         // WITHOUT THIS, d3d12=n,b finds whatever is in the prefix's system32 instead.
         // CONSERVATIVE: only include paths for DLLs that are actually requested to be native.
         let mut wine_dll_dirs: Vec<String> = Vec::new();
+        let use_symlinks = glc.use_symlinks_in_prefix;
 
         for res in &ctx.dll_resolutions {
-            if let crate::launch::dll_provider_resolver::DllProvider::Runner = res.chosen_provider {
+            if (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner ||
+                res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Custom) && !use_symlinks
+            {
                 // Check if this DLL is actually selected for use by the current policy/overrides
                 let name = res.name.to_lowercase();
                 let is_dxvk_dll = matches!(name.as_str(), "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi");

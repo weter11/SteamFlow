@@ -72,6 +72,14 @@ pub struct GraphicsLayerConfig {
     pub graphics_backend_policy: GraphicsBackendPolicy,
     #[serde(default)]
     pub d3d12_policy: D3D12ProviderPolicy,
+    #[serde(default)]
+    pub use_symlinks_in_prefix: bool,
+    #[serde(default)]
+    pub custom_dxvk_path: Option<PathBuf>,
+    #[serde(default)]
+    pub custom_vkd3d_path: Option<PathBuf>,
+    #[serde(default)]
+    pub custom_vkd3d_proton_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
