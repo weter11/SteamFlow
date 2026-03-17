@@ -63,6 +63,9 @@ impl DllProviderResolver {
                 "d3d12core".into(),
                 "libvkd3d-1".into(),
                 "libvkd3d-shader-1".into(),
+                "nvapi".into(),
+                "nvapi64".into(),
+                "nvofapi64".into(),
             ],
         }
     }
@@ -156,6 +159,14 @@ impl DllProviderResolver {
                 matched_dll: None,
             });
         }
+        if let Some(ref c) = runner_components.nvapi {
+            report.components_found.insert("nvapi".into(), ComponentFoundInfo {
+                family: "nvapi".into(),
+                version: c.version.clone(),
+                source: format!("{:?}", c.source),
+                matched_dll: None,
+            });
+        }
         if let Some(ref c) = runner_components.vkd3d_proton {
             report.components_found.insert("vkd3d-proton".into(), ComponentFoundInfo {
                 family: "vkd3d-proton".into(),
@@ -188,6 +199,8 @@ impl DllProviderResolver {
                      // Try to match back to component
                      let family = if res.name.starts_with("d3d12") || res.name.contains("vkd3d") {
                          if path.to_string_lossy().contains("vkd3d-proton") { "vkd3d-proton" } else { "vkd3d" }
+                     } else if res.name.contains("nvapi") {
+                         "nvapi"
                      } else {
                          "dxvk"
                      };
@@ -268,6 +281,10 @@ impl DllProviderResolver {
                 "/usr/lib/x86_64-linux-gnu/vkd3d-proton",
                 "/usr/lib/x86_64-linux-gnu", // standard system vkd3d
                 "/usr/lib64",
+            ],
+            "nvapi" | "nvapi64" | "nvofapi64" => vec![
+                "/usr/lib/nvapi/x64",
+                "/usr/lib/x86_64-linux-gnu/nvapi",
             ],
             _ => vec![],
         };
@@ -382,6 +399,40 @@ impl DllProviderResolver {
             ];
 
             // Strictly filter by architecture
+            match target_arch {
+                crate::models::ExecutableArchitecture::X86 => {
+                    relative_paths.retain(|p| p.contains("i386") || !p.contains("windows"));
+                }
+                crate::models::ExecutableArchitecture::X86_64 => {
+                    relative_paths.retain(|p| p.contains("x86_64") || !p.contains("windows"));
+                }
+                _ => {}
+            }
+
+            for rel in relative_paths {
+                let root = runner_root.join(rel);
+                let p = root.join(&dll_filename);
+                if p.exists() {
+                    tracing::trace!("Found runner component DLL at: {}", p.display());
+                    return Some(p);
+                }
+            }
+        }
+
+        let is_nvapi = matches!(dll_name, "nvapi" | "nvapi64" | "nvofapi64");
+        if is_nvapi && components.nvapi.is_some() {
+             let mut relative_paths = vec![
+                "lib/wine/nvapi/x86_64-windows",
+                "lib/wine/nvapi/i386-windows",
+                "files/lib/wine/nvapi/x86_64-windows",
+                "files/lib/wine/nvapi/i386-windows",
+                "dist/lib/wine/nvapi/x86_64-windows",
+                "dist/lib/wine/nvapi/i386-windows",
+                "lib/wine/nvapi",
+                "files/lib/wine/nvapi",
+                "dist/lib/wine/nvapi",
+            ];
+
             match target_arch {
                 crate::models::ExecutableArchitecture::X86 => {
                     relative_paths.retain(|p| p.contains("i386") || !p.contains("windows"));

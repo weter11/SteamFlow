@@ -119,6 +119,7 @@ pub struct RunnerComponents {
     pub dxvk: Option<ComponentInfo>,
     pub vkd3d_proton: Option<ComponentInfo>,
     pub vkd3d: Option<ComponentInfo>,
+    pub nvapi: Option<ComponentInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,10 +167,11 @@ pub fn detect_runner_components(
 ) -> RunnerComponents {
     let root = derive_runner_root(runner_path);
 
-    let (dxvk, vkd3d_proton, vkd3d) = (
+    let (dxvk, vkd3d_proton, vkd3d, nvapi) = (
         detect_dxvk(&root, wineprefix),
         detect_vkd3d_proton(&root, wineprefix),
         detect_vkd3d(&root, wineprefix),
+        detect_nvapi(&root, wineprefix),
     );
 
 
@@ -177,6 +179,7 @@ pub fn detect_runner_components(
         dxvk,
         vkd3d_proton,
         vkd3d,
+        nvapi,
     }
 }
 
@@ -372,6 +375,57 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
 }
 
 // ── VKD3D (upstream) ─────────────────────────────────────────────────────────
+
+fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 1. Bundled inside runner (Modern Wine-TKG layout)
+    let comp_subdirs = ["lib/wine/nvapi", "files/lib/wine/nvapi", "dist/lib/wine/nvapi"];
+
+    for subdir in comp_subdirs {
+        let comp_path = root.join(subdir);
+        if comp_path.is_dir() {
+            // Check arch subfolders
+            for arch in ["x86_64-windows", "i386-windows"] {
+                let arch_path = comp_path.join(arch);
+                let dlls = if arch == "x86_64-windows" {
+                    vec!["nvapi64.dll"]
+                } else {
+                    vec!["nvapi.dll"]
+                };
+
+                if dlls.iter().all(|dll| arch_path.join(dll).exists()) {
+                    let version = ["version", "../version"]
+                        .iter()
+                        .filter_map(|v| {
+                            let p = arch_path.join(v);
+                            std::fs::read_to_string(p).ok()
+                        })
+                        .map(|s| parse_short_version(&s))
+                        .find(|s| s != "unknown")
+                        .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Installed into WINEPREFIX
+    if let Some(pfx) = prefix {
+        let prefix_dlls = [
+            "drive_c/windows/system32/nvapi64.dll",
+            "drive_c/windows/syswow64/nvapi.dll",
+        ];
+        if let Some(info) = check_prefix(pfx, &prefix_dlls, "NVAPI") {
+            return Some(info);
+        }
+    }
+
+    None
+}
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     // 1. Modern Wine-TKG layout
@@ -878,16 +932,18 @@ pub fn detect_exe_architecture(exe_path: &Path) -> crate::models::ExecutableArch
 }
 
 pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
-    let (dxvk, vkd3d_proton, vkd3d) = (
+    let (dxvk, vkd3d_proton, vkd3d, nvapi) = (
         detect_dxvk(path, None),
         detect_vkd3d_proton(path, None),
         detect_vkd3d(path, None),
+        detect_nvapi(path, None),
     );
 
     crate::utils::RunnerComponents {
         dxvk,
         vkd3d_proton,
         vkd3d,
+        nvapi,
     }
 }
 
@@ -1076,20 +1132,14 @@ pub fn cleanup_dll_symlinks(prefix: &Path) -> Result<()> {
 pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,
-    user_configs: &crate::models::UserConfigStore,
+    _user_configs: &crate::models::UserConfigStore,
 ) -> std::path::PathBuf {
-    let mode = user_configs
-        .get(&app_id)
-        .map(|c| c.steam_prefix_mode.clone())
-        .unwrap_or_default();
-
-    match mode {
-        crate::models::SteamPrefixMode::Shared => resolve_master_wineprefix(),
-        crate::models::SteamPrefixMode::PerGame => {
-            std::path::PathBuf::from(&config.steam_library_path)
-                .join("steamapps/compatdata")
-                .join(app_id.to_string())
-                .join("pfx")
-        }
+    if config.use_shared_compat_data {
+        std::path::PathBuf::from(&config.steam_library_path)
+            .join("steamapps/compatdata")
+            .join(app_id.to_string())
+            .join("pfx")
+    } else {
+        resolve_master_wineprefix()
     }
 }

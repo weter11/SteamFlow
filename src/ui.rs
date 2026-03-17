@@ -1402,6 +1402,7 @@ impl SteamLauncher {
                             row("DXVK:", &c.dxvk);
                             row("VKD3D-Proton:", &c.vkd3d_proton);
                             row("VKD3D:", &c.vkd3d);
+                            row("NVAPI:", &c.nvapi);
                         });
                 });
             }
@@ -2426,6 +2427,7 @@ impl eframe::App for SteamLauncher {
                                         row("DXVK:", &c.dxvk);
                                         row("VKD3D-Proton:", &c.vkd3d_proton);
                                         row("VKD3D:", &c.vkd3d);
+                                        row("NVAPI:", &c.nvapi);
                                     });
                             });
                         }
