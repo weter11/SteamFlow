@@ -1300,7 +1300,47 @@ impl SteamLauncher {
             }
 
             ui.add_space(8.0);
-            ui.heading("Manual Overrides");
+            ui.heading("Deployment Mode");
+            if ui.checkbox(&mut glc.use_symlinks_in_prefix, "Use symlinks instead of WINEDLLPATH")
+                .on_hover_text("Deploys translation DLLs directly into the Wine prefix system directories. \
+                                Recommended for games that ignore environment-based DLL injection.")
+                .changed() {
+                gl_changed = true;
+            }
+
+            ui.add_space(8.0);
+            ui.heading("Custom Components");
+            ui.label(egui::RichText::new("Point to a directory containing x86_64-windows and i386-windows subfolders.").small());
+
+            ui.horizontal(|ui| {
+                ui.label("Custom DXVK Path:");
+                let mut path_str = glc.custom_dxvk_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                if ui.text_edit_singleline(&mut path_str).changed() {
+                    glc.custom_dxvk_path = if path_str.is_empty() { None } else { Some(PathBuf::from(path_str)) };
+                    gl_changed = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Custom VKD3D Path:");
+                let mut path_str = glc.custom_vkd3d_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                if ui.text_edit_singleline(&mut path_str).changed() {
+                    glc.custom_vkd3d_path = if path_str.is_empty() { None } else { Some(PathBuf::from(path_str)) };
+                    gl_changed = true;
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Custom VKD3D-Proton Path:");
+                let mut path_str = glc.custom_vkd3d_proton_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                if ui.text_edit_singleline(&mut path_str).changed() {
+                    glc.custom_vkd3d_proton_path = if path_str.is_empty() { None } else { Some(PathBuf::from(path_str)) };
+                    gl_changed = true;
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.heading("Manual Overrides (advanced)");
             ui.horizontal(|ui| {
                 if ui.checkbox(&mut glc.dxvk_enabled, "Force DXVK").on_hover_text("Always use DXVK for DX8-11, ignoring policy.").changed() {
                     gl_changed = true;
@@ -1343,10 +1383,13 @@ impl SteamLauncher {
                                             } else {
                                                 format!("{}", c.source)
                                             };
-                                            ui.colored_label(
+                                            let label = ui.colored_label(
                                                 egui::Color32::GRAY,
                                                 format!("({})", source_text),
                                             );
+                                            if let Some(path) = &c.path {
+                                                label.on_hover_text(path.to_string_lossy());
+                                            }
                                         }
                                         None => {
                                             ui.colored_label(egui::Color32::GRAY, "not found");
@@ -1359,6 +1402,7 @@ impl SteamLauncher {
                             row("DXVK:", &c.dxvk);
                             row("VKD3D-Proton:", &c.vkd3d_proton);
                             row("VKD3D:", &c.vkd3d);
+                            row("NVAPI:", &c.nvapi);
                         });
                 });
             }
@@ -1742,10 +1786,40 @@ impl SteamLauncher {
         } else {
             None
         };
-        self.runner_components = Some(crate::utils::detect_runner_components(
+        let mut components = crate::utils::detect_runner_components(
             runner_path,
             wineprefix.as_deref(),
-        ));
+        );
+
+        // Overlay custom components if set
+        if let Some(config) = self.user_configs.get(&app_id) {
+            if let Some(path) = &config.graphics_layers.custom_dxvk_path {
+                let custom = crate::utils::detect_custom_components(path);
+                if let Some(mut info) = custom.dxvk {
+                    info.source = crate::utils::ComponentSource::SystemWide; // Hack: display as custom/system
+                    info.path = Some(path.clone());
+                    components.dxvk = Some(info);
+                }
+            }
+            if let Some(path) = &config.graphics_layers.custom_vkd3d_proton_path {
+                let custom = crate::utils::detect_custom_components(path);
+                if let Some(mut info) = custom.vkd3d_proton {
+                    info.source = crate::utils::ComponentSource::SystemWide;
+                    info.path = Some(path.clone());
+                    components.vkd3d_proton = Some(info);
+                }
+            }
+            if let Some(path) = &config.graphics_layers.custom_vkd3d_path {
+                let custom = crate::utils::detect_custom_components(path);
+                if let Some(mut info) = custom.vkd3d {
+                    info.source = crate::utils::ComponentSource::SystemWide;
+                    info.path = Some(path.clone());
+                    components.vkd3d = Some(info);
+                }
+            }
+        }
+
+        self.runner_components = Some(components);
     }
 
     fn draw_uninstall_modal(&mut self, ctx: &egui::Context) {
@@ -2334,10 +2408,13 @@ impl eframe::App for SteamLauncher {
                                                         } else {
                                                             format!("{}", c.source)
                                                         };
-                                                        ui.colored_label(
+                                                        let label = ui.colored_label(
                                                             egui::Color32::GRAY,
                                                             format!("({})", source_text),
                                                         );
+                                                        if let Some(path) = &c.path {
+                                                            label.on_hover_text(path.to_string_lossy());
+                                                        }
                                                     }
                                                     None => {
                                                         ui.colored_label(egui::Color32::GRAY, "not found");
@@ -2350,6 +2427,7 @@ impl eframe::App for SteamLauncher {
                                         row("DXVK:", &c.dxvk);
                                         row("VKD3D-Proton:", &c.vkd3d_proton);
                                         row("VKD3D:", &c.vkd3d);
+                                        row("NVAPI:", &c.nvapi);
                                     });
                             });
                         }

@@ -49,6 +49,16 @@ impl PipelineStage for ResolveDllProvidersStage {
         let components = crate::utils::detect_runner_components(&resolved_runner, wineprefix.as_deref());
         let d3d12_policy = ctx.user_config.as_ref().map(|c| c.graphics_layers.d3d12_policy.clone()).unwrap_or_default();
 
+        let (custom_dxvk, custom_vkd3d, custom_vkd3d_proton) = if let Some(config) = &ctx.user_config {
+            (
+                config.graphics_layers.custom_dxvk_path.as_deref(),
+                config.graphics_layers.custom_vkd3d_path.as_deref(),
+                config.graphics_layers.custom_vkd3d_proton_path.as_deref(),
+            )
+        } else {
+            (None, None, None)
+        };
+
         // Detect architecture before resolution
         let mut exe_path = PathBuf::from(install_path);
         if let Some(info) = &ctx.launch_info {
@@ -68,7 +78,16 @@ impl PipelineStage for ResolveDllProvidersStage {
             }
         }
 
-        let (resolutions, scan_report) = resolver.resolve(&game_exe_dir, &resolved_runner, &components, &d3d12_policy, &ctx.target_architecture);
+        let (resolutions, scan_report) = resolver.resolve(
+            &game_exe_dir,
+            &resolved_runner,
+            &components,
+            &d3d12_policy,
+            &ctx.target_architecture,
+            custom_dxvk,
+            custom_vkd3d,
+            custom_vkd3d_proton,
+        );
         ctx.dll_resolutions = resolutions;
 
         // Strict Backend Policy Enforcement

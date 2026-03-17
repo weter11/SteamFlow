@@ -18,15 +18,21 @@ impl Runner for WineTkgRunner {
             .map(|c| c.steam_prefix_mode.clone())
             .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
 
-        let compat_data_path = library_root
-            .join("steamapps")
-            .join("compatdata")
-            .join(ctx.app.app_id.to_string());
-        let target_prefix_path = compat_data_path.join("pfx");
-        std::fs::create_dir_all(&target_prefix_path)
-            .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", target_prefix_path.display())).with_source(anyhow!(e)))?;
+        let effective_game_prefix = crate::utils::steam_wineprefix_for_game(
+            &ctx.launcher_config,
+            ctx.app.app_id,
+            &ctx.user_config.as_ref().map(|c| {
+                let mut store = HashMap::new();
+                store.insert(ctx.app.app_id, c.clone());
+                store
+            }).unwrap_or_default().into()
+        );
+        std::fs::create_dir_all(&effective_game_prefix)
+            .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", effective_game_prefix.display())).with_source(anyhow!(e)))?;
 
-        let mut steam_wineprefix = target_prefix_path.clone();
+        tracing::info!("Effective game prefix: {}", effective_game_prefix.display());
+        tracing::info!("Shared steam compatibility data enabled: {}", ctx.launcher_config.use_shared_compat_data);
+        tracing::info!("Steam Runtime Prefix Mode: {:?}", steam_prefix_mode);
 
         if use_steam_runtime {
             let base_config = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
@@ -46,51 +52,74 @@ impl Runner for WineTkgRunner {
                     ).with_context("master_prefix", master_prefix.to_string_lossy()));
                 }
                 Some(master_steam_dir) => {
-                    let master_wineprefix_original = crate::utils::resolve_master_wineprefix();
-
-                    let prefix_steam_dir = match steam_prefix_mode {
+                    let (prefix_steam_dir, steam_wineprefix) = match steam_prefix_mode {
                         crate::models::SteamPrefixMode::Shared => {
-                            steam_wineprefix = master_wineprefix_original.clone();
-                            master_steam_dir.clone()
+                            (master_steam_dir.clone(), crate::utils::resolve_master_wineprefix())
                         }
                         crate::models::SteamPrefixMode::PerGame => {
-                            let target_steam_dir = target_prefix_path
+                            let target_steam_dir = effective_game_prefix
                                 .join("drive_c/Program Files (x86)/Steam");
 
                             tracing::info!(
-                                "Linking/Cloning {} → {}",
-                                master_steam_dir.display(),
+                                "Deploying required Steam runtime files to {}",
                                 target_steam_dir.display()
                             );
-                            let _ = std::fs::create_dir_all(target_steam_dir.parent().unwrap());
-                            #[cfg(unix)]
-                            {
-                                if !target_steam_dir.exists() {
-                                    if let Err(e) =
-                                        std::os::unix::fs::symlink(&master_steam_dir, &target_steam_dir)
+                            let _ = std::fs::create_dir_all(&target_steam_dir);
+
+                            let required_files = [
+                                "steam.exe",
+                                "steamclient.dll",
+                                "steamclient64.dll",
+                                "tier0_s.dll",
+                                "tier0_s64.dll",
+                                "vstdlib_s.dll",
+                                "vstdlib_s64.dll",
+                            ];
+
+                            for file in required_files {
+                                let src = master_steam_dir.join(file);
+                                let dst = target_steam_dir.join(file);
+                                if src.exists() && !dst.exists() {
+                                    #[cfg(unix)]
                                     {
-                                        tracing::warn!("Symlink failed, falling back to copy: {}", e);
-                                        let _ = crate::utils::copy_dir_all(
-                                            &master_steam_dir,
-                                            &target_steam_dir,
-                                        );
+                                        if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                                            tracing::warn!("Symlink failed for {}, falling back to copy: {}", file, e);
+                                            let _ = std::fs::copy(&src, &dst);
+                                        }
+                                    }
+                                    #[cfg(not(unix))]
+                                    {
+                                        let _ = std::fs::copy(&src, &dst);
                                     }
                                 }
                             }
-                            #[cfg(not(unix))]
-                            {
-                                let _ = crate::utils::copy_dir_all(
-                                    &master_steam_dir,
-                                    &target_steam_dir,
-                                );
+
+                            // Also symlink required subdirectories
+                            let required_dirs = ["bin", "public"];
+                            for dir in required_dirs {
+                                let src = master_steam_dir.join(dir);
+                                let dst = target_steam_dir.join(dir);
+                                if src.exists() && !dst.exists() {
+                                    #[cfg(unix)]
+                                    {
+                                        if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                                            tracing::warn!("Symlink failed for {}, falling back to copy: {}", dir, e);
+                                            let _ = crate::utils::copy_dir_all(&src, &dst);
+                                        }
+                                    }
+                                    #[cfg(not(unix))]
+                                    {
+                                        let _ = crate::utils::copy_dir_all(&src, &dst);
+                                    }
+                                }
                             }
-                            target_steam_dir
+
+                            (target_steam_dir, effective_game_prefix.clone())
                         }
                     };
 
-                    println!("--- STEAM LAUNCH DEBUG ---");
-                    println!("Prefix Steam dir : {}", prefix_steam_dir.display());
-                    println!("Steam WINEPREFIX : {}", steam_wineprefix.display());
+                    tracing::debug!("Runtime Steam dir : {}", prefix_steam_dir.display());
+                    tracing::debug!("Runtime WINEPREFIX : {}", steam_wineprefix.display());
 
                     SteamClient::write_headless_steam_cfg(&prefix_steam_dir);
 
@@ -254,25 +283,24 @@ impl Runner for WineTkgRunner {
         let app_id_str = ctx.app.app_id.to_string();
 
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
-        let steam_prefix_mode = ctx.user_config.as_ref()
-            .map(|c| c.steam_prefix_mode.clone())
-            .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
-        let use_steam_runtime = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
-
         let compat_data_path = library_root
             .join("steamapps")
             .join("compatdata")
             .join(&app_id_str);
-        let target_prefix_path = compat_data_path.join("pfx");
 
-        let mut game_wineprefix = target_prefix_path.clone();
-        if use_steam_runtime && matches!(steam_prefix_mode, crate::models::SteamPrefixMode::Shared) {
-            game_wineprefix = crate::utils::resolve_master_wineprefix();
-        }
+        let effective_game_prefix = crate::utils::steam_wineprefix_for_game(
+            &ctx.launcher_config,
+            ctx.app.app_id,
+            &ctx.user_config.as_ref().map(|c| {
+                let mut store = HashMap::new();
+                store.insert(ctx.app.app_id, c.clone());
+                store
+            }).unwrap_or_default().into()
+        );
 
         env.insert("SteamAppId".to_string(), app_id_str.clone());
         env.insert("SteamGameId".to_string(), app_id_str);
-        env.insert("WINEPREFIX".to_string(), game_wineprefix.to_string_lossy().to_string());
+        env.insert("WINEPREFIX".to_string(), effective_game_prefix.to_string_lossy().to_string());
         env.insert("STEAM_COMPAT_DATA_PATH".to_string(), compat_data_path.to_string_lossy().to_string());
 
         let glc = ctx.user_config.as_ref()
@@ -310,7 +338,7 @@ impl Runner for WineTkgRunner {
 
         let _components = crate::utils::detect_runner_components(
             &crate::utils::resolve_runner(proton, &library_root),
-            Some(&game_wineprefix),
+            Some(&effective_game_prefix),
         );
 
         // 1. Resolve DX8-11 policy (GraphicsBackendPolicy) - CONSERVATIVE
@@ -339,6 +367,13 @@ impl Runner for WineTkgRunner {
         let effective_vkd3d_proton = glc.vkd3d_proton_enabled || policy_vkd3dp;
         let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
 
+        // NVAPI Support
+        let nvapi_active = _components.nvapi.is_some();
+        if nvapi_active {
+            tracing::info!("NVAPI component detected, will be exposed to game");
+        }
+
+        let use_symlinks = glc.use_symlinks_in_prefix;
         let mut dll_overrides = crate::utils::build_dll_overrides(
             effective_dxvk,
             effective_vkd3d_proton,
@@ -351,8 +386,10 @@ impl Runner for WineTkgRunner {
 
         // Enhance overrides with resolved DLL providers
         for res in &ctx.dll_resolutions {
-            if let crate::launch::dll_provider_resolver::DllProvider::GameLocal = res.chosen_provider {
-                // Ensure native wins for game-local DLLs
+            if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal ||
+               (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Custom && !use_symlinks) ||
+               (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner && res.name.contains("nvapi")) {
+                // Ensure native wins for game-local or non-symlinked custom DLLs
                 if !dll_overrides.contains(&format!("{}=n", res.name)) {
                      dll_overrides.push_str(&format!(";{}=n", res.name));
                 }
@@ -370,15 +407,19 @@ impl Runner for WineTkgRunner {
         // WITHOUT THIS, d3d12=n,b finds whatever is in the prefix's system32 instead.
         // CONSERVATIVE: only include paths for DLLs that are actually requested to be native.
         let mut wine_dll_dirs: Vec<String> = Vec::new();
+        let use_symlinks = glc.use_symlinks_in_prefix;
 
         for res in &ctx.dll_resolutions {
-            if let crate::launch::dll_provider_resolver::DllProvider::Runner = res.chosen_provider {
+            if (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner ||
+                res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Custom) && !use_symlinks
+            {
                 // Check if this DLL is actually selected for use by the current policy/overrides
                 let name = res.name.to_lowercase();
                 let is_dxvk_dll = matches!(name.as_str(), "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi");
                 let is_d3d12_dll = matches!(name.as_str(), "d3d12" | "d3d12core" | "libvkd3d-1" | "libvkd3d-shader-1");
 
-                let selected = (is_dxvk_dll && effective_dxvk) || (is_d3d12_dll && (effective_vkd3d_proton || effective_vkd3d));
+                let is_nvapi_dll = matches!(name.as_str(), "nvapi" | "nvapi64" | "nvofapi64");
+                let selected = (is_dxvk_dll && effective_dxvk) || (is_d3d12_dll && (effective_vkd3d_proton || effective_vkd3d)) || is_nvapi_dll;
 
                 if !selected {
                     continue;

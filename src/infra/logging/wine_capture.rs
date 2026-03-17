@@ -2,7 +2,11 @@ pub fn classify_graphics_evidence(log_line: &str) -> Option<String> {
     let line_lower = log_line.to_lowercase();
 
     // DXVK signatures
-    if line_lower.contains("dxvk: v") {
+    if line_lower.contains("dxvk: v") ||
+       line_lower.contains("info:  game:") ||
+       line_lower.contains("d3d11internalcreatedevice") ||
+       line_lower.contains("presenter: actual swapchain properties") ||
+       (line_lower.contains("vulkan:") && line_lower.contains("found vkgetinstanceprocaddr")) {
         return Some(format!("DXVK Detected: {}", log_line.trim()));
     }
 

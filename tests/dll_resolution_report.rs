@@ -20,6 +20,7 @@ fn test_dll_resolution_report_includes_runner_candidates() {
     components.dxvk = Some(steamflow::utils::ComponentInfo {
         version: "2.3".into(),
         source: steamflow::utils::ComponentSource::BundledWithRunner,
+        path: None,
     });
 
     let resolver = DllProviderResolver::new();
@@ -28,7 +29,10 @@ fn test_dll_resolution_report_includes_runner_candidates() {
         &proton_script,
         &components,
         &D3D12ProviderPolicy::Auto,
-        &steamflow::models::ExecutableArchitecture::X86_64
+        &steamflow::models::ExecutableArchitecture::X86_64,
+        None,
+        None,
+        None,
     );
 
     let d3d11 = resolutions.iter().find(|r| r.name == "d3d11").unwrap();

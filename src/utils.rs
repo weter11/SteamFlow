@@ -119,12 +119,14 @@ pub struct RunnerComponents {
     pub dxvk: Option<ComponentInfo>,
     pub vkd3d_proton: Option<ComponentInfo>,
     pub vkd3d: Option<ComponentInfo>,
+    pub nvapi: Option<ComponentInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentInfo {
     pub version: String,
     pub source: ComponentSource,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,10 +167,11 @@ pub fn detect_runner_components(
 ) -> RunnerComponents {
     let root = derive_runner_root(runner_path);
 
-    let (dxvk, vkd3d_proton, vkd3d) = (
+    let (dxvk, vkd3d_proton, vkd3d, nvapi) = (
         detect_dxvk(&root, wineprefix),
         detect_vkd3d_proton(&root, wineprefix),
         detect_vkd3d(&root, wineprefix),
+        detect_nvapi(&root, wineprefix),
     );
 
 
@@ -176,6 +179,7 @@ pub fn detect_runner_components(
         dxvk,
         vkd3d_proton,
         vkd3d,
+        nvapi,
     }
 }
 
@@ -238,6 +242,7 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
                     return Some(ComponentInfo {
                         version,
                         source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
                     });
                 }
             }
@@ -312,6 +317,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
                     return Some(ComponentInfo {
                         version,
                         source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
                     });
                 }
             }
@@ -353,6 +359,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
                     return Some(ComponentInfo {
                         version,
                         source: ComponentSource::InstalledInPrefix,
+                        path: Some(p),
                     });
                 }
             }
@@ -368,6 +375,57 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
 }
 
 // ── VKD3D (upstream) ─────────────────────────────────────────────────────────
+
+fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 1. Bundled inside runner (Modern Wine-TKG layout)
+    let comp_subdirs = ["lib/wine/nvapi", "files/lib/wine/nvapi", "dist/lib/wine/nvapi"];
+
+    for subdir in comp_subdirs {
+        let comp_path = root.join(subdir);
+        if comp_path.is_dir() {
+            // Check arch subfolders
+            for arch in ["x86_64-windows", "i386-windows"] {
+                let arch_path = comp_path.join(arch);
+                let dlls = if arch == "x86_64-windows" {
+                    vec!["nvapi64.dll"]
+                } else {
+                    vec!["nvapi.dll"]
+                };
+
+                if dlls.iter().all(|dll| arch_path.join(dll).exists()) {
+                    let version = ["version", "../version"]
+                        .iter()
+                        .filter_map(|v| {
+                            let p = arch_path.join(v);
+                            std::fs::read_to_string(p).ok()
+                        })
+                        .map(|s| parse_short_version(&s))
+                        .find(|s| s != "unknown")
+                        .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Installed into WINEPREFIX
+    if let Some(pfx) = prefix {
+        let prefix_dlls = [
+            "drive_c/windows/system32/nvapi64.dll",
+            "drive_c/windows/syswow64/nvapi.dll",
+        ];
+        if let Some(info) = check_prefix(pfx, &prefix_dlls, "NVAPI") {
+            return Some(info);
+        }
+    }
+
+    None
+}
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     // 1. Modern Wine-TKG layout
@@ -393,6 +451,7 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
                     return Some(ComponentInfo {
                         version,
                         source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
                     });
                 }
             }
@@ -433,6 +492,7 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
                 return Some(ComponentInfo {
                     version,
                     source: ComponentSource::InstalledInPrefix,
+                    path: Some(p),
                 });
             }
         }
@@ -481,6 +541,7 @@ fn check_bundled(root: &Path, dll_candidates: &[&str], version_files: &[&str]) -
     Some(ComponentInfo {
         version,
         source: ComponentSource::BundledWithRunner,
+        path: root.join(found_dll.unwrap()).parent().map(|p| p.to_path_buf()),
     })
 }
 
@@ -498,6 +559,7 @@ fn check_prefix(prefix: &Path, dll_candidates: &[&str], _name: &str) -> Option<C
             return Some(ComponentInfo {
                 version,
                 source: ComponentSource::InstalledInPrefix,
+                path: Some(p),
             });
         }
     }
@@ -514,6 +576,7 @@ fn check_system(paths: &[&str]) -> Option<ComponentInfo> {
             return Some(ComponentInfo {
                 version,
                 source: ComponentSource::SystemWide,
+                path: Some(p.to_path_buf()),
             });
         }
     }
@@ -868,23 +931,215 @@ pub fn detect_exe_architecture(exe_path: &Path) -> crate::models::ExecutableArch
     }
 }
 
+pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
+    let (dxvk, vkd3d_proton, vkd3d, nvapi) = (
+        detect_dxvk(path, None),
+        detect_vkd3d_proton(path, None),
+        detect_vkd3d(path, None),
+        detect_nvapi(path, None),
+    );
+
+    crate::utils::RunnerComponents {
+        dxvk,
+        vkd3d_proton,
+        vkd3d,
+        nvapi,
+    }
+}
+
+pub fn deploy_dll_symlinks(
+    prefix: &Path,
+    resolutions: &[crate::launch::dll_provider_resolver::DllResolution],
+    target_arch: &crate::models::ExecutableArchitecture,
+) -> Result<Vec<PathBuf>> {
+    let mut deployed = Vec::new();
+    let is_64bit_prefix = prefix.join("drive_c/windows/syswow64").exists();
+
+    for res in resolutions {
+        if res.chosen_provider != crate::launch::dll_provider_resolver::DllProvider::Runner &&
+           res.chosen_provider != crate::launch::dll_provider_resolver::DllProvider::Custom {
+            continue;
+        }
+
+        if let Some(src_path) = &res.chosen_path {
+            let dll_name = format!("{}.dll", res.name);
+
+            // Determine destination directory in prefix
+            let dest_dir = match target_arch {
+                crate::models::ExecutableArchitecture::X86_64 => {
+                    prefix.join("drive_c/windows/system32")
+                }
+                crate::models::ExecutableArchitecture::X86 => {
+                    if is_64bit_prefix {
+                        prefix.join("drive_c/windows/syswow64")
+                    } else {
+                        prefix.join("drive_c/windows/system32")
+                    }
+                }
+                _ => continue,
+            };
+
+            if !dest_dir.exists() {
+                continue;
+            }
+
+            let dest_path = dest_dir.join(&dll_name);
+
+            // Safety check: if it exists and is not a symlink, back it up or skip?
+            // Usually we want to replace it if it's a Wine builtin.
+            if dest_path.exists() {
+                let meta = std::fs::symlink_metadata(&dest_path)?;
+                if !meta.file_type().is_symlink() {
+                    let backup = dest_path.with_extension("dll.bak");
+                    if !backup.exists() {
+                        tracing::info!("Backing up original DLL: {} -> {}", dest_path.display(), backup.display());
+                        std::fs::rename(&dest_path, &backup)?;
+                    } else {
+                        // Backup already exists, just remove the original to make room for symlink
+                        std::fs::remove_file(&dest_path)?;
+                    }
+                } else {
+                    // It's already a symlink, remove it to update
+                    std::fs::remove_file(&dest_path)?;
+                }
+            }
+
+            tracing::info!("Symlinking {} -> {}", src_path.display(), dest_path.display());
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(src_path, &dest_path)?;
+            #[cfg(not(unix))]
+            std::fs::copy(src_path, &dest_path)?;
+
+            deployed.push(dest_path);
+
+            // Also try to deploy the "other" architecture if it's a 64-bit prefix and we have it
+            if is_64bit_prefix {
+                let (other_arch, other_dir) = match target_arch {
+                    crate::models::ExecutableArchitecture::X86_64 => (
+                        crate::models::ExecutableArchitecture::X86,
+                        prefix.join("drive_c/windows/syswow64")
+                    ),
+                    crate::models::ExecutableArchitecture::X86 => (
+                        crate::models::ExecutableArchitecture::X86_64,
+                        prefix.join("drive_c/windows/system32")
+                    ),
+                    _ => continue,
+                };
+
+                // We need to find the sibling DLL.
+                // This is a bit tricky because we don't have the full resolution for the other arch here.
+                // But we can guess based on common layouts.
+                if let Some(other_src) = find_sibling_dll(src_path, target_arch, &other_arch) {
+                    let other_dest = other_dir.join(&dll_name);
+                    if other_dest.exists() {
+                        let meta = std::fs::symlink_metadata(&other_dest)?;
+                        if !meta.file_type().is_symlink() {
+                            let backup = other_dest.with_extension("dll.bak");
+                            if !backup.exists() {
+                                std::fs::rename(&other_dest, &backup)?;
+                            } else {
+                                std::fs::remove_file(&other_dest)?;
+                            }
+                        } else {
+                            std::fs::remove_file(&other_dest)?;
+                        }
+                    }
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&other_src, &other_dest)?;
+                    #[cfg(not(unix))]
+                    std::fs::copy(&other_src, &other_dest)?;
+                    deployed.push(other_dest);
+                }
+            }
+        }
+    }
+
+    Ok(deployed)
+}
+
+fn find_sibling_dll(
+    path: &Path,
+    current_arch: &crate::models::ExecutableArchitecture,
+    target_arch: &crate::models::ExecutableArchitecture,
+) -> Option<PathBuf> {
+    let (current_tag, target_tag) = match (current_arch, target_arch) {
+        (crate::models::ExecutableArchitecture::X86_64, crate::models::ExecutableArchitecture::X86) => ("x86_64", "i386"),
+        (crate::models::ExecutableArchitecture::X86, crate::models::ExecutableArchitecture::X86_64) => ("i386", "x86_64"),
+        _ => return None,
+    };
+
+    let path_str = path.to_string_lossy();
+    if path_str.contains(current_tag) {
+        let other_str = path_str.replace(current_tag, target_tag);
+        let other_path = PathBuf::from(other_str);
+        if other_path.exists() {
+            return Some(other_path);
+        }
+    }
+
+    // Also check for x64/x32 variant
+    let (current_tag2, target_tag2) = match (current_arch, target_arch) {
+        (crate::models::ExecutableArchitecture::X86_64, crate::models::ExecutableArchitecture::X86) => ("x64", "x32"),
+        (crate::models::ExecutableArchitecture::X86, crate::models::ExecutableArchitecture::X86_64) => ("x32", "x64"),
+        _ => return None,
+    };
+    if path_str.contains(current_tag2) {
+        let other_str = path_str.replace(current_tag2, target_tag2);
+        let other_path = PathBuf::from(other_str);
+        if other_path.exists() {
+            return Some(other_path);
+        }
+    }
+
+    None
+}
+
+pub fn cleanup_dll_symlinks(prefix: &Path) -> Result<()> {
+    let target_dlls = [
+        "d3d8.dll", "d3d9.dll", "dxgi.dll", "d3d10.dll", "d3d10_1.dll", "d3d10core.dll",
+        "d3d11.dll", "d3d12.dll", "d3d12core.dll", "libvkd3d-1.dll", "libvkd3d-shader-1.dll"
+    ];
+
+    let dirs = [
+        prefix.join("drive_c/windows/system32"),
+        prefix.join("drive_c/windows/syswow64"),
+    ];
+
+    for dir in dirs {
+        if !dir.exists() { continue; }
+        for dll in &target_dlls {
+            let p = dir.join(dll);
+            if p.exists() {
+                let meta = std::fs::symlink_metadata(&p)?;
+                if meta.file_type().is_symlink() {
+                    tracing::info!("Cleaning up symlink: {}", p.display());
+                    std::fs::remove_file(&p)?;
+
+                    // Restore backup if it exists
+                    let backup = p.with_extension("dll.bak");
+                    if backup.exists() {
+                        tracing::info!("Restoring backup: {} -> {}", backup.display(), p.display());
+                        std::fs::rename(&backup, &p)?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,
-    user_configs: &crate::models::UserConfigStore,
+    _user_configs: &crate::models::UserConfigStore,
 ) -> std::path::PathBuf {
-    let mode = user_configs
-        .get(&app_id)
-        .map(|c| c.steam_prefix_mode.clone())
-        .unwrap_or_default();
-
-    match mode {
-        crate::models::SteamPrefixMode::Shared => resolve_master_wineprefix(),
-        crate::models::SteamPrefixMode::PerGame => {
-            std::path::PathBuf::from(&config.steam_library_path)
-                .join("steamapps/compatdata")
-                .join(app_id.to_string())
-                .join("pfx")
-        }
+    if config.use_shared_compat_data {
+        std::path::PathBuf::from(&config.steam_library_path)
+            .join("steamapps/compatdata")
+            .join(app_id.to_string())
+            .join("pfx")
+    } else {
+        resolve_master_wineprefix()
     }
 }
