@@ -39,13 +39,24 @@ pub struct LaunchSummary {
     pub warnings: Vec<crate::launch::pipeline::CompatibilityWarning>,
     #[serde(default)]
     pub graphics_stack: Option<crate::launch::pipeline::GraphicsStackInfo>,
+    #[serde(default)]
+    pub verification: LaunchVerification,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct LaunchVerification {
+    pub status: String, // "verified", "uncertain", "failed_after_spawn", "not_verified"
+    pub process_lifetime_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub log_growth_observed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchResult {
     Success,
     Failure,
-    Degraded, // Process spawned but policy was violated
+    Degraded, // Process spawned but policy was violated (e.g. WineD3D fallback when DXVK requested)
+    Uncertain, // Process spawned but exited early or evidence is missing
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

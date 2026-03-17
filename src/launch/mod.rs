@@ -3,6 +3,9 @@ pub mod stages;
 pub mod validators;
 pub mod dll_provider_resolver;
 
+#[cfg(test)]
+mod verification_tests;
+
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context, anyhow};
 use crate::config::{config_dir, LauncherConfig};

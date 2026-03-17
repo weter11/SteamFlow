@@ -92,6 +92,7 @@ pub struct PipelineContext {
     pub warnings: Vec<CompatibilityWarning>,
     pub graphics_stack: GraphicsStackInfo,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
+    pub verification: crate::infra::logging::LaunchVerification,
 }
 
 impl PipelineContext {
@@ -115,6 +116,7 @@ impl PipelineContext {
             warnings: Vec::new(),
             graphics_stack: GraphicsStackInfo::default(),
             dll_resolutions: Vec::new(),
+            verification: crate::infra::logging::LaunchVerification::default(),
         }
     }
 
@@ -296,6 +298,7 @@ pub fn detect_duplicate_instance(ctx: &PipelineContext) -> DuplicateInstanceInfo
         }
     }
 
+
     // 2. Check for tracked PID if we had a mechanism to store it
     // For now, check if steam.pid exists in the prefix (if applicable)
     if let Some(spec) = &ctx.command_spec {
@@ -344,6 +347,38 @@ pub struct LaunchPipeline {
 }
 
 impl LaunchPipeline {
+    async fn verify_launch_health(&self, ctx: &mut PipelineContext) {
+        if let Some(child) = &mut ctx.child {
+            let start_wait = std::time::Instant::now();
+            let verify_duration = std::time::Duration::from_millis(2000);
+
+            // Initial wait
+            tokio::time::sleep(verify_duration).await;
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // Process exited already
+                    ctx.verification.status = "failed_after_spawn".to_string();
+                    ctx.verification.process_lifetime_ms = Some(start_wait.elapsed().as_millis() as u64);
+                    ctx.verification.exit_code = status.code();
+                }
+                Ok(None) => {
+                    // Process still running
+                    ctx.verification.status = "verified".to_string();
+                    ctx.verification.process_lifetime_ms = Some(start_wait.elapsed().as_millis() as u64);
+                }
+                Err(e) => {
+                    ctx.verification.status = "uncertain".to_string();
+                    if let Some(logger) = &ctx.logger {
+                         let _ = logger.error("verification_error", format!("Failed to poll process status: {}", e), None, HashMap::new());
+                    }
+                }
+            }
+        } else {
+            ctx.verification.status = "not_verified".to_string();
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             stages: Vec::new(),
@@ -456,7 +491,22 @@ impl LaunchPipeline {
         }
 
         if let Some(logger) = &ctx.logger {
-            let _ = logger.info("launch_end", "Launch successful".to_string(), None, HashMap::new());
+            let _ = logger.info("launch_end", "Process spawned successfully".to_string(), None, HashMap::new());
+        }
+
+        // Post-spawn verification window
+        self.verify_launch_health(ctx).await;
+
+        if let Some(logger) = &ctx.logger {
+            let mut metadata = HashMap::new();
+            metadata.insert("status".to_string(), ctx.verification.status.clone());
+            if let Some(lifetime) = ctx.verification.process_lifetime_ms {
+                metadata.insert("lifetime_ms".to_string(), lifetime.to_string());
+            }
+            if let Some(code) = ctx.verification.exit_code {
+                metadata.insert("exit_code".to_string(), code.to_string());
+            }
+            let _ = logger.info("launch_verification", "Launch health verification complete".to_string(), None, metadata);
         }
 
         // After stages are complete (or failed), populate effective stack and scan logs for evidence
@@ -479,6 +529,16 @@ impl LaunchPipeline {
         }
 
         self.scan_logs_for_graphics_evidence(ctx).await;
+
+        // Final verification adjustment based on evidence
+        if ctx.verification.status == "verified" {
+            let dxvk_requested = ctx.graphics_stack.runtime_evidence.dxvk.expected;
+            let dxvk_found = ctx.graphics_stack.runtime_evidence.dxvk.evidence_found;
+
+            if dxvk_requested && !dxvk_found && !ctx.verification.log_growth_observed {
+                ctx.verification.status = "uncertain".to_string();
+            }
+        }
 
         // Run validators again on the final effective config
         for validator in &self.validators {
@@ -503,7 +563,24 @@ impl LaunchPipeline {
              }
         }
 
+        // Adjust result based on verification
+        if ctx.verification.status == "failed_after_spawn" {
+            final_result = LaunchResult::Failure;
+        } else if ctx.verification.status == "uncertain" && final_result == LaunchResult::Success {
+            final_result = LaunchResult::Uncertain;
+        }
+
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
+
+        if let Some(logger) = &ctx.logger {
+            let msg = match final_result {
+                LaunchResult::Success => "Launch successful".to_string(),
+                LaunchResult::Failure => "Launch failed".to_string(),
+                LaunchResult::Degraded => "Launch successful (degraded)".to_string(),
+                LaunchResult::Uncertain => "Launch uncertain".to_string(),
+            };
+            let _ = logger.info("launch_final_status", msg, None, HashMap::new());
+        }
 
         Ok(())
     }
@@ -595,11 +672,20 @@ impl LaunchPipeline {
             let max_retries = 3;
             let mut content = String::new();
 
+            let initial_file_size = if log_path.exists() {
+                std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            };
+
             while retries <= max_retries {
                 if log_path.exists() {
                     ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = true;
-                    if let Ok(metadata) = std::fs::metadata(&log_path) {
-                        ctx.graphics_stack.runtime_evidence.scan_metadata.file_size = metadata.len();
+                    let current_size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+                    ctx.graphics_stack.runtime_evidence.scan_metadata.file_size = current_size;
+
+                    if current_size > initial_file_size {
+                        ctx.verification.log_growth_observed = true;
                     }
 
                     if let Ok(current_content) = std::fs::read_to_string(&log_path) {
@@ -953,6 +1039,7 @@ impl LaunchPipeline {
                 timestamp,
                 warnings: ctx.warnings.clone(),
                 graphics_stack: Some(ctx.graphics_stack.clone()),
+                verification: ctx.verification.clone(),
             };
 
             let _ = session.write_summary(&summary);
