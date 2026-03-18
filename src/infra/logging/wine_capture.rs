@@ -32,10 +32,23 @@ pub fn classify_graphics_evidence(log_line: &str) -> Option<String> {
         if line_lower.contains("winemac.drv") {
             return None;
         }
+
+        // Specific middleware/dependency failure patterns
+        if line_lower.contains("physx") {
+             return Some(format!("PhysX/Middleware failure: {}", log_line.trim()));
+        }
+
         return Some(format!("DLL Load Failure: {}", log_line.trim()));
     }
     if line_lower.contains("not found") && line_lower.contains("which is needed by") {
         return Some(format!("DLL Dependency Missing: {}", log_line.trim()));
+    }
+
+    // Steam/Client patterns
+    if line_lower.contains("failed to create steam.exe") ||
+       line_lower.contains("cannot find 'steam.exe'") ||
+       (line_lower.contains("steam.exe") && (line_lower.contains("not found") || line_lower.contains("failed"))) {
+        return Some(format!("Steam Client/Environment Failure: {}", log_line.trim()));
     }
 
     None

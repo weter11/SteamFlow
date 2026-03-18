@@ -391,6 +391,14 @@ impl LaunchPipeline {
 
         let mut fatal_error = None;
         for evidence in &ctx.graphics_stack.graphics_stack_evidence {
+            if evidence.contains("Steam Client/Environment Failure") {
+                 fatal_error = Some("steam_environment_incomplete");
+                 break;
+            }
+            if evidence.contains("PhysX/Middleware failure") {
+                fatal_error = Some("middleware_dependency_failure");
+                break;
+            }
             if evidence.contains("DLL Load Failure") {
                 fatal_error = Some("missing_required_module");
                 break;
@@ -756,6 +764,12 @@ impl LaunchPipeline {
                 let lines: Vec<&str> = content.lines().collect();
                 ctx.graphics_stack.runtime_evidence.scan_metadata.line_count = lines.len();
 
+                // Capture Log Head/Tail
+                ctx.verification.log_head = lines.iter().take(50).map(|s| s.to_string()).collect();
+                if lines.len() > 50 {
+                     ctx.verification.log_tail = lines.iter().rev().take(100).rev().map(|s| s.to_string()).collect();
+                }
+
                 // Derive component paths from dll resolutions
                 let mut component_paths = HashMap::new();
                 for res in &ctx.dll_resolutions {
@@ -964,16 +978,50 @@ impl LaunchPipeline {
                 let mut metadata = HashMap::new();
                 metadata.insert("prefix_path".to_string(), prefix.clone());
 
+                // Detect Windows username
+                let users_dir = prefix_path.join("drive_c/users");
+                if users_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&users_dir) {
+                        let mut usernames = Vec::new();
+                        for entry in entries.flatten() {
+                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name != "Public" && name != "All Users" && name != "Default User" {
+                                    usernames.push(name);
+                                }
+                            }
+                        }
+                        if !usernames.is_empty() {
+                            // Sort and pick first (most likely primary)
+                            usernames.sort();
+                            let primary = usernames[0].clone();
+                            ctx.verification.windows_username = Some(primary.clone());
+                            ctx.verification.windows_user_path = Some(format!("C:\\users\\{}", primary));
+                            metadata.insert("detected_windows_username".to_string(), primary);
+                        }
+                    }
+                }
+
+                let username = ctx.verification.windows_username.as_deref().unwrap_or("steamuser");
                 let common_dirs = [
-                    "drive_c/users/steamuser/Documents",
-                    "drive_c/users/steamuser/AppData/Local",
-                    "drive_c/users/steamuser/AppData/Roaming",
+                    format!("drive_c/users/{}/Documents", username),
+                    format!("drive_c/users/{}/AppData/Local", username),
+                    format!("drive_c/users/{}/AppData/Roaming", username),
+                    "drive_c/Program Files (x86)/Steam/steam.exe".to_string(),
+                    "drive_c/windows/system32/PhysXLoader.dll".to_string(),
+                    "drive_c/windows/syswow64/PhysXLoader.dll".to_string(),
                 ];
 
                 for dir in common_dirs {
-                    let full_path = prefix_path.join(dir);
-                    metadata.insert(format!("dir_exists:{}", dir), full_path.exists().to_string());
+                    let full_path = prefix_path.join(&dir);
+                    let exists = full_path.exists();
+                    metadata.insert(format!("path_exists:{}", dir), exists.to_string());
+                    ctx.verification.key_paths_detected.insert(dir, exists);
                 }
+
+                // Check steam client exposure
+                ctx.verification.steam_client_exposed = spec.env.contains_key("STEAM_COMPAT_CLIENT_INSTALL_PATH") ||
+                                                       spec.env.get("WINEPATH").map(|wp| wp.contains("Steam")).unwrap_or(false);
 
                 if let Some(logger) = &ctx.logger {
                     let _ = logger.info("prefix_health_check", "WINEPREFIX sanity check complete".to_string(), None, metadata);
@@ -1147,6 +1195,11 @@ impl LaunchPipeline {
                  if let Some(ref detailed) = ctx.verification.detailed_status {
                      metadata.insert("verification_detailed".to_string(), detailed.clone());
                  }
+
+                 if let Some(ref username) = ctx.verification.windows_username {
+                      metadata.insert("windows_user".to_string(), username.clone());
+                 }
+                 metadata.insert("steam_client_exposed".to_string(), ctx.verification.steam_client_exposed.to_string());
 
                  let _ = logger.info("launch_summary_concise", "Concise launch summary recorded".to_string(), None, metadata);
             }

@@ -50,6 +50,12 @@ pub struct LaunchVerification {
     pub process_lifetime_ms: Option<u64>,
     pub exit_code: Option<i32>,
     pub log_growth_observed: bool,
+    pub windows_username: Option<String>,
+    pub windows_user_path: Option<String>,
+    pub key_paths_detected: HashMap<String, bool>,
+    pub steam_client_exposed: bool,
+    pub log_head: Vec<String>,
+    pub log_tail: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

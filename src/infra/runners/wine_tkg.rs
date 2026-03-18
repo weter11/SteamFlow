@@ -299,7 +299,8 @@ impl Runner for WineTkgRunner {
         );
 
         env.insert("SteamAppId".to_string(), app_id_str.clone());
-        env.insert("SteamGameId".to_string(), app_id_str);
+        env.insert("SteamGameId".to_string(), app_id_str.clone());
+        env.insert("STEAM_COMPAT_APP_ID".to_string(), app_id_str);
         env.insert("WINEPREFIX".to_string(), effective_game_prefix.to_string_lossy().to_string());
         env.insert("STEAM_COMPAT_DATA_PATH".to_string(), compat_data_path.to_string_lossy().to_string());
 
