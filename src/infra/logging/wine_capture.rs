@@ -2,7 +2,8 @@ pub fn classify_graphics_evidence(log_line: &str) -> Option<String> {
     let line_lower = log_line.to_lowercase();
 
     // DXVK signatures
-    if line_lower.contains("dxvk: v") ||
+    if line_lower.contains("info:  dxvk:") ||
+       line_lower.contains("dxvk: v") ||
        line_lower.contains("info:  game:") ||
        line_lower.contains("d3d11internalcreatedevice") ||
        line_lower.contains("presenter: actual swapchain properties") ||
@@ -27,6 +28,10 @@ pub fn classify_graphics_evidence(log_line: &str) -> Option<String> {
 
     // DLL Load Failures
     if line_lower.contains("failed to load module") && line_lower.contains("status=") {
+        // Filter out winemac.drv which is normal to fail on Linux (standard Wine bootstrap noise)
+        if line_lower.contains("winemac.drv") {
+            return None;
+        }
         return Some(format!("DLL Load Failure: {}", log_line.trim()));
     }
     if line_lower.contains("not found") && line_lower.contains("which is needed by") {

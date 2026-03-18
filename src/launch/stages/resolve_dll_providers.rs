@@ -14,6 +14,11 @@ impl PipelineStage for ResolveDllProvidersStage {
         let install_path = app.install_path.as_ref().ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, "Install path missing"))?;
 
         let mut game_exe_dir = PathBuf::from(install_path);
+
+        let nvapi_enabled = ctx.user_config.as_ref()
+            .map(|c| c.graphics_layers.nvapi_enabled)
+            .unwrap_or(true);
+
         // If we have launch info, we can be more precise about the exe dir
         if let Some(info) = &ctx.launch_info {
             let exe_rel = info.executable.replace('\\', "/");
@@ -78,7 +83,7 @@ impl PipelineStage for ResolveDllProvidersStage {
             }
         }
 
-        let (resolutions, scan_report) = resolver.resolve(
+        let (mut resolutions, scan_report) = resolver.resolve(
             &game_exe_dir,
             &resolved_runner,
             &components,
@@ -88,6 +93,17 @@ impl PipelineStage for ResolveDllProvidersStage {
             custom_vkd3d,
             custom_vkd3d_proton,
         );
+
+        if !nvapi_enabled {
+            for res in &mut resolutions {
+                if res.name.contains("nvapi") || res.name.contains("nvofapi") {
+                    res.chosen_provider = crate::launch::dll_provider_resolver::DllProvider::None;
+                    res.chosen_path = None;
+                    res.fallback_reason = Some("NVAPI is disabled in per-game settings".to_string());
+                }
+            }
+        }
+
         ctx.dll_resolutions = resolutions;
 
         // Strict Backend Policy Enforcement

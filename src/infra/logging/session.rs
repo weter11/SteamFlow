@@ -46,6 +46,7 @@ pub struct LaunchSummary {
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct LaunchVerification {
     pub status: String, // "verified", "uncertain", "failed_after_spawn", "not_verified"
+    pub detailed_status: Option<String>,
     pub process_lifetime_ms: Option<u64>,
     pub exit_code: Option<i32>,
     pub log_growth_observed: bool,
@@ -99,6 +100,8 @@ pub struct EffectiveSettingsConfig {
     pub effective_backend: String,
     pub requested_d3d12_provider: String,
     pub effective_d3d12_provider: String,
+    pub requested_nvapi: bool,
+    pub effective_nvapi: bool,
     pub requested_gpu: Option<String>,
     pub effective_gpu: Option<String>,
     pub target_architecture: crate::models::ExecutableArchitecture,

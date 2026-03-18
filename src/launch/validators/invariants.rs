@@ -222,6 +222,11 @@ impl LaunchValidator for LaunchInvariantValidator {
                          "unknown"
                     };
 
+                    // Noise filter for common non-fatal middleware/bootstrap DLLs
+                    if dll_name.contains("winemac.drv") || dll_name.contains("steam_api") {
+                        continue;
+                    }
+
                     let stem = dll_name.trim_end_matches(".dll");
                     let resolution = ctx.dll_resolutions.iter().find(|r| r.name == stem || r.name == dll_name);
                     let provider = resolution.map(|r| format!("{:?}", r.chosen_provider)).unwrap_or_else(|| "Unknown".into());

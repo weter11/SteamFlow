@@ -32,6 +32,8 @@ pub struct GraphicsStackInfo {
     pub effective_backend: String,
     pub requested_d3d12_provider: String,
     pub effective_d3d12_provider: String,
+    pub requested_nvapi: bool,
+    pub effective_nvapi: bool,
     pub requested_gpu: Option<String>,
     pub effective_gpu: Option<String>,
     pub target_architecture: crate::models::ExecutableArchitecture,
@@ -379,6 +381,37 @@ impl LaunchPipeline {
         }
     }
 
+    fn classify_early_exit(&self, ctx: &mut PipelineContext) {
+        if ctx.verification.status != "failed_after_spawn" {
+            return;
+        }
+
+        let dxvk_found = ctx.graphics_stack.runtime_evidence.dxvk.evidence_found;
+        let vkd3d_found = ctx.graphics_stack.runtime_evidence.vkd3d_proton.evidence_found || ctx.graphics_stack.runtime_evidence.vkd3d.evidence_found;
+
+        let mut fatal_error = None;
+        for evidence in &ctx.graphics_stack.graphics_stack_evidence {
+            if evidence.contains("DLL Load Failure") {
+                fatal_error = Some("missing_required_module");
+                break;
+            }
+            if evidence.contains("DLL Dependency Missing") {
+                fatal_error = Some("middleware_or_runtime_component_failure");
+                break;
+            }
+        }
+
+        ctx.verification.detailed_status = Some(if dxvk_found || vkd3d_found {
+            "dxvk_loaded_but_game_exited_early".to_string()
+        } else if let Some(err) = fatal_error {
+            err.to_string()
+        } else if !ctx.verification.log_growth_observed {
+            "graphics_backend_not_confirmed".to_string()
+        } else {
+            "unknown_early_exit".to_string()
+        });
+    }
+
     pub fn new() -> Self {
         Self {
             stages: Vec::new(),
@@ -570,6 +603,9 @@ impl LaunchPipeline {
             final_result = LaunchResult::Uncertain;
         }
 
+        self.classify_early_exit(ctx);
+        self.check_prefix_health(ctx);
+
         self.write_summary_if_possible(ctx, final_result, failing_stage, total_start.elapsed().as_millis(), stage_durations);
 
         if let Some(logger) = &ctx.logger {
@@ -621,6 +657,9 @@ impl LaunchPipeline {
                  ctx.graphics_stack.graphics_stack_expected = stack_parts.join(", ");
              }
 
+             let nvapi_res = ctx.dll_resolutions.iter().find(|r| r.name == "nvapi");
+             ctx.graphics_stack.effective_nvapi = nvapi_res.map(|r| r.chosen_provider != crate::launch::dll_provider_resolver::DllProvider::None).unwrap_or(false);
+
              // GPU Selection
              ctx.graphics_stack.effective_gpu = None;
              if let Some(val) = spec.env.get("__NV_PRIME_RENDER_OFFLOAD") {
@@ -641,6 +680,7 @@ impl LaunchPipeline {
         if let Some(config) = &ctx.user_config {
             ctx.graphics_stack.requested_backend = format!("{:?}", config.graphics_layers.graphics_backend_policy);
             ctx.graphics_stack.requested_d3d12_provider = format!("{:?}", config.graphics_layers.d3d12_policy);
+            ctx.graphics_stack.requested_nvapi = config.graphics_layers.nvapi_enabled;
             ctx.graphics_stack.requested_gpu = config.gpu_preference.clone();
 
             // Initial baseline assumption - will be overridden by populate_effective_graphics_stack
@@ -912,6 +952,36 @@ impl LaunchPipeline {
         ctx.graphics_stack.runtime_evidence.scan_metadata.scan_duration_ms = scan_start.elapsed().as_millis();
     }
 
+    fn check_prefix_health(&self, ctx: &mut PipelineContext) {
+        if let Some(spec) = &ctx.command_spec {
+            if let Some(prefix) = spec.env.get("WINEPREFIX") {
+                let prefix_path = std::path::PathBuf::from(prefix);
+                if !prefix_path.exists() {
+                    ctx.add_warning("PREFIX_MISSING", format!("WINEPREFIX does not exist on disk: {}", prefix));
+                    return;
+                }
+
+                let mut metadata = HashMap::new();
+                metadata.insert("prefix_path".to_string(), prefix.clone());
+
+                let common_dirs = [
+                    "drive_c/users/steamuser/Documents",
+                    "drive_c/users/steamuser/AppData/Local",
+                    "drive_c/users/steamuser/AppData/Roaming",
+                ];
+
+                for dir in common_dirs {
+                    let full_path = prefix_path.join(dir);
+                    metadata.insert(format!("dir_exists:{}", dir), full_path.exists().to_string());
+                }
+
+                if let Some(logger) = &ctx.logger {
+                    let _ = logger.info("prefix_health_check", "WINEPREFIX sanity check complete".to_string(), None, metadata);
+                }
+            }
+        }
+    }
+
     fn write_summary_if_possible(
         &self,
         ctx: &mut PipelineContext,
@@ -993,6 +1063,8 @@ impl LaunchPipeline {
                          effective_backend: ctx.graphics_stack.effective_backend.clone(),
                          requested_d3d12_provider: ctx.graphics_stack.requested_d3d12_provider.clone(),
                          effective_d3d12_provider: ctx.graphics_stack.effective_d3d12_provider.clone(),
+                         requested_nvapi: ctx.graphics_stack.requested_nvapi,
+                         effective_nvapi: ctx.graphics_stack.effective_nvapi,
                          requested_gpu: ctx.graphics_stack.requested_gpu.clone(),
                          effective_gpu: ctx.graphics_stack.effective_gpu.clone(),
                          target_architecture: ctx.target_architecture,
@@ -1061,6 +1133,20 @@ impl LaunchPipeline {
                  }
                  metadata.insert("validation_passed".to_string(), ctx.warnings.is_empty().to_string());
                  metadata.insert("fallback_occurred".to_string(), (!ctx.graphics_stack.fallback_reasons.is_empty()).to_string());
+
+                 if let Some(spec) = &ctx.command_spec {
+                     if let Some(prefix) = spec.env.get("WINEPREFIX") {
+                         metadata.insert("prefix".to_string(), prefix.clone());
+                     }
+                 }
+                 if let Some(config) = &ctx.launcher_config {
+                     metadata.insert("shared_prefix".to_string(), config.use_shared_compat_data.to_string());
+                 }
+                 metadata.insert("nvapi_requested".to_string(), ctx.graphics_stack.requested_nvapi.to_string());
+                 metadata.insert("nvapi_exposed".to_string(), ctx.graphics_stack.effective_nvapi.to_string());
+                 if let Some(ref detailed) = ctx.verification.detailed_status {
+                     metadata.insert("verification_detailed".to_string(), detailed.clone());
+                 }
 
                  let _ = logger.info("launch_summary_concise", "Concise launch summary recorded".to_string(), None, metadata);
             }
