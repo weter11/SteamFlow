@@ -25,6 +25,7 @@ pub enum DllProvider {
     Custom,
     Runner,
     System,
+    Internal, // Satisfied via capability (e.g. DXVK D3D10 core)
     None,
 }
 

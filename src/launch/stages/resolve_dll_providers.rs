@@ -106,6 +106,29 @@ impl PipelineStage for ResolveDllProvidersStage {
 
         ctx.dll_resolutions = resolutions;
 
+        // DXVK Capability Fixup for D3D10/10.1
+        if let Some(config) = &ctx.user_config {
+            if config.graphics_layers.graphics_backend_policy == crate::models::GraphicsBackendPolicy::DXVK {
+                let has_dxvk_core = |name: &str| -> bool {
+                    ctx.dll_resolutions.iter()
+                        .find(|r| r.name == name)
+                        .map(|r| r.chosen_provider != crate::launch::dll_provider_resolver::DllProvider::None)
+                        .unwrap_or(false)
+                };
+
+                let d3d10_supported = has_dxvk_core("d3d10core") && has_dxvk_core("d3d11") && has_dxvk_core("dxgi");
+
+                if d3d10_supported {
+                    for res in &mut ctx.dll_resolutions {
+                        if (res.name == "d3d10" || res.name == "d3d10_1") && res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::None {
+                            res.chosen_provider = crate::launch::dll_provider_resolver::DllProvider::Internal;
+                            res.fallback_reason = Some("Satisfied via DXVK D3D10 capability (d3d10core + d3d11 + dxgi)".to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         // Strict Backend Policy Enforcement
         if let Some(config) = &ctx.user_config {
             let backend_policy = &config.graphics_layers.graphics_backend_policy;
@@ -113,29 +136,30 @@ impl PipelineStage for ResolveDllProvidersStage {
             if *backend_policy == crate::models::GraphicsBackendPolicy::DXVK {
                 let mut missing_capabilities = Vec::new();
 
-                let has_dll = |name: &str| -> bool {
+                let has_capability = |name: &str| -> bool {
                     ctx.dll_resolutions.iter()
                         .find(|r| r.name == name)
                         .map(|r| {
                             r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner ||
-                            r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal
+                            r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal ||
+                            r.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Internal
                         })
                         .unwrap_or(false)
                 };
 
-                let has_dx11_dxgi = has_dll("d3d11") && has_dll("dxgi");
-                let has_dx10 = has_dx11_dxgi && has_dll("d3d10core");
-                let has_dx9 = has_dll("d3d9");
-                let has_dx8 = has_dx9 && has_dll("d3d8");
+                let has_dx11_dxgi = has_capability("d3d11") && has_capability("dxgi");
+                let has_dx10_core = has_capability("d3d10core");
+                let has_dx9 = has_capability("d3d9");
+                let has_dx8 = has_capability("d3d8");
 
                 if !has_dx11_dxgi {
-                    missing_capabilities.push("DX11/DXGI (requires d3d11.dll, dxgi.dll)");
+                    missing_capabilities.push("DX11/DXGI (requires d3d11.dll and dxgi.dll)");
                 }
-                if !has_dx10 {
-                    if has_dx11_dxgi {
-                        missing_capabilities.push("DX10/10.1 (requires d3d10core.dll)");
+                if !has_dx10_core || !has_dx11_dxgi {
+                    if !has_dx10_core {
+                        missing_capabilities.push("DX10/10.1 capability incomplete: missing d3d10core.dll");
                     } else {
-                        missing_capabilities.push("DX10/10.1 (requires d3d10core.dll and DX11/DXGI)");
+                        missing_capabilities.push("DX10/10.1 support unavailable because d3d11.dll or dxgi.dll could not be resolved");
                     }
                 }
                 if !has_dx9 {
