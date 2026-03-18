@@ -38,6 +38,11 @@ impl LaunchValidator for LaunchInvariantValidator {
                         if let Some((dll, mode)) = part.split_once('=') {
                             let dll_trimmed = dll.trim().to_lowercase();
                             if dxvk_dlls.contains(&dll_trimmed.as_str()) && mode.contains('n') {
+                                // Exclude d3d10/10_1 from being flagged as DXVK-forcing if they are not in the concrete list
+                                if dll_trimmed == "d3d10" || dll_trimmed == "d3d10_1" {
+                                    continue;
+                                }
+
                                 warnings.push((
                                     "INVARIANT_B_VIOLATION",
                                     format!("Effective backend is not DXVK but found native override for DXVK DLL: {}", dll),
