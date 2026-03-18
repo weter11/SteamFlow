@@ -395,11 +395,15 @@ impl Runner for WineTkgRunner {
                (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner && res.name.contains("nvapi")) {
                 // Ensure native wins for game-local or non-symlinked custom DLLs
                 if !dll_overrides.contains(&format!("{}=n", res.name)) {
+                     tracing::info!("Adding native override for resolved DLL: {} (provider: {:?})", res.name, res.chosen_provider);
                      dll_overrides.push_str(&format!(";{}=n", res.name));
                 }
+            } else if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Internal {
+                 tracing::info!("Resolved DLL {} is handled internally (alias), skipping explicit override", res.name);
             }
         }
 
+        tracing::info!("Final WINEDLLOVERRIDES: {}", dll_overrides);
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
 
         // Track effective state for diagnostics (HACK: should ideally be done in a separate stage)

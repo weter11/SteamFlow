@@ -391,8 +391,12 @@ impl LaunchPipeline {
 
         let mut fatal_error = None;
         for evidence in &ctx.graphics_stack.graphics_stack_evidence {
+            if evidence.contains("Override Policy Conflict") {
+                 fatal_error = Some("override_policy_regression");
+                 break;
+            }
             if evidence.contains("Steam Client/Environment Failure") {
-                 fatal_error = Some("steam_environment_incomplete");
+                 fatal_error = Some("steam_runtime_exposure_regression");
                  break;
             }
             if evidence.contains("PhysX/Middleware failure") {
@@ -400,7 +404,11 @@ impl LaunchPipeline {
                 break;
             }
             if evidence.contains("DLL Load Failure") {
-                fatal_error = Some("missing_required_module");
+                if evidence.contains("d3d10") || evidence.contains("d3d11") {
+                     fatal_error = Some("startup_environment_regression");
+                } else {
+                     fatal_error = Some("missing_required_module");
+                }
                 break;
             }
             if evidence.contains("DLL Dependency Missing") {

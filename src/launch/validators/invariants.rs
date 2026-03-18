@@ -250,6 +250,24 @@ impl LaunchValidator for LaunchInvariantValidator {
             ));
         }
 
+        // Invariant E: DXVK alias DLLs (d3d10, d3d10_1) should not be explicitly overridden as native.
+        if let Some(spec) = &ctx.command_spec {
+            if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
+                let alias_dlls = ["d3d10", "d3d10_1"];
+                for part in overrides.split(';') {
+                    if let Some((dll, mode)) = part.split_once('=') {
+                        let dll_trimmed = dll.trim().to_lowercase();
+                        if alias_dlls.contains(&dll_trimmed.as_str()) && mode.contains('n') {
+                            warnings.push((
+                                "DANGEROUS_ALIAS_OVERRIDE",
+                                format!("Found native override for DXVK alias DLL: {}. This often causes startup failures. These should be handled via Wine's built-in wrappers delegating to d3d10core.", dll),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         for (code, msg) in warnings {
             ctx.add_warning(code, msg);
         }
