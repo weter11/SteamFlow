@@ -368,9 +368,12 @@ impl Runner for WineTkgRunner {
         let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
 
         // NVAPI Support
-        let nvapi_active = _components.nvapi.is_some();
+        let nvapi_enabled_cfg = ctx.user_config.as_ref().map(|c| c.graphics_layers.nvapi_enabled).unwrap_or(true);
+        let nvapi_active = _components.nvapi.is_some() && nvapi_enabled_cfg;
         if nvapi_active {
-            tracing::info!("NVAPI component detected, will be exposed to game");
+            tracing::info!("NVAPI component detected and enabled, will be exposed to game");
+        } else if _components.nvapi.is_some() {
+            tracing::info!("NVAPI component detected but disabled by per-game settings");
         }
 
         let use_symlinks = glc.use_symlinks_in_prefix;

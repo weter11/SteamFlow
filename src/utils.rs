@@ -768,7 +768,10 @@ pub fn build_dll_overrides(
             "dxgi.dll",
         ] {
             let stem = dll.trim_end_matches(".dll");
-            let mode = if strict_dxvk { "n" } else { "n,b" };
+            // Special case: d3d10 and d3d10_1 should always allow builtin fallback (n,b)
+            // even in strict DXVK mode, because DXVK typically doesn't provide them
+            // standalone; it uses d3d10core instead.
+            let mode = if strict_dxvk && stem != "d3d10" && stem != "d3d10_1" { "n" } else { "n,b" };
 
             if strict_dxvk || !game_has(dll) {
                 overrides.push(format!("{stem}={mode}"));

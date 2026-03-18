@@ -128,6 +128,7 @@ mod tests {
             dxvk_enabled: false,
             vkd3d_proton_enabled: false,
             vkd3d_enabled: false,
+            nvapi_enabled: true,
             graphics_backend_policy: crate::models::GraphicsBackendPolicy::WineD3D,
             d3d12_policy: crate::models::D3D12ProviderPolicy::Auto,
             use_symlinks_in_prefix: false,

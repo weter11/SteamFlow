@@ -1351,6 +1351,9 @@ impl SteamLauncher {
                 if ui.checkbox(&mut glc.vkd3d_enabled, "Force VKD3D (Wine)").on_hover_text("Always use upstream Wine VKD3D for DX12, ignoring policy.").changed() {
                     gl_changed = true;
                 }
+                if ui.checkbox(&mut glc.nvapi_enabled, "Enable NVAPI").on_hover_text("Expose NVIDIA API to the game (requires runner support).").changed() {
+                    gl_changed = true;
+                }
             });
 
             if gl_changed {

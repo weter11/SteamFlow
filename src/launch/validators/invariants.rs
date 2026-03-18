@@ -174,9 +174,28 @@ impl LaunchValidator for LaunchInvariantValidator {
              } else {
                  "DIAGNOSTICS_MISSING_DXVK_EVIDENCE"
              };
+
+             let msg = if ctx.verification.status == "failed_after_spawn" {
+                 format!("DXVK was requested/effective but the game process exited immediately (lifetime: {}ms, exit code: {:?}). No runtime evidence could be collected.",
+                     ctx.verification.process_lifetime_ms.unwrap_or(0), ctx.verification.exit_code)
+             } else {
+                 format!("DXVK was requested/effective but no runtime evidence was found in logs{}. This may indicate a silent fallback to WineD3D.", suffix)
+             };
+
+             warnings.push((code, msg));
+        }
+
+        // Post-launch validation: Early process death
+        if ctx.verification.status == "failed_after_spawn" {
              warnings.push((
-                code,
-                format!("DXVK was requested/effective but no runtime evidence was found in logs{}. This may indicate a silent fallback to WineD3D.", suffix)
+                "LAUNCH_EARLY_EXIT",
+                format!("The game process exited immediately after spawn (exit code: {:?}, lifetime: {}ms).",
+                    ctx.verification.exit_code, ctx.verification.process_lifetime_ms.unwrap_or(0))
+            ));
+        } else if ctx.verification.status == "uncertain" {
+             warnings.push((
+                "LAUNCH_UNCERTAIN",
+                "The launch status is uncertain: the process is running but no meaningful log growth or graphics evidence was observed within the verification window.".into()
             ));
         }
 
@@ -202,6 +221,11 @@ impl LaunchValidator for LaunchInvariantValidator {
                     } else {
                          "unknown"
                     };
+
+                    // Noise filter for common non-fatal middleware/bootstrap DLLs
+                    if dll_name.contains("winemac.drv") || dll_name.contains("steam_api") {
+                        continue;
+                    }
 
                     let stem = dll_name.trim_end_matches(".dll");
                     let resolution = ctx.dll_resolutions.iter().find(|r| r.name == stem || r.name == dll_name);

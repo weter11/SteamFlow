@@ -60,7 +60,7 @@ pub enum D3D12ProviderPolicy {
     Vkd3dWine,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphicsLayerConfig {
     #[serde(default)]
     pub dxvk_enabled: bool,
@@ -68,6 +68,8 @@ pub struct GraphicsLayerConfig {
     pub vkd3d_proton_enabled: bool,
     #[serde(default)]
     pub vkd3d_enabled: bool,
+    #[serde(default = "default_true")]
+    pub nvapi_enabled: bool,
     #[serde(default)]
     pub graphics_backend_policy: GraphicsBackendPolicy,
     #[serde(default)]
@@ -80,6 +82,23 @@ pub struct GraphicsLayerConfig {
     pub custom_vkd3d_path: Option<PathBuf>,
     #[serde(default)]
     pub custom_vkd3d_proton_path: Option<PathBuf>,
+}
+
+impl Default for GraphicsLayerConfig {
+    fn default() -> Self {
+        Self {
+            dxvk_enabled: false,
+            vkd3d_proton_enabled: false,
+            vkd3d_enabled: false,
+            nvapi_enabled: true,
+            graphics_backend_policy: GraphicsBackendPolicy::Auto,
+            d3d12_policy: D3D12ProviderPolicy::Auto,
+            use_symlinks_in_prefix: false,
+            custom_dxvk_path: None,
+            custom_vkd3d_path: None,
+            custom_vkd3d_proton_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
