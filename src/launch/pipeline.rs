@@ -404,7 +404,7 @@ impl LaunchPipeline {
                 break;
             }
             if evidence.contains("DLL Load Failure") {
-                if evidence.contains("d3d10") || evidence.contains("d3d11") {
+                if evidence.contains("d3d11") {
                      fatal_error = Some("startup_environment_regression");
                 } else {
                      fatal_error = Some("missing_required_module");

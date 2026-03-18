@@ -737,8 +737,6 @@ pub fn build_dll_overrides(
         for dll in &[
             "d3d8",
             "d3d9",
-            "d3d10",
-            "d3d10_1",
             "d3d10core",
             "d3d11",
             "dxgi",
@@ -1094,7 +1092,7 @@ fn find_sibling_dll(
 
 pub fn cleanup_dll_symlinks(prefix: &Path) -> Result<()> {
     let target_dlls = [
-        "d3d8.dll", "d3d9.dll", "dxgi.dll", "d3d10.dll", "d3d10_1.dll", "d3d10core.dll",
+        "d3d8.dll", "d3d9.dll", "dxgi.dll", "d3d10core.dll",
         "d3d11.dll", "d3d12.dll", "d3d12core.dll", "libvkd3d-1.dll", "libvkd3d-shader-1.dll"
     ];
 

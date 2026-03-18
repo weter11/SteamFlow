@@ -53,7 +53,7 @@ pub fn classify_graphics_evidence(log_line: &str) -> Option<String> {
 
     // Override/Policy regressions
     if line_lower.contains("invalid dll") ||
-       (line_lower.contains("failed to load") && (line_lower.contains("d3d10") || line_lower.contains("d3d11"))) {
+       (line_lower.contains("failed to load") && (line_lower.contains("d3d11"))) {
          return Some(format!("Override Policy Conflict: {}", log_line.trim()));
     }
 

@@ -16,7 +16,7 @@ impl LaunchValidator for OverrideConflictValidator {
 
             // 1. Check for D3D/DXGI override conflicts with DXVK
             if dxvk_enabled {
-                let conflicts = ["d3d9", "d3d10", "d3d10core", "d3d11", "dxgi"];
+                let conflicts = ["d3d9", "d3d10core", "d3d11", "dxgi"];
                 if let Some(val) = user_config.env_variables.get("WINEDLLOVERRIDES") {
                     for part in val.split(';') {
                         if let Some((dll, mode)) = part.split_once('=') {
