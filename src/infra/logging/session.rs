@@ -54,6 +54,8 @@ pub struct LaunchVerification {
     pub windows_user_path: Option<String>,
     pub key_paths_detected: HashMap<String, bool>,
     pub steam_client_exposed: bool,
+    pub last_successful_startup_milestone: String,
+    pub dependency_families_detected: Vec<String>,
     pub log_head: Vec<String>,
     pub log_tail: Vec<String>,
 }

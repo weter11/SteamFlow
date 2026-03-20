@@ -778,6 +778,8 @@ impl LaunchPipeline {
                      ctx.verification.log_tail = lines.iter().rev().take(100).rev().map(|s| s.to_string()).collect();
                 }
 
+                let mut max_milestone = crate::infra::logging::StartupMilestone::None;
+
                 // Derive component paths from dll resolutions
                 let mut component_paths = HashMap::new();
                 for res in &ctx.dll_resolutions {
@@ -797,6 +799,14 @@ impl LaunchPipeline {
 
                 for line in &lines {
                     let mut line_matched = false;
+
+                    // Update Milestone
+                    if let Some(m) = crate::infra::logging::detect_startup_milestone(line) {
+                         if m > max_milestone {
+                             max_milestone = m;
+                         }
+                    }
+
                     if let Some(evidence) = crate::infra::logging::classify_graphics_evidence(line) {
                         if !ctx.graphics_stack.graphics_stack_evidence.contains(&evidence) {
                             ctx.graphics_stack.graphics_stack_evidence.push(evidence.clone());
@@ -890,6 +900,8 @@ impl LaunchPipeline {
                         ctx.graphics_stack.runtime_evidence.scan_metadata.candidate_matches += 1;
                     }
                 }
+
+                ctx.verification.last_successful_startup_milestone = max_milestone.to_string();
             }
         } else {
             ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = false;
@@ -1026,6 +1038,20 @@ impl LaunchPipeline {
                     metadata.insert(format!("path_exists:{}", dir), exists.to_string());
                     ctx.verification.key_paths_detected.insert(dir, exists);
                 }
+
+                // Title-Specific Dependency Detection
+                let mut families = Vec::new();
+                let families_to_check = [
+                    ("Batman (PhysX/APEX)", vec!["drive_c/windows/system32/PhysXLoader.dll", "drive_c/windows/syswow64/PhysXLoader.dll"]),
+                    ("Amnesia (SDL2/Newton)", vec!["drive_c/windows/system32/SDL2.dll", "drive_c/windows/syswow64/SDL2.dll"]),
+                ];
+
+                for (family, paths) in families_to_check {
+                    if paths.iter().any(|p| prefix_path.join(p).exists()) {
+                        families.push(family.to_string());
+                    }
+                }
+                ctx.verification.dependency_families_detected = families;
 
                 // Check steam client exposure
                 ctx.verification.steam_client_exposed = spec.env.contains_key("STEAM_COMPAT_CLIENT_INSTALL_PATH") ||
@@ -1208,6 +1234,10 @@ impl LaunchPipeline {
                       metadata.insert("windows_user".to_string(), username.clone());
                  }
                  metadata.insert("steam_client_exposed".to_string(), ctx.verification.steam_client_exposed.to_string());
+                 metadata.insert("last_milestone".to_string(), ctx.verification.last_successful_startup_milestone.clone());
+                 if !ctx.verification.dependency_families_detected.is_empty() {
+                      metadata.insert("dependency_families".to_string(), ctx.verification.dependency_families_detected.join(", "));
+                 }
 
                  let _ = logger.info("launch_summary_concise", "Concise launch summary recorded".to_string(), None, metadata);
             }
