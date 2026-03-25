@@ -13,7 +13,11 @@ pub struct LaunchContext {
     pub proton_path: Option<String>,
     pub target_architecture: crate::models::ExecutableArchitecture,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
+    pub verification_ptr: *mut crate::infra::logging::LaunchVerification, // HACK: for Runner to write diagnostics
 }
+
+unsafe impl Send for LaunchContext {}
+unsafe impl Sync for LaunchContext {}
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandSpec {

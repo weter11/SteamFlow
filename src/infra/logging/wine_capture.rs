@@ -25,6 +25,11 @@ impl std::fmt::Display for StartupMilestone {
 pub fn detect_startup_milestone(log_line: &str) -> Option<StartupMilestone> {
     let line_lower = log_line.to_lowercase();
 
+    // Steam Runtime specific milestones (can be used for background Steam too)
+    if line_lower.contains("steam.exe") && line_lower.contains("starting") {
+        return Some(StartupMilestone::InitialProcessBootstrap);
+    }
+
     // Generic bootstrap markers
     if line_lower.contains("wine_init") || line_lower.contains("ntdll:ldrload_dll") || line_lower.contains("kernelbase:loadlibrary") {
         return Some(StartupMilestone::InitialProcessBootstrap);

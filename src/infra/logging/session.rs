@@ -56,6 +56,11 @@ pub struct LaunchVerification {
     pub steam_client_exposed: bool,
     pub last_successful_startup_milestone: String,
     pub dependency_families_detected: Vec<String>,
+    pub steam_runtime_exe: Option<String>,
+    pub steam_runtime_args: Vec<String>,
+    pub steam_runtime_exit_code: Option<i32>,
+    pub steam_runtime_lifetime_ms: Option<u64>,
+    pub steam_runtime_milestone: String,
     pub log_head: Vec<String>,
     pub log_tail: Vec<String>,
 }

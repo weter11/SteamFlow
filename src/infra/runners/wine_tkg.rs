@@ -196,8 +196,25 @@ impl Runner for WineTkgRunner {
                         println!("Args: {:?}", steam_cmd.get_args().collect::<Vec<_>>());
                         println!("--------------------------");
 
+                        // Record Steam runtime diagnostics
+                        unsafe {
+                            if !ctx.verification_ptr.is_null() {
+                                let v = &mut *ctx.verification_ptr;
+                                v.steam_runtime_exe = Some(steam_cmd.get_program().to_string_lossy().to_string());
+                                v.steam_runtime_args = steam_cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+                                v.steam_runtime_milestone = "steam_process_spawn_requested".to_string();
+                            }
+                        }
+
+                        let start_time = std::time::Instant::now();
                         let mut steam_process =
                             steam_cmd.spawn().map_err(|e| LaunchError::new(LaunchErrorKind::Process, "Failed to spawn background Steam").with_source(anyhow!(e)))?;
+
+                        unsafe {
+                            if !ctx.verification_ptr.is_null() {
+                                (*ctx.verification_ptr).steam_runtime_milestone = "steam_process_spawned".to_string();
+                            }
+                        }
 
                         println!("Waiting for Steam to initialise (max 30s)...");
 
@@ -213,6 +230,14 @@ impl Runner for WineTkgRunner {
                                 // Crash detection — bail immediately
                                 if let Ok(Some(status)) = steam_process.try_wait() {
                                     println!("❌ FATAL: Background Steam exited after {}s with: {}", i + 1, status);
+                                    unsafe {
+                                        if !ctx.verification_ptr.is_null() {
+                                            let v = &mut *ctx.verification_ptr;
+                                            v.steam_runtime_exit_code = status.code();
+                                            v.steam_runtime_lifetime_ms = Some(start_time.elapsed().as_millis() as u64);
+                                            v.steam_runtime_milestone = "steam_process_exited_early".to_string();
+                                        }
+                                    }
                                     break 'wait false;
                                 }
 
@@ -240,12 +265,22 @@ impl Runner for WineTkgRunner {
                                     .unwrap_or(0);
                                 if log_count >= 2 {
                                     println!("✅ Steam ready after {}s ({} log files found)", i + 1, log_count);
+                                    unsafe {
+                                        if !ctx.verification_ptr.is_null() {
+                                            (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_signal_observed".to_string();
+                                        }
+                                    }
                                     break 'wait true;
                                 }
 
                                 println!("  Waiting... {}s", i + 1);
                             }
                             println!("⚠️ Steam did not signal ready after 30s, launching game anyway");
+                            unsafe {
+                                if !ctx.verification_ptr.is_null() {
+                                    (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_timeout".to_string();
+                                }
+                            }
                             true
                         };
 

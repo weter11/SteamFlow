@@ -383,6 +383,10 @@ impl LaunchPipeline {
 
     fn classify_early_exit(&self, ctx: &mut PipelineContext) {
         if ctx.verification.status != "failed_after_spawn" {
+            if ctx.verification.steam_runtime_milestone == "steam_process_exited_early" {
+                ctx.verification.detailed_status = Some("steam_runtime_failed_before_game_start".to_string());
+                return;
+            }
             return;
         }
 
@@ -1028,6 +1032,8 @@ impl LaunchPipeline {
                     format!("drive_c/users/{}/AppData/Local", username),
                     format!("drive_c/users/{}/AppData/Roaming", username),
                     "drive_c/Program Files (x86)/Steam/steam.exe".to_string(),
+                    "drive_c/Program Files (x86)/Steam/steamclient.dll".to_string(),
+                    "drive_c/Program Files (x86)/Steam/tier0_s.dll".to_string(),
                     "drive_c/windows/system32/PhysXLoader.dll".to_string(),
                     "drive_c/windows/syswow64/PhysXLoader.dll".to_string(),
                 ];
@@ -1237,6 +1243,9 @@ impl LaunchPipeline {
                  metadata.insert("last_milestone".to_string(), ctx.verification.last_successful_startup_milestone.clone());
                  if !ctx.verification.dependency_families_detected.is_empty() {
                       metadata.insert("dependency_families".to_string(), ctx.verification.dependency_families_detected.join(", "));
+                 }
+                 if !ctx.verification.steam_runtime_milestone.is_empty() {
+                      metadata.insert("steam_runtime_milestone".to_string(), ctx.verification.steam_runtime_milestone.clone());
                  }
 
                  let _ = logger.info("launch_summary_concise", "Concise launch summary recorded".to_string(), None, metadata);
