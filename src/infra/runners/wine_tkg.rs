@@ -41,26 +41,31 @@ impl Runner for WineTkgRunner {
         tracing::info!("Steam Runtime Prefix Mode: {:?}", steam_prefix_mode);
 
         if use_steam_runtime {
-            let base_config = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
-            let master_prefix = base_config.join("master_steam_prefix");
+            let steam_cfg = crate::utils::get_master_steam_config();
+            tracing::info!("Unified Master Steam resolution (Game Launch):");
+            tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
+            tracing::info!("  - Wine Prefix: {}", steam_cfg.wine_prefix.display());
+            tracing::info!("  - Layout Kind: {}", steam_cfg.layout_kind);
 
-            tracing::info!("Looking for Master Steam in: {}", master_prefix.display());
-
-            match find_master_steam_dir(&master_prefix) {
+            let master_steam_dir = match &steam_cfg.steam_exe {
+                Some(exe) => exe.parent().unwrap().to_path_buf(),
                 None => {
                     return Err(LaunchError::new(
                         LaunchErrorKind::Environment,
                         format!(
                             "use_steam_runtime is enabled but steam.exe was not found in {}.\n\
                              Go to Settings → 'Install / Manage Windows Steam Runtime' first.",
-                            master_prefix.display()
+                            steam_cfg.wine_prefix.display()
                         )
-                    ).with_context("master_prefix", master_prefix.to_string_lossy()));
+                    ).with_context("master_prefix", steam_cfg.wine_prefix.to_string_lossy()));
                 }
-                Some(master_steam_dir) => {
-                    let (prefix_steam_dir, steam_wineprefix) = match steam_prefix_mode {
+            };
+
+            tracing::info!("  - Steam Exe: {}", steam_cfg.steam_exe.as_ref().unwrap().display());
+
+            let (prefix_steam_dir, steam_wineprefix) = match steam_prefix_mode {
                         crate::models::SteamPrefixMode::Shared => {
-                            (master_steam_dir.clone(), crate::utils::resolve_master_wineprefix())
+                            (master_steam_dir.clone(), steam_cfg.wine_prefix.clone())
                         }
                         crate::models::SteamPrefixMode::PerGame => {
                             let target_steam_dir = effective_game_prefix
@@ -120,11 +125,11 @@ impl Runner for WineTkgRunner {
                                 }
                             }
 
-                            (target_steam_dir, effective_game_prefix.clone())
-                        }
-                    };
+                    (target_steam_dir, effective_game_prefix.clone())
+                }
+            };
 
-                    tracing::debug!("Runtime Steam dir : {}", prefix_steam_dir.display());
+            tracing::debug!("Runtime Steam dir : {}", prefix_steam_dir.display());
                     tracing::debug!("Runtime WINEPREFIX : {}", steam_wineprefix.display());
 
                     SteamClient::write_headless_steam_cfg(&prefix_steam_dir);
@@ -232,7 +237,8 @@ impl Runner for WineTkgRunner {
                             }
                         }
 
-                        println!("Waiting for Steam to initialise (max 30s)...");
+                        let readiness_timeout = 8;
+                        println!("Waiting for Steam to initialise (max {}s)...", readiness_timeout);
 
                         let steam_pid_path = prefix_steam_dir.join("steam.pid");
                         let steam_pipe     = steam_wineprefix.join("drive_c/windows/temp/.steampath");
@@ -240,7 +246,7 @@ impl Runner for WineTkgRunner {
                         let steam_logs_dir   = prefix_steam_dir.join("logs");
 
                         let ready = 'wait: {
-                            for i in 0..30 {
+                            for i in 0..readiness_timeout {
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
                                 // Crash detection — bail immediately
@@ -291,7 +297,7 @@ impl Runner for WineTkgRunner {
 
                                 println!("  Waiting... {}s", i + 1);
                             }
-                            println!("⚠️ Steam did not signal ready after 30s, launching game anyway");
+                            println!("⚠️ Steam did not signal ready after {}s, launching game anyway", readiness_timeout);
                             unsafe {
                                 if !ctx.verification_ptr.is_null() {
                                     (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_timeout".to_string();
@@ -309,8 +315,6 @@ impl Runner for WineTkgRunner {
                             return Err(LaunchError::new(LaunchErrorKind::Process, "Background Steam crashed before the game could start"));
                         }
                     }
-                }
-            }
         }
 
         // Write steam_appid.txt to the game working directory
@@ -793,24 +797,3 @@ impl Runner for WineTkgRunner {
     }
 }
 
-fn find_master_steam_exe(prefix: &Path) -> Option<PathBuf> {
-    let candidates = [
-        "pfx/drive_c/Program Files (x86)/Steam/steam.exe",
-        "pfx/drive_c/Program Files/Steam/steam.exe",
-        "drive_c/Program Files (x86)/Steam/steam.exe",
-        "drive_c/Program Files/Steam/steam.exe",
-    ];
-
-    for rel_path in candidates {
-        let full_path = prefix.join(rel_path);
-        if full_path.exists() {
-            return Some(full_path);
-        }
-    }
-
-    None
-}
-
-fn find_master_steam_dir(prefix: &Path) -> Option<PathBuf> {
-    find_master_steam_exe(prefix).and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-}

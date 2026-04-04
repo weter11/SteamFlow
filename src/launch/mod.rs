@@ -13,7 +13,7 @@ use crate::utils::build_runner_command;
 
 pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     let base_dir = config_dir()?;
-    let master_prefix = base_dir.join("master_steam_prefix");
+    let steam_cfg = crate::utils::get_master_steam_config();
     let runtimes_dir = base_dir.join("runtimes");
     std::fs::create_dir_all(&runtimes_dir)?;
 
@@ -31,14 +31,15 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     let resolved_runner = crate::utils::resolve_runner(&runner_name, &library_root);
     let mut cmd = build_runner_command(&resolved_runner)?;
 
-    // Check if steam.exe exists in the prefix
-    let steam_exe_path = find_steam_exe_in_prefix(&master_prefix);
-
-    if let Some(exe_path) = steam_exe_path {
-        // Run existing steam.exe
-        cmd.arg(exe_path);
+    tracing::info!("Unified Master Steam resolution:");
+    tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
+    tracing::info!("  - Wine Prefix: {}", steam_cfg.wine_prefix.display());
+    tracing::info!("  - Layout Kind: {}", steam_cfg.layout_kind);
+    if let Some(ref exe) = steam_cfg.steam_exe {
+        tracing::info!("  - Steam Exe: {}", exe.display());
+        cmd.arg(exe);
     } else {
-        // Run installer
+        tracing::info!("  - Steam Exe: NOT FOUND (running installer)");
         cmd.arg(setup_exe);
     }
 
@@ -47,8 +48,8 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     cmd.arg("-cef-disable-gpu-compositing");
 
     // Environment Variables
-    cmd.env("WINEPREFIX", master_prefix.join("pfx"));
-    cmd.env("STEAM_COMPAT_DATA_PATH", &master_prefix);
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
     cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
     let fake_env = crate::utils::setup_fake_steam_trap(&base_dir)?;
@@ -87,20 +88,3 @@ async fn download_steam_setup(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn find_steam_exe_in_prefix(prefix: &Path) -> Option<PathBuf> {
-    let common_paths = [
-        "pfx/drive_c/Program Files (x86)/Steam/steam.exe",
-        "pfx/drive_c/Program Files/Steam/steam.exe",
-        "drive_c/Program Files (x86)/Steam/steam.exe",
-        "drive_c/Program Files/Steam/steam.exe",
-    ];
-
-    for rel_path in common_paths {
-        let full_path = prefix.join(rel_path);
-        if full_path.exists() {
-            return Some(full_path);
-        }
-    }
-
-    None
-}
