@@ -13,7 +13,14 @@ impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
-        let use_steam_runtime = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
+
+        let is_batman = ctx.app.app_id == 209000;
+        let is_amnesia = ctx.app.app_id == 10;
+        let requires_steam_runtime = is_batman || is_amnesia;
+
+        let use_steam_runtime = ctx.user_config.as_ref()
+            .map(|c| c.use_steam_runtime)
+            .unwrap_or(requires_steam_runtime);
         let steam_prefix_mode = ctx.user_config.as_ref()
             .map(|c| c.steam_prefix_mode.clone())
             .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
@@ -190,8 +197,8 @@ impl Runner for WineTkgRunner {
                             .env("WINEPREFIX", &steam_wineprefix)
                             .env(
                                 "WINEDLLOVERRIDES",
-                                "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;\
-                                 steam_api=n;steam_api64=n;lsteamclient=;\
+                                "vstdlib_s=n,b;tier0_s=n,b;steamclient=n,b;steamclient64=n,b;\
+                                 steam_api=n,b;steam_api64=n,b;lsteamclient=;\
                                  GameOverlayRenderer=n;GameOverlayRenderer64=n",
                             )
                             .env("WINEPATH", "C:\\Program Files (x86)\\Steam")
@@ -313,7 +320,13 @@ impl Runner for WineTkgRunner {
                 .clone()
                 .ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, format!("game {} is not installed", ctx.app.app_id)))?,
         );
-        let executable = install_dir.join(&ctx.launch_info.executable.replace('\\', "/"));
+
+        let exe_rel = ctx.launch_info.executable.replace('\\', "/");
+        let executable = if Path::new(&exe_rel).is_absolute() {
+            PathBuf::from(&exe_rel)
+        } else {
+            install_dir.join(&exe_rel)
+        };
         let game_working_dir: PathBuf = ctx.launch_info.workingdir
             .as_deref()
             .filter(|s| !s.is_empty())
@@ -366,7 +379,13 @@ impl Runner for WineTkgRunner {
                 .clone()
                 .ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, format!("game {} is not installed", ctx.app.app_id)))?,
         );
-        let executable = install_dir.join(&ctx.launch_info.executable.replace('\\', "/"));
+
+        let exe_rel = ctx.launch_info.executable.replace('\\', "/");
+        let executable = if Path::new(&exe_rel).is_absolute() {
+            PathBuf::from(&exe_rel)
+        } else {
+            install_dir.join(&exe_rel)
+        };
         let game_working_dir: PathBuf = ctx.launch_info.workingdir
             .as_deref()
             .filter(|s| !s.is_empty())
@@ -707,7 +726,13 @@ impl Runner for WineTkgRunner {
                 .clone()
                 .ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, format!("game {} is not installed", ctx.app.app_id)))?,
         );
-        let executable = install_dir.join(&ctx.launch_info.executable.replace('\\', "/"));
+
+        let exe_rel = ctx.launch_info.executable.replace('\\', "/");
+        let executable = if Path::new(&exe_rel).is_absolute() {
+            PathBuf::from(&exe_rel)
+        } else {
+            install_dir.join(&exe_rel)
+        };
         let game_working_dir: PathBuf = ctx.launch_info.workingdir
             .as_deref()
             .filter(|s| !s.is_empty())

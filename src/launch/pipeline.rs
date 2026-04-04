@@ -383,14 +383,21 @@ impl LaunchPipeline {
 
     fn classify_early_exit(&self, ctx: &mut PipelineContext) {
         if ctx.verification.status != "failed_after_spawn" {
-            if ctx.verification.steam_runtime_milestone == "steam_process_exited_early" {
-                ctx.verification.detailed_status = Some("steam_runtime_failed_before_game_start".to_string());
+            if ctx.verification.steam_runtime_milestone == "steam_process_exited_early" || ctx.verification.steam_auto_start_failed {
+                ctx.verification.detailed_status = Some("steam_runtime_startup_failed".to_string());
                 return;
             }
-            if ctx.verification.steam_auto_start_failed {
-                 ctx.verification.detailed_status = Some("steam_runtime_failed_to_start".to_string());
-                 return;
+
+            if ctx.command_spec.is_none() {
+                ctx.verification.detailed_status = Some("command_spec_missing".to_string());
+                return;
             }
+
+            if !ctx.executable_exists && ctx.resolved_executable_path.is_some() {
+                ctx.verification.detailed_status = Some("game_executable_not_found".to_string());
+                return;
+            }
+
             return;
         }
 
@@ -426,15 +433,15 @@ impl LaunchPipeline {
         }
 
         ctx.verification.detailed_status = Some(if dxvk_found || vkd3d_found {
-            "dxvk_loaded_but_game_exited_early".to_string()
+            "game_failed_after_spawn".to_string()
         } else if let Some(err) = fatal_error {
             err.to_string()
         } else if ctx.verification.steam_running_before_launch {
-            "game_failed_with_steam_already_running".to_string()
+            "game_failed_after_spawn".to_string()
         } else if !ctx.verification.log_growth_observed {
-            "graphics_backend_not_confirmed".to_string()
+            "game_failed_after_spawn".to_string()
         } else {
-            "unknown_early_exit".to_string()
+            "game_failed_after_spawn".to_string()
         });
     }
 
