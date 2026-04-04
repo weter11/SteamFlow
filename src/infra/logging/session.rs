@@ -61,6 +61,9 @@ pub struct LaunchVerification {
     pub steam_runtime_exit_code: Option<i32>,
     pub steam_runtime_lifetime_ms: Option<u64>,
     pub steam_runtime_milestone: String,
+    pub steam_running_before_launch: bool,
+    pub steam_auto_start_attempted: bool,
+    pub steam_auto_start_failed: bool,
     pub log_head: Vec<String>,
     pub log_tail: Vec<String>,
 }

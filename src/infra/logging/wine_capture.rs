@@ -127,6 +127,14 @@ pub fn classify_graphics_evidence(log_line: &str) -> Option<String> {
         return Some(format!("Steam Client/Environment Failure: {}", log_line.trim()));
     }
 
+    if line_lower.contains("steamapi_init") && (line_lower.contains("failed") || line_lower.contains("error")) {
+        return Some(format!("Steam Handoff Failed: {}", log_line.trim()));
+    }
+
+    if line_lower.contains("steamapi_restartappifnecessary") && (line_lower.contains("returning true") || line_lower.contains("restarting")) {
+        return Some(format!("Steam Handoff Triggered Restart: {}", log_line.trim()));
+    }
+
     // Override/Policy regressions
     if line_lower.contains("invalid dll") ||
        (line_lower.contains("failed to load") && (line_lower.contains("d3d11"))) {

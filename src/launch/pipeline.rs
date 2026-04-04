@@ -387,6 +387,10 @@ impl LaunchPipeline {
                 ctx.verification.detailed_status = Some("steam_runtime_failed_before_game_start".to_string());
                 return;
             }
+            if ctx.verification.steam_auto_start_failed {
+                 ctx.verification.detailed_status = Some("steam_runtime_failed_to_start".to_string());
+                 return;
+            }
             return;
         }
 
@@ -425,6 +429,8 @@ impl LaunchPipeline {
             "dxvk_loaded_but_game_exited_early".to_string()
         } else if let Some(err) = fatal_error {
             err.to_string()
+        } else if ctx.verification.steam_running_before_launch {
+            "game_failed_with_steam_already_running".to_string()
         } else if !ctx.verification.log_growth_observed {
             "graphics_backend_not_confirmed".to_string()
         } else {
@@ -1247,6 +1253,9 @@ impl LaunchPipeline {
                  if !ctx.verification.steam_runtime_milestone.is_empty() {
                       metadata.insert("steam_runtime_milestone".to_string(), ctx.verification.steam_runtime_milestone.clone());
                  }
+                 metadata.insert("steam_running_before_launch".to_string(), ctx.verification.steam_running_before_launch.to_string());
+                 metadata.insert("steam_auto_start_attempted".to_string(), ctx.verification.steam_auto_start_attempted.to_string());
+                 metadata.insert("steam_auto_start_failed".to_string(), ctx.verification.steam_auto_start_failed.to_string());
 
                  let _ = logger.info("launch_summary_concise", "Concise launch summary recorded".to_string(), None, metadata);
             }

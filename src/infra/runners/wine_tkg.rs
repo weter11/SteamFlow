@@ -155,7 +155,16 @@ impl Runner for WineTkgRunner {
                         steam_args.push("-bigpicture".to_string());
                     }
 
-                    if SteamClient::is_steam_running_in_prefix(&steam_wineprefix) {
+                    let steam_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix);
+
+                    unsafe {
+                        if !ctx.verification_ptr.is_null() {
+                            let v = &mut *ctx.verification_ptr;
+                            v.steam_running_before_launch = steam_running;
+                        }
+                    }
+
+                    if steam_running {
                         println!("✅ Steam already running in prefix — skipping spawn");
                     } else {
                         let proton = if let Some(forced) = ctx.launcher_config
@@ -203,6 +212,7 @@ impl Runner for WineTkgRunner {
                                 v.steam_runtime_exe = Some(steam_cmd.get_program().to_string_lossy().to_string());
                                 v.steam_runtime_args = steam_cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
                                 v.steam_runtime_milestone = "steam_process_spawn_requested".to_string();
+                                v.steam_auto_start_attempted = true;
                             }
                         }
 
@@ -285,7 +295,12 @@ impl Runner for WineTkgRunner {
                         };
 
                         if !ready {
-                                    return Err(LaunchError::new(LaunchErrorKind::Process, "Background Steam crashed before the game could start"));
+                            unsafe {
+                                if !ctx.verification_ptr.is_null() {
+                                    (*ctx.verification_ptr).steam_auto_start_failed = true;
+                                }
+                            }
+                            return Err(LaunchError::new(LaunchErrorKind::Process, "Background Steam crashed before the game could start"));
                         }
                     }
                 }
