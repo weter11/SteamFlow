@@ -436,8 +436,8 @@ impl LaunchPipeline {
             "game_failed_after_spawn".to_string()
         } else if let Some(err) = fatal_error {
             err.to_string()
-        } else if ctx.verification.steam_running_before_launch {
-            "game_failed_after_spawn".to_string()
+        } else if ctx.verification.steam_running_before_launch && ctx.verification.steam_client_exposed {
+            "steam_sensitive_game_failed_after_spawn".to_string()
         } else if !ctx.verification.log_growth_observed {
             "game_failed_after_spawn".to_string()
         } else {
@@ -816,6 +816,22 @@ impl LaunchPipeline {
 
                 for line in &lines {
                     let mut line_matched = false;
+                    let line_lower = line.to_lowercase();
+
+                    // Detect Dependency Families from log lines
+                    let families_to_scan = [
+                        ("Batman (GFSDK/APEX)", vec!["gfsdk", "apex", "nvtt"]),
+                        ("Metro (4A Engine)", vec!["4a engine", "metro"]),
+                        ("PhysX Runtime", vec!["physx"]),
+                    ];
+
+                    for (family, patterns) in families_to_scan {
+                        if patterns.iter().any(|p| line_lower.contains(p)) {
+                            if !ctx.verification.dependency_families_detected.contains(&family.to_string()) {
+                                ctx.verification.dependency_families_detected.push(family.to_string());
+                            }
+                        }
+                    }
 
                     // Update Milestone
                     if let Some(m) = crate::infra::logging::detect_startup_milestone(line) {
@@ -1059,15 +1075,18 @@ impl LaunchPipeline {
                 }
 
                 // Title-Specific Dependency Detection
-                let mut families = Vec::new();
+                let mut families = ctx.verification.dependency_families_detected.clone();
                 let families_to_check = [
                     ("Batman (PhysX/APEX)", vec!["drive_c/windows/system32/PhysXLoader.dll", "drive_c/windows/syswow64/PhysXLoader.dll"]),
                     ("Amnesia (SDL2/Newton)", vec!["drive_c/windows/system32/SDL2.dll", "drive_c/windows/syswow64/SDL2.dll"]),
+                    ("Metro (4A Engine)", vec!["drive_c/windows/system32/PhysXDevice.dll", "drive_c/windows/syswow64/PhysXDevice.dll"]),
                 ];
 
                 for (family, paths) in families_to_check {
                     if paths.iter().any(|p| prefix_path.join(p).exists()) {
-                        families.push(family.to_string());
+                        if !families.contains(&family.to_string()) {
+                            families.push(family.to_string());
+                        }
                     }
                 }
                 ctx.verification.dependency_families_detected = families;

@@ -15,8 +15,7 @@ impl Runner for WineTkgRunner {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
         let is_batman = ctx.app.app_id == 209000;
-        let is_amnesia = ctx.app.app_id == 10;
-        let requires_steam_runtime = is_batman || is_amnesia;
+        let requires_steam_runtime = is_batman;
 
         let use_steam_runtime = ctx.user_config.as_ref()
             .map(|c| c.use_steam_runtime)

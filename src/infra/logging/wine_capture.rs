@@ -36,14 +36,15 @@ pub fn detect_startup_milestone(log_line: &str) -> Option<StartupMilestone> {
     }
 
     // Steam bootstrap
-    if line_lower.contains("steamapi_init") || line_lower.contains("steamapi_restartappifnecessary") || line_lower.contains("steam_client: initialized") {
+    if line_lower.contains("steamapi_init") || line_lower.contains("steamapi_restartappifnecessary") || line_lower.contains("steam_client: initialized") || line_lower.contains("steamapi_init_all") {
         return Some(StartupMilestone::SteamBootstrapInitialized);
     }
 
-    // Game local DLLs (representative families for Batman/Amnesia)
+    // Game local DLLs (representative families for Batman/Amnesia/Metro)
     if line_lower.contains("loaddll") && (
         line_lower.contains("physx") || line_lower.contains("gfsdk") || line_lower.contains("nvtt") || // Batman
-        line_lower.contains("sdl2") || line_lower.contains("newton") || line_lower.contains("devil")    // Amnesia
+        line_lower.contains("sdl2") || line_lower.contains("newton") || line_lower.contains("devil") ||   // Amnesia
+        line_lower.contains("physxdevice") || line_lower.contains("4a_backend")                         // Metro
     ) {
         return Some(StartupMilestone::GameLocalDllsLoaded);
     }
