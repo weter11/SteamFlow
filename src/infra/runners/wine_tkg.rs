@@ -370,6 +370,16 @@ impl Runner for WineTkgRunner {
         env.insert("WINEPREFIX".to_string(), effective_game_prefix.to_string_lossy().to_string());
         env.insert("STEAM_COMPAT_DATA_PATH".to_string(), compat_data_path.to_string_lossy().to_string());
 
+        // Add user identity context if available
+        if let Ok(session) = crate::config::load_session().await {
+            if let Some(steam_id) = session.steam_id {
+                env.insert("SteamUser".to_string(), steam_id.to_string());
+            }
+            if let Some(account_name) = session.account_name {
+                env.insert("SteamAppUser".to_string(), account_name);
+            }
+        }
+
         let glc = ctx.user_config.as_ref()
             .map(|c| c.graphics_layers.clone())
             .unwrap_or_default();
@@ -377,24 +387,26 @@ impl Runner for WineTkgRunner {
             .map(|c| c.steam_launch_config.no_overlay)
             .unwrap_or(true);
 
-        let install_dir = PathBuf::from(
-            ctx.app.install_path
-                .clone()
-                .ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, format!("game {} is not installed", ctx.app.app_id)))?,
-        );
+        let game_working_dir: PathBuf = {
+            let install_dir = PathBuf::from(
+                ctx.app.install_path
+                    .clone()
+                    .ok_or_else(|| LaunchError::new(LaunchErrorKind::GameData, format!("game {} is not installed", ctx.app.app_id)))?,
+            );
 
-        let exe_rel = ctx.launch_info.executable.replace('\\', "/");
-        let executable = if Path::new(&exe_rel).is_absolute() {
-            PathBuf::from(&exe_rel)
-        } else {
-            install_dir.join(&exe_rel)
+            let exe_rel = ctx.launch_info.executable.replace('\\', "/");
+            let executable = if Path::new(&exe_rel).is_absolute() {
+                PathBuf::from(&exe_rel)
+            } else {
+                install_dir.join(&exe_rel)
+            };
+            ctx.launch_info.workingdir
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|wd| install_dir.join(wd.replace('\\', "/")))
+                .or_else(|| executable.parent().map(|p| p.to_path_buf()))
+                .unwrap_or_else(|| install_dir.clone())
         };
-        let game_working_dir: PathBuf = ctx.launch_info.workingdir
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(|wd| install_dir.join(wd.replace('\\', "/")))
-            .or_else(|| executable.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| install_dir.clone());
 
         // Resolve proton version for component detection and DLL path building
         let proton = if let Some(forced) = ctx.launcher_config

@@ -64,6 +64,9 @@ pub struct LaunchVerification {
     pub steam_running_before_launch: bool,
     pub steam_auto_start_attempted: bool,
     pub steam_auto_start_failed: bool,
+    pub steam_api_initialized: Option<bool>,
+    pub steam_ownership_confirmed: Option<bool>,
+    pub steam_client_artifact: Option<String>, // "local", "windows", "host"
     pub log_head: Vec<String>,
     pub log_tail: Vec<String>,
 }

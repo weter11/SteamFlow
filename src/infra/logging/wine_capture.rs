@@ -129,11 +129,38 @@ pub fn classify_graphics_evidence(log_line: &str) -> Option<String> {
     }
 
     if line_lower.contains("steamapi_init") && (line_lower.contains("failed") || line_lower.contains("error")) {
-        return Some(format!("Steam Handoff Failed: {}", log_line.trim()));
+        return Some(format!("SteamAPI Initialization Failed: {}", log_line.trim()));
     }
 
     if line_lower.contains("steamapi_restartappifnecessary") && (line_lower.contains("returning true") || line_lower.contains("restarting")) {
         return Some(format!("Steam Handoff Triggered Restart: {}", log_line.trim()));
+    }
+
+    if line_lower.contains("steamapi_issteamrunning") && line_lower.contains("did not locate") {
+        return Some(format!("SteamAPI Connection Failed (Steam not found): {}", log_line.trim()));
+    }
+
+    if line_lower.contains("user does not own") || line_lower.contains("ownership failed") {
+        return Some(format!("Steam Ownership Validation Failed: {}", log_line.trim()));
+    }
+
+    if line_lower.contains("tried to access steam interface") && line_lower.contains("before steamapi_init") {
+        return Some(format!("SteamAPI Access Violation: {}", log_line.trim()));
+    }
+
+    // Steam Client Artifact Detection
+    if line_lower.contains("loaddll") || line_lower.contains("load_module") {
+        if line_lower.contains("steam_api.dll") || line_lower.contains("steam_api64.dll") {
+             return Some(format!("Steam Client Artifact: local ({})", log_line.trim()));
+        }
+        if line_lower.contains("steamclient.dll") || line_lower.contains("steamclient64.dll") {
+             if line_lower.contains("program files") || line_lower.contains("steam") {
+                 return Some(format!("Steam Client Artifact: windows ({})", log_line.trim()));
+             }
+        }
+        if line_lower.contains("lsteamclient") || line_lower.contains("steamclient.so") {
+             return Some(format!("Steam Client Artifact: host ({})", log_line.trim()));
+        }
     }
 
     // Override/Policy regressions

@@ -418,6 +418,18 @@ impl LaunchPipeline {
                 fatal_error = Some("middleware_dependency_failure");
                 break;
             }
+            if evidence.contains("SteamAPI Initialization Failed") || evidence.contains("SteamAPI Access Violation") {
+                fatal_error = Some("steamapi_init_failed");
+                break;
+            }
+            if evidence.contains("Steam Ownership Validation Failed") {
+                fatal_error = Some("steam_ownership_or_session_failed");
+                break;
+            }
+            if evidence.contains("SteamAPI Connection Failed") {
+                fatal_error = Some("steam_not_found_by_game");
+                break;
+            }
             if evidence.contains("DLL Load Failure") {
                 if evidence.contains("d3d11") {
                      fatal_error = Some("startup_environment_regression");
@@ -845,6 +857,18 @@ impl LaunchPipeline {
                             ctx.graphics_stack.graphics_stack_evidence.push(evidence.clone());
                         }
 
+                        if evidence.contains("SteamAPI Initialization Failed") {
+                            ctx.verification.steam_api_initialized = Some(false);
+                        }
+                        if evidence.contains("Steam Ownership Validation Failed") {
+                            ctx.verification.steam_ownership_confirmed = Some(false);
+                        }
+                        if evidence.contains("Steam Client Artifact:") {
+                            if evidence.contains("local") { ctx.verification.steam_client_artifact = Some("local".into()); }
+                            else if evidence.contains("windows") { ctx.verification.steam_client_artifact = Some("windows".into()); }
+                            else if evidence.contains("host") { ctx.verification.steam_client_artifact = Some("host".into()); }
+                        }
+
                         if evidence.contains("DXVK") {
                             ctx.graphics_stack.runtime_evidence.dxvk.evidence_found = true;
                             if ctx.graphics_stack.runtime_evidence.dxvk.evidence.len() < 5 {
@@ -1065,6 +1089,9 @@ impl LaunchPipeline {
                     "drive_c/Program Files (x86)/Steam/tier0_s.dll".to_string(),
                     "drive_c/windows/system32/PhysXLoader.dll".to_string(),
                     "drive_c/windows/syswow64/PhysXLoader.dll".to_string(),
+                    "drive_c/windows/system32/steam_api.dll".to_string(),
+                    "drive_c/windows/syswow64/steam_api.dll".to_string(),
+                    "drive_c/windows/system32/steam_api64.dll".to_string(),
                 ];
 
                 for dir in common_dirs {
@@ -1278,6 +1305,15 @@ impl LaunchPipeline {
                  }
                  if !ctx.verification.steam_runtime_milestone.is_empty() {
                       metadata.insert("steam_runtime_milestone".to_string(), ctx.verification.steam_runtime_milestone.clone());
+                 }
+                 if let Some(init) = ctx.verification.steam_api_initialized {
+                      metadata.insert("steam_api_initialized".to_string(), init.to_string());
+                 }
+                 if let Some(own) = ctx.verification.steam_ownership_confirmed {
+                      metadata.insert("steam_ownership_confirmed".to_string(), own.to_string());
+                 }
+                 if let Some(ref art) = ctx.verification.steam_client_artifact {
+                      metadata.insert("steam_client_artifact".to_string(), art.clone());
                  }
                  metadata.insert("steam_running_before_launch".to_string(), ctx.verification.steam_running_before_launch.to_string());
                  metadata.insert("steam_auto_start_attempted".to_string(), ctx.verification.steam_auto_start_attempted.to_string());
