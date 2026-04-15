@@ -21,6 +21,7 @@ impl PipelineStage for BuildCommandStage {
                 proton_path: ctx.proton_path.clone(),
                 target_architecture: ctx.target_architecture,
                 dll_resolutions: ctx.dll_resolutions.clone(),
+                verification_ptr: &mut ctx.verification as *mut _,
             };
             let spec = runner.build_command(&runner_ctx).await?;
             ctx.command_spec = Some(spec);

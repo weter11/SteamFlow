@@ -737,8 +737,6 @@ pub fn build_dll_overrides(
         for dll in &[
             "d3d8",
             "d3d9",
-            "d3d10",
-            "d3d10_1",
             "d3d10core",
             "d3d11",
             "dxgi",
@@ -761,17 +759,12 @@ pub fn build_dll_overrides(
         for dll in &[
             "d3d8.dll",
             "d3d9.dll",
-            "d3d10.dll",
-            "d3d10_1.dll",
             "d3d10core.dll",
             "d3d11.dll",
             "dxgi.dll",
         ] {
             let stem = dll.trim_end_matches(".dll");
-            // Special case: d3d10 and d3d10_1 should always allow builtin fallback (n,b)
-            // even in strict DXVK mode, because DXVK typically doesn't provide them
-            // standalone; it uses d3d10core instead.
-            let mode = if strict_dxvk && stem != "d3d10" && stem != "d3d10_1" { "n" } else { "n,b" };
+            let mode = if strict_dxvk { "n" } else { "n,b" };
 
             if strict_dxvk || !game_has(dll) {
                 overrides.push(format!("{stem}={mode}"));
@@ -793,25 +786,59 @@ pub fn build_dll_overrides(
     overrides.join(";")
 }
 
-/// Detects the actual WINEPREFIX layout for the master Steam install.
-/// Handles both master_steam_prefix/pfx/drive_c and master_steam_prefix/drive_c layouts.
-pub fn resolve_master_wineprefix() -> PathBuf {
-    let base = crate::config::config_dir()
+#[derive(Debug, Clone)]
+pub struct MasterSteamConfig {
+    pub root_dir: PathBuf,      // e.g. ~/.config/SteamFlow/master_steam_prefix
+    pub wine_prefix: PathBuf,   // e.g. root_dir or root_dir/pfx
+    pub layout_kind: String,    // "root" or "pfx"
+    pub steam_exe: Option<PathBuf>,
+}
+
+pub fn get_master_steam_config() -> MasterSteamConfig {
+    let root_dir = crate::config::config_dir()
         .unwrap_or_default()
         .join("master_steam_prefix");
 
-    // Check direct layout first (drive_c directly under base) — this wins
-    // if Steam was installed with WINEPREFIX=master_steam_prefix (no /pfx).
-    // Only fall back to /pfx if drive_c genuinely lives there.
-    if base.join("drive_c").exists() {
-        return base;
+    // Layout detection: prefer /pfx if it exists, otherwise check root for drive_c
+    let (wine_prefix, layout_kind) = if root_dir.join("pfx/drive_c").exists() {
+        (root_dir.join("pfx"), "pfx".to_string())
+    } else if root_dir.join("drive_c").exists() {
+        (root_dir.clone(), "root".to_string())
+    } else {
+        // Default for new installs
+        (root_dir.join("pfx"), "pfx".to_string())
+    };
+
+    let steam_exe = find_steam_exe_in_prefix(&wine_prefix);
+
+    MasterSteamConfig {
+        root_dir,
+        wine_prefix,
+        layout_kind,
+        steam_exe,
     }
-    if base.join("pfx/drive_c").exists() {
-        return base.join("pfx");
+}
+
+pub fn find_steam_exe_in_prefix(prefix: &Path) -> Option<PathBuf> {
+    let candidates = [
+        "drive_c/Program Files (x86)/Steam/steam.exe",
+        "drive_c/Program Files/Steam/steam.exe",
+    ];
+
+    for rel_path in candidates {
+        let full_path = prefix.join(rel_path);
+        if full_path.exists() {
+            return Some(full_path);
+        }
     }
 
-    // Fresh install default — Proton-style nesting
-    base.join("pfx")
+    None
+}
+
+/// Detects the actual WINEPREFIX layout for the master Steam install.
+/// Handles both master_steam_prefix/pfx/drive_c and master_steam_prefix/drive_c layouts.
+pub fn resolve_master_wineprefix() -> PathBuf {
+    get_master_steam_config().wine_prefix
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1099,7 +1126,7 @@ fn find_sibling_dll(
 
 pub fn cleanup_dll_symlinks(prefix: &Path) -> Result<()> {
     let target_dlls = [
-        "d3d8.dll", "d3d9.dll", "dxgi.dll", "d3d10.dll", "d3d10_1.dll", "d3d10core.dll",
+        "d3d8.dll", "d3d9.dll", "dxgi.dll", "d3d10core.dll",
         "d3d11.dll", "d3d12.dll", "d3d12core.dll", "libvkd3d-1.dll", "libvkd3d-shader-1.dll"
     ];
 

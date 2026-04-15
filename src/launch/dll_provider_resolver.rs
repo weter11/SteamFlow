@@ -56,8 +56,6 @@ impl DllProviderResolver {
                 "d3d8".into(),
                 "d3d9".into(),
                 "dxgi".into(),
-                "d3d10".into(),
-                "d3d10_1".into(),
                 "d3d10core".into(),
                 "d3d11".into(),
                 "d3d12".into(),
@@ -273,7 +271,7 @@ impl DllProviderResolver {
         // 3. System Priority
         // For now, we use a simplified check for system paths
         let system_paths = match dll_name {
-            "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi" => vec![
+            "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi" => vec![
                 "/usr/lib/dxvk/x64",
                 "/usr/lib/x86_64-linux-gnu/dxvk",
             ],
@@ -324,7 +322,7 @@ impl DllProviderResolver {
         custom_vkd3d_proton_path: Option<&Path>,
     ) -> Option<PathBuf> {
         let dll_filename = format!("{}.dll", dll_name);
-        let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi");
+        let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi");
         let is_vkd3d_proton = matches!(dll_name, "d3d12" | "d3d12core");
         let is_vkd3d = matches!(dll_name, "libvkd3d-1" | "libvkd3d-shader-1");
 
@@ -382,7 +380,7 @@ impl DllProviderResolver {
         let dll_filename = format!("{}.dll", dll_name);
 
         // Match DLL to component and look for it in runner root
-        let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10" | "d3d10_1" | "d3d10core" | "d3d11" | "dxgi");
+        let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi");
         if is_dxvk && components.dxvk.is_some() {
             let mut relative_paths = vec![
                 "lib/wine/dxvk/x86_64-windows",

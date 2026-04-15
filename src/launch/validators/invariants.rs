@@ -33,7 +33,7 @@ impl LaunchValidator for LaunchInvariantValidator {
         if ctx.graphics_stack.effective_backend != "DXVK" {
             if let Some(spec) = &ctx.command_spec {
                 if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
-                    let dxvk_dlls = ["d3d8", "d3d9", "d3d10", "d3d10core", "d3d11", "dxgi"];
+                    let dxvk_dlls = ["d3d8", "d3d9", "d3d10core", "d3d11", "dxgi"];
                     for part in overrides.split(';') {
                         if let Some((dll, mode)) = part.split_once('=') {
                             let dll_trimmed = dll.trim().to_lowercase();
@@ -249,6 +249,7 @@ impl LaunchValidator for LaunchInvariantValidator {
                 format!("VKD3D-Proton was requested/effective but no runtime evidence was found in logs{}.", suffix)
             ));
         }
+
 
         for (code, msg) in warnings {
             ctx.add_warning(code, msg);

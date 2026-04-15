@@ -24,6 +24,7 @@ impl PipelineStage for PreparePrefixStage {
                 proton_path: ctx.proton_path.clone(),
                 target_architecture: ctx.target_architecture,
                 dll_resolutions: ctx.dll_resolutions.clone(),
+                verification_ptr: &mut ctx.verification as *mut _,
             };
             runner.prepare_prefix(&runner_ctx).await?;
 

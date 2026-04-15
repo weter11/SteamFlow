@@ -383,6 +383,21 @@ impl LaunchPipeline {
 
     fn classify_early_exit(&self, ctx: &mut PipelineContext) {
         if ctx.verification.status != "failed_after_spawn" {
+            if ctx.verification.steam_runtime_milestone == "steam_process_exited_early" || ctx.verification.steam_auto_start_failed {
+                ctx.verification.detailed_status = Some("steam_runtime_startup_failed".to_string());
+                return;
+            }
+
+            if ctx.command_spec.is_none() {
+                ctx.verification.detailed_status = Some("command_spec_missing".to_string());
+                return;
+            }
+
+            if !ctx.executable_exists && ctx.resolved_executable_path.is_some() {
+                ctx.verification.detailed_status = Some("game_executable_not_found".to_string());
+                return;
+            }
+
             return;
         }
 
@@ -391,8 +406,36 @@ impl LaunchPipeline {
 
         let mut fatal_error = None;
         for evidence in &ctx.graphics_stack.graphics_stack_evidence {
+            if evidence.contains("Override Policy Conflict") {
+                 fatal_error = Some("override_policy_regression");
+                 break;
+            }
+            if evidence.contains("Steam Client/Environment Failure") {
+                 fatal_error = Some("steam_runtime_exposure_regression");
+                 break;
+            }
+            if evidence.contains("PhysX/Middleware failure") {
+                fatal_error = Some("middleware_dependency_failure");
+                break;
+            }
+            if evidence.contains("SteamAPI Initialization Failed") || evidence.contains("SteamAPI Access Violation") {
+                fatal_error = Some("steamapi_init_failed");
+                break;
+            }
+            if evidence.contains("Steam Ownership Validation Failed") {
+                fatal_error = Some("steam_ownership_or_session_failed");
+                break;
+            }
+            if evidence.contains("SteamAPI Connection Failed") {
+                fatal_error = Some("steam_not_found_by_game");
+                break;
+            }
             if evidence.contains("DLL Load Failure") {
-                fatal_error = Some("missing_required_module");
+                if evidence.contains("d3d11") {
+                     fatal_error = Some("startup_environment_regression");
+                } else {
+                     fatal_error = Some("missing_required_module");
+                }
                 break;
             }
             if evidence.contains("DLL Dependency Missing") {
@@ -402,13 +445,15 @@ impl LaunchPipeline {
         }
 
         ctx.verification.detailed_status = Some(if dxvk_found || vkd3d_found {
-            "dxvk_loaded_but_game_exited_early".to_string()
+            "game_failed_after_spawn".to_string()
         } else if let Some(err) = fatal_error {
             err.to_string()
+        } else if ctx.verification.steam_running_before_launch && ctx.verification.steam_client_exposed {
+            "steam_sensitive_game_failed_after_spawn".to_string()
         } else if !ctx.verification.log_growth_observed {
-            "graphics_backend_not_confirmed".to_string()
+            "game_failed_after_spawn".to_string()
         } else {
-            "unknown_early_exit".to_string()
+            "game_failed_after_spawn".to_string()
         });
     }
 
@@ -756,6 +801,14 @@ impl LaunchPipeline {
                 let lines: Vec<&str> = content.lines().collect();
                 ctx.graphics_stack.runtime_evidence.scan_metadata.line_count = lines.len();
 
+                // Capture Log Head/Tail
+                ctx.verification.log_head = lines.iter().take(50).map(|s| s.to_string()).collect();
+                if lines.len() > 50 {
+                     ctx.verification.log_tail = lines.iter().rev().take(100).rev().map(|s| s.to_string()).collect();
+                }
+
+                let mut max_milestone = crate::infra::logging::StartupMilestone::None;
+
                 // Derive component paths from dll resolutions
                 let mut component_paths = HashMap::new();
                 for res in &ctx.dll_resolutions {
@@ -775,9 +828,45 @@ impl LaunchPipeline {
 
                 for line in &lines {
                     let mut line_matched = false;
+                    let line_lower = line.to_lowercase();
+
+                    // Detect Dependency Families from log lines
+                    let families_to_scan = [
+                        ("Batman (GFSDK/APEX)", vec!["gfsdk", "apex", "nvtt"]),
+                        ("Metro (4A Engine)", vec!["4a engine", "metro"]),
+                        ("PhysX Runtime", vec!["physx"]),
+                    ];
+
+                    for (family, patterns) in families_to_scan {
+                        if patterns.iter().any(|p| line_lower.contains(p)) {
+                            if !ctx.verification.dependency_families_detected.contains(&family.to_string()) {
+                                ctx.verification.dependency_families_detected.push(family.to_string());
+                            }
+                        }
+                    }
+
+                    // Update Milestone
+                    if let Some(m) = crate::infra::logging::detect_startup_milestone(line) {
+                         if m > max_milestone {
+                             max_milestone = m;
+                         }
+                    }
+
                     if let Some(evidence) = crate::infra::logging::classify_graphics_evidence(line) {
                         if !ctx.graphics_stack.graphics_stack_evidence.contains(&evidence) {
                             ctx.graphics_stack.graphics_stack_evidence.push(evidence.clone());
+                        }
+
+                        if evidence.contains("SteamAPI Initialization Failed") {
+                            ctx.verification.steam_api_initialized = Some(false);
+                        }
+                        if evidence.contains("Steam Ownership Validation Failed") {
+                            ctx.verification.steam_ownership_confirmed = Some(false);
+                        }
+                        if evidence.contains("Steam Client Artifact:") {
+                            if evidence.contains("local") { ctx.verification.steam_client_artifact = Some("local".into()); }
+                            else if evidence.contains("windows") { ctx.verification.steam_client_artifact = Some("windows".into()); }
+                            else if evidence.contains("host") { ctx.verification.steam_client_artifact = Some("host".into()); }
                         }
 
                         if evidence.contains("DXVK") {
@@ -868,6 +957,8 @@ impl LaunchPipeline {
                         ctx.graphics_stack.runtime_evidence.scan_metadata.candidate_matches += 1;
                     }
                 }
+
+                ctx.verification.last_successful_startup_milestone = max_milestone.to_string();
             }
         } else {
             ctx.graphics_stack.runtime_evidence.scan_metadata.file_exists = false;
@@ -964,16 +1055,72 @@ impl LaunchPipeline {
                 let mut metadata = HashMap::new();
                 metadata.insert("prefix_path".to_string(), prefix.clone());
 
+                // Detect Windows username
+                let users_dir = prefix_path.join("drive_c/users");
+                if users_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&users_dir) {
+                        let mut usernames = Vec::new();
+                        for entry in entries.flatten() {
+                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name != "Public" && name != "All Users" && name != "Default User" {
+                                    usernames.push(name);
+                                }
+                            }
+                        }
+                        if !usernames.is_empty() {
+                            // Sort and pick first (most likely primary)
+                            usernames.sort();
+                            let primary = usernames[0].clone();
+                            ctx.verification.windows_username = Some(primary.clone());
+                            ctx.verification.windows_user_path = Some(format!("C:\\users\\{}", primary));
+                            metadata.insert("detected_windows_username".to_string(), primary);
+                        }
+                    }
+                }
+
+                let username = ctx.verification.windows_username.as_deref().unwrap_or("steamuser");
                 let common_dirs = [
-                    "drive_c/users/steamuser/Documents",
-                    "drive_c/users/steamuser/AppData/Local",
-                    "drive_c/users/steamuser/AppData/Roaming",
+                    format!("drive_c/users/{}/Documents", username),
+                    format!("drive_c/users/{}/AppData/Local", username),
+                    format!("drive_c/users/{}/AppData/Roaming", username),
+                    "drive_c/Program Files (x86)/Steam/steam.exe".to_string(),
+                    "drive_c/Program Files (x86)/Steam/steamclient.dll".to_string(),
+                    "drive_c/Program Files (x86)/Steam/tier0_s.dll".to_string(),
+                    "drive_c/windows/system32/PhysXLoader.dll".to_string(),
+                    "drive_c/windows/syswow64/PhysXLoader.dll".to_string(),
+                    "drive_c/windows/system32/steam_api.dll".to_string(),
+                    "drive_c/windows/syswow64/steam_api.dll".to_string(),
+                    "drive_c/windows/system32/steam_api64.dll".to_string(),
                 ];
 
                 for dir in common_dirs {
-                    let full_path = prefix_path.join(dir);
-                    metadata.insert(format!("dir_exists:{}", dir), full_path.exists().to_string());
+                    let full_path = prefix_path.join(&dir);
+                    let exists = full_path.exists();
+                    metadata.insert(format!("path_exists:{}", dir), exists.to_string());
+                    ctx.verification.key_paths_detected.insert(dir, exists);
                 }
+
+                // Title-Specific Dependency Detection
+                let mut families = ctx.verification.dependency_families_detected.clone();
+                let families_to_check = [
+                    ("Batman (PhysX/APEX)", vec!["drive_c/windows/system32/PhysXLoader.dll", "drive_c/windows/syswow64/PhysXLoader.dll"]),
+                    ("Amnesia (SDL2/Newton)", vec!["drive_c/windows/system32/SDL2.dll", "drive_c/windows/syswow64/SDL2.dll"]),
+                    ("Metro (4A Engine)", vec!["drive_c/windows/system32/PhysXDevice.dll", "drive_c/windows/syswow64/PhysXDevice.dll"]),
+                ];
+
+                for (family, paths) in families_to_check {
+                    if paths.iter().any(|p| prefix_path.join(p).exists()) {
+                        if !families.contains(&family.to_string()) {
+                            families.push(family.to_string());
+                        }
+                    }
+                }
+                ctx.verification.dependency_families_detected = families;
+
+                // Check steam client exposure
+                ctx.verification.steam_client_exposed = spec.env.contains_key("STEAM_COMPAT_CLIENT_INSTALL_PATH") ||
+                                                       spec.env.get("WINEPATH").map(|wp| wp.contains("Steam")).unwrap_or(false);
 
                 if let Some(logger) = &ctx.logger {
                     let _ = logger.info("prefix_health_check", "WINEPREFIX sanity check complete".to_string(), None, metadata);
@@ -1147,6 +1294,30 @@ impl LaunchPipeline {
                  if let Some(ref detailed) = ctx.verification.detailed_status {
                      metadata.insert("verification_detailed".to_string(), detailed.clone());
                  }
+
+                 if let Some(ref username) = ctx.verification.windows_username {
+                      metadata.insert("windows_user".to_string(), username.clone());
+                 }
+                 metadata.insert("steam_client_exposed".to_string(), ctx.verification.steam_client_exposed.to_string());
+                 metadata.insert("last_milestone".to_string(), ctx.verification.last_successful_startup_milestone.clone());
+                 if !ctx.verification.dependency_families_detected.is_empty() {
+                      metadata.insert("dependency_families".to_string(), ctx.verification.dependency_families_detected.join(", "));
+                 }
+                 if !ctx.verification.steam_runtime_milestone.is_empty() {
+                      metadata.insert("steam_runtime_milestone".to_string(), ctx.verification.steam_runtime_milestone.clone());
+                 }
+                 if let Some(init) = ctx.verification.steam_api_initialized {
+                      metadata.insert("steam_api_initialized".to_string(), init.to_string());
+                 }
+                 if let Some(own) = ctx.verification.steam_ownership_confirmed {
+                      metadata.insert("steam_ownership_confirmed".to_string(), own.to_string());
+                 }
+                 if let Some(ref art) = ctx.verification.steam_client_artifact {
+                      metadata.insert("steam_client_artifact".to_string(), art.clone());
+                 }
+                 metadata.insert("steam_running_before_launch".to_string(), ctx.verification.steam_running_before_launch.to_string());
+                 metadata.insert("steam_auto_start_attempted".to_string(), ctx.verification.steam_auto_start_attempted.to_string());
+                 metadata.insert("steam_auto_start_failed".to_string(), ctx.verification.steam_auto_start_failed.to_string());
 
                  let _ = logger.info("launch_summary_concise", "Concise launch summary recorded".to_string(), None, metadata);
             }

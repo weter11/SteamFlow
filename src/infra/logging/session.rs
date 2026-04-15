@@ -50,6 +50,25 @@ pub struct LaunchVerification {
     pub process_lifetime_ms: Option<u64>,
     pub exit_code: Option<i32>,
     pub log_growth_observed: bool,
+    pub windows_username: Option<String>,
+    pub windows_user_path: Option<String>,
+    pub key_paths_detected: HashMap<String, bool>,
+    pub steam_client_exposed: bool,
+    pub last_successful_startup_milestone: String,
+    pub dependency_families_detected: Vec<String>,
+    pub steam_runtime_exe: Option<String>,
+    pub steam_runtime_args: Vec<String>,
+    pub steam_runtime_exit_code: Option<i32>,
+    pub steam_runtime_lifetime_ms: Option<u64>,
+    pub steam_runtime_milestone: String,
+    pub steam_running_before_launch: bool,
+    pub steam_auto_start_attempted: bool,
+    pub steam_auto_start_failed: bool,
+    pub steam_api_initialized: Option<bool>,
+    pub steam_ownership_confirmed: Option<bool>,
+    pub steam_client_artifact: Option<String>, // "local", "windows", "host"
+    pub log_head: Vec<String>,
+    pub log_tail: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
