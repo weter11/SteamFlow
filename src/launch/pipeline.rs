@@ -1315,6 +1315,21 @@ impl LaunchPipeline {
                  if let Some(ref art) = ctx.verification.steam_client_artifact {
                       metadata.insert("steam_client_artifact".to_string(), art.clone());
                  }
+                 if let Some(ref pfx) = ctx.verification.effective_game_wineprefix {
+                      metadata.insert("effective_game_wineprefix".to_string(), pfx.clone());
+                 }
+                 if let Some(ref pfx) = ctx.verification.effective_steam_wineprefix {
+                      metadata.insert("effective_steam_wineprefix".to_string(), pfx.clone());
+                 }
+                 if let Some(ref path) = ctx.verification.steam_client_install_path_exposed_to_game {
+                      metadata.insert("steam_client_install_path_exposed_to_game".to_string(), path.clone());
+                 }
+                 if let Some(ref source) = ctx.verification.steam_client_install_path_source {
+                      metadata.insert("steam_client_install_path_source".to_string(), source.clone());
+                 }
+                 metadata.insert("per_game_prefix_requested".to_string(), ctx.verification.per_game_prefix_requested.to_string());
+                 metadata.insert("per_game_prefix_honored".to_string(), ctx.verification.per_game_prefix_honored.to_string());
+
                  metadata.insert("steam_running_before_launch".to_string(), ctx.verification.steam_running_before_launch.to_string());
                  metadata.insert("steam_auto_start_attempted".to_string(), ctx.verification.steam_auto_start_attempted.to_string());
                  metadata.insert("steam_auto_start_failed".to_string(), ctx.verification.steam_auto_start_failed.to_string());

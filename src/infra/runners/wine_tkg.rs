@@ -24,14 +24,16 @@ impl Runner for WineTkgRunner {
             .map(|c| c.steam_prefix_mode.clone())
             .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
 
+        let user_config_store: crate::models::UserConfigStore = ctx.user_config.as_ref().map(|c| {
+            let mut store = HashMap::new();
+            store.insert(ctx.app.app_id, c.clone());
+            store
+        }).unwrap_or_default().into();
+
         let effective_game_prefix = crate::utils::steam_wineprefix_for_game(
             &ctx.launcher_config,
             ctx.app.app_id,
-            &ctx.user_config.as_ref().map(|c| {
-                let mut store = HashMap::new();
-                store.insert(ctx.app.app_id, c.clone());
-                store
-            }).unwrap_or_default().into()
+            &user_config_store
         );
         std::fs::create_dir_all(&effective_game_prefix)
             .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", effective_game_prefix.display())).with_source(anyhow!(e)))?;
@@ -172,6 +174,10 @@ impl Runner for WineTkgRunner {
                         if !ctx.verification_ptr.is_null() {
                             let v = &mut *ctx.verification_ptr;
                             v.steam_running_before_launch = steam_running;
+                            v.effective_game_wineprefix = Some(effective_game_prefix.to_string_lossy().to_string());
+                            v.effective_steam_wineprefix = Some(steam_wineprefix.to_string_lossy().to_string());
+                            v.per_game_prefix_requested = steam_prefix_mode == crate::models::SteamPrefixMode::PerGame;
+                            v.per_game_prefix_honored = effective_game_prefix == steam_wineprefix;
                         }
                     }
 
@@ -354,14 +360,16 @@ impl Runner for WineTkgRunner {
             .join("compatdata")
             .join(&app_id_str);
 
+        let user_config_store: crate::models::UserConfigStore = ctx.user_config.as_ref().map(|c| {
+            let mut store = HashMap::new();
+            store.insert(ctx.app.app_id, c.clone());
+            store
+        }).unwrap_or_default().into();
+
         let effective_game_prefix = crate::utils::steam_wineprefix_for_game(
             &ctx.launcher_config,
             ctx.app.app_id,
-            &ctx.user_config.as_ref().map(|c| {
-                let mut store = HashMap::new();
-                store.insert(ctx.app.app_id, c.clone());
-                store
-            }).unwrap_or_default().into()
+            &user_config_store
         );
 
         env.insert("SteamAppId".to_string(), app_id_str.clone());
@@ -421,8 +429,9 @@ impl Runner for WineTkgRunner {
                 .unwrap_or("wine")
         };
 
+        let active_runner_path = crate::utils::resolve_runner(proton, &library_root);
         let _components = crate::utils::detect_runner_components(
-            &crate::utils::resolve_runner(proton, &library_root),
+            &active_runner_path,
             Some(&effective_game_prefix),
         );
 
@@ -609,10 +618,60 @@ impl Runner for WineTkgRunner {
         }
         env.insert("WINEPATH".to_string(), wine_path.join(";"));
 
-        let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
-        let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
-            .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, "failed to setup fake steam trap").with_source(e))?;
-        env.insert("STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(), fake_env.to_string_lossy().to_string());
+        let use_steam_runtime = ctx.user_config.as_ref()
+            .map(|c| c.use_steam_runtime)
+            .unwrap_or(ctx.app.app_id == 209000); // Default to true for Batman
+
+        if use_steam_runtime {
+            let steam_cfg = crate::utils::get_master_steam_config();
+            let steam_prefix_mode = ctx.user_config.as_ref()
+                .map(|c| c.steam_prefix_mode.clone())
+                .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
+
+            let steam_client_path = match steam_prefix_mode {
+                crate::models::SteamPrefixMode::Shared => {
+                    steam_cfg.steam_exe.as_ref().and_then(|e| e.parent().map(|p| p.to_path_buf()))
+                }
+                crate::models::SteamPrefixMode::PerGame => {
+                    Some(effective_game_prefix.join("drive_c/Program Files (x86)/Steam"))
+                }
+            };
+
+            if let Some(path) = steam_client_path {
+                env.insert("STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(), path.to_string_lossy().to_string());
+                unsafe {
+                    if !ctx.verification_ptr.is_null() {
+                        let v = &mut *ctx.verification_ptr;
+                        v.steam_client_install_path_exposed_to_game = Some(path.to_string_lossy().to_string());
+                        v.steam_client_install_path_source = Some("real".to_string());
+                    }
+                }
+            } else {
+                let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
+                let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
+                    .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, "failed to setup fake steam trap").with_source(e))?;
+                env.insert("STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(), fake_env.to_string_lossy().to_string());
+                unsafe {
+                    if !ctx.verification_ptr.is_null() {
+                        let v = &mut *ctx.verification_ptr;
+                        v.steam_client_install_path_exposed_to_game = Some(fake_env.to_string_lossy().to_string());
+                        v.steam_client_install_path_source = Some("fake_trap".to_string());
+                    }
+                }
+            }
+        } else {
+            let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
+            let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
+                .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, "failed to setup fake steam trap").with_source(e))?;
+            env.insert("STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(), fake_env.to_string_lossy().to_string());
+            unsafe {
+                if !ctx.verification_ptr.is_null() {
+                    let v = &mut *ctx.verification_ptr;
+                    v.steam_client_install_path_exposed_to_game = Some(fake_env.to_string_lossy().to_string());
+                    v.steam_client_install_path_source = Some("fake_trap".to_string());
+                }
+            }
+        }
 
         if let Ok(display) = std::env::var("DISPLAY") {
             env.insert("DISPLAY".to_string(), display);
