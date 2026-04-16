@@ -3,6 +3,7 @@ use crate::models::{GameLibrary, GameModel, LibraryGame, LocalGame, OwnedGame};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -23,7 +24,6 @@ enum LibraryFolderRecord {
     },
     Ignore(#[allow(dead_code)] HashMap<String, serde_json::Value>),
 }
-
 
 #[derive(Debug, Clone)]
 pub struct InstalledAppInfo {
@@ -243,10 +243,26 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
 
     match (app_id, install_dir_name) {
         (Some(id), Some(dir)) => {
-            let install_path = path
-                .parent()
-                .map(|p| p.join("common").join(dir))
-                .unwrap_or_default();
+            let Some(steamapps) = path.parent() else {
+                return Ok(None);
+            };
+
+            let expected_path = steamapps.join("common").join(&dir);
+            let install_path = if is_valid_install_path(&expected_path, id).await {
+                expected_path
+            } else if let Some(recovered_path) = probe_install_dir_by_appid(steamapps, id).await {
+                if let Some(recovered_name) = recovered_path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .filter(|name| *name != dir)
+                {
+                    let _ = rewrite_manifest_installdir(path, recovered_name).await;
+                }
+                recovered_path
+            } else {
+                expected_path
+            };
+
             Ok(Some((
                 id,
                 InstalledAppInfo {
@@ -258,6 +274,91 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
         }
         _ => Ok(None),
     }
+}
+
+async fn is_valid_install_path(path: &Path, appid: u32) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+
+    let appid_path = path.join("steam_appid.txt");
+    if let Ok(content) = fs::read_to_string(&appid_path).await {
+        if content.trim() == appid.to_string() {
+            return true;
+        }
+    }
+
+    let mut entries = match fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path().is_file() {
+            return true;
+        }
+    }
+
+    false
+}
+
+async fn probe_install_dir_by_appid(steamapps: &Path, appid: u32) -> Option<PathBuf> {
+    let common = steamapps.join("common");
+    if !common.exists() {
+        return None;
+    }
+
+    let mut entries = fs::read_dir(&common).await.ok()?;
+    let appid_str = appid.to_string();
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let appid_txt = path.join("steam_appid.txt");
+        let Ok(content) = fs::read_to_string(appid_txt).await else {
+            continue;
+        };
+
+        if content.trim() == appid_str {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+async fn rewrite_manifest_installdir(manifest_path: &Path, recovered_name: &str) -> Result<()> {
+    let raw = fs::read_to_string(manifest_path)
+        .await
+        .with_context(|| format!("failed reading {}", manifest_path.display()))?;
+
+    let mut updated = String::with_capacity(raw.len() + recovered_name.len());
+    let mut replaced = false;
+
+    for line in raw.lines() {
+        let values = extract_quoted_values(line.trim());
+        if !replaced && values.len() >= 2 && values[0].eq_ignore_ascii_case("installdir") {
+            let prefix = line.find('"').map(|idx| &line[..idx]).unwrap_or_default();
+            updated.push_str(prefix);
+            updated.push_str(&format!("\"installdir\"\t\"{}\"", recovered_name));
+            updated.push('\n');
+            replaced = true;
+        } else {
+            updated.push_str(line);
+            updated.push('\n');
+        }
+    }
+
+    if replaced {
+        fs::write(manifest_path, updated)
+            .await
+            .with_context(|| format!("failed writing {}", manifest_path.display()))?;
+    }
+
+    Ok(())
 }
 
 fn extract_quoted_values(line: &str) -> Vec<String> {
