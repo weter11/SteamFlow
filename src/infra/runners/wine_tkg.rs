@@ -15,11 +15,23 @@ impl Runner for WineTkgRunner {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
         let is_batman = ctx.app.app_id == 209000;
-        let requires_steam_runtime = is_batman;
+        let default_requires_steam_runtime = is_batman;
 
-        let use_steam_runtime = ctx.user_config.as_ref()
-            .map(|c| c.use_steam_runtime)
-            .unwrap_or(requires_steam_runtime);
+        let (use_steam_runtime, runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
+            Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
+            Some(crate::models::SteamRuntimePolicy::Disabled) => (false, "override"),
+            Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+                // Fallback to deprecated boolean if policy is Auto/None for backward compat
+                let manual_toggle = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
+                if manual_toggle {
+                    (true, "override_legacy")
+                } else if default_requires_steam_runtime {
+                    (true, "auto")
+                } else {
+                    (false, "default")
+                }
+            }
+        };
         let steam_prefix_mode = ctx.user_config.as_ref()
             .map(|c| c.steam_prefix_mode.clone())
             .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
@@ -178,6 +190,9 @@ impl Runner for WineTkgRunner {
                             v.effective_steam_wineprefix = Some(steam_wineprefix.to_string_lossy().to_string());
                             v.per_game_prefix_requested = steam_prefix_mode == crate::models::SteamPrefixMode::PerGame;
                             v.per_game_prefix_honored = effective_game_prefix == steam_wineprefix;
+                            v.steam_runtime_policy = format!("{:?}", ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy).unwrap_or(&crate::models::SteamRuntimePolicy::Auto));
+                            v.steam_runtime_source = runtime_source.to_string();
+                            v.windows_steam_discovery_enabled = ctx.launcher_config.windows_steam_discovery_enabled;
                         }
                     }
 
@@ -618,9 +633,23 @@ impl Runner for WineTkgRunner {
         }
         env.insert("WINEPATH".to_string(), wine_path.join(";"));
 
-        let use_steam_runtime = ctx.user_config.as_ref()
-            .map(|c| c.use_steam_runtime)
-            .unwrap_or(ctx.app.app_id == 209000); // Default to true for Batman
+        let is_batman = ctx.app.app_id == 209000;
+        let default_requires_steam_runtime = is_batman;
+
+        let (use_steam_runtime, _runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
+            Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
+            Some(crate::models::SteamRuntimePolicy::Disabled) => (false, "override"),
+            Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+                let manual_toggle = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
+                if manual_toggle {
+                    (true, "override_legacy")
+                } else if default_requires_steam_runtime {
+                    (true, "auto")
+                } else {
+                    (false, "default")
+                }
+            }
+        };
 
         if use_steam_runtime {
             let steam_cfg = crate::utils::get_master_steam_config();

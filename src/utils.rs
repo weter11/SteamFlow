@@ -1164,8 +1164,20 @@ pub fn steam_wineprefix_for_game(
     app_id: u32,
     user_configs: &crate::models::UserConfigStore,
 ) -> std::path::PathBuf {
+    let is_batman = app_id == 209000;
+    let default_requires_steam_runtime = is_batman;
+
+    let use_steam_runtime = match user_configs.get(&app_id).map(|c| &c.steam_runtime_policy) {
+        Some(crate::models::SteamRuntimePolicy::Enabled) => true,
+        Some(crate::models::SteamRuntimePolicy::Disabled) => false,
+        Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+            let manual_toggle = user_configs.get(&app_id).map(|c| c.use_steam_runtime).unwrap_or(false);
+            manual_toggle || default_requires_steam_runtime
+        }
+    };
+
     let use_per_game_compat_data = user_configs.get(&app_id)
-        .map(|c| c.use_steam_runtime && c.steam_prefix_mode == crate::models::SteamPrefixMode::PerGame)
+        .map(|c| use_steam_runtime && c.steam_prefix_mode == crate::models::SteamPrefixMode::PerGame)
         .unwrap_or(config.use_shared_compat_data);
 
     if use_per_game_compat_data {

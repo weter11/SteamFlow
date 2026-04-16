@@ -50,8 +50,9 @@ pub async fn find_local_games() -> Result<Vec<LocalGame>> {
 }
 
 pub async fn scan_installed_app_info() -> Result<HashMap<u32, InstalledAppInfo>> {
-    let config_path = load_launcher_config().await.ok().and_then(|cfg| {
-        let p = PathBuf::from(cfg.steam_library_path);
+    let config = load_launcher_config().await.ok();
+    let config_path = config.as_ref().and_then(|cfg| {
+        let p = PathBuf::from(&cfg.steam_library_path);
         if p.join("steamapps").exists() || p.join("Steam").join("steamapps").exists() {
             Some(p)
         } else {
@@ -63,7 +64,27 @@ pub async fn scan_installed_app_info() -> Result<HashMap<u32, InstalledAppInfo>>
         .or_else(detect_steam_path)
         .unwrap_or_else(default_steam_root);
     println!("Scanning Library Root: {:?}", root);
-    scan_library_info(&root).await
+    let mut installed = scan_library_info(&root).await?;
+
+    if let Some(cfg) = config {
+        if cfg.windows_steam_discovery_enabled {
+            let master_steam = crate::utils::get_master_steam_config();
+            if master_steam.wine_prefix.exists() {
+                println!("Scanning Windows Steam Root: {:?}", master_steam.wine_prefix);
+                // Windows Steam layout is drive_c/Program Files (x86)/Steam
+                let windows_steam_root = master_steam.wine_prefix.join("drive_c/Program Files (x86)/Steam");
+                if windows_steam_root.exists() {
+                    let windows_installed = scan_library_info(&windows_steam_root).await.unwrap_or_default();
+                    for (app_id, info) in windows_installed {
+                        // Prefer native/standard Linux Steam if duplicate
+                        installed.entry(app_id).or_insert(info);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(installed)
 }
 
 pub async fn scan_installed_app_paths() -> Result<HashMap<u32, String>> {

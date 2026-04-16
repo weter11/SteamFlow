@@ -1026,13 +1026,32 @@ impl SteamLauncher {
 
             ui.add_space(8.0);
             ui.heading("Runtime Settings");
-            if ui.checkbox(&mut config.use_steam_runtime, "Use Steam Runtime (Windows)")
-                .on_hover_text("Required for DRM-protected games. Runs an official Steam client in the background.")
-                .changed() {
-                changed = true;
-            }
+            ui.horizontal(|ui| {
+                ui.label("Use Windows Steam Runtime:");
+                egui::ComboBox::from_id_salt("steam_runtime_policy_selector")
+                    .selected_text(format!("{:?}", config.steam_runtime_policy))
+                    .show_ui(ui, |ui| {
+                        use crate::models::SteamRuntimePolicy;
+                        if ui.selectable_value(&mut config.steam_runtime_policy, SteamRuntimePolicy::Auto, "Auto (Recommended)").clicked() {
+                            changed = true;
+                        }
+                        if ui.selectable_value(&mut config.steam_runtime_policy, SteamRuntimePolicy::Enabled, "Enabled").clicked() {
+                            changed = true;
+                        }
+                        if ui.selectable_value(&mut config.steam_runtime_policy, SteamRuntimePolicy::Disabled, "Disabled").clicked() {
+                            changed = true;
+                        }
+                    });
+            }).response.on_hover_text("Required for DRM-protected games. Runs an official Steam client in the background.");
 
-            if config.use_steam_runtime {
+            let is_batman = game.app_id == 209000;
+            let effective_runtime = match config.steam_runtime_policy {
+                crate::models::SteamRuntimePolicy::Enabled => true,
+                crate::models::SteamRuntimePolicy::Disabled => false,
+                crate::models::SteamRuntimePolicy::Auto => config.use_steam_runtime || is_batman,
+            };
+
+            if effective_runtime {
                 ui.add_space(4.0);
                 ui.label("Steam Prefix Mode:");
                 if ui.radio_value(
@@ -2260,6 +2279,8 @@ impl eframe::App for SteamLauncher {
                         ui.add_enabled_ui(!self.client.is_offline(), |ui| {
                             ui.checkbox(&mut self.launcher_config.enable_cloud_sync, "Enable Cloud Sync");
                         });
+
+                        ui.checkbox(&mut self.launcher_config.windows_steam_discovery_enabled, "Discover installed games from Windows Steam");
 
                         let shield_color = if self.launcher_config.use_shared_compat_data {
                             egui::Color32::from_rgb(220, 80, 80)

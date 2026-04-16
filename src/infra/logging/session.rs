@@ -73,6 +73,9 @@ pub struct LaunchVerification {
     pub steam_client_install_path_source: Option<String>, // "real" vs "fake_trap"
     pub per_game_prefix_requested: bool,
     pub per_game_prefix_honored: bool,
+    pub steam_runtime_policy: String,
+    pub steam_runtime_source: String, // "default", "auto", "override"
+    pub windows_steam_discovery_enabled: bool,
     pub log_head: Vec<String>,
     pub log_tail: Vec<String>,
 }
