@@ -1162,11 +1162,16 @@ pub fn cleanup_dll_symlinks(prefix: &Path) -> Result<()> {
 pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,
-    _user_configs: &crate::models::UserConfigStore,
+    user_configs: &crate::models::UserConfigStore,
 ) -> std::path::PathBuf {
-    if config.use_shared_compat_data {
+    let use_per_game_compat_data = user_configs.get(&app_id)
+        .map(|c| c.use_steam_runtime && c.steam_prefix_mode == crate::models::SteamPrefixMode::PerGame)
+        .unwrap_or(config.use_shared_compat_data);
+
+    if use_per_game_compat_data {
         std::path::PathBuf::from(&config.steam_library_path)
-            .join("steamapps/compatdata")
+            .join("steamapps")
+            .join("compatdata")
             .join(app_id.to_string())
             .join("pfx")
     } else {

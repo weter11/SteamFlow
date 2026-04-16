@@ -67,6 +67,12 @@ pub struct LaunchVerification {
     pub steam_api_initialized: Option<bool>,
     pub steam_ownership_confirmed: Option<bool>,
     pub steam_client_artifact: Option<String>, // "local", "windows", "host"
+    pub effective_game_wineprefix: Option<String>,
+    pub effective_steam_wineprefix: Option<String>,
+    pub steam_client_install_path_exposed_to_game: Option<String>,
+    pub steam_client_install_path_source: Option<String>, // "real" vs "fake_trap"
+    pub per_game_prefix_requested: bool,
+    pub per_game_prefix_honored: bool,
     pub log_head: Vec<String>,
     pub log_tail: Vec<String>,
 }
