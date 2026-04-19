@@ -11,6 +11,14 @@ pub enum SteamPrefixMode {
     PerGame, // copy/symlink Steam into game's own compatdata prefix
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum SteamRuntimePolicy {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteamLaunchConfig {
     #[serde(default = "default_true")]
@@ -27,7 +35,7 @@ pub struct SteamLaunchConfig {
     pub big_picture: bool, // force Big Picture (lighter than desktop UI)
 }
 
-fn default_true() -> bool {
+pub fn default_true() -> bool {
     true
 }
 
@@ -105,7 +113,9 @@ impl Default for GraphicsLayerConfig {
 pub struct UserAppConfig {
     pub launch_options: String,                 // e.g. "-novid -console"
     pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
-    pub use_steam_runtime: bool,                // Ghost Steam / Master Prefix toggle
+    pub use_steam_runtime: bool,                // DEPRECATED: use steam_runtime_policy instead
+    #[serde(default)]
+    pub steam_runtime_policy: SteamRuntimePolicy,
     #[serde(default)]
     pub steam_prefix_mode: SteamPrefixMode,
     #[serde(default)]
