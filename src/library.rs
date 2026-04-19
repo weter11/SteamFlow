@@ -2,7 +2,7 @@ use crate::config::{detect_steam_path, load_launcher_config};
 use crate::models::{GameLibrary, GameModel, LibraryGame, LocalGame, OwnedGame};
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -338,24 +338,49 @@ fn extract_quoted_values(line: &str) -> Vec<String> {
     out
 }
 
+/// Reconciles network-owned games with locally discovered Steam installations.
+///
+/// Merging logic:
+/// 1. Start with all games from the Steam network (owned games).
+/// 2. If a network game is also found locally, merge its installation state.
+/// 3. If a game is found locally but NOT in the network list (e.g. demos, free titles,
+///    or during network failure), add it as a "local-only" discovery.
+///
+/// This ensures that installed titles like demos are always discoverable even if
+/// the Steam network metadata is incomplete or filtered.
 pub fn build_game_library(
     owned: Vec<OwnedGame>,
     installed_info: HashMap<u32, InstalledAppInfo>,
 ) -> GameLibrary {
     let mut games = Vec::new();
+    let mut remote_appids = HashSet::new();
+
+    let mut local_only_count = 0;
+    let mut merged_count = 0;
+    let mut demo_count = 0;
 
     for owned_game in owned {
+        remote_appids.insert(owned_game.app_id);
         let info = installed_info.get(&owned_game.app_id);
         let install_path = info.map(|i| i.install_path.to_string_lossy().to_string());
+        let is_installed = install_path.is_some();
         let active_branch = info
             .map(|i| i.active_branch.clone())
             .unwrap_or_else(|| "public".to_string());
+
+        if is_installed {
+            merged_count += 1;
+        }
+
+        if owned_game.name.to_lowercase().contains("demo") {
+            demo_count += 1;
+        }
 
         games.push(LibraryGame {
             app_id: owned_game.app_id,
             name: owned_game.name,
             playtime_forever_minutes: Some(owned_game.playtime_forever_minutes),
-            is_installed: install_path.is_some(),
+            is_installed,
             install_path,
             local_manifest_ids: owned_game.local_manifest_ids,
             update_available: owned_game.update_available,
@@ -365,13 +390,21 @@ pub fn build_game_library(
     }
 
     for (app_id, info) in installed_info {
-        if games.iter().any(|g| g.app_id == app_id) {
+        if remote_appids.contains(&app_id) {
             continue;
         }
 
+        local_only_count += 1;
+        let name = info.name.clone().unwrap_or_else(|| format!("App {app_id}"));
+        if name.to_lowercase().contains("demo") {
+            demo_count += 1;
+        }
+
+        tracing::info!("Discovered local-only Steam app (not in owned list): {} ({})", name, app_id);
+
         games.push(LibraryGame {
             app_id,
-            name: info.name.unwrap_or_else(|| format!("App {app_id}")),
+            name,
             playtime_forever_minutes: None,
             is_installed: true,
             install_path: Some(info.install_path.to_string_lossy().to_string()),
@@ -381,6 +414,15 @@ pub fn build_game_library(
             active_branch: info.active_branch,
         });
     }
+
+    tracing::info!(
+        "Library reconciliation complete: {} merged (local+remote), {} remote-only, {} local-only discovered. Total games: {}. Demos detected: {}.",
+        merged_count,
+        remote_appids.len() - merged_count,
+        local_only_count,
+        games.len(),
+        demo_count
+    );
 
     games.sort_by(|a, b| a.name.cmp(&b.name));
     GameLibrary { games }

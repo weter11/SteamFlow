@@ -697,38 +697,26 @@ impl SteamLauncher {
         let mut client = self.client.clone();
         let tx = self.operation_tx.clone();
         self.runtime.spawn(async move {
-            let result = match client.fetch_owned_games().await {
-                Ok(owned) => {
-                    let installed = crate::library::scan_installed_app_info()
-                        .await
-                        .unwrap_or_default();
-                    let mut lib = build_game_library(owned, installed).games;
-                    let _ = client.check_for_updates(&mut lib).await;
-                    Ok(lib)
-                }
-                Err(err) => {
-                    if client.is_offline() {
-                        let cached = client.load_cached_owned_games().await.unwrap_or_default();
-                        let installed = crate::library::scan_installed_app_info()
-                            .await
-                            .unwrap_or_default();
-                        let mut lib = build_game_library(cached, installed).games;
-                        let _ = client.check_for_updates(&mut lib).await;
-                        Ok(lib)
-                    } else {
-                        Err(err)
+            let owned = if client.is_offline() {
+                client.load_cached_owned_games().await.unwrap_or_default()
+            } else {
+                match client.fetch_owned_games().await {
+                    Ok(games) => games,
+                    Err(err) => {
+                        tracing::warn!("Failed to fetch owned games from Steam network: {}. Falling back to cache.", err);
+                        client.load_cached_owned_games().await.unwrap_or_default()
                     }
                 }
             };
 
-            match result {
-                Ok(lib) => {
-                    let _ = tx.send(AsyncOp::LibraryFetched(lib));
-                }
-                Err(err) => {
-                    let _ = tx.send(AsyncOp::Error(format!("Failed to refresh library: {err}")));
-                }
-            }
+            let installed = crate::library::scan_installed_app_info()
+                .await
+                .unwrap_or_default();
+
+            let mut lib = build_game_library(owned, installed).games;
+            let _ = client.check_for_updates(&mut lib).await;
+
+            let _ = tx.send(AsyncOp::LibraryFetched(lib));
         });
     }
 
