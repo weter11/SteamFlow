@@ -1291,28 +1291,51 @@ impl SteamClient {
             steamid: Some(u64::from(connection.steam_id())),
             include_appinfo: Some(true),
             include_played_free_games: Some(true),
+            include_free_sub: Some(true),
+            include_extended_appinfo: Some(true),
             ..Default::default()
         };
+
+        tracing::info!("Refreshing Steam library: Player.GetOwnedGames(include_appinfo=true, include_played_free_games=true, include_free_sub=true, include_extended_appinfo=true)");
 
         let response: CPlayer_GetOwnedGames_Response = connection
             .service_method(request)
             .await
             .context("failed calling Player.GetOwnedGames")?;
 
+        let total_returned = response.game_count();
         let mut owned = Vec::new();
+        let mut demos_count = 0;
+
         for game in response.games {
+            let app_id = game.appid() as u32;
+            let name = if game.name().is_empty() {
+                format!("App {}", app_id)
+            } else {
+                game.name().to_string()
+            };
+
+            // In some proto versions, we might be able to check app type here if extended info is parsed.
+            // For now, we trust GetOwnedGames filtered them appropriately based on our request.
+            if name.to_lowercase().contains("demo") {
+                demos_count += 1;
+            }
+
             owned.push(OwnedGame {
-                app_id: game.appid() as u32,
-                name: if game.name().is_empty() {
-                    format!("App {}", game.appid())
-                } else {
-                    game.name().to_string()
-                },
+                app_id,
+                name,
                 playtime_forever_minutes: game.playtime_forever() as u32,
                 local_manifest_ids: HashMap::new(),
                 update_available: false,
             });
         }
+
+        tracing::info!(
+            "Library refreshed: {} apps returned, {} demos detected. {} games total in local list.",
+            total_returned,
+            demos_count,
+            owned.len()
+        );
 
         save_library_cache(&owned).await.ok();
         Ok(owned)
