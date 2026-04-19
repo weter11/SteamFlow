@@ -1949,7 +1949,7 @@ impl SteamClient {
                 }
 
                 // Fallback: search for app id markers if the specified installdir doesn't exist
-                if let Some(fallback) = self.probe_install_dir_by_appid(&steamapps, appid) {
+                if let Some(fallback) = crate::utils::probe_install_dir_by_appid(&steamapps, appid) {
                     tracing::info!("Found fallback install dir for app {appid}: {:?}", fallback);
                     return Ok(fallback);
                 }
@@ -1964,33 +1964,6 @@ impl SteamClient {
             .join("steamapps")
             .join("common")
             .join(appid.to_string()))
-    }
-
-    fn probe_install_dir_by_appid(&self, steamapps: &Path, appid: u32) -> Option<PathBuf> {
-        let common = steamapps.join("common");
-        if !common.exists() {
-            return None;
-        }
-
-        let appid_str = appid.to_string();
-
-        if let Ok(entries) = std::fs::read_dir(common) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // Check for steam_appid.txt
-                    let appid_txt = path.join("steam_appid.txt");
-                    if appid_txt.exists() {
-                        if let Ok(content) = std::fs::read_to_string(appid_txt) {
-                            if content.trim() == appid_str {
-                                return Some(path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 
     async fn remote_manifest_ids_static(

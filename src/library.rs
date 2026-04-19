@@ -30,6 +30,9 @@ pub struct InstalledAppInfo {
     pub install_path: PathBuf,
     pub active_branch: String,
     pub name: Option<String>,
+    pub manifest_installdir: Option<String>,
+    pub manifest_installdir_valid: bool,
+    pub install_dir_resolution_method: String,
 }
 
 pub async fn find_local_games() -> Result<Vec<LocalGame>> {
@@ -43,6 +46,9 @@ pub async fn find_local_games() -> Result<Vec<LocalGame>> {
             install_dir: info.install_path,
             proton_version: None,
             active_branch: info.active_branch,
+            manifest_installdir: info.manifest_installdir,
+            manifest_installdir_valid: info.manifest_installdir_valid,
+            install_dir_resolution_method: Some(info.install_dir_resolution_method),
         });
     }
 
@@ -136,7 +142,35 @@ pub async fn scan_library_info(root_path: &Path) -> Result<HashMap<u32, Installe
             }
 
             match parse_app_manifest_info(&path).await {
-                Ok(Some((app_id, info))) => {
+                Ok(Some((app_id, mut info))) => {
+                    let steamapps = path.parent().unwrap_or(Path::new(""));
+
+                    // Validation and Fallback
+                    let mut valid = true;
+                    let mut method = "manifest".to_string();
+
+                    if crate::utils::is_suspicious_installdir(info.manifest_installdir.as_deref().unwrap_or_default(), app_id) {
+                        valid = false;
+                        method = "manifest_suspicious".to_string();
+                    } else if !info.install_path.exists() {
+                        valid = false;
+                        method = "manifest_not_found".to_string();
+                    }
+
+                    if !valid {
+                        if let Some(probed_path) = crate::utils::probe_install_dir_by_appid(steamapps, app_id) {
+                            tracing::info!("Resolved suspicious/missing installdir for app {} via probe: {:?}", app_id, probed_path);
+                            info.install_path = probed_path;
+                            method = if method == "manifest_suspicious" { "appid_probe_suspicious" } else { "appid_probe_missing" }.to_string();
+                            valid = true;
+                        }
+                    } else {
+                        method = "manifest_validated".to_string();
+                    }
+
+                    info.manifest_installdir_valid = valid;
+                    info.install_dir_resolution_method = method;
+
                     installed.insert(app_id, info);
                 }
                 Ok(None) => {}
@@ -266,7 +300,7 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
         (Some(id), Some(dir)) => {
             let install_path = path
                 .parent()
-                .map(|p| p.join("common").join(dir))
+                .map(|p| p.join("common").join(&dir))
                 .unwrap_or_default();
             Ok(Some((
                 id,
@@ -274,6 +308,9 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
                     install_path,
                     active_branch,
                     name,
+                    manifest_installdir: Some(dir),
+                    manifest_installdir_valid: true,
+                    install_dir_resolution_method: "manifest".to_string(),
                 },
             )))
         }
