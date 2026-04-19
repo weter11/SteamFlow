@@ -33,6 +33,7 @@ pub struct InstalledAppInfo {
     pub manifest_installdir: Option<String>,
     pub manifest_installdir_valid: bool,
     pub install_dir_resolution_method: String,
+    pub manifest_missing: bool,
 }
 
 pub async fn find_local_games() -> Result<Vec<LocalGame>> {
@@ -49,6 +50,7 @@ pub async fn find_local_games() -> Result<Vec<LocalGame>> {
             manifest_installdir: info.manifest_installdir,
             manifest_installdir_valid: info.manifest_installdir_valid,
             install_dir_resolution_method: Some(info.install_dir_resolution_method),
+            manifest_missing: info.manifest_missing,
         });
     }
 
@@ -113,6 +115,9 @@ pub async fn scan_library_info(root_path: &Path) -> Result<HashMap<u32, Installe
     let mut installed = HashMap::new();
     let mut libraries = vec![root_path.to_path_buf()];
 
+    let mut acf_count = 0;
+    let mut recovered_count = 0;
+
     let library_folders_path = root_path.join("steamapps").join("libraryfolders.vdf");
     let extra_libraries = parse_library_folders(library_folders_path)
         .await
@@ -143,6 +148,7 @@ pub async fn scan_library_info(root_path: &Path) -> Result<HashMap<u32, Installe
 
             match parse_app_manifest_info(&path).await {
                 Ok(Some((app_id, mut info))) => {
+                    acf_count += 1;
                     let steamapps = path.parent().unwrap_or(Path::new(""));
 
                     // Validation and Fallback
@@ -170,6 +176,7 @@ pub async fn scan_library_info(root_path: &Path) -> Result<HashMap<u32, Installe
 
                     info.manifest_installdir_valid = valid;
                     info.install_dir_resolution_method = method;
+                    info.manifest_missing = false;
 
                     installed.insert(app_id, info);
                 }
@@ -177,7 +184,57 @@ pub async fn scan_library_info(root_path: &Path) -> Result<HashMap<u32, Installe
                 Err(e) => println!("Skipping bad manifest {:?}: {}", path, e),
             }
         }
+
+        // 2. Recovery: Scan 'common' for orphaned directories (missing ACF)
+        let common = library_root.join("steamapps").join("common");
+        if common.exists() {
+            if let Ok(mut dir) = fs::read_dir(&common).await {
+                while let Some(entry) = dir.next_entry().await? {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+
+                    // Check if this directory is already tracked by any app_id we found via ACF
+                    let already_tracked = installed.values().any(|info| info.install_path == path);
+                    if already_tracked {
+                        continue;
+                    }
+
+                    // Try to identify app_id from steam_appid.txt
+                    let appid_txt = path.join("steam_appid.txt");
+                    if appid_txt.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&appid_txt) {
+                            if let Ok(app_id) = content.trim().parse::<u32>() {
+                                if !installed.contains_key(&app_id) {
+                                    recovered_count += 1;
+                                    let name = path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string());
+                                    tracing::info!("Recovered orphaned Steam installation for app {}: {:?}", app_id, path);
+
+                                    installed.insert(app_id, InstalledAppInfo {
+                                        install_path: path.clone(),
+                                        active_branch: "public".to_string(),
+                                        name,
+                                        manifest_installdir: path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()),
+                                        manifest_installdir_valid: true,
+                                        install_dir_resolution_method: "recovery_orphaned_manifest".to_string(),
+                                        manifest_missing: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    tracing::info!(
+        "Scan of library root {:?} complete: {} via ACF, {} recovered via fallback.",
+        root_path,
+        acf_count,
+        recovered_count
+    );
 
     Ok(installed)
 }
@@ -311,6 +368,7 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
                     manifest_installdir: Some(dir),
                     manifest_installdir_valid: true,
                     install_dir_resolution_method: "manifest".to_string(),
+                    manifest_missing: false,
                 },
             )))
         }
@@ -386,6 +444,7 @@ pub fn build_game_library(
             update_available: owned_game.update_available,
             update_queued: false,
             active_branch,
+            manifest_missing: info.map(|i| i.manifest_missing).unwrap_or(false),
         });
     }
 
@@ -412,6 +471,7 @@ pub fn build_game_library(
             update_available: false,
             update_queued: false,
             active_branch: info.active_branch,
+            manifest_missing: info.manifest_missing,
         });
     }
 
