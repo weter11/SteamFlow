@@ -14,9 +14,6 @@ impl Runner for WineTkgRunner {
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
-        let is_batman = ctx.app.app_id == 209000;
-        let default_requires_steam_runtime = is_batman;
-
         let (use_steam_runtime, runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
             Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
             Some(crate::models::SteamRuntimePolicy::Disabled) => (false, "override"),
@@ -25,8 +22,6 @@ impl Runner for WineTkgRunner {
                 let manual_toggle = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
                 if manual_toggle {
                     (true, "override_legacy")
-                } else if default_requires_steam_runtime {
-                    (true, "auto")
                 } else {
                     (false, "default")
                 }
@@ -633,9 +628,6 @@ impl Runner for WineTkgRunner {
         }
         env.insert("WINEPATH".to_string(), wine_path.join(";"));
 
-        let is_batman = ctx.app.app_id == 209000;
-        let default_requires_steam_runtime = is_batman;
-
         let (use_steam_runtime, _runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
             Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
             Some(crate::models::SteamRuntimePolicy::Disabled) => (false, "override"),
@@ -643,8 +635,6 @@ impl Runner for WineTkgRunner {
                 let manual_toggle = ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false);
                 if manual_toggle {
                     (true, "override_legacy")
-                } else if default_requires_steam_runtime {
-                    (true, "auto")
                 } else {
                     (false, "default")
                 }

@@ -1044,11 +1044,10 @@ impl SteamLauncher {
                     });
             }).response.on_hover_text("Required for DRM-protected games. Runs an official Steam client in the background.");
 
-            let is_batman = game.app_id == 209000;
             let effective_runtime = match config.steam_runtime_policy {
                 crate::models::SteamRuntimePolicy::Enabled => true,
                 crate::models::SteamRuntimePolicy::Disabled => false,
-                crate::models::SteamRuntimePolicy::Auto => config.use_steam_runtime || is_batman,
+                crate::models::SteamRuntimePolicy::Auto => config.use_steam_runtime,
             };
 
             if effective_runtime {
