@@ -69,3 +69,24 @@ async fn test_orphaned_directory_recovery() {
     assert_eq!(installed.get(&202).unwrap().install_dir_resolution_method, "recovery_orphaned_manifest");
     assert_eq!(installed.get(&202).unwrap().name.as_deref(), Some("Orphaned Game"));
 }
+
+#[test]
+fn test_manifest_generation_minimal() {
+    let temp = tempfile::tempdir().unwrap();
+    let manifest_path = temp.path().join("appmanifest_123.acf");
+
+    steamflow::steam_client::SteamClient::write_appmanifest(
+        &manifest_path,
+        123,
+        "Test Game",
+        "TestGameDir",
+        Vec::new()
+    ).unwrap();
+
+    let content = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(content.contains("\"appid\"\t\"123\""));
+    assert!(content.contains("\"name\"\t\"Test Game\""));
+    assert!(content.contains("\"installdir\"\t\"TestGameDir\""));
+    assert!(content.contains("\"Universe\"\t\"1\""));
+    assert!(content.contains("\"StateFlags\"\t\"4\""));
+}

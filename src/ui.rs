@@ -79,6 +79,7 @@ pub enum AsyncOp {
     BranchUpdated(u32, String),
     AccountDataFetched(crate::steam_client::AccountData),
     Uninstalled(u32, String),
+    ManifestRepaired(u32),
     PlatformsFetched(u32, Vec<DepotPlatform>, Vec<u8>),
     ExtendedInfoFetched(u32, crate::steam_client::ExtendedAppInfo),
     LibraryFetched(Vec<LibraryGame>),
@@ -488,6 +489,12 @@ impl SteamLauncher {
                         game.local_manifest_ids.clear();
                     }
                     self.status = format!("Uninstalled {name}");
+                }
+                AsyncOp::ManifestRepaired(appid) => {
+                    if let Some(game) = self.library.iter_mut().find(|g| g.app_id == appid) {
+                        game.manifest_missing = false;
+                    }
+                    self.status = format!("Successfully repaired Steam manifest for app {appid}");
                 }
                 AsyncOp::PlatformsFetched(appid, platforms, buffer) => {
                     if platforms.len() > 1 {
@@ -1541,6 +1548,31 @@ impl SteamLauncher {
                     }
                 }
             });
+
+            ui.add_space(16.0);
+            ui.heading("Library Repair");
+            ui.label("If this game was recovered from an orphaned directory, you can recreate its Steam manifest.");
+
+            let mut repair_label = "Repair Steam Manifest".to_string();
+            if game.manifest_missing {
+                repair_label = "⚠ Repair Missing ACF Manifest".to_string();
+            }
+
+            if ui.button(repair_label).on_hover_text("Generates a minimal appmanifest_*.acf file so official Steam can recognize this installation.").clicked() {
+                let client = self.client.clone();
+                let tx = self.operation_tx.clone();
+                let app_id = game.app_id;
+                self.runtime.spawn(async move {
+                    match client.repair_manifest(app_id).await {
+                        Ok(()) => {
+                            let _ = tx.send(AsyncOp::ManifestRepaired(app_id));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AsyncOp::Error(format!("Failed to repair manifest: {e}")));
+                        }
+                    }
+                });
+            }
 
             if !self.depot_list.is_empty() {
                 ui.add_space(10.0);

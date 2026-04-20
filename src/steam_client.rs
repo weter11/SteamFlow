@@ -2115,6 +2115,48 @@ impl SteamClient {
         self.resolve_install_game_info(appid).await.0
     }
 
+    pub async fn repair_manifest(&self, appid: u32) -> Result<()> {
+        let manifest_path = self.appmanifest_path(appid).await?;
+        if manifest_path.exists() {
+            tracing::warn!("Appmanifest for {} already exists, creating backup.", appid);
+            let mut backup_path = manifest_path.clone();
+            backup_path.set_extension("acf.bak");
+            std::fs::copy(&manifest_path, &backup_path)?;
+        }
+
+        let (game_name, pics_installdir) = self.resolve_install_game_info(appid).await;
+
+        // Ensure we have a reasonable installdir and name, avoid placeholders
+        let final_name = if game_name.starts_with("App ") {
+            // Try to find a better name from local files or just use the appid
+            game_name
+        } else {
+            game_name
+        };
+
+        let final_installdir = match pics_installdir {
+            Some(dir) if !crate::utils::is_suspicious_installdir(&dir, appid) => dir,
+            _ => {
+                // Fallback to searching for the actual directory on disk
+                let cfg = load_launcher_config().await?;
+                let steamapps = PathBuf::from(&cfg.steam_library_path).join("steamapps");
+                if let Some(probed) = crate::utils::probe_install_dir_by_appid(&steamapps, appid) {
+                    probed.file_name().and_then(|n| n.to_str()).unwrap_or(&appid.to_string()).to_string()
+                } else {
+                    sanitize_install_dir(&final_name)
+                }
+            }
+        };
+
+        tracing::info!("Repairing manifest for {appid}: name='{final_name}', installdir='{final_installdir}'");
+
+        // For a minimal repair, we don't necessarily know the full depot list
+        // but we can write the manifest with just the basic AppState
+        Self::write_appmanifest(&manifest_path, appid, &final_name, &final_installdir, Vec::new())?;
+
+        Ok(())
+    }
+
     pub fn write_appmanifest(
         path: &Path,
         appid: u32,
@@ -2129,8 +2171,16 @@ impl SteamClient {
 
         let game_name = game_name.replace('"', "");
 
+        // StateFlags 4 means 'Fully Installed'
+        // Universe 1 is the public Steam universe
         let mut content = format!(
-            "\"AppState\"\n{{\n\t\"appid\"\t\"{appid}\"\n\t\"name\"\t\"{game_name}\"\n\t\"StateFlags\"\t\"4\"\n\t\"installdir\"\t\"{installdir}\"\n"
+            "\"AppState\"\n\
+            {{\n\
+            \t\"appid\"\t\"{appid}\"\n\
+            \t\"Universe\"\t\"1\"\n\
+            \t\"name\"\t\"{game_name}\"\n\
+            \t\"StateFlags\"\t\"4\"\n\
+            \t\"installdir\"\t\"{installdir}\"\n"
         );
 
         if !installed_depots.is_empty() {
@@ -2145,6 +2195,7 @@ impl SteamClient {
 
         content.push_str("}\n");
 
+        tracing::info!("Writing appmanifest for {appid} to {:?}", path);
         std::fs::write(path, content)
             .with_context(|| format!("failed writing {}", path.display()))?;
         Ok(())
@@ -3034,6 +3085,7 @@ mod tests {
             update_available: false,
             update_queued: false,
             local_manifest_ids: HashMap::new(),
+            manifest_missing: false,
         };
         let launch_info = LaunchInfo {
             app_id: 123,

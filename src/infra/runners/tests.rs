@@ -18,6 +18,7 @@ mod tests {
                 update_available: false,
                 update_queued: false,
                 active_branch: "public".to_string(),
+                manifest_missing: false,
             },
             launch_info: LaunchInfo {
                 app_id: 123,
@@ -88,6 +89,7 @@ mod tests {
             update_available: false,
             update_queued: false,
             local_manifest_ids: HashMap::new(),
+            manifest_missing: false,
         };
 
         let mut config = LauncherConfig::default();
