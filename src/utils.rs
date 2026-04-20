@@ -1159,6 +1159,52 @@ pub fn cleanup_dll_symlinks(prefix: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn is_suspicious_installdir(dir: &str, app_id: u32) -> bool {
+    let dir_lower = dir.to_lowercase();
+    if dir_lower == format!("app {}", app_id).to_lowercase() {
+        return true;
+    }
+    // Placeholder-like values from Steam
+    if dir_lower.starts_with("app ") && dir_lower[4..].chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    false
+}
+
+pub fn probe_install_dir_by_appid(steamapps: &Path, app_id: u32) -> Option<PathBuf> {
+    let common = steamapps.join("common");
+    if !common.exists() {
+        return None;
+    }
+
+    let appid_str = app_id.to_string();
+
+    if let Ok(entries) = std::fs::read_dir(common) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Strong signal 1: steam_appid.txt
+                let appid_txt = path.join("steam_appid.txt");
+                if appid_txt.exists() {
+                    if let Ok(content) = std::fs::read_to_string(appid_txt) {
+                        if content.trim() == appid_str {
+                            return Some(path);
+                        }
+                    }
+                }
+
+                // Signal 2: appid in directory name but NOT just "App <id>"
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.contains(&appid_str) && !is_suspicious_installdir(name, app_id) {
+                    // If it contains appid and is not a suspicious generic name, it's a good candidate
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,

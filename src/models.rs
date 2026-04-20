@@ -165,6 +165,14 @@ pub struct LocalGame {
     pub proton_version: Option<String>,
     #[serde(default = "default_branch")]
     pub active_branch: String,
+    #[serde(default)]
+    pub manifest_installdir: Option<String>,
+    #[serde(default = "default_true")]
+    pub manifest_installdir_valid: bool,
+    #[serde(default)]
+    pub install_dir_resolution_method: Option<String>,
+    #[serde(default)]
+    pub manifest_missing: bool,
 }
 
 fn default_branch() -> String {
@@ -202,6 +210,8 @@ pub struct LibraryGame {
     pub update_queued: bool,
     #[serde(default = "default_branch")]
     pub active_branch: String,
+    #[serde(default)]
+    pub manifest_missing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

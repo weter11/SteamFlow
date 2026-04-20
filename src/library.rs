@@ -2,7 +2,7 @@ use crate::config::{detect_steam_path, load_launcher_config};
 use crate::models::{GameLibrary, GameModel, LibraryGame, LocalGame, OwnedGame};
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -30,6 +30,10 @@ pub struct InstalledAppInfo {
     pub install_path: PathBuf,
     pub active_branch: String,
     pub name: Option<String>,
+    pub manifest_installdir: Option<String>,
+    pub manifest_installdir_valid: bool,
+    pub install_dir_resolution_method: String,
+    pub manifest_missing: bool,
 }
 
 pub async fn find_local_games() -> Result<Vec<LocalGame>> {
@@ -43,6 +47,10 @@ pub async fn find_local_games() -> Result<Vec<LocalGame>> {
             install_dir: info.install_path,
             proton_version: None,
             active_branch: info.active_branch,
+            manifest_installdir: info.manifest_installdir,
+            manifest_installdir_valid: info.manifest_installdir_valid,
+            install_dir_resolution_method: Some(info.install_dir_resolution_method),
+            manifest_missing: info.manifest_missing,
         });
     }
 
@@ -107,6 +115,9 @@ pub async fn scan_library_info(root_path: &Path) -> Result<HashMap<u32, Installe
     let mut installed = HashMap::new();
     let mut libraries = vec![root_path.to_path_buf()];
 
+    let mut acf_count = 0;
+    let mut recovered_count = 0;
+
     let library_folders_path = root_path.join("steamapps").join("libraryfolders.vdf");
     let extra_libraries = parse_library_folders(library_folders_path)
         .await
@@ -136,14 +147,94 @@ pub async fn scan_library_info(root_path: &Path) -> Result<HashMap<u32, Installe
             }
 
             match parse_app_manifest_info(&path).await {
-                Ok(Some((app_id, info))) => {
+                Ok(Some((app_id, mut info))) => {
+                    acf_count += 1;
+                    let steamapps = path.parent().unwrap_or(Path::new(""));
+
+                    // Validation and Fallback
+                    let mut valid = true;
+                    let mut method = "manifest".to_string();
+
+                    if crate::utils::is_suspicious_installdir(info.manifest_installdir.as_deref().unwrap_or_default(), app_id) {
+                        valid = false;
+                        method = "manifest_suspicious".to_string();
+                    } else if !info.install_path.exists() {
+                        valid = false;
+                        method = "manifest_not_found".to_string();
+                    }
+
+                    if !valid {
+                        if let Some(probed_path) = crate::utils::probe_install_dir_by_appid(steamapps, app_id) {
+                            tracing::info!("Resolved suspicious/missing installdir for app {} via probe: {:?}", app_id, probed_path);
+                            info.install_path = probed_path;
+                            method = if method == "manifest_suspicious" { "appid_probe_suspicious" } else { "appid_probe_missing" }.to_string();
+                            valid = true;
+                        }
+                    } else {
+                        method = "manifest_validated".to_string();
+                    }
+
+                    info.manifest_installdir_valid = valid;
+                    info.install_dir_resolution_method = method;
+                    info.manifest_missing = false;
+
                     installed.insert(app_id, info);
                 }
                 Ok(None) => {}
                 Err(e) => println!("Skipping bad manifest {:?}: {}", path, e),
             }
         }
+
+        // 2. Recovery: Scan 'common' for orphaned directories (missing ACF)
+        let common = library_root.join("steamapps").join("common");
+        if common.exists() {
+            if let Ok(mut dir) = fs::read_dir(&common).await {
+                while let Some(entry) = dir.next_entry().await? {
+                    let path = entry.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+
+                    // Check if this directory is already tracked by any app_id we found via ACF
+                    let already_tracked = installed.values().any(|info| info.install_path == path);
+                    if already_tracked {
+                        continue;
+                    }
+
+                    // Try to identify app_id from steam_appid.txt
+                    let appid_txt = path.join("steam_appid.txt");
+                    if appid_txt.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&appid_txt) {
+                            if let Ok(app_id) = content.trim().parse::<u32>() {
+                                if !installed.contains_key(&app_id) {
+                                    recovered_count += 1;
+                                    let name = path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string());
+                                    tracing::info!("Recovered orphaned Steam installation for app {}: {:?}", app_id, path);
+
+                                    installed.insert(app_id, InstalledAppInfo {
+                                        install_path: path.clone(),
+                                        active_branch: "public".to_string(),
+                                        name,
+                                        manifest_installdir: path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()),
+                                        manifest_installdir_valid: true,
+                                        install_dir_resolution_method: "recovery_orphaned_manifest".to_string(),
+                                        manifest_missing: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    tracing::info!(
+        "Scan of library root {:?} complete: {} via ACF, {} recovered via fallback.",
+        root_path,
+        acf_count,
+        recovered_count
+    );
 
     Ok(installed)
 }
@@ -266,7 +357,7 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
         (Some(id), Some(dir)) => {
             let install_path = path
                 .parent()
-                .map(|p| p.join("common").join(dir))
+                .map(|p| p.join("common").join(&dir))
                 .unwrap_or_default();
             Ok(Some((
                 id,
@@ -274,6 +365,10 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
                     install_path,
                     active_branch,
                     name,
+                    manifest_installdir: Some(dir),
+                    manifest_installdir_valid: true,
+                    install_dir_resolution_method: "manifest".to_string(),
+                    manifest_missing: false,
                 },
             )))
         }
@@ -301,40 +396,74 @@ fn extract_quoted_values(line: &str) -> Vec<String> {
     out
 }
 
+/// Reconciles network-owned games with locally discovered Steam installations.
+///
+/// Merging logic:
+/// 1. Start with all games from the Steam network (owned games).
+/// 2. If a network game is also found locally, merge its installation state.
+/// 3. If a game is found locally but NOT in the network list (e.g. demos, free titles,
+///    or during network failure), add it as a "local-only" discovery.
+///
+/// This ensures that installed titles like demos are always discoverable even if
+/// the Steam network metadata is incomplete or filtered.
 pub fn build_game_library(
     owned: Vec<OwnedGame>,
     installed_info: HashMap<u32, InstalledAppInfo>,
 ) -> GameLibrary {
     let mut games = Vec::new();
+    let mut remote_appids = HashSet::new();
+
+    let mut local_only_count = 0;
+    let mut merged_count = 0;
+    let mut demo_count = 0;
 
     for owned_game in owned {
+        remote_appids.insert(owned_game.app_id);
         let info = installed_info.get(&owned_game.app_id);
         let install_path = info.map(|i| i.install_path.to_string_lossy().to_string());
+        let is_installed = install_path.is_some();
         let active_branch = info
             .map(|i| i.active_branch.clone())
             .unwrap_or_else(|| "public".to_string());
+
+        if is_installed {
+            merged_count += 1;
+        }
+
+        if owned_game.name.to_lowercase().contains("demo") {
+            demo_count += 1;
+        }
 
         games.push(LibraryGame {
             app_id: owned_game.app_id,
             name: owned_game.name,
             playtime_forever_minutes: Some(owned_game.playtime_forever_minutes),
-            is_installed: install_path.is_some(),
+            is_installed,
             install_path,
             local_manifest_ids: owned_game.local_manifest_ids,
             update_available: owned_game.update_available,
             update_queued: false,
             active_branch,
+            manifest_missing: info.map(|i| i.manifest_missing).unwrap_or(false),
         });
     }
 
     for (app_id, info) in installed_info {
-        if games.iter().any(|g| g.app_id == app_id) {
+        if remote_appids.contains(&app_id) {
             continue;
         }
 
+        local_only_count += 1;
+        let name = info.name.clone().unwrap_or_else(|| format!("App {app_id}"));
+        if name.to_lowercase().contains("demo") {
+            demo_count += 1;
+        }
+
+        tracing::info!("Discovered local-only Steam app (not in owned list): {} ({})", name, app_id);
+
         games.push(LibraryGame {
             app_id,
-            name: info.name.unwrap_or_else(|| format!("App {app_id}")),
+            name,
             playtime_forever_minutes: None,
             is_installed: true,
             install_path: Some(info.install_path.to_string_lossy().to_string()),
@@ -342,8 +471,18 @@ pub fn build_game_library(
             update_available: false,
             update_queued: false,
             active_branch: info.active_branch,
+            manifest_missing: info.manifest_missing,
         });
     }
+
+    tracing::info!(
+        "Library reconciliation complete: {} merged (local+remote), {} remote-only, {} local-only discovered. Total games: {}. Demos detected: {}.",
+        merged_count,
+        remote_appids.len() - merged_count,
+        local_only_count,
+        games.len(),
+        demo_count
+    );
 
     games.sort_by(|a, b| a.name.cmp(&b.name));
     GameLibrary { games }
