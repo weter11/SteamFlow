@@ -51,7 +51,7 @@ impl Runner for NativeRunner {
 impl PipelineStage for ResolveComponentsStage {
     fn name(&self) -> &str { "ResolveComponents" }
     async fn execute(&self, ctx: &mut PipelineContext) -> std::result::Result<(), LaunchError> {
-        use crate::infra::runners::WineTkgRunner;
+        use crate::infra::runners::ProtonTkgRunner;
         use crate::steam_client::LaunchTarget;
 
         if ctx.runner.is_none() {
@@ -61,7 +61,7 @@ impl PipelineStage for ResolveComponentsStage {
                         ctx.runner = Some(Box::new(NativeRunner));
                     }
                     LaunchTarget::WindowsProton => {
-                        ctx.runner = Some(Box::new(WineTkgRunner));
+                        ctx.runner = Some(Box::new(ProtonTkgRunner));
                     }
                 }
             } else {
