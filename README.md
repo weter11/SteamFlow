@@ -44,8 +44,8 @@ sudo apt-get install build-essential pkg-config libssl-dev libx11-dev libxi-dev 
 ## Build and Run
 1. Clone the repository:
 ```bash
-git clone https://github.com/OpenSteamClient/OpenSteamClient.git
-cd OpenSteamClient
+git clone https://github.com/weter11/SteamFlow.git
+cd SteamFlow
 ```
 2. Build and run:
 ```bash
