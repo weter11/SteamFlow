@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::infra::runners::{LaunchContext, CommandSpec, Runner, WineTkgRunner};
+    use crate::infra::runners::{LaunchContext, CommandSpec, Runner, ProtonTkgRunner};
     use crate::models::LibraryGame;
     use crate::steam_client::{LaunchInfo, LaunchTarget};
     use crate::config::LauncherConfig;
@@ -56,8 +56,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wine_tkg_runner_graphics_policy_autodetect() {
-        use crate::infra::runners::wine_tkg::WineTkgRunner;
+    async fn test_proton_tkg_runner_graphics_policy_autodetect() {
+        use crate::infra::runners::proton_tkg::ProtonTkgRunner;
         use crate::models::GraphicsBackendPolicy;
         use crate::config::LauncherConfig;
         use crate::steam_client::{LaunchInfo, LaunchTarget};
@@ -115,7 +115,7 @@ mod tests {
             verification_ptr: std::ptr::null_mut(),
         };
 
-        let runner = WineTkgRunner;
+        let runner = ProtonTkgRunner;
         let env = runner.build_env(&ctx).await.unwrap();
 
         // Auto is now CONSERVATIVE: it should NOT have enabled DXVK even if simulated on disk
@@ -135,9 +135,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wine_tkg_runner_stubs() {
+    async fn test_proton_tkg_runner_stubs() {
         // We can only test stubs that don't hit the filesystem hard or expect real Proton/Wine
-        let runner = WineTkgRunner;
+        let runner = ProtonTkgRunner;
         let ctx = mock_context();
 
         // build_env should succeed without real filesystem

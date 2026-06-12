@@ -6,11 +6,11 @@ use crate::infra::runners::{Runner, LaunchContext, CommandSpec};
 use crate::steam_client::SteamClient;
 use crate::launch::pipeline::{LaunchError, LaunchErrorKind};
 
-pub struct WineTkgRunner;
+pub struct ProtonTkgRunner;
 
 #[async_trait::async_trait]
-impl Runner for WineTkgRunner {
-    fn name(&self) -> &str { "Wine-TKG" }
+impl Runner for ProtonTkgRunner {
+    fn name(&self) -> &str { "Proton-TKG" }
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
@@ -362,6 +362,10 @@ impl Runner for WineTkgRunner {
 
     async fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, LaunchError> {
         let mut env = HashMap::new();
+
+        // Disables Proton's native lsteamclient bridge to force the use of the Windows Steam Client.
+        env.insert("PROTON_DISABLE_LSTEAMCLIENT".to_string(), "1".to_string());
+
         let app_id_str = ctx.app.app_id.to_string();
 
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
