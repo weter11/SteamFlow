@@ -2115,11 +2115,11 @@ fn scan_proton_runtimes(config: &LauncherConfig) -> (Vec<String>, Vec<String>) {
     let mut unique_paths = Vec::new();
     for p in custom_paths {
         if let Ok(can) = std::fs::canonicalize(&p) {
-            if !unique_paths.contains(&can) {
-                unique_paths.push(can);
-            }
+            unique_paths.push(can);
         }
     }
+    unique_paths.sort();
+    unique_paths.dedup();
 
     let mut custom = Vec::new();
     for path in unique_paths {
@@ -2343,48 +2343,64 @@ impl eframe::App for SteamLauncher {
 
                         ui.add_space(8.0);
                         ui.label("Steam Runtime Runner:");
-                        let runner_name = self
-                            .launcher_config
-                            .steam_runtime_runner
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "None Selected".to_string());
+
+                        ui.horizontal(|ui| {
+                            use crate::models::RunnerSource;
+                            ui.radio_value(&mut self.launcher_config.steam_runtime_runner_source, RunnerSource::Official, "Official Proton (Valve)");
+                            ui.radio_value(&mut self.launcher_config.steam_runtime_runner_source, RunnerSource::Custom, "Custom (compatibilitytools.d)");
+                        });
+
+                        let runner_display_name = if self.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                            "None Selected".to_string()
+                        } else {
+                            self.launcher_config.steam_runtime_runner.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Unknown".to_string())
+                        };
 
                         egui::ComboBox::from_id_salt("runtime_runner_selector")
-                            .selected_text(runner_name)
+                            .selected_text(runner_display_name)
                             .show_ui(ui, |ui| {
-                                let home = std::env::var("HOME").unwrap_or_default();
-                                let custom_tools_paths = vec![
-                                    PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
-                                    PathBuf::from(&home).join(".steam/steam/compatibilitytools.d"),
-                                    crate::config::config_dir().unwrap_or_default().join("runtimes"),
-                                ];
+                                use crate::models::RunnerSource;
+                                if self.launcher_config.steam_runtime_runner_source == RunnerSource::Official {
+                                    let (steam_protons, _) = scan_proton_runtimes(&self.launcher_config);
+                                    let library_root = PathBuf::from(&self.launcher_config.steam_library_path);
+                                    let common_dir = library_root.join("steamapps/common");
 
-                                // Canonicalize and deduplicate paths
-                                let mut unique_paths = Vec::new();
-                                for p in custom_tools_paths {
-                                    if let Ok(can) = std::fs::canonicalize(&p) {
-                                        if !unique_paths.contains(&can) {
-                                            unique_paths.push(can);
+                                    for name in steam_protons {
+                                        let p = common_dir.join(&name);
+                                        if ui.selectable_label(self.launcher_config.steam_runtime_runner == p, &name).clicked() {
+                                            self.launcher_config.steam_runtime_runner = p;
                                         }
                                     }
-                                }
+                                } else {
+                                    let home = std::env::var("HOME").unwrap_or_default();
+                                    let custom_tools_paths = vec![
+                                        PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
+                                        PathBuf::from(&home).join(".steam/steam/compatibilitytools.d"),
+                                        crate::config::config_dir().unwrap_or_default().join("runtimes"),
+                                    ];
 
-                                for path in unique_paths {
-                                    if let Ok(entries) = std::fs::read_dir(path) {
-                                        for entry in entries.flatten() {
-                                            if entry.path().is_dir() {
-                                                let p = entry.path();
-                                                // Only show entries that have a valid Wine binary
-                                                if crate::utils::build_runner_command(&p).is_err() {
-                                                    continue;
-                                                }
-                                                let name = p.file_name().unwrap().to_string_lossy().to_string();
-                                                if ui
-                                                    .selectable_label(self.launcher_config.steam_runtime_runner == p, name)
-                                                    .clicked()
-                                                {
-                                                    self.launcher_config.steam_runtime_runner = p;
+                                    let mut unique_paths = Vec::new();
+                                    for p in custom_tools_paths {
+                                        if let Ok(can) = std::fs::canonicalize(&p) {
+                                        unique_paths.push(can);
+                                        }
+                                    }
+                                unique_paths.sort();
+                                unique_paths.dedup();
+
+                                    for path in unique_paths {
+                                        if let Ok(entries) = std::fs::read_dir(path) {
+                                            for entry in entries.flatten() {
+                                                if entry.path().is_dir() {
+                                                    let p = entry.path();
+                                                    if crate::utils::build_runner_command(&p).is_ok() {
+                                                        let name = p.file_name().unwrap().to_string_lossy().to_string();
+                                                        if ui.selectable_label(self.launcher_config.steam_runtime_runner == p, name).clicked() {
+                                                            self.launcher_config.steam_runtime_runner = p;
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }

@@ -1,5 +1,7 @@
 pub const VALVE_PROTONS: &[(&str, &str)] = &[
     ("Proton - Experimental", "experimental"),
+    ("Proton 11.0", "11.0"),
+    ("Proton 10.0", "10.0"),
     ("Proton 9.0 (Beta)", "9.0"),
     ("Proton 8.0", "8.0"),
     ("Proton 7.0", "7.0"),
