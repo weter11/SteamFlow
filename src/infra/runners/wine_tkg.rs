@@ -14,6 +14,19 @@ impl Runner for WineTkgRunner {
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
+        let proton = if let Some(forced) = ctx.launcher_config
+            .game_configs
+            .get(&ctx.app.app_id)
+            .and_then(|c| c.forced_proton_version.as_ref())
+        {
+            forced.as_str()
+        } else {
+            ctx.proton_path.as_deref()
+                .filter(|p| !p.is_empty())
+                .unwrap_or(ctx.launcher_config.proton_version.as_str())
+        };
+        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+
         let (use_steam_runtime, runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
             Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
             Some(crate::models::SteamRuntimePolicy::Disabled) => (false, "override"),
@@ -141,6 +154,21 @@ impl Runner for WineTkgRunner {
             tracing::debug!("Runtime Steam dir : {}", prefix_steam_dir.display());
                     tracing::debug!("Runtime WINEPREFIX : {}", steam_wineprefix.display());
 
+                    if let Some(active_wine) = crate::utils::detect_active_wineserver_runtime(&steam_wineprefix) {
+                        let active_canonical = active_wine.canonicalize().unwrap_or(active_wine);
+                        let runner_canonical = active_runner.canonicalize().unwrap_or_else(|_| active_runner.clone());
+
+                        if active_canonical != runner_canonical {
+                            return Err(LaunchError::new(
+                                LaunchErrorKind::Runner,
+                                format!(
+                                    "A wineserver is already running in this prefix using a different runtime ({:?}). Stop all running games and Wine processes before launching with a different Proton/Wine version, or enable per-game prefix mode.",
+                                    active_canonical
+                                )
+                            ));
+                        }
+                    }
+
                     SteamClient::write_headless_steam_cfg(&prefix_steam_dir);
 
                     let slc = ctx.user_config.as_ref()
@@ -194,22 +222,10 @@ impl Runner for WineTkgRunner {
                     if steam_running {
                         println!("✅ Steam already running in prefix — skipping spawn");
                     } else {
-                        let proton = if let Some(forced) = ctx.launcher_config
-                            .game_configs
-                            .get(&ctx.app.app_id)
-                            .and_then(|c| c.forced_proton_version.as_ref())
-                        {
-                            forced.as_str()
-                        } else {
-                            ctx.proton_path.as_deref()
-                                .filter(|p| !p.is_empty())
-                                .ok_or_else(|| LaunchError::new(LaunchErrorKind::Environment, "proton path is required for Windows launch"))?
-                        };
-
                         let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {
-                            crate::utils::resolve_runner(proton, &library_root)
+                            active_runner.clone()
                         };
 
                         tracing::info!("Using runner for background Steam: {}", steam_runner.display());
@@ -443,7 +459,7 @@ impl Runner for WineTkgRunner {
         } else {
             ctx.proton_path.as_deref()
                 .filter(|p| !p.is_empty())
-                .unwrap_or("wine")
+                .unwrap_or(ctx.launcher_config.proton_version.as_str())
         };
 
         let active_runner_path = crate::utils::resolve_runner(proton, &library_root);
@@ -531,6 +547,21 @@ impl Runner for WineTkgRunner {
 
         tracing::info!("Final WINEDLLOVERRIDES: {}", dll_overrides);
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
+
+        let steam_prefix_mode = ctx.user_config.as_ref()
+            .map(|c| c.steam_prefix_mode.clone())
+            .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
+
+        if steam_prefix_mode == crate::models::SteamPrefixMode::Shared && SteamClient::is_steam_running_in_prefix(&effective_game_prefix) {
+            let msg = "Shared prefix mode: Steam is already running in this prefix. Launching a second game with a different runner will crash. Consider switching to per-game prefix mode in Settings.";
+            tracing::warn!("{}", msg);
+            unsafe {
+                if !ctx.verification_ptr.is_null() {
+                    let v = &mut *ctx.verification_ptr;
+                    v.detailed_status = Some(msg.to_string());
+                }
+            }
+        }
 
         // Track effective state for diagnostics (HACK: should ideally be done in a separate stage)
         // This is safe because WineTkgRunner is currently the only one implementing this logic.
@@ -818,7 +849,7 @@ impl Runner for WineTkgRunner {
         } else {
             ctx.proton_path.as_deref()
                 .filter(|p| !p.is_empty())
-                .ok_or_else(|| LaunchError::new(LaunchErrorKind::Environment, "proton path is required for Windows launch"))?
+                .unwrap_or(ctx.launcher_config.proton_version.as_str())
         };
         let active_runner = crate::utils::resolve_runner(proton, &library_root);
 

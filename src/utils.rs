@@ -3,6 +3,36 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
+    let prefix_str = wineprefix.to_string_lossy().to_string();
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
+    for entry in proc_dir.flatten() {
+        let pid_path = entry.path();
+        if !pid_path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false) { continue; }
+        let environ = std::fs::read(pid_path.join("environ")).ok()?;
+        let environ_str = String::from_utf8_lossy(&environ);
+        if !environ_str.contains(&prefix_str) { continue; }
+        // Check if this is a wine process
+        let cmdline = std::fs::read(pid_path.join("cmdline")).ok()?;
+        let cmdline_str = String::from_utf8_lossy(&cmdline);
+        if !cmdline_str.to_lowercase().contains("wine") { continue; }
+        // Read the actual binary
+        if let Ok(exe) = std::fs::read_link(pid_path.join("exe")) {
+            return Some(exe);
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+pub fn detect_active_wineserver_runtime(_wineprefix: &Path) -> Option<PathBuf> {
+    None
+}
+
 pub fn normalize_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric())

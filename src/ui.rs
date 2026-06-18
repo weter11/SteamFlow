@@ -645,7 +645,11 @@ impl SteamLauncher {
                     }
                 }
                 AsyncOp::Error(err) => {
-                    self.status = err;
+                    if err.contains("wineserver is already running") {
+                        self.status = "Runtime conflict: stop running games first, or use per-game prefix mode (Game Options → Runtime Settings → Per-game prefix).".to_string();
+                    } else {
+                        self.status = err;
+                    }
                 }
             }
         }
