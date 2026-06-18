@@ -136,9 +136,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_wine_tkg_runner_stubs() {
+        use tempfile::tempdir;
+        use std::fs;
+
         // We can only test stubs that don't hit the filesystem hard or expect real Proton/Wine
         let runner = WineTkgRunner;
-        let ctx = mock_context();
+        let mut ctx = mock_context();
+
+        let tmp = tempdir().unwrap();
+        let proton_path = tmp.path().join("proton");
+        fs::create_dir_all(&proton_path).unwrap();
+        ctx.proton_path = Some(proton_path.to_string_lossy().to_string());
 
         // build_env should succeed without real filesystem
         let env = runner.build_env(&ctx).await.unwrap();

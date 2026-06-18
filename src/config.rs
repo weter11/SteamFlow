@@ -51,7 +51,7 @@ impl Default for LauncherConfig {
 
         Self {
             steam_library_path,
-            proton_version: "experimental".to_string(),
+            proton_version: "Proton - Experimental".to_string(),
             steam_runtime_runner: PathBuf::new(),
             steam_prefix_mode: SteamPrefixMode::default(),
             enable_cloud_sync: true,

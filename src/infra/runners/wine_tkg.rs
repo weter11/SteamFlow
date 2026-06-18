@@ -205,10 +205,17 @@ impl Runner for WineTkgRunner {
                                 .filter(|p| !p.is_empty())
                                 .ok_or_else(|| LaunchError::new(LaunchErrorKind::Environment, "proton path is required for Windows launch"))?
                         };
-                        let active_runner = crate::utils::resolve_runner(proton, &library_root);
 
-                        let mut steam_cmd = crate::utils::build_runner_command(&active_runner)
-                            .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Compatibility Layer path: {}", active_runner.display())).with_source(e))?;
+                        let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                            ctx.launcher_config.steam_runtime_runner.clone()
+                        } else {
+                            crate::utils::resolve_runner(proton, &library_root)
+                        };
+
+                        tracing::info!("Using runner for background Steam: {}", steam_runner.display());
+
+                        let mut steam_cmd = crate::utils::build_runner_command(&steam_runner)
+                            .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?;
                         steam_cmd.current_dir(&prefix_steam_dir);
                         steam_cmd
                             .arg("C:\\Program Files (x86)\\Steam\\steam.exe")
@@ -440,6 +447,15 @@ impl Runner for WineTkgRunner {
         };
 
         let active_runner_path = crate::utils::resolve_runner(proton, &library_root);
+        if !active_runner_path.exists() {
+            return Err(LaunchError::new(
+                LaunchErrorKind::Runner,
+                format!(
+                    "Compatibility Layer '{}' not found. Please check your Compatibility Layer setting in Global Settings.",
+                    proton
+                )
+            ));
+        }
         let _components = crate::utils::detect_runner_components(
             &active_runner_path,
             Some(&effective_game_prefix),

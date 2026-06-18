@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub fn normalize_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+}
+
 pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
     let mut final_path = runner_path.to_path_buf();
 
@@ -44,9 +51,26 @@ pub fn resolve_runner(name: &str, library_root: &Path) -> PathBuf {
     }
 
     // 1. Steam Library (steamapps/common)
-    let steam_path = library_root.join("steamapps/common").join(name);
+    let common_dir = library_root.join("steamapps/common");
+    let steam_path = common_dir.join(name);
     if steam_path.exists() {
         return steam_path;
+    }
+
+    // Fallback: Normalized match in steamapps/common
+    if let Ok(entries) = std::fs::read_dir(&common_dir) {
+        let normalized_input = normalize_name(name);
+        for entry in entries.flatten() {
+            if let Ok(file_name) = entry.file_name().into_string() {
+                if normalize_name(&file_name) == normalized_input {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        tracing::debug!("Found normalized runner match: {} -> {}", name, file_name);
+                        return path;
+                    }
+                }
+            }
+        }
     }
 
     // 2. compatibilitytools.d (Steam Custom)
@@ -63,6 +87,13 @@ pub fn resolve_runner(name: &str, library_root: &Path) -> PathBuf {
     }
 
     // 4. Fallback to name as provided
+    tracing::warn!(
+        "Runner '{}' not found in searched locations: {:?}, {:?}, {:?}",
+        name,
+        library_root.join("steamapps/common"),
+        PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
+        PathBuf::from(&home).join(".local/share/lutris/runners/wine")
+    );
     name_path.to_path_buf()
 }
 
