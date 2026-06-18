@@ -167,7 +167,7 @@ impl SteamLauncher {
             }
         }
 
-        let (steam_protons, custom_protons) = scan_proton_runtimes();
+        let (steam_protons, custom_protons) = scan_proton_runtimes(&launcher_config);
         let user_profile = runtime
             .block_on(client.get_user_profile(library.len()))
             .ok();
@@ -645,7 +645,11 @@ impl SteamLauncher {
                     }
                 }
                 AsyncOp::Error(err) => {
-                    self.status = err;
+                    if err.contains("wineserver is already running") {
+                        self.status = "Runtime conflict: stop running games first, or use per-game prefix mode (Game Options → Runtime Settings → Per-game prefix).".to_string();
+                    } else {
+                        self.status = err;
+                    }
                 }
             }
         }
@@ -1261,6 +1265,18 @@ impl SteamLauncher {
                 );
                 SteamClient::kill_steam_in_prefix(&prefix);
                 self.status = "Steam stopped".to_string();
+            }
+
+            if ui.button("☠  Kill all Wine processes in prefix")
+                .on_hover_text("Emergency stop: kills all Wine, wineserver, Steam, and game processes running in this prefix. Use if a game crash leaves processes stuck.")
+                .clicked() {
+                let prefix = crate::utils::steam_wineprefix_for_game(
+                    &self.launcher_config,
+                    game_app_id,
+                    &self.user_configs,
+                );
+                crate::utils::kill_all_wine_in_prefix(&prefix);
+                self.status = "All Wine processes in prefix terminated".to_string();
             }
 
             ui.add_space(8.0);
@@ -2077,37 +2093,51 @@ impl SteamLauncher {
     }
 }
 
-fn scan_proton_runtimes() -> (Vec<String>, Vec<String>) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let steam_tools = PathBuf::from(&home).join(".local/share/Steam/steamapps/common");
-    let custom_tools = PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d");
+fn scan_proton_runtimes(config: &LauncherConfig) -> (Vec<String>, Vec<String>) {
+    // Official Valve list from VALVE_PROTONS constant
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let common_dir = library_root.join("steamapps/common");
 
-    let mut steam = vec!["experimental".to_string()];
-    if let Ok(entries) = std::fs::read_dir(steam_tools) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.to_ascii_lowercase().contains("proton") {
-                    steam.push(name);
+    let steam_protons = crate::proton::VALVE_PROTONS
+        .iter()
+        .filter(|(name, _)| common_dir.join(name).exists())
+        .map(|(name, _)| name.to_string())
+        .collect();
+
+    // Custom: compatibilitytools.d + runtimes/
+    let home = std::env::var("HOME").unwrap_or_default();
+    let custom_paths = vec![
+        PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
+        PathBuf::from(&home).join(".steam/steam/compatibilitytools.d"),
+        crate::config::config_dir().unwrap_or_default().join("runtimes"),
+    ];
+
+    let mut unique_paths = Vec::new();
+    for p in custom_paths {
+        if let Ok(can) = std::fs::canonicalize(&p) {
+            unique_paths.push(can);
+        }
+    }
+    unique_paths.sort();
+    unique_paths.dedup();
+
+    let mut custom = Vec::new();
+    for path in unique_paths {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let p = entry.path();
+                    if crate::utils::build_runner_command(&p).is_ok() {
+                        custom.push(entry.file_name().to_string_lossy().to_string());
+                    }
                 }
             }
         }
     }
 
-    let mut custom = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(custom_tools) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                custom.push(entry.file_name().to_string_lossy().to_string());
-            }
-        }
-    }
-
-    steam.sort();
-    steam.dedup();
     custom.sort();
     custom.dedup();
-    (steam, custom)
+    (steam_protons, custom)
 }
 
 impl eframe::App for SteamLauncher {
@@ -2313,32 +2343,64 @@ impl eframe::App for SteamLauncher {
 
                         ui.add_space(8.0);
                         ui.label("Steam Runtime Runner:");
-                        let runner_name = self
-                            .launcher_config
-                            .steam_runtime_runner
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "None Selected".to_string());
+
+                        ui.horizontal(|ui| {
+                            use crate::models::RunnerSource;
+                            ui.radio_value(&mut self.launcher_config.steam_runtime_runner_source, RunnerSource::Official, "Official Proton (Valve)");
+                            ui.radio_value(&mut self.launcher_config.steam_runtime_runner_source, RunnerSource::Custom, "Custom (compatibilitytools.d)");
+                        });
+
+                        let runner_display_name = if self.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                            "None Selected".to_string()
+                        } else {
+                            self.launcher_config.steam_runtime_runner.file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Unknown".to_string())
+                        };
 
                         egui::ComboBox::from_id_salt("runtime_runner_selector")
-                            .selected_text(runner_name)
+                            .selected_text(runner_display_name)
                             .show_ui(ui, |ui| {
-                                let home = std::env::var("HOME").unwrap_or_default();
-                                let custom_tools_paths = [
-                                    PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
-                                    PathBuf::from(&home).join(".steam/steam/compatibilitytools.d"),
-                                ];
-                                for path in custom_tools_paths {
-                                    if let Ok(entries) = std::fs::read_dir(path) {
-                                        for entry in entries.flatten() {
-                                            if entry.path().is_dir() {
-                                                let p = entry.path();
-                                                let name = p.file_name().unwrap().to_string_lossy().to_string();
-                                                if ui
-                                                    .selectable_label(self.launcher_config.steam_runtime_runner == p, name)
-                                                    .clicked()
-                                                {
-                                                    self.launcher_config.steam_runtime_runner = p;
+                                use crate::models::RunnerSource;
+                                if self.launcher_config.steam_runtime_runner_source == RunnerSource::Official {
+                                    let (steam_protons, _) = scan_proton_runtimes(&self.launcher_config);
+                                    let library_root = PathBuf::from(&self.launcher_config.steam_library_path);
+                                    let common_dir = library_root.join("steamapps/common");
+
+                                    for name in steam_protons {
+                                        let p = common_dir.join(&name);
+                                        if ui.selectable_label(self.launcher_config.steam_runtime_runner == p, &name).clicked() {
+                                            self.launcher_config.steam_runtime_runner = p;
+                                        }
+                                    }
+                                } else {
+                                    let home = std::env::var("HOME").unwrap_or_default();
+                                    let custom_tools_paths = vec![
+                                        PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
+                                        PathBuf::from(&home).join(".steam/steam/compatibilitytools.d"),
+                                        crate::config::config_dir().unwrap_or_default().join("runtimes"),
+                                    ];
+
+                                    let mut unique_paths = Vec::new();
+                                    for p in custom_tools_paths {
+                                        if let Ok(can) = std::fs::canonicalize(&p) {
+                                        unique_paths.push(can);
+                                        }
+                                    }
+                                unique_paths.sort();
+                                unique_paths.dedup();
+
+                                    for path in unique_paths {
+                                        if let Ok(entries) = std::fs::read_dir(path) {
+                                            for entry in entries.flatten() {
+                                                if entry.path().is_dir() {
+                                                    let p = entry.path();
+                                                    if crate::utils::build_runner_command(&p).is_ok() {
+                                                        let name = p.file_name().unwrap().to_string_lossy().to_string();
+                                                        if ui.selectable_label(self.launcher_config.steam_runtime_runner == p, name).clicked() {
+                                                            self.launcher_config.steam_runtime_runner = p;
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -2361,11 +2423,11 @@ impl eframe::App for SteamLauncher {
                         ui.separator();
                         ui.heading("Compatibility Layer");
 
-                        ui.radio_value(&mut self.proton_source, ProtonSource::Steam, "Steam runtimes");
+                        ui.radio_value(&mut self.proton_source, ProtonSource::Steam, "Official Proton (Valve)");
                         ui.radio_value(
                             &mut self.proton_source,
                             ProtonSource::Custom,
-                            "Custom compatibilitytools.d",
+                            "Custom (compatibilitytools.d)",
                         );
 
                         let selected_list = if self.proton_source == ProtonSource::Steam {

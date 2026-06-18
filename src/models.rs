@@ -4,6 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, Copy)]
+pub enum RunnerSource {
+    #[default]
+    Official,
+    Custom,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum SteamPrefixMode {
     #[default]

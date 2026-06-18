@@ -1,4 +1,4 @@
-use crate::models::{OwnedGame, SessionState, SteamPrefixMode, UserConfigStore};
+use crate::models::{OwnedGame, RunnerSource, SessionState, SteamPrefixMode, UserConfigStore};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,6 +17,8 @@ pub struct LauncherConfig {
     pub proton_version: String,
     #[serde(default)]
     pub steam_runtime_runner: PathBuf,
+    #[serde(default)]
+    pub steam_runtime_runner_source: RunnerSource,
     #[serde(default)]
     pub steam_prefix_mode: SteamPrefixMode,
     pub enable_cloud_sync: bool,
@@ -51,8 +53,9 @@ impl Default for LauncherConfig {
 
         Self {
             steam_library_path,
-            proton_version: "experimental".to_string(),
+            proton_version: "Proton - Experimental".to_string(),
             steam_runtime_runner: PathBuf::new(),
+            steam_runtime_runner_source: RunnerSource::default(),
             steam_prefix_mode: SteamPrefixMode::default(),
             enable_cloud_sync: true,
             use_shared_compat_data: false,

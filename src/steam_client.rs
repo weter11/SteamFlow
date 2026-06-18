@@ -2183,10 +2183,10 @@ impl SteamClient {
                 }
 
                 let environ = match std::fs::read(pid_path.join("environ")) {
-                    Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                    Ok(b) => b,
                     Err(_) => continue,
                 };
-                if !environ.contains(&prefix_str) {
+                if !String::from_utf8_lossy(&environ).contains(&prefix_str) {
                     continue;
                 }
 

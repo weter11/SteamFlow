@@ -3,6 +3,66 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
+    let prefix_str = wineprefix.to_string_lossy().to_string();
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
+    for entry in proc_dir.flatten() {
+        let pid_path = entry.path();
+        if !pid_path.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false) { continue; }
+        let environ = std::fs::read(pid_path.join("environ")).ok()?;
+        let environ_str = String::from_utf8_lossy(&environ);
+        if !environ_str.contains(&prefix_str) { continue; }
+        // Check if this is a wine process
+        let cmdline = std::fs::read(pid_path.join("cmdline")).ok()?;
+        let cmdline_str = String::from_utf8_lossy(&cmdline);
+        if !cmdline_str.to_lowercase().contains("wine") { continue; }
+        // Read the actual binary
+        if let Ok(exe) = std::fs::read_link(pid_path.join("exe")) {
+            return Some(exe);
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+pub fn detect_active_wineserver_runtime(_wineprefix: &Path) -> Option<PathBuf> {
+    None
+}
+
+pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
+    // Same /proc scan pattern as is_steam_running_in_prefix and kill_steam_in_prefix
+    // but match on any process whose cmdline contains "wine" (case-insensitive)
+    // and whose environ contains the prefix path
+    // Send SIGTERM first; this covers: wine, wine64, wineserver, winedevice,
+    // plugplay, steam.exe, steamwebhelper.exe, the game exe itself
+    #[cfg(unix)]
+    {
+        let prefix_str = wineprefix.to_string_lossy().to_string();
+        if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+            for entry in proc_dir.flatten() {
+                let pid_path = entry.path();
+                let Some(pid_str) = pid_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+                else { continue };
+                let environ = match std::fs::read(pid_path.join("environ")) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if !String::from_utf8_lossy(&environ).contains(&prefix_str) { continue }
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    unsafe { libc::kill(pid, libc::SIGTERM); }
+                }
+            }
+        }
+    }
+}
+
+
 pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
     let mut final_path = runner_path.to_path_buf();
 
@@ -44,9 +104,26 @@ pub fn resolve_runner(name: &str, library_root: &Path) -> PathBuf {
     }
 
     // 1. Steam Library (steamapps/common)
-    let steam_path = library_root.join("steamapps/common").join(name);
+    let common_dir = library_root.join("steamapps/common");
+    let steam_path = common_dir.join(name);
     if steam_path.exists() {
         return steam_path;
+    }
+
+    // Fallback: Normalized match in steamapps/common
+    if let Ok(entries) = std::fs::read_dir(&common_dir) {
+        let normalized_input = crate::proton::normalize_name(name);
+        for entry in entries.flatten() {
+            if let Ok(file_name) = entry.file_name().into_string() {
+                if crate::proton::normalize_name(&file_name) == normalized_input {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        tracing::debug!("Found normalized runner match: {} -> {}", name, file_name);
+                        return path;
+                    }
+                }
+            }
+        }
     }
 
     // 2. compatibilitytools.d (Steam Custom)
@@ -63,6 +140,13 @@ pub fn resolve_runner(name: &str, library_root: &Path) -> PathBuf {
     }
 
     // 4. Fallback to name as provided
+    tracing::warn!(
+        "Runner '{}' not found in searched locations: {:?}, {:?}, {:?}",
+        name,
+        library_root.join("steamapps/common"),
+        PathBuf::from(&home).join(".local/share/Steam/compatibilitytools.d"),
+        PathBuf::from(&home).join(".local/share/lutris/runners/wine")
+    );
     name_path.to_path_buf()
 }
 
