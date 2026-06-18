@@ -33,12 +33,35 @@ pub fn detect_active_wineserver_runtime(_wineprefix: &Path) -> Option<PathBuf> {
     None
 }
 
-pub fn normalize_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| c.is_alphanumeric())
-        .collect::<String>()
-        .to_lowercase()
+pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
+    // Same /proc scan pattern as is_steam_running_in_prefix and kill_steam_in_prefix
+    // but match on any process whose cmdline contains "wine" (case-insensitive)
+    // and whose environ contains the prefix path
+    // Send SIGTERM first; this covers: wine, wine64, wineserver, winedevice,
+    // plugplay, steam.exe, steamwebhelper.exe, the game exe itself
+    #[cfg(unix)]
+    {
+        let prefix_str = wineprefix.to_string_lossy().to_string();
+        if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+            for entry in proc_dir.flatten() {
+                let pid_path = entry.path();
+                let Some(pid_str) = pid_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+                else { continue };
+                let environ = match std::fs::read(pid_path.join("environ")) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if !String::from_utf8_lossy(&environ).contains(&prefix_str) { continue }
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    unsafe { libc::kill(pid, libc::SIGTERM); }
+                }
+            }
+        }
+    }
 }
+
 
 pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
     let mut final_path = runner_path.to_path_buf();
@@ -89,10 +112,10 @@ pub fn resolve_runner(name: &str, library_root: &Path) -> PathBuf {
 
     // Fallback: Normalized match in steamapps/common
     if let Ok(entries) = std::fs::read_dir(&common_dir) {
-        let normalized_input = normalize_name(name);
+        let normalized_input = crate::proton::normalize_name(name);
         for entry in entries.flatten() {
             if let Ok(file_name) = entry.file_name().into_string() {
-                if normalize_name(&file_name) == normalized_input {
+                if crate::proton::normalize_name(&file_name) == normalized_input {
                     let path = entry.path();
                     if path.is_dir() {
                         tracing::debug!("Found normalized runner match: {} -> {}", name, file_name);

@@ -155,8 +155,11 @@ impl Runner for WineTkgRunner {
                     tracing::debug!("Runtime WINEPREFIX : {}", steam_wineprefix.display());
 
                     if let Some(active_wine) = crate::utils::detect_active_wineserver_runtime(&steam_wineprefix) {
-                        let active_canonical = active_wine.canonicalize().unwrap_or(active_wine);
-                        let runner_canonical = active_runner.canonicalize().unwrap_or_else(|_| active_runner.clone());
+                        let active_root = crate::utils::derive_runner_root(&active_wine);
+                        let runner_root = crate::utils::derive_runner_root(&active_runner);
+
+                        let active_canonical = active_root.canonicalize().unwrap_or(active_root);
+                        let runner_canonical = runner_root.canonicalize().unwrap_or(runner_root);
 
                         if active_canonical != runner_canonical {
                             return Err(LaunchError::new(
