@@ -225,7 +225,7 @@ impl SteamLauncher {
             play_result_rx: None,
             show_settings: false,
             launcher_config,
-            proton_source: ProtonSource::Valve,
+            proton_source: ProtonSource::Valve { app_id: 0 },
             steam_protons,
             custom_protons,
             user_profile,
@@ -1198,7 +1198,7 @@ impl SteamLauncher {
             }
 
             if let Some(ref mut version) = config.forced_proton_version {
-                let selected_list = if self.proton_source == ProtonSource::Valve {
+                let selected_list = if matches!(self.proton_source, ProtonSource::Valve { .. }) {
                     &self.steam_protons
                 } else {
                     &self.custom_protons
@@ -1657,7 +1657,28 @@ impl SteamLauncher {
                             if filter.is_some() && Some(&package.label) != filter.as_ref() {
                                 continue;
                             }
-                            ui.label(&package.name);
+                            let name_label = if package.label == "Proton-CachyOS" {
+                                let arch_tag = if let crate::proton::ProtonSource::Github { url, .. } =
+                                    &package.source
+                                {
+                                    if url.contains("x86_64_v3") {
+                                        " (x86_64_v3 — AVX2 optimized)"
+                                    } else if url.contains("x86_64") {
+                                        " (x86_64)"
+                                    } else if url.contains("arm64") {
+                                        " (arm64)"
+                                    } else {
+                                        ""
+                                    }
+                                } else {
+                                    ""
+                                };
+                                format!("{}{}", package.name, arch_tag)
+                            } else {
+                                package.name.clone()
+                            };
+
+                            ui.label(name_label);
                             ui.label(&package.label);
                             if package.size > 0 {
                                 ui.label(format_bytes(package.size));
@@ -1694,24 +1715,34 @@ impl SteamLauncher {
                                 });
                             } else {
                                 let btn = ui.button("Install");
-                                if package.source == crate::proton::ProtonSource::Valve {
-                                    btn.on_hover_text("Valve Protons are managed via the Steam content pipeline. Trigger an install for the corresponding Proton app in Steam.");
-                                } else if btn.clicked() {
-                                    let package_clone = package.clone();
-                                    let tx = self.operation_tx.clone();
-                                    self.runtime.spawn(async move {
-                                        let name = package_clone.name.clone();
-                                        let name_for_progress = name.clone();
-                                        let tx_for_progress = tx.clone();
-                                        let res = crate::proton::install_github_package(package_clone, move |downloaded, total| {
-                                            let _ = tx_for_progress.send(AsyncOp::ProtonInstallProgress(name_for_progress.clone(), downloaded, total));
-                                        }).await;
-
-                                        match res {
-                                            Ok(_) => { let _ = tx.send(AsyncOp::ProtonInstallComplete(name)); }
-                                            Err(e) => { let _ = tx.send(AsyncOp::ProtonInstallFailed(name, e.to_string())); }
+                                match &package.source {
+                                    crate::proton::ProtonSource::Valve { app_id } => {
+                                        let app_id = *app_id;
+                                        let btn = btn.on_hover_text("Valve Protons are managed via the Steam content pipeline. Triggering an install will treat the Proton app as a normal Steam app.");
+                                        if btn.clicked() {
+                                            // Call the Steam install flow for this app_id
+                                            self.start_install(app_id, DepotPlatform::Linux, None, None);
                                         }
-                                    });
+                                    }
+                                    crate::proton::ProtonSource::Github { .. } => {
+                                        if btn.clicked() {
+                                            let package_clone = package.clone();
+                                            let tx = self.operation_tx.clone();
+                                            self.runtime.spawn(async move {
+                                                let name = package_clone.name.clone();
+                                                let name_for_progress = name.clone();
+                                                let tx_for_progress = tx.clone();
+                                                let res = crate::proton::install_github_package(package_clone, move |downloaded, total| {
+                                                    let _ = tx_for_progress.send(AsyncOp::ProtonInstallProgress(name_for_progress.clone(), downloaded, total));
+                                                }).await;
+
+                                                match res {
+                                                    Ok(_) => { let _ = tx.send(AsyncOp::ProtonInstallComplete(name)); }
+                                                    Err(e) => { let _ = tx.send(AsyncOp::ProtonInstallFailed(name, e.to_string())); }
+                                                }
+                                            });
+                                        }
+                                    }
                                 }
                             }
                             ui.end_row();
@@ -2668,14 +2699,14 @@ impl eframe::App for SteamLauncher {
                         ui.separator();
                         ui.heading("Compatibility Layer");
 
-                        ui.radio_value(&mut self.proton_source, ProtonSource::Valve, "Official Proton (Valve)");
-                        ui.radio_value(
-                            &mut self.proton_source,
-                            ProtonSource::Github,
-                            "Custom (compatibilitytools.d)",
-                        );
+                        if ui.selectable_label(matches!(self.proton_source, ProtonSource::Valve { .. }), "Official Proton (Valve)").clicked() {
+                             self.proton_source = ProtonSource::Valve { app_id: 0 };
+                        }
+                        if ui.selectable_label(matches!(self.proton_source, ProtonSource::Github { .. }), "Custom (compatibilitytools.d)").clicked() {
+                             self.proton_source = ProtonSource::Github { url: String::new(), ext: String::new() };
+                        }
 
-                        let selected_list = if self.proton_source == ProtonSource::Valve {
+                        let selected_list = if matches!(self.proton_source, ProtonSource::Valve { .. }) {
                             &self.steam_protons
                         } else {
                             &self.custom_protons

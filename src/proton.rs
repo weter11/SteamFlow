@@ -3,22 +3,22 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow, Context};
 use std::fs;
 
-pub const VALVE_PROTONS: &[(&str, &str)] = &[
-    ("Proton - Experimental", "experimental"),
-    ("Proton 11.0", "11.0"),
-    ("Proton 10.0", "10.0"),
-    ("Proton 9.0 (Beta)", "9.0"),
-    ("Proton 8.0", "8.0"),
-    ("Proton 7.0", "7.0"),
-    ("Proton 6.3", "6.3"),
-    ("Proton 5.13", "5.13"),
-    ("Proton 5.0", "5.0"),
+pub const VALVE_PROTONS: &[(&str, u32)] = &[
+    ("Proton - Experimental", 1493710),
+    ("Proton 11.0", 3418580),
+    ("Proton 10.0", 3144130),
+    ("Proton 9.0 (Beta)", 2465830),
+    ("Proton 8.0", 2348590),
+    ("Proton 7.0", 1887720),
+    ("Proton 6.3", 1580130),
+    ("Proton 5.13", 1493710),
+    ("Proton 5.0", 1245040),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProtonSource {
-    Valve,
-    Github,
+    Valve { app_id: u32 },
+    Github { url: String, ext: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +42,6 @@ pub struct ProtonPackage {
     pub name: String,
     pub source: ProtonSource,
     pub label: String, // e.g. "Proton-GE", "Valve"
-    pub download_url: Option<String>,
     pub size: u64,
 }
 
@@ -50,6 +49,36 @@ pub struct ProtonPackage {
 pub struct InstalledProton {
     pub name: String,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostArchTag {
+    Arm64,
+    X86_64V3, // AVX2 baseline
+    X86_64,   // generic fallback
+}
+
+pub fn detect_host_arch_tag() -> HostArchTag {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return HostArchTag::Arm64;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("bmi2")
+        {
+            return HostArchTag::X86_64V3;
+        }
+        return HostArchTag::X86_64;
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        HostArchTag::X86_64
+    }
 }
 
 pub fn normalize_name(name: &str) -> String {
@@ -63,12 +92,11 @@ pub async fn list_available() -> Result<Vec<ProtonPackage>> {
     let mut available = Vec::new();
 
     // Valve Protons
-    for (name, _id) in VALVE_PROTONS {
+    for (name, app_id) in VALVE_PROTONS {
         available.push(ProtonPackage {
             name: name.to_string(),
-            source: ProtonSource::Valve,
+            source: ProtonSource::Valve { app_id: *app_id },
             label: "Valve".to_string(),
-            download_url: None,
             size: 0, // Unknown/Not applicable for Valve protons here
         });
     }
@@ -112,28 +140,74 @@ struct GithubRelease {
     assets: Vec<GithubAsset>,
 }
 
-#[derive(Deserialize)]
-struct GithubAsset {
-    name: String,
+#[derive(Deserialize, Clone)]
+pub struct GithubAsset {
+    pub name: String,
     browser_download_url: String,
     size: u64,
 }
 
-fn release_to_package(release: GithubRelease, src: &GithubSource) -> Option<ProtonPackage> {
-    for asset in release.assets {
-        if asset.name.ends_with(src.ext) {
-            // Basic filtering for checksums/sigs is already handled by ends_with(src.ext)
-            // But we should ensure we don't pick up .sha512sum or similar if src.ext is .tar.gz
-            return Some(ProtonPackage {
-                name: asset.name.replace(src.ext, ""),
-                source: ProtonSource::Github,
-                label: src.label.to_string(),
-                download_url: Some(asset.browser_download_url),
-                size: asset.size,
-            });
-        }
+pub fn select_asset(assets: &[GithubAsset], arch: HostArchTag, ext: &str) -> Option<GithubAsset> {
+    let candidates: Vec<GithubAsset> = assets
+        .iter()
+        .filter(|a| {
+            a.name.ends_with(ext)
+                && !a.name.contains("sha512sum")
+                && !a.name.contains("sha256sum")
+                && !a.browser_download_url.contains("/archive/refs/tags/")
+        })
+        .cloned()
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
     }
-    None
+
+    if candidates.len() == 1 {
+        return candidates.into_iter().next();
+    }
+
+    // Multiple variants (e.g. CachyOS arm64/x86_64/x86_64_v3) — pick by host arch
+    let preferred = match arch {
+        HostArchTag::Arm64 => "arm64",
+        HostArchTag::X86_64V3 => "x86_64_v3",
+        HostArchTag::X86_64 => "x86_64",
+    };
+
+    candidates
+        .iter()
+        .find(|a| a.name.ends_with(&format!("{}{}", preferred, ext)))
+        .cloned()
+        // Fallback: if exact v3 tag isn't found, accept plain x86_64
+        // so non-AVX2 CPUs (or future releases without v3) still work
+        .or_else(|| {
+            if arch == HostArchTag::X86_64V3 {
+                candidates
+                    .iter()
+                    .find(|a| {
+                        a.name.ends_with(&format!("x86_64{}", ext)) && !a.name.contains("arm64")
+                    })
+                    .cloned()
+            } else {
+                None
+            }
+        })
+        .or_else(|| candidates.first().cloned())
+}
+
+fn release_to_package(release: GithubRelease, src: &GithubSource) -> Option<ProtonPackage> {
+    let tag = detect_host_arch_tag();
+    let asset = select_asset(&release.assets, tag, src.ext)?;
+
+    Some(ProtonPackage {
+        name: release.tag_name,
+        source: ProtonSource::Github {
+            url: asset.browser_download_url,
+            ext: src.ext.to_string(),
+        },
+        label: src.label.to_string(),
+        size: asset.size,
+    })
 }
 
 pub fn list_installed(library_root: &Path) -> Vec<InstalledProton> {
@@ -199,7 +273,10 @@ pub fn list_installed(library_root: &Path) -> Vec<InstalledProton> {
 pub async fn install_github_package<F>(package: ProtonPackage, mut progress: F) -> Result<()>
 where F: FnMut(u64, u64) + Send + 'static
 {
-    let url = package.download_url.ok_or_else(|| anyhow!("Package has no download URL"))?;
+    let url = match package.source {
+        ProtonSource::Github { url, .. } => url,
+        _ => return Err(anyhow!("Package is not a GitHub source")),
+    };
     let response = reqwest::get(&url).await?;
     let total_size = response.content_length().unwrap_or(package.size);
 
@@ -211,10 +288,11 @@ where F: FnMut(u64, u64) + Send + 'static
 
     {
         use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
         let mut file = tokio::fs::File::create(&tarball_path).await?;
         while let Some(item) = stream.next().await {
             let chunk = item?;
-            tokio::io::copy(&mut chunk.as_ref(), &mut file).await?;
+            file.write_all(&chunk).await?;
             downloaded += chunk.len() as u64;
             progress(downloaded, total_size);
         }
@@ -274,12 +352,12 @@ mod tests {
             assets: vec![
                 GithubAsset {
                     name: "GE-Proton9-7.sha512sum".to_string(),
-                    browser_download_url: "url1".to_string(),
+                    browser_download_url: "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton9-7/GE-Proton9-7.sha512sum".to_string(),
                     size: 100,
                 },
                 GithubAsset {
                     name: "GE-Proton9-7.tar.gz".to_string(),
-                    browser_download_url: "url2".to_string(),
+                    browser_download_url: "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton9-7/GE-Proton9-7.tar.gz".to_string(),
                     size: 500_000_000,
                 },
             ],
@@ -287,7 +365,11 @@ mod tests {
         let src = &GE_SOURCES[0]; // Proton-GE, .tar.gz
         let package = release_to_package(release, src).unwrap();
         assert_eq!(package.name, "GE-Proton9-7");
-        assert_eq!(package.download_url.unwrap(), "url2");
+        if let ProtonSource::Github { url, .. } = package.source {
+            assert_eq!(url, "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton9-7/GE-Proton9-7.tar.gz");
+        } else {
+            panic!("Expected Github source");
+        }
     }
 
     #[test]
@@ -309,7 +391,53 @@ mod tests {
         };
         let src = &GE_SOURCES[2]; // Proton-CachyOS, .tar.xz
         let package = release_to_package(release, src).unwrap();
-        assert_eq!(package.name, "proton-cachyos-11.0-20260602-slr-x86_64");
-        assert_eq!(package.download_url.unwrap(), "url2");
+        assert_eq!(package.name, "cachyos-11.0-20260602-slr");
+        if let ProtonSource::Github { url, .. } = package.source {
+            assert_eq!(url, "url2");
+        } else {
+            panic!("Expected Github source");
+        }
+    }
+
+    #[test]
+    fn cachyos_prefers_x86_64_v3_on_avx2_host() {
+        let assets = vec![
+            GithubAsset {
+                name: "proton-cachyos-11.0-20260602-slr-arm64.tar.xz".to_string(),
+                browser_download_url: "url_arm".to_string(),
+                size: 100,
+            },
+            GithubAsset {
+                name: "proton-cachyos-11.0-20260602-slr-x86_64.tar.xz".to_string(),
+                browser_download_url: "url_x64".to_string(),
+                size: 100,
+            },
+            GithubAsset {
+                name: "proton-cachyos-11.0-20260602-slr-x86_64_v3.tar.xz".to_string(),
+                browser_download_url: "url_v3".to_string(),
+                size: 100,
+            },
+        ];
+
+        let selected = select_asset(&assets, HostArchTag::X86_64V3, ".tar.xz").unwrap();
+        assert_eq!(selected.browser_download_url, "url_v3");
+
+        let selected = select_asset(&assets, HostArchTag::X86_64, ".tar.xz").unwrap();
+        assert_eq!(selected.browser_download_url, "url_x64");
+
+        let selected = select_asset(&assets, HostArchTag::Arm64, ".tar.xz").unwrap();
+        assert_eq!(selected.browser_download_url, "url_arm");
+    }
+
+    #[test]
+    fn source_tarball_is_never_selected() {
+        let assets = vec![GithubAsset {
+            name: "proton-11.0-1-beta5.tar.gz".to_string(),
+            browser_download_url: "https://github.com/ValveSoftware/Proton/archive/refs/tags/proton-11.0-1-beta5.tar.gz".to_string(),
+            size: 100,
+        }];
+
+        let selected = select_asset(&assets, HostArchTag::X86_64, ".tar.gz");
+        assert!(selected.is_none());
     }
 }
