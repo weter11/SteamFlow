@@ -5,6 +5,7 @@ mod tests {
     use crate::steam_client::{LaunchInfo, LaunchTarget};
     use crate::config::LauncherConfig;
     use std::path::PathBuf;
+    use std::collections::HashMap;
 
     fn mock_context() -> LaunchContext {
         LaunchContext {
@@ -59,12 +60,9 @@ mod tests {
     async fn test_wine_tkg_runner_graphics_policy_autodetect() {
         use crate::infra::runners::wine_tkg::WineTkgRunner;
         use crate::models::GraphicsBackendPolicy;
-        use crate::config::LauncherConfig;
-        use crate::steam_client::{LaunchInfo, LaunchTarget};
-        use crate::models::{LibraryGame, UserAppConfig};
+        use crate::models::UserAppConfig;
         use tempfile::tempdir;
         use std::fs;
-        use std::collections::HashMap;
 
         let tmp = tempdir().unwrap();
         let lib = tmp.path().join("library");
@@ -152,4 +150,32 @@ mod tests {
         let env = runner.build_env(&ctx).await.unwrap();
         assert_eq!(env.get("SteamAppId").unwrap(), "123");
     }
+
+    #[test]
+    fn test_resolve_launch_runner_equivalence() {
+        use crate::utils::resolve_launch_runner;
+
+        let mut config = LauncherConfig::default();
+        config.proton_version = "Global-Proton".to_string();
+        config.steam_library_path = "/tmp/lib".to_string();
+
+        let app_id = 456;
+
+        // 1. Test global default
+        let runner = resolve_launch_runner(&config, app_id, None);
+        assert!(runner.to_string_lossy().contains("Global-Proton"));
+
+        // 2. Test override path
+        let runner = resolve_launch_runner(&config, app_id, Some("/custom/proton"));
+        assert_eq!(runner, PathBuf::from("/custom/proton"));
+
+        // 3. Test forced per-game version (highest precedence)
+        let mut game_cfg = crate::config::GameConfig::default();
+        game_cfg.forced_proton_version = Some("Forced-Proton".to_string());
+        config.game_configs.insert(app_id, game_cfg);
+
+        let runner = resolve_launch_runner(&config, app_id, Some("/custom/proton"));
+        assert!(runner.to_string_lossy().contains("Forced-Proton"));
+    }
+
 }

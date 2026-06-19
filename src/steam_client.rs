@@ -655,6 +655,14 @@ impl SteamClient {
 
             let mut has_windows = false;
             let parse_res = parse_pics_product_info(appinfo_vdf_bytes);
+
+            // DEBUG: Dump raw appinfo for troubleshooting tool app installs
+            if appid == 4628710 || appid == 1493710 {
+                let debug_path = format!("/tmp/steamflow_appinfo_{}.bin", appid);
+                let _ = std::fs::write(&debug_path, appinfo_vdf_bytes);
+                tracing::info!("Dumped raw appinfo for {} to {}", appid, debug_path);
+            }
+
             if let Ok(map) = parse_res.as_ref() {
                 // To keep filtering, we re-parse or re-use the find_vdf logic.
                 // We'll re-parse here to stay strictly compliant with Task 2's request to call parse_pics_product_info.

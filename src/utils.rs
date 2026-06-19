@@ -97,6 +97,31 @@ pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
     bail!("Failed to resolve a valid runner binary from {}", runner_path.display())
 }
 
+/// Resolves the single runner that should be used for this app's launch,
+/// applying the same precedence everywhere: per-game forced version,
+/// then caller-provided proton_path, then the global default.
+/// This is the ONLY function that should be called to answer
+/// "which runner binary do we use for this launch" — call it once per
+/// launch and pass the result through, rather than re-deriving it at
+/// each pipeline stage.
+
+pub fn resolve_launch_runner(
+    launcher_config: &crate::config::LauncherConfig,
+    app_id: u32,
+    proton_path_override: Option<&str>,
+) -> PathBuf {
+    let proton = launcher_config
+        .game_configs
+        .get(&app_id)
+        .and_then(|c| c.forced_proton_version.as_ref())
+        .map(|s| s.as_str())
+        .or(proton_path_override.filter(|p| !p.is_empty()))
+        .unwrap_or(launcher_config.proton_version.as_str());
+
+    let library_root = PathBuf::from(&launcher_config.steam_library_path);
+    resolve_runner(proton, &library_root)
+}
+
 pub fn resolve_runner(name: &str, library_root: &Path) -> PathBuf {
     let name_path = Path::new(name);
     if name_path.is_absolute() || name_path.exists() {
@@ -1245,31 +1270,27 @@ pub fn cleanup_dll_symlinks(prefix: &Path) -> Result<()> {
 
 pub fn check_runner_consistency(prefix_root: &Path, current_runner: &Path) -> Result<()> {
     let marker_path = prefix_root.join(".steamflow_runner");
-    let canonical_runner = std::fs::canonicalize(current_runner).unwrap_or(current_runner.to_path_buf());
+    let current_canonical = std::fs::canonicalize(current_runner).unwrap_or(current_runner.to_path_buf());
 
     if let Ok(existing) = std::fs::read_to_string(&marker_path) {
         let existing_path = PathBuf::from(existing.trim());
-        if existing_path != canonical_runner && prefix_root.join("pfx/drive_c").exists() {
-             return Err(anyhow!(
-                "This Steam Runtime prefix was initialized with a different runner ({}). \
-                 Using a different runner ({}) on an existing prefix can corrupt it. \
-                 Delete the prefix at {} to reinitialize with the new runner, or switch \
-                 back to the original runner.",
-                existing_path.display(), canonical_runner.display(), prefix_root.display()
-            ));
-        }
-        if existing_path != canonical_runner && prefix_root.join("drive_c").exists() {
-             return Err(anyhow!(
-                "This Steam Runtime prefix was initialized with a different runner ({}). \
-                 Using a different runner ({}) on an existing prefix can corrupt it. \
-                 Delete the prefix at {} to reinitialize with the new runner, or switch \
-                 back to the original runner.",
-                existing_path.display(), canonical_runner.display(), prefix_root.display()
-            ));
+        let existing_canonical = std::fs::canonicalize(&existing_path).unwrap_or(existing_path);
+
+        if existing_canonical != current_canonical {
+            let has_drive_c = prefix_root.join("drive_c").exists() || prefix_root.join("pfx/drive_c").exists();
+            if has_drive_c {
+                return Err(anyhow!(
+                    "This Steam Runtime prefix was initialized with a different runner ({}). \
+                     Using a different runner ({}) on an existing prefix can corrupt it. \
+                     Delete the prefix at {} to reinitialize with the new runner, or switch \
+                     back to the original runner.",
+                    existing_canonical.display(), current_canonical.display(), prefix_root.display()
+                ));
+            }
         }
     }
 
-    std::fs::write(&marker_path, canonical_runner.to_string_lossy().as_bytes()).ok();
+    std::fs::write(&marker_path, current_canonical.to_string_lossy().as_bytes()).ok();
     Ok(())
 }
 

@@ -12,20 +12,7 @@ pub struct WineTkgRunner;
 impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
-        let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
-
-        let proton = if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced.as_str()
-        } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
-        };
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let active_runner = crate::utils::resolve_launch_runner(&ctx.launcher_config, ctx.app.app_id, ctx.proton_path.as_deref());
 
         let (use_steam_runtime, runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
             Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
@@ -399,6 +386,7 @@ impl Runner for WineTkgRunner {
     }
 
     async fn build_env(&self, ctx: &LaunchContext) -> std::result::Result<HashMap<String, String>, LaunchError> {
+        let active_runner = crate::utils::resolve_launch_runner(&ctx.launcher_config, ctx.app.app_id, ctx.proton_path.as_deref());
         let mut env = HashMap::new();
         let app_id_str = ctx.app.app_id.to_string();
 
@@ -465,30 +453,17 @@ impl Runner for WineTkgRunner {
         };
 
         // Resolve proton version for component detection and DLL path building
-        let proton = if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced.as_str()
-        } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
-        };
-
-        let active_runner_path = crate::utils::resolve_runner(proton, &library_root);
-        if !active_runner_path.exists() {
+        if !active_runner.exists() {
             return Err(LaunchError::new(
                 LaunchErrorKind::Runner,
                 format!(
-                    "Compatibility Layer '{}' not found. Please check your Compatibility Layer setting in Global Settings.",
-                    proton
+                    "Compatibility Layer '{:?}' not found. Please check your Compatibility Layer setting in Global Settings.",
+                    active_runner
                 )
             ));
         }
         let _components = crate::utils::detect_runner_components(
-            &active_runner_path,
+            &active_runner,
             Some(&effective_game_prefix),
         );
 
@@ -640,7 +615,6 @@ impl Runner for WineTkgRunner {
 
         // Also add the runner's main lib/wine directories so Wine can find
         // the .dll.so PE loader stubs it needs to bridge into native DLLs.
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
         let runner_root = crate::utils::derive_runner_root(&active_runner);
         for lib_sub in &[
             "lib/wine",
@@ -853,20 +827,7 @@ impl Runner for WineTkgRunner {
     }
 
     async fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
-        let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
-
-        let proton = if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced.as_str()
-        } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
-        };
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let active_runner = crate::utils::resolve_launch_runner(&ctx.launcher_config, ctx.app.app_id, ctx.proton_path.as_deref());
 
         let mut spec = CommandSpec::default();
 
