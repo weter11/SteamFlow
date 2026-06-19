@@ -6,6 +6,8 @@ use crate::models::{
     SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
+use crate::proton::ProtonSource;
+use crate::utils::format_bytes;
 use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
@@ -18,12 +20,22 @@ use tokio::runtime::Runtime;
 
 pub type AppId = u32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProtonSource {
-    Steam,
-    Custom,
+#[derive(Debug, Clone)]
+struct ProtonManagerState {
+    available: Vec<crate::proton::ProtonPackage>,
+    installed: Vec<crate::proton::InstalledProton>,
+    loading: bool,
+    install_progress: Option<(String, u64, u64)>, // (package_name, downloaded, total)
+    filter_label: Option<String>, // None = all, Some("Valve"|"Proton-GE"|"Wine-GE"|"Proton-CachyOS") = filtered
+    error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ProtonRemoveConfirmState {
+    name: String,
+    is_default: bool,
+    affected_games: Vec<String>, // games with forced_proton_version == name
+}
 
 #[derive(Debug, Clone)]
 struct UninstallModalState {
@@ -95,6 +107,11 @@ pub enum AsyncOp {
     ScanCompleted(u32, HashMap<u32, String>),
     MetadataFetched(u32, crate::steam_client::AppMetadata),
     UserConfigsFetched(crate::models::UserConfigStore),
+    ProtonListFetched(Vec<crate::proton::ProtonPackage>, Vec<crate::proton::InstalledProton>),
+    ProtonInstallProgress(String, u64, u64),
+    ProtonInstallComplete(String),
+    ProtonInstallFailed(String, String), // (package_name, error)
+    ProtonRemoved(String),
     Error(String),
 }
 
@@ -141,6 +158,8 @@ pub struct SteamLauncher {
     available_branches: HashMap<u32, Vec<String>>,
     is_verifying: bool,
     user_configs: crate::models::UserConfigStore,
+    proton_manager: ProtonManagerState,
+    proton_remove_confirm: Option<ProtonRemoveConfirmState>,
     env_vars_edit_buffer: String,
     runner_components: Option<crate::utils::RunnerComponents>,
     last_scanned_runner: PathBuf,
@@ -206,7 +225,7 @@ impl SteamLauncher {
             play_result_rx: None,
             show_settings: false,
             launcher_config,
-            proton_source: ProtonSource::Steam,
+            proton_source: ProtonSource::Valve,
             steam_protons,
             custom_protons,
             user_profile,
@@ -224,6 +243,15 @@ impl SteamLauncher {
             available_branches: HashMap::new(),
             is_verifying: false,
             user_configs,
+            proton_manager: ProtonManagerState {
+                available: Vec::new(),
+                installed: Vec::new(),
+                loading: false,
+                install_progress: None,
+                filter_label: None,
+                error: None,
+            },
+            proton_remove_confirm: None,
             env_vars_edit_buffer: String::new(),
             runner_components,
             last_scanned_runner: resolved,
@@ -582,6 +610,27 @@ impl SteamLauncher {
                 }
                 AsyncOp::UserConfigsFetched(configs) => {
                     self.user_configs = configs;
+                }
+                AsyncOp::ProtonListFetched(available, installed) => {
+                    self.proton_manager.available = available;
+                    self.proton_manager.installed = installed;
+                    self.proton_manager.loading = false;
+                }
+                AsyncOp::ProtonInstallProgress(name, downloaded, total) => {
+                    self.proton_manager.install_progress = Some((name, downloaded, total));
+                }
+                AsyncOp::ProtonInstallComplete(name) => {
+                    self.proton_manager.install_progress = None;
+                    self.status = format!("Installed {}", name);
+                    self.refresh_proton_list();
+                }
+                AsyncOp::ProtonInstallFailed(name, err) => {
+                    self.proton_manager.install_progress = None;
+                    self.proton_manager.error = Some(format!("Failed to install {}: {}", name, err));
+                }
+                AsyncOp::ProtonRemoved(name) => {
+                    self.status = format!("Removed {}", name);
+                    self.refresh_proton_list();
                 }
                 AsyncOp::BranchesFetched(appid, branches) => {
                     self.available_branches.insert(appid, branches);
@@ -1149,7 +1198,7 @@ impl SteamLauncher {
             }
 
             if let Some(ref mut version) = config.forced_proton_version {
-                let selected_list = if self.proton_source == ProtonSource::Steam {
+                let selected_list = if self.proton_source == ProtonSource::Valve {
                     &self.steam_protons
                 } else {
                     &self.custom_protons
@@ -1530,6 +1579,196 @@ impl SteamLauncher {
                 }
             });
         });
+    }
+
+    fn refresh_proton_list(&mut self) {
+        self.proton_manager.loading = true;
+        let tx = self.operation_tx.clone();
+        let library_root = PathBuf::from(&self.launcher_config.steam_library_path);
+        self.runtime.spawn(async move {
+            let available = crate::proton::list_available().await.unwrap_or_default();
+            let installed = crate::proton::list_installed(&library_root);
+            let _ = tx.send(AsyncOp::ProtonListFetched(available, installed));
+        });
+    }
+
+    fn draw_proton_manager(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Refresh List").clicked() {
+                self.refresh_proton_list();
+            }
+            if self.proton_manager.loading {
+                ui.add(egui::Spinner::new());
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            if ui.selectable_label(self.proton_manager.filter_label.is_none(), "All").clicked() {
+                self.proton_manager.filter_label = None;
+            }
+            for label in &["Valve", "Proton-GE", "Wine-GE", "Proton-CachyOS"] {
+                if ui.selectable_label(self.proton_manager.filter_label.as_deref() == Some(*label), *label).clicked() {
+                    self.proton_manager.filter_label = Some(label.to_string());
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+
+        if self.proton_manager.error.is_some() {
+            ui.horizontal(|ui| {
+                if let Some(err) = &self.proton_manager.error {
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                if ui.button("Dismiss").clicked() {
+                    self.proton_manager.error = None;
+                }
+            });
+        }
+
+        if let Some((name, downloaded, total)) = &self.proton_manager.install_progress {
+            let fraction = if *total > 0 { *downloaded as f32 / *total as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(fraction).text(format!("Installing {}: {} / {}", name, format_bytes(*downloaded), format_bytes(*total))));
+        }
+
+        ui.add_space(8.0);
+
+        egui::ScrollArea::vertical()
+            .id_salt("proton_manager_scroll")
+            .max_height(400.0)
+            .show(ui, |ui| {
+                let filter = self.proton_manager.filter_label.clone();
+                let available = self.proton_manager.available.clone();
+
+                egui::Grid::new("proton_package_grid")
+                    .num_columns(4)
+                    .spacing([16.0, 8.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.label("Source");
+                        ui.label("Size");
+                        ui.label("Action");
+                        ui.end_row();
+
+                        for package in available {
+                            if filter.is_some() && Some(&package.label) != filter.as_ref() {
+                                continue;
+                            }
+                            ui.label(&package.name);
+                            ui.label(&package.label);
+                            if package.size > 0 {
+                                ui.label(format_bytes(package.size));
+                            } else {
+                                ui.label("-");
+                            }
+
+                            let is_installed = self.proton_manager.installed.iter().any(|i| i.name == package.name);
+                            if is_installed {
+                                ui.horizontal(|ui| {
+                                    ui.label("Installed ✓");
+                                    if ui.button("Remove").clicked() {
+                                        let name = package.name.clone();
+                                        let is_default = self.launcher_config.proton_version == name;
+                                        let affected_games = self.launcher_config.game_configs.iter()
+                                            .filter(|(_, cfg)| cfg.forced_proton_version.as_deref() == Some(&name))
+                                            .map(|(appid, _)| {
+                                                self.library.iter().find(|g| g.app_id == *appid)
+                                                    .map(|g| g.name.clone())
+                                                    .unwrap_or_else(|| format!("App {}", appid))
+                                            })
+                                            .collect::<Vec<_>>();
+
+                                        if is_default || !affected_games.is_empty() {
+                                            self.proton_remove_confirm = Some(ProtonRemoveConfirmState {
+                                                name,
+                                                is_default,
+                                                affected_games,
+                                            });
+                                        } else {
+                                            self.perform_proton_remove(&name);
+                                        }
+                                    }
+                                });
+                            } else {
+                                let btn = ui.button("Install");
+                                if package.source == crate::proton::ProtonSource::Valve {
+                                    btn.on_hover_text("Valve Protons are managed via the Steam content pipeline. Trigger an install for the corresponding Proton app in Steam.");
+                                } else if btn.clicked() {
+                                    let package_clone = package.clone();
+                                    let tx = self.operation_tx.clone();
+                                    self.runtime.spawn(async move {
+                                        let name = package_clone.name.clone();
+                                        let name_for_progress = name.clone();
+                                        let tx_for_progress = tx.clone();
+                                        let res = crate::proton::install_github_package(package_clone, move |downloaded, total| {
+                                            let _ = tx_for_progress.send(AsyncOp::ProtonInstallProgress(name_for_progress.clone(), downloaded, total));
+                                        }).await;
+
+                                        match res {
+                                            Ok(_) => { let _ = tx.send(AsyncOp::ProtonInstallComplete(name)); }
+                                            Err(e) => { let _ = tx.send(AsyncOp::ProtonInstallFailed(name, e.to_string())); }
+                                        }
+                                    });
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    fn perform_proton_remove(&mut self, name: &str) {
+        let name_str = name.to_string();
+        let tx = self.operation_tx.clone();
+        self.runtime.spawn(async move {
+            match crate::proton::remove(&name_str) {
+                Ok(_) => { let _ = tx.send(AsyncOp::ProtonRemoved(name_str)); }
+                Err(e) => { let _ = tx.send(AsyncOp::Error(format!("Failed to remove {}: {}", name_str, e))); }
+            }
+        });
+    }
+
+    fn draw_proton_remove_confirm_modal(&mut self, ctx: &egui::Context) {
+        let mut remove_name = None;
+        let mut close = false;
+
+        if let Some(state) = &self.proton_remove_confirm {
+            egui::Window::new("Confirm Removal")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Are you sure you want to remove {}?", state.name));
+                    if state.is_default {
+                        ui.colored_label(egui::Color32::YELLOW, "Warning: This is your global default Proton version.");
+                    }
+                    if !state.affected_games.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label("The following games are configured to use this version:");
+                        for game in &state.affected_games {
+                            ui.label(format!("• {}", game));
+                        }
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Remove anyway").clicked() {
+                            remove_name = Some(state.name.clone());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+        }
+
+        if let Some(name) = remove_name {
+            self.perform_proton_remove(&name);
+            self.proton_remove_confirm = None;
+        } else if close {
+            self.proton_remove_confirm = None;
+        }
     }
 
     fn draw_misc_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
@@ -2421,16 +2660,22 @@ impl eframe::App for SteamLauncher {
 
                         ui.add_space(8.0);
                         ui.separator();
+                        ui.collapsing("Proton/Wine Manager", |ui| {
+                            self.draw_proton_manager(ui);
+                        });
+
+                        ui.add_space(8.0);
+                        ui.separator();
                         ui.heading("Compatibility Layer");
 
-                        ui.radio_value(&mut self.proton_source, ProtonSource::Steam, "Official Proton (Valve)");
+                        ui.radio_value(&mut self.proton_source, ProtonSource::Valve, "Official Proton (Valve)");
                         ui.radio_value(
                             &mut self.proton_source,
-                            ProtonSource::Custom,
+                            ProtonSource::Github,
                             "Custom (compatibilitytools.d)",
                         );
 
-                        let selected_list = if self.proton_source == ProtonSource::Steam {
+                        let selected_list = if self.proton_source == ProtonSource::Valve {
                             &self.steam_protons
                         } else {
                             &self.custom_protons
@@ -2768,6 +3013,7 @@ impl eframe::App for SteamLauncher {
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
         self.draw_launch_selector_modal(ctx);
+        self.draw_proton_remove_confirm_modal(ctx);
         ctx.request_repaint();
     }
 }
