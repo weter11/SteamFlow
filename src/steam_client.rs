@@ -644,11 +644,18 @@ impl SteamClient {
 
             let appinfo_vdf_text = String::from_utf8_lossy(appinfo_vdf_bytes).to_string();
 
+            // DEBUG: Dump raw appinfo for troubleshooting tool app installs
+            if appid == 4628710 || appid == 3418580 {
+                let debug_path = format!("/tmp/steamflow_appinfo_{}.bin", appid);
+                let _ = std::fs::write(&debug_path, appinfo_vdf_bytes);
+                tracing::info!("Dumped raw appinfo to {}", debug_path);
+            }
 
             let mut selections = Vec::new();
 
             let mut has_windows = false;
-            if let Ok(map) = parse_pics_product_info(appinfo_vdf_bytes) {
+            let parse_res = parse_pics_product_info(appinfo_vdf_bytes);
+            if let Ok(map) = parse_res.as_ref() {
                 // To keep filtering, we re-parse or re-use the find_vdf logic.
                 // We'll re-parse here to stay strictly compliant with Task 2's request to call parse_pics_product_info.
                 if let Ok(vdf) = find_vdf_in_pics(appinfo_vdf_bytes) {
@@ -709,6 +716,8 @@ impl SteamClient {
                                                 manifest_id: *m_id,
                                                 appinfo_vdf: appinfo_vdf_text.clone(),
                                             });
+                        } else if appid == 4628710 || appid == 1493710 {
+                             tracing::warn!("Tool app {} depot {} matched OS but missing manifest ID", appid, d_id);
                                         }
                                     }
                                 }
@@ -717,15 +726,19 @@ impl SteamClient {
                     }
                 }
             } else {
-                println!("CRITICAL: VDF parse failed for appid {appid} during install/update attempt");
+                let err = parse_res.as_ref().err().unwrap();
+                let head = &appinfo_vdf_bytes[..std::cmp::min(500, appinfo_vdf_bytes.len())];
+                tracing::debug!("VDF parse failed for {appid}: {err}. Buffer head: {:?}", String::from_utf8_lossy(head));
+                println!("CRITICAL: VDF parse failed for appid {appid} during install/update attempt: {err}");
             }
 
             if selections.is_empty() {
-
-                let msg = if has_windows && matches!(platform, DepotPlatform::Linux) {
-                    "No native Linux depots found. This game may only support Windows (Proton)."
+                let msg = if let Err(err) = parse_res {
+                    format!("Failed to parse product info for app {appid}: {err}")
+                } else if has_windows && matches!(platform, DepotPlatform::Linux) {
+                    "No native Linux depots found. This game may only support Windows (Proton).".to_string()
                 } else {
-                    "No matching depots found for the selected platform."
+                    "No matching depots found for the selected platform.".to_string()
                 };
 
                 let _ = tx
@@ -733,7 +746,7 @@ impl SteamClient {
                         state: DownloadProgressState::Failed,
                         bytes_downloaded: 0,
                         total_bytes: 0,
-                        current_file: msg.to_string(),
+                        current_file: msg,
                     })
                     .await;
                 return;
@@ -2040,6 +2053,12 @@ impl SteamClient {
                             if let Some(m_id) = extract_manifest_id_robust(value, "public") {
                                 manifests.insert(d_id, m_id);
                             }
+                        } else if appid == 4628710 || appid == 1493710 {
+                             // Fallback for manifestless tool depots (evergreen)
+                             // Tool depots sometimes omit manifests block or gid entirely
+                             // and the client is expected to request with manifest 0 or special handling.
+                             // For now, we only log this to confirm if it's the cause.
+                             tracing::warn!("App {} depot {} has no manifest version info (evergreen tool depot?)", appid, d_id);
                         }
                     }
                 }
@@ -2811,23 +2830,34 @@ fn extract_manifest_id_robust(value: &steam_vdf_parser::Value, branch: &str) -> 
                     return Some(gid_val);
                 }
                 if let Some(branch_obj) = branch_entry.as_obj() {
-                    if let Some(gid) = branch_obj.get("gid") {
-                        if let Some(s) = gid.as_str() {
-                            return s.parse().ok();
+                    // Try 'gid' or 'manifest' keys
+                    for key in &["gid", "manifest"] {
+                        if let Some(v) = branch_obj.get(*key) {
+                            if let Some(s) = v.as_str() {
+                                if let Ok(n) = s.parse::<u64>() {
+                                    return Some(n);
+                                }
+                            }
+                            if let Some(n) = v.as_u64() {
+                                return Some(n);
+                            }
                         }
-                        return gid.as_u64();
                     }
                 }
             }
         }
 
-        // Direct gid
-        if let Some(gid_entry) = obj.get("gid") {
-            if let Some(gid_str) = gid_entry.as_str() {
-                return gid_str.parse::<u64>().ok();
-            }
-            if let Some(gid_val) = gid_entry.as_u64() {
-                return Some(gid_val);
+        // Direct gid or manifest
+        for key in &["gid", "manifest"] {
+            if let Some(entry) = obj.get(*key) {
+                if let Some(s) = entry.as_str() {
+                    if let Ok(n) = s.parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+                if let Some(n) = entry.as_u64() {
+                    return Some(n);
+                }
             }
         }
     }
