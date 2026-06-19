@@ -3,16 +3,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow, Context};
 use std::fs;
 
+// TODO: Valve Proton tools could be discovered dynamically via PICS
+// by querying the Steam client's supported compatibility tools list.
 pub const VALVE_PROTONS: &[(&str, u32)] = &[
     ("Proton - Experimental", 1493710),
-    ("Proton 11.0", 3418580),
-    ("Proton 10.0", 3144130),
-    ("Proton 9.0 (Beta)", 2465830),
+    ("Proton 11.0", 4628710),
+    ("Proton 10.0", 3658110),
+    ("Proton 9.0", 2805730),
     ("Proton 8.0", 2348590),
     ("Proton 7.0", 1887720),
-    ("Proton 6.3", 1580130),
-    ("Proton 5.13", 1493710),
-    ("Proton 5.0", 1245040),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -55,6 +55,15 @@ impl Runner for WineTkgRunner {
             ctx.app.app_id,
             &user_config_store
         );
+
+        let prefix_root = if effective_game_prefix.ends_with("pfx") {
+            effective_game_prefix.parent().unwrap()
+        } else {
+            &effective_game_prefix
+        };
+        crate::utils::check_runner_consistency(prefix_root, &active_runner)
+            .map_err(|e| LaunchError::new(LaunchErrorKind::Environment, e.to_string()))?;
+
         std::fs::create_dir_all(&effective_game_prefix)
             .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", effective_game_prefix.display())).with_source(anyhow!(e)))?;
 
@@ -65,6 +74,9 @@ impl Runner for WineTkgRunner {
         if use_steam_runtime {
             let steam_cfg = crate::utils::get_master_steam_config();
             tracing::info!("Unified Master Steam resolution (Game Launch):");
+
+            crate::utils::check_runner_consistency(&steam_cfg.root_dir, &active_runner)
+                .map_err(|e| LaunchError::new(LaunchErrorKind::Environment, e.to_string()))?;
             tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
             tracing::info!("  - Wine Prefix: {}", steam_cfg.wine_prefix.display());
             tracing::info!("  - Layout Kind: {}", steam_cfg.layout_kind);

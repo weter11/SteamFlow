@@ -29,6 +29,9 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     let library_root = PathBuf::from(&config.steam_library_path);
     let resolved_runner = crate::utils::resolve_runner(&runner_name, &library_root);
+
+    crate::utils::check_runner_consistency(&steam_cfg.root_dir, &resolved_runner)?;
+
     let mut cmd = build_runner_command(&resolved_runner)?;
 
     tracing::info!("Unified Master Steam resolution:");

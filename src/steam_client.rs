@@ -717,7 +717,7 @@ impl SteamClient {
                     }
                 }
             } else {
-                println!("CRITICAL: VDF parse failed for {appid}");
+                println!("CRITICAL: VDF parse failed for appid {appid} during install/update attempt");
             }
 
             if selections.is_empty() {

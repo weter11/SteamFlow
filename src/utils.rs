@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1240,6 +1240,36 @@ pub fn cleanup_dll_symlinks(prefix: &Path) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+pub fn check_runner_consistency(prefix_root: &Path, current_runner: &Path) -> Result<()> {
+    let marker_path = prefix_root.join(".steamflow_runner");
+    let canonical_runner = std::fs::canonicalize(current_runner).unwrap_or(current_runner.to_path_buf());
+
+    if let Ok(existing) = std::fs::read_to_string(&marker_path) {
+        let existing_path = PathBuf::from(existing.trim());
+        if existing_path != canonical_runner && prefix_root.join("pfx/drive_c").exists() {
+             return Err(anyhow!(
+                "This Steam Runtime prefix was initialized with a different runner ({}). \
+                 Using a different runner ({}) on an existing prefix can corrupt it. \
+                 Delete the prefix at {} to reinitialize with the new runner, or switch \
+                 back to the original runner.",
+                existing_path.display(), canonical_runner.display(), prefix_root.display()
+            ));
+        }
+        if existing_path != canonical_runner && prefix_root.join("drive_c").exists() {
+             return Err(anyhow!(
+                "This Steam Runtime prefix was initialized with a different runner ({}). \
+                 Using a different runner ({}) on an existing prefix can corrupt it. \
+                 Delete the prefix at {} to reinitialize with the new runner, or switch \
+                 back to the original runner.",
+                existing_path.display(), canonical_runner.display(), prefix_root.display()
+            ));
+        }
+    }
+
+    std::fs::write(&marker_path, canonical_runner.to_string_lossy().as_bytes()).ok();
     Ok(())
 }
 
