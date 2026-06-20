@@ -16,3 +16,24 @@ pub fn normalize_name(name: &str) -> String {
         .collect::<String>()
         .to_lowercase()
 }
+
+pub const UNIFIED_LIB_SUBDIRS: &[&str] = &[
+    "files/lib/wine",
+    "files/lib64/wine",
+    "lib/wine",
+    "lib64/wine",
+    "dist/lib/wine",
+    "dist/lib64/wine",
+];
+
+pub const ARCH_SUBDIRS: &[(&str, &str)] = &[
+    ("x86_64", "x86_64-windows"),
+    ("i386", "i386-windows"),
+];
+
+pub const COMPONENT_FAMILIES: &[&str] = &[
+    "dxvk",
+    "vkd3d-proton",
+    "vkd3d",
+    "nvapi",
+];

@@ -630,14 +630,7 @@ impl Runner for WineTkgRunner {
         // the .dll.so PE loader stubs it needs to bridge into native DLLs.
         let active_runner = crate::utils::resolve_runner(proton, &library_root);
         let runner_root = crate::utils::derive_runner_root(&active_runner);
-        for lib_sub in &[
-            "lib/wine",
-            "lib64/wine",
-            "files/lib/wine",
-            "files/lib64/wine",
-            "dist/lib/wine",
-            "dist/lib64/wine",
-        ] {
+        for lib_sub in crate::proton::UNIFIED_LIB_SUBDIRS {
             let p = runner_root.join(lib_sub);
             if p.exists() {
                 let s = p.to_string_lossy().to_string();
@@ -648,8 +641,8 @@ impl Runner for WineTkgRunner {
                 // Ensure architecture-specific subdirectories are also in WINEDLLPATH.
                 // This is critical for PE-based runners where Wine expects DLLs in
                 // x86_64-windows or i386-windows folders even for the main runner libs.
-                for arch in &["x86_64-windows", "i386-windows"] {
-                    let arch_p = p.join(arch);
+                for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                    let arch_p = p.join(arch_dir);
                     if arch_p.exists() {
                         let arch_s = arch_p.to_string_lossy().to_string();
                         if !wine_dll_dirs.contains(&arch_s) {
