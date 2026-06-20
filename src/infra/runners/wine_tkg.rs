@@ -233,12 +233,48 @@ impl Runner for WineTkgRunner {
 
                         tracing::info!("Using runner for background Steam: {}", steam_runner.display());
 
-                        let mut steam_cmd = crate::utils::build_runner_command(&steam_runner)
-                            .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?;
+                        let use_umu_for_runner = ctx.launcher_config.use_umu_for_steam_runner;
+
+                        let mut steam_cmd = if use_umu_for_runner {
+                            tracing::info!("Intercepting Steam spawn for umu-run wrapping");
+
+                            // Ensure umu-run is available
+                            if let Err(e) = std::process::Command::new("umu-run").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status() {
+                                return Err(LaunchError::new(LaunchErrorKind::Environment, format!("umu-run not found in PATH: {}", e)));
+                            }
+
+                            let mut cmd = Command::new("umu-run");
+
+                            // umu-run requirements: GAMEID and PROTONPATH
+                            let game_id = ctx.app.app_id.to_string();
+                            let proton_path = ctx.proton_path.as_deref()
+                                .filter(|p| !p.is_empty())
+                                .unwrap_or(ctx.launcher_config.proton_version.as_str());
+                            let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
+                            let resolved_proton = crate::utils::resolve_runner(proton_path, &library_root);
+
+                            cmd.env("GAMEID", &game_id);
+                            cmd.env("PROTONPATH", resolved_proton.to_string_lossy().to_string());
+
+                            // Append aggressive headless arguments for Steam
+                            let mut aggressive_args = vec![
+                                "C:\\Program Files (x86)\\Steam\\steam.exe".to_string(),
+                                "-silent".to_string(),
+                                "-no-browser".to_string(),
+                                "-skip-steamwebhelper".to_string(),
+                            ];
+                            aggressive_args.extend(steam_args);
+                            cmd.args(aggressive_args);
+                            cmd
+                        } else {
+                            let mut cmd = crate::utils::build_runner_command(&steam_runner)
+                                .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?;
+                            cmd.arg("C:\\Program Files (x86)\\Steam\\steam.exe")
+                                .args(&steam_args);
+                            cmd
+                        };
+
                         steam_cmd.current_dir(&prefix_steam_dir);
-                        steam_cmd
-                            .arg("C:\\Program Files (x86)\\Steam\\steam.exe")
-                            .args(&steam_args);
                         steam_cmd
                             .env("WINEPREFIX", &steam_wineprefix)
                             .env(
@@ -250,9 +286,24 @@ impl Runner for WineTkgRunner {
                             .env("WINEPATH", "C:\\Program Files (x86)\\Steam")
                             .env("STEAM_DISABLE_BROWSER", "1")
                             .env("STEAM_NO_BROWSER", "1")
-                            .env("STEAMCMD", "1") // tells Steam it's running as a cmd tool
-                            .stdout(std::process::Stdio::null()) // silence CEF log spam
-                            .stderr(std::process::Stdio::null());
+                            .env("STEAMCMD", "1"); // tells Steam it's running as a cmd tool
+
+                        // Capture logs for Steam runtime
+                        let log_dir = crate::config::config_dir()
+                            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                            .join("logs");
+                        let _ = std::fs::create_dir_all(&log_dir);
+                        let steam_log_path = log_dir.join(format!("steam_runtime_{}.log", ctx.app.app_id));
+
+                        if let Ok(log_file) = std::fs::File::create(&steam_log_path) {
+                            if let Ok(dup) = log_file.try_clone() {
+                                steam_cmd.stdout(dup);
+                            }
+                            steam_cmd.stderr(log_file);
+                        } else {
+                            steam_cmd.stdout(std::process::Stdio::null());
+                            steam_cmd.stderr(std::process::Stdio::null());
+                        }
 
                         println!("Program: {:?}", steam_cmd.get_program());
                         println!("Args: {:?}", steam_cmd.get_args().collect::<Vec<_>>());

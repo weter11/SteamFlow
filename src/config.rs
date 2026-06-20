@@ -32,6 +32,8 @@ pub struct LauncherConfig {
     pub game_configs: HashMap<u32, GameConfig>,
     #[serde(default)]
     pub use_umu: bool,
+    #[serde(default)]
+    pub use_umu_for_steam_runner: bool,
 }
 
 impl LauncherConfig {
@@ -65,6 +67,7 @@ impl Default for LauncherConfig {
             preferred_launch_options: HashMap::new(),
             game_configs: HashMap::new(),
             use_umu: false,
+            use_umu_for_steam_runner: false,
         }
     }
 }

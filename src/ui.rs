@@ -2463,6 +2463,9 @@ impl eframe::App for SteamLauncher {
                         ui.checkbox(&mut self.launcher_config.use_umu, "Use umu for proton")
                             .on_hover_text("Enables umu-launcher (Unified Proton Launcher) integration.");
 
+                        ui.checkbox(&mut self.launcher_config.use_umu_for_steam_runner, "Force UMU for Windows Steam Runner (Headless/Experimental)")
+                            .on_hover_text("Runs the Windows Steam client without a UI to prevent Proton crashes. Required if launching DRM games via UMU.");
+
                         // Runner components for selected game OR default runner
                         let active_runner_name = if let Some(game) = self.selected_game() {
                              self.launcher_config
