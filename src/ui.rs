@@ -1164,6 +1164,19 @@ impl SteamLauncher {
                     });
             }
 
+            {
+                let mut user_cfg = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
+                let mut use_umu = user_cfg.use_umu.unwrap_or(self.launcher_config.use_umu);
+                if ui.checkbox(&mut use_umu, "Use umu for this game").changed() {
+                    user_cfg.use_umu = Some(use_umu);
+                    self.user_configs.insert(game.app_id, user_cfg);
+                    let store = self.user_configs.clone();
+                    self.runtime.spawn(async move {
+                        let _ = crate::config::save_user_configs(&store).await;
+                    });
+                }
+            }
+
             if self.launcher_config.game_configs.get(&game.app_id) != Some(&config) {
                 self.launcher_config.game_configs.insert(game.app_id, config);
                 let config_to_save = self.launcher_config.clone();
@@ -2446,6 +2459,9 @@ impl eframe::App for SteamLauncher {
                                     );
                                 }
                             });
+
+                        ui.checkbox(&mut self.launcher_config.use_umu, "Use umu for proton")
+                            .on_hover_text("Enables umu-launcher (Unified Proton Launcher) integration.");
 
                         // Runner components for selected game OR default runner
                         let active_runner_name = if let Some(game) = self.selected_game() {

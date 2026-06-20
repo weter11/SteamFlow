@@ -34,13 +34,19 @@ impl PipelineStage for PreflightStage {
 
         // 1. Verify runner binary
         let runner_file = &spec.program;
+
+        // umu-launcher integration: if program is umu-run, we don't check for file existence
+        // as it should be in PATH. We already checked it in BuildCommandStage but
+        // Preflight should also be aware.
+        let is_umu = runner_file.to_string_lossy() == "umu-run";
+
         let mut check = PreflightCheck { name: "Runner Existence".into(), status: true, details: "OK".into() };
-        if !runner_file.exists() {
+        if !is_umu && !runner_file.exists() {
             check.status = false;
             check.details = format!("Runner binary not found: {}", runner_file.display());
             final_res = Err(LaunchError::new(LaunchErrorKind::Runner, format!("[Preflight] {}", check.details))
                 .with_context("runner_path", runner_path.clone()));
-        } else if !runner_file.is_file() {
+        } else if !is_umu && !runner_file.is_file() {
             check.status = false;
             check.details = format!("Runner path is not a file: {}", runner_file.display());
             final_res = Err(LaunchError::new(LaunchErrorKind::Runner, format!("[Preflight] {}", check.details))
@@ -152,7 +158,7 @@ impl PipelineStage for PreflightStage {
 
         // 5. Check runner executability
         #[cfg(unix)]
-        if final_res.is_ok() {
+        if final_res.is_ok() && !is_umu {
             use std::os::unix::fs::PermissionsExt;
             let mut check = PreflightCheck { name: "Runner Executability".into(), status: true, details: "OK".into() };
             if let Ok(metadata) = std::fs::metadata(runner_file) {
@@ -301,5 +307,25 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(err.message.contains("is not executable"));
+    }
+
+    #[tokio::test]
+    async fn test_preflight_umu_run_exception() {
+        let mut ctx = PipelineContext::new(123);
+        let mut spec = CommandSpec::default();
+        spec.program = Path::new("umu-run").to_path_buf();
+        spec.args = vec!["game.exe".to_string()];
+        ctx.command_spec = Some(spec);
+
+        let stage = PreflightStage;
+        // Even if umu-run doesn't exist as a file, preflight should skip existence check for it
+        let res = stage.execute(&mut ctx).await;
+
+        // It might still fail on "game.exe" existence check but should pass the runner check.
+        // If it fails on game executable, it means it passed the runner check.
+        if let Err(e) = res {
+             assert!(!e.message.contains("Runner binary not found"));
+             assert!(e.message.contains("Game executable not found"));
+        }
     }
 }

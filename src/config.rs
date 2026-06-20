@@ -30,6 +30,8 @@ pub struct LauncherConfig {
     pub preferred_launch_options: HashMap<u32, String>,
     #[serde(default)]
     pub game_configs: HashMap<u32, GameConfig>,
+    #[serde(default)]
+    pub use_umu: bool,
 }
 
 impl LauncherConfig {
@@ -62,6 +64,7 @@ impl Default for LauncherConfig {
             windows_steam_discovery_enabled: true,
             preferred_launch_options: HashMap::new(),
             game_configs: HashMap::new(),
+            use_umu: false,
         }
     }
 }

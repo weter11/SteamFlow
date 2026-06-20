@@ -131,6 +131,8 @@ pub struct UserAppConfig {
     pub graphics_layers: GraphicsLayerConfig,
     #[serde(default)]
     pub gpu_preference: Option<String>,
+    #[serde(default)]
+    pub use_umu: Option<bool>,
     pub hidden: bool,   // Future use
     pub favorite: bool, // Future use
 }
