@@ -302,15 +302,22 @@ pub fn detect_prime_env() -> std::collections::HashMap<String, String> {
 // ── DXVK ────────────────────────────────────────────────────────────────────
 
 fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    // 1. Bundled inside runner (Modern Wine-TKG layout)
-    let comp_subdirs = ["lib/wine/dxvk", "files/lib/wine/dxvk", "dist/lib/wine/dxvk"];
+    // 1. Bundled inside runner (Modern Wine-TKG / Unified Proton layouts)
+    let comp_subdirs = [
+        "lib/wine/dxvk",
+        "lib64/wine/dxvk",
+        "files/lib/wine/dxvk",
+        "files/lib64/wine/dxvk",
+        "dist/lib/wine/dxvk",
+        "dist/lib64/wine/dxvk"
+    ];
     let required = ["d3d11.dll", "dxgi.dll", "d3d9.dll", "d3d8.dll", "d3d10core.dll"];
 
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
         if comp_path.is_dir() {
             // Check arch subfolders
-            for arch in ["x86_64-windows", "i386-windows"] {
+            for arch in ["x86_64-windows", "i386-windows", "x86_64", "x86"] {
                 let arch_path = comp_path.join(arch);
                 if required.iter().all(|dll| arch_path.join(dll).exists()) {
                     let version = ["version", "../version"] // check in arch or component folder
@@ -378,14 +385,21 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 // ── VKD3D-Proton ─────────────────────────────────────────────────────────────
 
 fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    // 1. Modern Wine-TKG layout
-    let comp_subdirs = ["lib/wine/vkd3d-proton", "files/lib/wine/vkd3d-proton", "dist/lib/wine/vkd3d-proton"];
+    // 1. Modern Wine-TKG / Unified Proton layouts
+    let comp_subdirs = [
+        "lib/wine/vkd3d-proton",
+        "lib64/wine/vkd3d-proton",
+        "files/lib/wine/vkd3d-proton",
+        "files/lib64/wine/vkd3d-proton",
+        "dist/lib/wine/vkd3d-proton",
+        "dist/lib64/wine/vkd3d-proton"
+    ];
     let required = ["d3d12.dll", "d3d12core.dll"];
 
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
         if comp_path.is_dir() {
-            for arch in ["x86_64-windows", "i386-windows"] {
+            for arch in ["x86_64-windows", "i386-windows", "x86_64", "x86"] {
                 let arch_path = comp_path.join(arch);
                 if required.iter().all(|dll| arch_path.join(dll).exists()) {
                     let version = ["version", "../version"]
@@ -461,16 +475,23 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
 // ── VKD3D (upstream) ─────────────────────────────────────────────────────────
 
 fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    // 1. Bundled inside runner (Modern Wine-TKG layout)
-    let comp_subdirs = ["lib/wine/nvapi", "files/lib/wine/nvapi", "dist/lib/wine/nvapi"];
+    // 1. Bundled inside runner (Modern Wine-TKG / Unified Proton layouts)
+    let comp_subdirs = [
+        "lib/wine/nvapi",
+        "lib64/wine/nvapi",
+        "files/lib/wine/nvapi",
+        "files/lib64/wine/nvapi",
+        "dist/lib/wine/nvapi",
+        "dist/lib64/wine/nvapi"
+    ];
 
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
         if comp_path.is_dir() {
             // Check arch subfolders
-            for arch in ["x86_64-windows", "i386-windows"] {
+            for arch in ["x86_64-windows", "i386-windows", "x86_64", "x86"] {
                 let arch_path = comp_path.join(arch);
-                let dlls = if arch == "x86_64-windows" {
+                let dlls = if arch == "x86_64-windows" || arch == "x86_64" {
                     vec!["nvapi64.dll"]
                 } else {
                     vec!["nvapi.dll"]
@@ -512,14 +533,21 @@ fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 }
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
-    // 1. Modern Wine-TKG layout
-    let comp_subdirs = ["lib/wine/vkd3d", "files/lib/wine/vkd3d", "dist/lib/wine/vkd3d"];
+    // 1. Modern Wine-TKG / Unified Proton layouts
+    let comp_subdirs = [
+        "lib/wine/vkd3d",
+        "lib64/wine/vkd3d",
+        "files/lib/wine/vkd3d",
+        "files/lib64/wine/vkd3d",
+        "dist/lib/wine/vkd3d",
+        "dist/lib64/wine/vkd3d"
+    ];
     let required = ["libvkd3d-1.dll", "libvkd3d-shader-1.dll"];
 
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
         if comp_path.is_dir() {
-            for arch in ["x86_64-windows", "i386-windows"] {
+            for arch in ["x86_64-windows", "i386-windows", "x86_64", "x86"] {
                 let arch_path = comp_path.join(arch);
                 if required.iter().all(|dll| arch_path.join(dll).exists()) {
                     let version = ["version", "../version"]

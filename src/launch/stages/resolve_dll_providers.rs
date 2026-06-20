@@ -171,6 +171,12 @@ impl PipelineStage for ResolveDllProvidersStage {
                 let _ = logger.log(crate::infra::logging::LogLevel::Warn, "zero_runner_roots", "Zero Runner roots derived from runner path".into(), Some("ResolveDllProviders".into()), std::collections::HashMap::new());
             }
 
+            for root in &scan_report.scan_roots {
+                let mut metadata = std::collections::HashMap::new();
+                metadata.insert("scan_root".into(), root.to_string_lossy().to_string());
+                let _ = logger.info("dll_scan_path", format!("Probing directory for DLLs: {}", root.display()), Some("ResolveDllProviders".into()), metadata);
+            }
+
             for res in &ctx.dll_resolutions {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("dll".into(), res.name.clone());
