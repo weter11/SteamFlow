@@ -645,7 +645,7 @@ impl SteamClient {
             let appinfo_vdf_text = String::from_utf8_lossy(appinfo_vdf_bytes).to_string();
 
             // DEBUG: Dump raw appinfo for troubleshooting tool app installs
-            if appid == 4628710 || appid == 3418580 {
+            if appid == 4628710 || appid == 3418580 || appid == 2348590 {
                 let debug_path = format!("/tmp/steamflow_appinfo_{}.bin", appid);
                 let _ = std::fs::write(&debug_path, appinfo_vdf_bytes);
                 tracing::info!("Dumped raw appinfo to {}", debug_path);
@@ -657,7 +657,7 @@ impl SteamClient {
             let parse_res = parse_pics_product_info(appinfo_vdf_bytes);
 
             // DEBUG: Dump raw appinfo for troubleshooting tool app installs
-            if appid == 4628710 || appid == 1493710 {
+            if appid == 4628710 || appid == 1493710 || appid == 2348590 {
                 let debug_path = format!("/tmp/steamflow_appinfo_{}.bin", appid);
                 let _ = std::fs::write(&debug_path, appinfo_vdf_bytes);
                 tracing::info!("Dumped raw appinfo for {} to {}", appid, debug_path);
@@ -724,7 +724,7 @@ impl SteamClient {
                                                 manifest_id: *m_id,
                                                 appinfo_vdf: appinfo_vdf_text.clone(),
                                             });
-                        } else if appid == 4628710 || appid == 1493710 {
+                        } else if appid == 4628710 || appid == 1493710 || appid == 2348590 {
                              tracing::warn!("Tool app {} depot {} matched OS but missing manifest ID", appid, d_id);
                                         }
                                     }
@@ -2061,7 +2061,7 @@ impl SteamClient {
                             if let Some(m_id) = extract_manifest_id_robust(value, "public") {
                                 manifests.insert(d_id, m_id);
                             }
-                        } else if appid == 4628710 || appid == 1493710 {
+                        } else if appid == 4628710 || appid == 1493710 || appid == 2348590 {
                              // Fallback for manifestless tool depots (evergreen)
                              // Tool depots sometimes omit manifests block or gid entirely
                              // and the client is expected to request with manifest 0 or special handling.
@@ -2655,14 +2655,22 @@ pub fn parse_pics_product_info(buffer: &[u8]) -> Result<HashMap<u64, u64>> {
         .unwrap_or(false);
 
     if is_text {
+        tracing::info!("parse_pics_product_info: detected TEXT format");
         parse_text_vdf(buffer)
     } else {
+        tracing::info!("parse_pics_product_info: detected BINARY format");
         parse_binary_vdf_with_offset(buffer)
     }
 }
 
 fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
     let text = String::from_utf8_lossy(data);
+    tracing::info!("parse_text_vdf: input length {} bytes", text.len());
+    if text.len() > 500 {
+        tracing::debug!("parse_text_vdf head: {}", &text[..500]);
+    } else {
+        tracing::debug!("parse_text_vdf content: {}", text);
+    }
     let mut depot_map = HashMap::new();
 
     match steam_vdf_parser::parse_text(&text) {
@@ -2700,12 +2708,12 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
     }
 
     if depot_map.is_empty() {
+        tracing::info!("parse_text_vdf: structured parse returned empty map, falling back to manual scan");
         let mut current_depot = 0;
         let mut inside_depots = false;
         let mut inside_manifests = false;
         let mut inside_public = false;
         let mut depot_langs = HashMap::new();
-
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.contains("\"depots\"") {
@@ -2743,7 +2751,7 @@ fn parse_text_vdf(data: &[u8]) -> Result<HashMap<u64, u64>> {
                 }
             } else if parts.len() >= 2 && current_depot > 0 {
                 let key = parts[0].to_lowercase();
-                if inside_public && key == "gid" {
+                if inside_public && (key == "gid" || key == "manifest") {
                     if let Ok(gid) = parts[1].parse::<u64>() {
                         if gid > 0 {
                             depot_map.insert(current_depot, gid);

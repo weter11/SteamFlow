@@ -12,7 +12,9 @@ pub struct WineTkgRunner;
 impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
+        tracing::info!("[WineTkgRunner] Entering prepare_prefix for app {}", ctx.app.app_id);
         let active_runner = crate::utils::resolve_launch_runner(&ctx.launcher_config, ctx.app.app_id, ctx.proton_path.as_deref());
+        tracing::info!("[WineTkgRunner] Resolved active_runner: {}", active_runner.display());
 
         let (use_steam_runtime, runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
             Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
@@ -48,8 +50,12 @@ impl Runner for WineTkgRunner {
         } else {
             &effective_game_prefix
         };
-        crate::utils::check_runner_consistency(prefix_root, &active_runner)
-            .map_err(|e| LaunchError::new(LaunchErrorKind::Environment, e.to_string()))?;
+        tracing::info!("[WineTkgRunner] Checking runner consistency for prefix_root: {}", prefix_root.display());
+        if let Err(e) = crate::utils::check_runner_consistency(prefix_root, &active_runner) {
+            tracing::error!("[WineTkgRunner] Runner consistency check FAILED: {}", e);
+            return Err(LaunchError::new(LaunchErrorKind::Environment, e.to_string()));
+        }
+        tracing::info!("[WineTkgRunner] Runner consistency check passed");
 
         std::fs::create_dir_all(&effective_game_prefix)
             .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", effective_game_prefix.display())).with_source(anyhow!(e)))?;
@@ -59,18 +65,27 @@ impl Runner for WineTkgRunner {
         tracing::info!("Steam Runtime Prefix Mode: {:?}", steam_prefix_mode);
 
         if use_steam_runtime {
+            tracing::info!("[WineTkgRunner] use_steam_runtime is ENABLED");
             let steam_cfg = crate::utils::get_master_steam_config();
             tracing::info!("Unified Master Steam resolution (Game Launch):");
 
-            crate::utils::check_runner_consistency(&steam_cfg.root_dir, &active_runner)
-                .map_err(|e| LaunchError::new(LaunchErrorKind::Environment, e.to_string()))?;
+            tracing::info!("[WineTkgRunner] Checking runner consistency for master steam root: {}", steam_cfg.root_dir.display());
+            if let Err(e) = crate::utils::check_runner_consistency(&steam_cfg.root_dir, &active_runner) {
+                tracing::error!("[WineTkgRunner] Master Steam runner consistency check FAILED: {}", e);
+                return Err(LaunchError::new(LaunchErrorKind::Environment, e.to_string()));
+            }
             tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
             tracing::info!("  - Wine Prefix: {}", steam_cfg.wine_prefix.display());
             tracing::info!("  - Layout Kind: {}", steam_cfg.layout_kind);
 
             let master_steam_dir = match &steam_cfg.steam_exe {
-                Some(exe) => exe.parent().unwrap().to_path_buf(),
+                Some(exe) => {
+                    let d = exe.parent().unwrap().to_path_buf();
+                    tracing::info!("[WineTkgRunner] Found master steam.exe parent dir: {}", d.display());
+                    d
+                },
                 None => {
+                    tracing::error!("[WineTkgRunner] steam.exe NOT FOUND in master prefix: {}", steam_cfg.wine_prefix.display());
                     return Err(LaunchError::new(
                         LaunchErrorKind::Environment,
                         format!(
@@ -222,18 +237,25 @@ impl Runner for WineTkgRunner {
                     }
 
                     if steam_running {
+                        tracing::info!("[WineTkgRunner] Steam already running in prefix {} — skipping spawn", steam_wineprefix.display());
                         println!("✅ Steam already running in prefix — skipping spawn");
                     } else {
+                        tracing::info!("[WineTkgRunner] Steam NOT running in prefix {}, attempting to spawn...", steam_wineprefix.display());
                         let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {
                             active_runner.clone()
                         };
 
-                        tracing::info!("Using runner for background Steam: {}", steam_runner.display());
+                        tracing::info!("[WineTkgRunner] Using runner for background Steam: {}", steam_runner.display());
 
-                        let mut steam_cmd = crate::utils::build_runner_command(&steam_runner)
-                            .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?;
+                        let mut steam_cmd = match crate::utils::build_runner_command(&steam_runner) {
+                            Ok(cmd) => cmd,
+                            Err(e) => {
+                                tracing::error!("[WineTkgRunner] Failed to build runner command for {}: {}", steam_runner.display(), e);
+                                return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e));
+                            }
+                        };
                         steam_cmd.current_dir(&prefix_steam_dir);
                         steam_cmd
                             .arg("C:\\Program Files (x86)\\Steam\\steam.exe")
@@ -249,9 +271,12 @@ impl Runner for WineTkgRunner {
                             .env("WINEPATH", "C:\\Program Files (x86)\\Steam")
                             .env("STEAM_DISABLE_BROWSER", "1")
                             .env("STEAM_NO_BROWSER", "1")
-                            .env("STEAMCMD", "1") // tells Steam it's running as a cmd tool
-                            .stdout(std::process::Stdio::null()) // silence CEF log spam
-                            .stderr(std::process::Stdio::null());
+                            .env("STEAMCMD", "1"); // tells Steam it's running as a cmd tool
+
+                        // For diagnostics, we let stderr through to the main terminal/log
+                        // CEF spam is annoying but total silence is worse when it fails.
+                        steam_cmd.stdout(std::process::Stdio::inherit());
+                        steam_cmd.stderr(std::process::Stdio::inherit());
 
                         println!("Program: {:?}", steam_cmd.get_program());
                         println!("Args: {:?}", steam_cmd.get_args().collect::<Vec<_>>());
@@ -262,15 +287,24 @@ impl Runner for WineTkgRunner {
                             if !ctx.verification_ptr.is_null() {
                                 let v = &mut *ctx.verification_ptr;
                                 v.steam_runtime_exe = Some(steam_cmd.get_program().to_string_lossy().to_string());
-                                v.steam_runtime_args = steam_cmd.get_args().map(|a| a.to_string_lossy().to_string()).collect();
+                                v.steam_runtime_args = steam_cmd.get_args().map(|a: &std::ffi::OsStr| a.to_string_lossy().to_string()).collect();
                                 v.steam_runtime_milestone = "steam_process_spawn_requested".to_string();
                                 v.steam_auto_start_attempted = true;
                             }
                         }
 
                         let start_time = std::time::Instant::now();
-                        let mut steam_process =
-                            steam_cmd.spawn().map_err(|e| LaunchError::new(LaunchErrorKind::Process, "Failed to spawn background Steam").with_source(anyhow!(e)))?;
+                        tracing::info!("[WineTkgRunner] Spawning Steam command: {:?}", steam_cmd);
+                        let mut steam_process = match steam_cmd.spawn() {
+                            Ok(p) => {
+                                tracing::info!("[WineTkgRunner] Background Steam process SPAWNED with PID {}", p.id());
+                                p
+                            },
+                            Err(e) => {
+                                tracing::error!("[WineTkgRunner] FAILED to spawn background Steam: {}", e);
+                                return Err(LaunchError::new(LaunchErrorKind::Process, "Failed to spawn background Steam").with_source(anyhow::Error::from(e)));
+                            }
+                        };
 
                         unsafe {
                             if !ctx.verification_ptr.is_null() {
@@ -292,11 +326,12 @@ impl Runner for WineTkgRunner {
 
                                 // Crash detection — bail immediately
                                 if let Ok(Some(status)) = steam_process.try_wait() {
+                                    tracing::error!("[WineTkgRunner] Background Steam EXITED EARLY after {}s with status: {}", i + 1, status);
                                     println!("❌ FATAL: Background Steam exited after {}s with: {}", i + 1, status);
                                     unsafe {
                                         if !ctx.verification_ptr.is_null() {
                                             let v = &mut *ctx.verification_ptr;
-                                            v.steam_runtime_exit_code = status.code();
+                                            v.steam_runtime_exit_code = status.code().map(|c| c as i32);
                                             v.steam_runtime_lifetime_ms = Some(start_time.elapsed().as_millis() as u64);
                                             v.steam_runtime_milestone = "steam_process_exited_early".to_string();
                                         }
@@ -348,6 +383,7 @@ impl Runner for WineTkgRunner {
                         };
 
                         if !ready {
+                            tracing::error!("[WineTkgRunner] Steam failed to signal readiness within timeout");
                             unsafe {
                                 if !ctx.verification_ptr.is_null() {
                                     (*ctx.verification_ptr).steam_auto_start_failed = true;
