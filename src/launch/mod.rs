@@ -121,3 +121,49 @@ async fn download_steam_setup(path: &Path) -> Result<()> {
     std::fs::write(path, response)?;
     Ok(())
 }
+
+pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
+    let steam_cfg = crate::utils::get_master_steam_config();
+    tracing::info!("Starting repair for Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
+
+    // 1. Kill all processes
+    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    // 2. Manage backups
+    if steam_cfg.root_dir.exists() {
+        let parent = steam_cfg.root_dir.parent().context("master steam root has no parent")?;
+
+        // Find existing backups
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            let mut backups: Vec<_> = entries.flatten()
+                .filter(|e| {
+                    e.file_name().to_string_lossy().starts_with("master_steam_prefix.bak.")
+                })
+                .map(|e| e.path())
+                .collect();
+
+            // Keep at most 1 previous backup: delete all but the newest before creating a new one
+            backups.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+
+            // If we have any backups, delete all of them so we only have one after renaming
+            for old_bak in backups {
+                tracing::info!("Removing old backup: {}", old_bak.display());
+                let _ = std::fs::remove_dir_all(old_bak);
+            }
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let backup_path = parent.join(format!("master_steam_prefix.bak.{}", timestamp));
+
+        tracing::info!("Moving {} to {}", steam_cfg.root_dir.display(), backup_path.display());
+        std::fs::rename(&steam_cfg.root_dir, &backup_path)
+            .context("failed to move prefix to backup")?;
+    }
+
+    // 3. Re-install
+    install_master_steam(config).await
+}

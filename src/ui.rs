@@ -124,6 +124,7 @@ pub enum AsyncOp {
     SettingsSaved(bool),
     WineControlPanelLaunched,
     ScanCompleted(u32, HashMap<u32, String>),
+    MasterSteamRepaired,
     MetadataFetched(u32, crate::steam_client::AppMetadata),
     UserConfigsFetched(crate::models::UserConfigStore),
     ProtonListFetched(Vec<crate::proton::ProtonPackage>, Vec<crate::proton::InstalledProton>),
@@ -184,6 +185,7 @@ pub struct SteamLauncher {
     last_scanned_runner: PathBuf,
     last_scanned_appid: Option<u32>,
     available_gpus: Vec<crate::utils::DetectedGpu>,
+    show_repair_confirmation: bool,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -269,6 +271,7 @@ impl SteamLauncher {
             last_scanned_runner: resolved,
             last_scanned_appid: None,
             available_gpus: crate::utils::list_available_gpus(),
+            show_repair_confirmation: false,
             operation_tx,
             operation_rx,
         }
@@ -590,6 +593,9 @@ impl SteamLauncher {
                     } else {
                         "Failed to save settings".to_string()
                     };
+                }
+                AsyncOp::MasterSteamRepaired => {
+                    self.status = "Windows Steam Runtime repaired successfully".to_string();
                 }
                 AsyncOp::WineControlPanelLaunched => {
                     self.status = "Wine Control Panel launched".to_string();
@@ -2681,13 +2687,43 @@ impl eframe::App for SteamLauncher {
                         }
 
                         ui.add_space(4.0);
-                        if ui.button("Install / Manage Windows Steam Runtime").clicked() {
-                            let config = self.launcher_config.clone();
-                            let tx = self.operation_tx.clone();
-                            self.runtime.spawn(async move {
-                                if let Err(e) = crate::launch::install_master_steam(&config).await {
-                                    let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
-                                }
+                        ui.horizontal(|ui| {
+                            if ui.button("Install / Manage Windows Steam Runtime").clicked() {
+                                let config = self.launcher_config.clone();
+                                let tx = self.operation_tx.clone();
+                                self.runtime.spawn(async move {
+                                    if let Err(e) = crate::launch::install_master_steam(&config).await {
+                                        let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
+                                    }
+                                });
+                            }
+
+                            if ui.button("Repair Windows Steam Runtime").clicked() {
+                                self.show_repair_confirmation = !self.show_repair_confirmation;
+                            }
+                        });
+
+                        if self.show_repair_confirmation {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.colored_label(egui::Color32::YELLOW, "⚠ Repair will move your current Steam prefix to a backup.");
+                                ui.label("You will need to log in to Windows Steam again.");
+                                ui.horizontal(|ui| {
+                                    if ui.button("Confirm Repair").clicked() {
+                                        self.show_repair_confirmation = false;
+                                        let config = self.launcher_config.clone();
+                                        let tx = self.operation_tx.clone();
+                                        self.runtime.spawn(async move {
+                                            if let Err(e) = crate::launch::repair_master_steam(&config).await {
+                                                let _ = tx.send(AsyncOp::Error(format!("Repair failed: {e}")));
+                                            } else {
+                                                let _ = tx.send(AsyncOp::MasterSteamRepaired);
+                                            }
+                                        });
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.show_repair_confirmation = false;
+                                    }
+                                });
                             });
                         }
 
