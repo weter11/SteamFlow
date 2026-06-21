@@ -95,6 +95,10 @@ pub async fn ensure_config_dirs() -> Result<()> {
     fs::create_dir_all(&config).await?;
     let images = opensteam_image_cache_dir()?;
     fs::create_dir_all(&images).await?;
+
+    // Seed default Rhai fixups
+    let _ = crate::launch::fixups::seed_default_fixups();
+
     Ok(())
 }
 

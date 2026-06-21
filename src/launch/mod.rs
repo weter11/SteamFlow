@@ -1,4 +1,5 @@
 pub mod pipeline;
+pub mod fixups;
 pub mod stages;
 pub mod validators;
 pub mod dll_provider_resolver;

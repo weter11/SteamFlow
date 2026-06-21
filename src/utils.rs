@@ -246,6 +246,96 @@ pub fn derive_runner_root(binary_path: &Path) -> PathBuf {
     parent.to_path_buf()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunnerKind {
+    /// A real Proton tree: has a `proton` script AND a bundled `protonfixes/` python package.
+    Proton {
+        /// Path to the `proton` script itself (for `{proton} run` invocation).
+        proton_script: PathBuf,
+        /// Path to the wine64 binary bundled inside this Proton tree, for bare-wine invocation
+        /// (used when this Proton tree is selected for the background Steam role).
+        bundled_wine64: Option<PathBuf>,
+        /// True if files/protonfixes or dist/protonfixes exists (the actual fixes database).
+        has_protonfixes: bool,
+    },
+    /// Plain Wine / wine-tkg: a `wine`/`wine64` binary with no Proton script and no
+    /// bundled protonfixes package.
+    PlainWine {
+        wine64: PathBuf,
+        wine32: Option<PathBuf>,
+    },
+    Unknown,
+}
+
+pub fn classify_runner(runner_path: &Path) -> RunnerKind {
+    if !runner_path.exists() {
+        return RunnerKind::Unknown;
+    }
+
+    // 1. Check if it's literally a wine binary
+    if runner_path.is_file() {
+        if let Some(name) = runner_path.file_name().and_then(|n| n.to_str()) {
+            if name == "wine" || name == "wine64" {
+                return RunnerKind::PlainWine {
+                    wine64: runner_path.to_path_buf(),
+                    wine32: None, // We don't know the 32-bit counterpart easily from just a file path
+                };
+            }
+        }
+    }
+
+    let root = if runner_path.is_dir() {
+        runner_path.to_path_buf()
+    } else {
+        derive_runner_root(runner_path)
+    };
+
+    let proton_script = root.join("proton");
+    if proton_script.is_file() {
+        // It has a proton script, check for protonfixes
+        let fix_candidates = ["protonfixes", "files/protonfixes", "dist/protonfixes"];
+        let has_protonfixes = fix_candidates.iter().any(|c| root.join(c).is_dir());
+
+        // Find bundled wine64
+        let wine_candidates = ["files/bin/wine64", "dist/bin/wine64", "bin/wine64"];
+        let bundled_wine64 = wine_candidates
+            .iter()
+            .map(|c| root.join(c))
+            .find(|p| p.is_file());
+
+        return RunnerKind::Proton {
+            proton_script,
+            bundled_wine64,
+            has_protonfixes,
+        };
+    }
+
+    // Check for PlainWine (directory layout)
+    let wine64_path = root.join("bin/wine64");
+    let wine32_path = root.join("bin/wine");
+
+    if wine64_path.is_file() || wine32_path.is_file() {
+        let final_wine64 = if wine64_path.is_file() {
+            wine64_path
+        } else {
+            wine32_path.clone()
+        };
+
+        let final_wine32 = if wine32_path.is_file() && wine32_path != final_wine64 {
+            Some(wine32_path)
+        } else {
+            None
+        };
+
+        return RunnerKind::PlainWine {
+            wine64: final_wine64,
+            wine32: final_wine32,
+        };
+    }
+
+    RunnerKind::Unknown
+}
+
 pub fn detect_runner_components(
     runner_path: &Path,
     wineprefix: Option<&Path>,
@@ -1486,5 +1576,79 @@ pub fn steam_wineprefix_for_game(
             .join("pfx")
     } else {
         resolve_master_wineprefix()
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::fs;
+
+    #[test]
+    fn test_classify_proton() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("proton"), "").unwrap();
+        fs::create_dir(root.join("protonfixes")).unwrap();
+        fs::create_dir_all(root.join("files/bin")).unwrap();
+        fs::write(root.join("files/bin/wine64"), "").unwrap();
+
+        let kind = classify_runner(root);
+        match kind {
+            RunnerKind::Proton { has_protonfixes, bundled_wine64, .. } => {
+                assert!(has_protonfixes);
+                assert!(bundled_wine64.is_some());
+                assert!(bundled_wine64.unwrap().to_string_lossy().contains("files/bin/wine64"));
+            }
+            _ => panic!("Expected Proton, got {:?}", kind),
+        }
+    }
+
+    #[test]
+    fn test_classify_plain_wine_dir() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/wine64"), "").unwrap();
+        fs::write(root.join("bin/wine"), "").unwrap();
+
+        let kind = classify_runner(root);
+        match kind {
+            RunnerKind::PlainWine { wine64, wine32 } => {
+                assert!(wine64.to_string_lossy().contains("bin/wine64"));
+                assert!(wine32.is_some());
+                assert!(wine32.unwrap().to_string_lossy().contains("bin/wine"));
+            }
+            _ => panic!("Expected PlainWine, got {:?}", kind),
+        }
+    }
+
+    #[test]
+    fn test_classify_plain_wine_binary() {
+        let dir = tempdir().unwrap();
+        let wine64 = dir.path().join("wine64");
+        fs::write(&wine64, "").unwrap();
+
+        let kind = classify_runner(&wine64);
+        match kind {
+            RunnerKind::PlainWine { wine64: p, .. } => {
+                assert_eq!(p, wine64);
+            }
+            _ => panic!("Expected PlainWine, got {:?}", kind),
+        }
+    }
+
+    #[test]
+    fn test_classify_unknown() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("something_else"), "").unwrap();
+
+        let kind = classify_runner(root);
+        assert_eq!(kind, RunnerKind::Unknown);
     }
 }

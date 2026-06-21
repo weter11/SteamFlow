@@ -13,6 +13,7 @@ pub struct LaunchContext {
     pub proton_path: Option<String>,
     pub target_architecture: crate::models::ExecutableArchitecture,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
+    pub fixup_result: Option<crate::launch::fixups::FixupResult>,
     pub verification_ptr: *mut crate::infra::logging::LaunchVerification, // HACK: for Runner to write diagnostics
 }
 

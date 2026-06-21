@@ -94,6 +94,7 @@ pub struct PipelineContext {
     pub warnings: Vec<CompatibilityWarning>,
     pub graphics_stack: GraphicsStackInfo,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
+    pub fixup_result: Option<crate::launch::fixups::FixupResult>,
     pub verification: crate::infra::logging::LaunchVerification,
 }
 
@@ -118,6 +119,7 @@ impl PipelineContext {
             warnings: Vec::new(),
             graphics_stack: GraphicsStackInfo::default(),
             dll_resolutions: Vec::new(),
+            fixup_result: None,
             verification: crate::infra::logging::LaunchVerification::default(),
         }
     }
@@ -477,6 +479,7 @@ impl LaunchPipeline {
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_game::ResolveGameStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_profile::ResolveProfileStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_components::ResolveComponentsStage));
+        pipeline.add_stage(Box::new(crate::launch::stages::resolve_game_fixups::ResolveGameFixupsStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_dll_providers::ResolveDllProvidersStage));
         pipeline.add_stage(Box::new(crate::launch::stages::prepare_prefix::PreparePrefixStage));
         pipeline.add_stage(Box::new(crate::launch::stages::build_environment::BuildEnvironmentStage));
@@ -1291,6 +1294,10 @@ impl LaunchPipeline {
                  }
                  metadata.insert("nvapi_requested".to_string(), ctx.graphics_stack.requested_nvapi.to_string());
                  metadata.insert("nvapi_exposed".to_string(), ctx.graphics_stack.effective_nvapi.to_string());
+                 metadata.insert("protonfixes_routed".to_string(), ctx.verification.protonfixes_routed.to_string());
+                 if let Some(ref fixup) = ctx.verification.rhai_fixup_applied {
+                      metadata.insert("rhai_fixup_applied".to_string(), fixup.clone());
+                 }
                  if let Some(ref detailed) = ctx.verification.detailed_status {
                      metadata.insert("verification_detailed".to_string(), detailed.clone());
                  }

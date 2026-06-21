@@ -2609,6 +2609,13 @@ impl eframe::App for SteamLauncher {
                         ui.add_space(8.0);
                         ui.label("Steam Runtime Runner:");
 
+                        if !self.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                            let kind = crate::utils::classify_runner(&self.launcher_config.steam_runtime_runner);
+                            if matches!(kind, crate::utils::RunnerKind::Unknown) {
+                                ui.colored_label(egui::Color32::YELLOW, "⚠️ Selected runner cannot be classified. Launch may fail.");
+                            }
+                        }
+
                         ui.horizontal(|ui| {
                             use crate::models::RunnerSource;
                             ui.radio_value(&mut self.launcher_config.steam_runtime_runner_source, RunnerSource::Official, "Official Proton (Valve)");

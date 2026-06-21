@@ -33,6 +33,7 @@ mod tests {
             proton_path: Some("/tmp/proton".to_string()),
             target_architecture: crate::models::ExecutableArchitecture::X86_64,
             dll_resolutions: Vec::new(),
+            fixup_result: None,
             verification_ptr: std::ptr::null_mut(),
         }
     }
@@ -112,6 +113,7 @@ mod tests {
             proton_path: Some(runner_path.to_string_lossy().to_string()),
             target_architecture: crate::models::ExecutableArchitecture::X86_64,
             dll_resolutions: Vec::new(),
+            fixup_result: None,
             verification_ptr: std::ptr::null_mut(),
         };
 
