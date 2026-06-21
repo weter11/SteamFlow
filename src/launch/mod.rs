@@ -2,6 +2,7 @@ pub mod pipeline;
 pub mod stages;
 pub mod validators;
 pub mod dll_provider_resolver;
+pub mod fixups;
 
 #[cfg(test)]
 mod verification_tests;
@@ -87,4 +88,3 @@ async fn download_steam_setup(path: &Path) -> Result<()> {
     std::fs::write(path, response)?;
     Ok(())
 }
-

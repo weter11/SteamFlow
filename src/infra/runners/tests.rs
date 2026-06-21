@@ -33,6 +33,7 @@ mod tests {
             proton_path: Some("/tmp/proton".to_string()),
             target_architecture: crate::models::ExecutableArchitecture::X86_64,
             dll_resolutions: Vec::new(),
+            fixup_result: None,
             verification_ptr: std::ptr::null_mut(),
         }
     }
@@ -77,6 +78,8 @@ mod tests {
         let dxvk_dll = runner_path.join("files/lib/wine/dxvk/d3d11.dll");
         fs::create_dir_all(dxvk_dll.parent().unwrap()).unwrap();
         fs::write(&dxvk_dll, "fake dll content").unwrap();
+        fs::create_dir_all(runner_path.join("bin")).unwrap();
+        fs::write(runner_path.join("bin/wine64"), "").unwrap();
 
         let app = LibraryGame {
             app_id: 123,
@@ -112,6 +115,7 @@ mod tests {
             proton_path: Some(runner_path.to_string_lossy().to_string()),
             target_architecture: crate::models::ExecutableArchitecture::X86_64,
             dll_resolutions: Vec::new(),
+            fixup_result: None,
             verification_ptr: std::ptr::null_mut(),
         };
 
@@ -145,7 +149,8 @@ mod tests {
 
         let tmp = tempdir().unwrap();
         let proton_path = tmp.path().join("proton");
-        fs::create_dir_all(&proton_path).unwrap();
+        fs::create_dir_all(proton_path.join("bin")).unwrap();
+        fs::write(proton_path.join("bin/wine64"), "").unwrap();
         ctx.proton_path = Some(proton_path.to_string_lossy().to_string());
 
         // build_env should succeed without real filesystem

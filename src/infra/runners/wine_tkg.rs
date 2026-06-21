@@ -228,13 +228,29 @@ impl Runner for WineTkgRunner {
                         let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {
-                            active_runner.clone()
+                            let discovered = crate::utils::resolve_runner("wine-tkg", &library_root);
+                            if !discovered.exists() {
+                                return Err(LaunchError::new(
+                                    LaunchErrorKind::Runner,
+                                    "Steam Runtime Runner is not set and no wine-tkg/plain Wine runner was found. Set “Steam Runtime Runner” in Settings."
+                                ));
+                            }
+                            discovered
                         };
 
                         tracing::info!("Using runner for background Steam: {}", steam_runner.display());
 
-                        let mut steam_cmd = crate::utils::build_runner_command(&steam_runner)
-                            .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?;
+                        let mut steam_cmd = match crate::utils::classify_runner(&steam_runner) {
+                            crate::utils::RunnerKind::PlainWine { .. } => crate::utils::build_runner_command(&steam_runner)
+                                .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?,
+                            crate::utils::RunnerKind::Proton { bundled_wine64: Some(wine64), .. } => Command::new(wine64),
+                            crate::utils::RunnerKind::Proton { bundled_wine64: None, .. } => {
+                                return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Steam Runtime Runner {} is a Proton tree but no bundled wine64 was found", steam_runner.display())));
+                            }
+                            crate::utils::RunnerKind::Unknown => {
+                                return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Steam Runtime Runner: {}", steam_runner.display())));
+                            }
+                        };
                         steam_cmd.current_dir(&prefix_steam_dir);
                         steam_cmd
                             .arg("C:\\Program Files (x86)\\Steam\\steam.exe")
@@ -475,6 +491,20 @@ impl Runner for WineTkgRunner {
                 )
             ));
         }
+        let game_runner_kind = crate::utils::classify_runner(&active_runner_path);
+        if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {
+            return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Compatibility Layer path: {}", active_runner_path.display())));
+        }
+        unsafe {
+            if !ctx.verification_ptr.is_null() {
+                (*ctx.verification_ptr).protonfixes_routed = matches!(game_runner_kind, crate::utils::RunnerKind::Proton { has_protonfixes: true, .. });
+                if let Some(result) = &ctx.fixup_result {
+                    if !result.extra_env.is_empty() || !result.extra_dll_overrides.is_empty() || !result.actions_log.is_empty() {
+                        (*ctx.verification_ptr).rhai_fixup_applied.get_or_insert_with(|| ctx.app.app_id.to_string());
+                    }
+                }
+            }
+        }
         let _components = crate::utils::detect_runner_components(
             &active_runner_path,
             Some(&effective_game_prefix),
@@ -525,6 +555,19 @@ impl Runner for WineTkgRunner {
             Some(&game_working_dir),
             strict_dxvk,
         );
+        if let Some(fixup) = &ctx.fixup_result {
+            for fragment in &fixup.extra_dll_overrides {
+                if !fragment.trim().is_empty() {
+                    if !dll_overrides.is_empty() {
+                        dll_overrides.push(';');
+                    }
+                    dll_overrides.push_str(fragment.trim());
+                }
+            }
+            for action in &fixup.actions_log {
+                tracing::info!("rhai fixup action: {}", action);
+            }
+        }
 
         // Enhance overrides with resolved DLL providers
         for res in &ctx.dll_resolutions {
@@ -550,6 +593,11 @@ impl Runner for WineTkgRunner {
 
         tracing::info!("Final WINEDLLOVERRIDES: {}", dll_overrides);
         env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
+        if let Some(fixup) = &ctx.fixup_result {
+            for (key, value) in &fixup.extra_env {
+                env.insert(key.clone(), value.clone());
+            }
+        }
 
         let steam_prefix_mode = ctx.user_config.as_ref()
             .map(|c| c.steam_prefix_mode.clone())
@@ -848,12 +896,25 @@ impl Runner for WineTkgRunner {
                 .unwrap_or(ctx.launcher_config.proton_version.as_str())
         };
         let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let game_runner_kind = crate::utils::classify_runner(&active_runner);
+        if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {
+            return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Compatibility Layer path: {}", active_runner.display())));
+        }
 
         let mut spec = CommandSpec::default();
 
         // Build the base command (handles 'proton run' wrapper and directory resolution)
-        let base_cmd = crate::utils::build_runner_command(&active_runner)
-            .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Compatibility Layer path: {}", active_runner.display())).with_source(e))?;
+        let base_cmd = match &game_runner_kind {
+            crate::utils::RunnerKind::Proton { has_protonfixes: false, bundled_wine64: Some(wine64), .. } => Command::new(wine64),
+            crate::utils::RunnerKind::Proton { has_protonfixes: false, bundled_wine64: None, .. } => {
+                return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Compatibility Layer {} has a proton script but no protonfixes and no bundled wine64 for fallback", active_runner.display())));
+            }
+            // Real Proton must go through the proton script so bundled protonfixes and
+            // pressure-vessel/bootstrap behavior run naturally. Environment construction is
+            // shared with Wine so DLL override/WINEDLLPATH handling remains intact.
+            _ => crate::utils::build_runner_command(&active_runner)
+                .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Compatibility Layer path: {}", active_runner.display())).with_source(e))?,
+        };
         spec.program = base_cmd.get_program().into();
         spec.args = base_cmd.get_args().map(|s| s.to_string_lossy().to_string()).collect();
 
@@ -929,4 +990,3 @@ impl Runner for WineTkgRunner {
         cmd.spawn().map_err(|e| LaunchError::new(LaunchErrorKind::Process, "failed to spawn runner process").with_source(anyhow!(e)))
     }
 }
-
