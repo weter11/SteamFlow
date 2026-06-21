@@ -51,6 +51,52 @@ fn test_path_discovery_roots() {
 }
 
 #[test]
+fn test_d7vk_discovery() {
+    use std::fs;
+    use tempfile::tempdir;
+    use steamflow::utils::{detect_runner_components, ComponentSource};
+
+    let tmp = tempdir().unwrap();
+    let runner_root = tmp.path().to_path_buf();
+
+    let d7vk_dir = runner_root.join("files/lib/wine/d7vk/x86_64-windows");
+    fs::create_dir_all(&d7vk_dir).unwrap();
+    fs::write(d7vk_dir.join("d3d7.dll"), "fake dll").unwrap();
+    fs::write(d7vk_dir.join("version"), "d7vk (v1.0-g1234567)").unwrap();
+
+    let components = detect_runner_components(&runner_root, None);
+
+    assert!(components.d7vk.is_some());
+    let d7vk = components.d7vk.unwrap();
+    assert_eq!(d7vk.version, "1.0");
+    assert_eq!(d7vk.source, ComponentSource::BundledWithRunner);
+}
+
+#[test]
+fn test_legacy_vkd3d_discovery() {
+    use std::fs;
+    use tempfile::tempdir;
+    use steamflow::utils::{detect_runner_components, ComponentSource};
+
+    let tmp = tempdir().unwrap();
+    let runner_root = tmp.path().to_path_buf();
+
+    // Legacy layout: files/lib/wine/vkd3d/x86_64-windows
+    let vkd3d_dir = runner_root.join("files/lib/wine/vkd3d/x86_64-windows");
+    fs::create_dir_all(&vkd3d_dir).unwrap();
+    fs::write(vkd3d_dir.join("libvkd3d-1.dll"), "fake dll").unwrap();
+    fs::write(vkd3d_dir.join("libvkd3d-shader-1.dll"), "fake dll").unwrap();
+    fs::write(vkd3d_dir.join("version"), "vkd3d (v1.8-gabcdef0)").unwrap();
+
+    let components = detect_runner_components(&runner_root, None);
+
+    assert!(components.vkd3d.is_some());
+    let vkd3d = components.vkd3d.unwrap();
+    assert_eq!(vkd3d.version, "1.8");
+    assert_eq!(vkd3d.source, ComponentSource::BundledWithRunner);
+}
+
+#[test]
 fn test_unified_layout_discovery() {
     use std::fs;
     use tempfile::tempdir;

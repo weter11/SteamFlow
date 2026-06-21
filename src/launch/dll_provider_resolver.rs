@@ -53,6 +53,7 @@ impl DllProviderResolver {
     pub fn new() -> Self {
         Self {
             target_dlls: vec![
+                "d3d7".into(),
                 "d3d8".into(),
                 "d3d9".into(),
                 "dxgi".into(),
@@ -99,6 +100,7 @@ impl DllProviderResolver {
              for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
                  // Component families
                  for family in crate::proton::COMPONENT_FAMILIES {
+                     if *family == "vkd3d" { continue; }
                      let family_root = runner_root.join(lib_subdir).join(family);
                      roots.push(family_root.clone());
                      for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
@@ -108,6 +110,15 @@ impl DllProviderResolver {
                  // Direct architecture subdirs (Modern Unified Layout)
                  for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
                      roots.push(runner_root.join(lib_subdir).join(arch_dir));
+                 }
+             }
+             // vkd3d in modern Proton 11+ is under files/lib/ (BASE_LIB)
+             for base_lib in crate::proton::UNIFIED_BASE_LIB_SUBDIRS {
+                 let family_root = runner_root.join(base_lib).join("vkd3d");
+                 roots.push(family_root.clone());
+                 for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                     roots.push(family_root.join(arch_dir));
+                     roots.push(runner_root.join(base_lib).join(arch_dir));
                  }
              }
              report.scan_roots = roots;
@@ -131,6 +142,14 @@ impl DllProviderResolver {
         if let Some(ref c) = runner_components.dxvk {
             report.components_found.insert("dxvk".into(), ComponentFoundInfo {
                 family: "dxvk".into(),
+                version: c.version.clone(),
+                source: format!("{:?}", c.source),
+                matched_dll: None,
+            });
+        }
+        if let Some(ref c) = runner_components.d7vk {
+            report.components_found.insert("d7vk".into(), ComponentFoundInfo {
+                family: "d7vk".into(),
                 version: c.version.clone(),
                 source: format!("{:?}", c.source),
                 matched_dll: None,
@@ -178,6 +197,8 @@ impl DllProviderResolver {
                          if path.to_string_lossy().contains("vkd3d-proton") { "vkd3d-proton" } else { "vkd3d" }
                      } else if res.name.contains("nvapi") {
                          "nvapi"
+                     } else if res.name == "d3d7" {
+                         "d7vk"
                      } else {
                          "dxvk"
                      };
@@ -358,6 +379,37 @@ impl DllProviderResolver {
         let dll_filename = format!("{}.dll", dll_name);
 
         // Match DLL to component and look for it in runner root
+        let is_d7vk = dll_name == "d3d7";
+        if is_d7vk && components.d7vk.is_some() {
+            let mut relative_paths = Vec::new();
+            for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+                relative_paths.push(format!("{}/d7vk", lib_subdir));
+                for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                    relative_paths.push(format!("{}/d7vk/{}", lib_subdir, arch_dir));
+                    relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
+                }
+            }
+
+            match target_arch {
+                crate::models::ExecutableArchitecture::X86 => {
+                    relative_paths.retain(|p| p.contains("i386") || (!p.contains("x86_64") && !p.contains("-windows")));
+                }
+                crate::models::ExecutableArchitecture::X86_64 => {
+                    relative_paths.retain(|p| p.contains("x86_64") || (!p.contains("i386") && !p.contains("-windows")));
+                }
+                _ => {}
+            }
+
+            for rel in relative_paths {
+                let root = runner_root.join(rel);
+                let p = root.join(&dll_filename);
+                if p.exists() {
+                    tracing::trace!("Found runner component DLL at: {}", p.display());
+                    return Some(p);
+                }
+            }
+        }
+
         let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi");
         if is_dxvk && components.dxvk.is_some() {
             let mut relative_paths = Vec::new();
@@ -461,6 +513,15 @@ impl DllProviderResolver {
 
             if (!use_proton || d3d12_policy == &crate::models::D3D12ProviderPolicy::Auto) && components.vkd3d.is_some() {
                 let mut relative_paths = Vec::new();
+                // vkd3d in modern Proton 11+ is under files/lib/ (BASE_LIB)
+                for lib_subdir in crate::proton::UNIFIED_BASE_LIB_SUBDIRS {
+                    relative_paths.push(format!("{}/vkd3d", lib_subdir));
+                    for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                        relative_paths.push(format!("{}/vkd3d/{}", lib_subdir, arch_dir));
+                        relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
+                    }
+                }
+                // Fallback for legacy vkd3d under lib/wine/
                 for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
                     relative_paths.push(format!("{}/vkd3d", lib_subdir));
                     for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
