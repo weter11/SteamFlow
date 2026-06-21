@@ -94,6 +94,8 @@ pub struct PipelineContext {
     pub warnings: Vec<CompatibilityWarning>,
     pub graphics_stack: GraphicsStackInfo,
     pub dll_resolutions: Vec<crate::launch::dll_provider_resolver::DllResolution>,
+    pub fixup_result: Option<crate::launch::fixups::FixupResult>,
+    pub fixup_script_name: Option<String>,
     pub verification: crate::infra::logging::LaunchVerification,
 }
 
@@ -118,6 +120,8 @@ impl PipelineContext {
             warnings: Vec::new(),
             graphics_stack: GraphicsStackInfo::default(),
             dll_resolutions: Vec::new(),
+            fixup_result: None,
+            fixup_script_name: None,
             verification: crate::infra::logging::LaunchVerification::default(),
         }
     }
@@ -477,6 +481,7 @@ impl LaunchPipeline {
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_game::ResolveGameStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_profile::ResolveProfileStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_components::ResolveComponentsStage));
+        pipeline.add_stage(Box::new(crate::launch::stages::resolve_game_fixups::ResolveGameFixupsStage));
         pipeline.add_stage(Box::new(crate::launch::stages::resolve_dll_providers::ResolveDllProvidersStage));
         pipeline.add_stage(Box::new(crate::launch::stages::prepare_prefix::PreparePrefixStage));
         pipeline.add_stage(Box::new(crate::launch::stages::build_environment::BuildEnvironmentStage));
@@ -1333,6 +1338,10 @@ impl LaunchPipeline {
                  metadata.insert("steam_running_before_launch".to_string(), ctx.verification.steam_running_before_launch.to_string());
                  metadata.insert("steam_auto_start_attempted".to_string(), ctx.verification.steam_auto_start_attempted.to_string());
                  metadata.insert("steam_auto_start_failed".to_string(), ctx.verification.steam_auto_start_failed.to_string());
+                 metadata.insert("protonfixes_routed".to_string(), ctx.verification.protonfixes_routed.to_string());
+                 if let Some(ref script) = ctx.verification.rhai_fixup_applied {
+                     metadata.insert("rhai_fixup_applied".to_string(), script.clone());
+                 }
 
                  let _ = logger.info("launch_summary_concise", "Concise launch summary recorded".to_string(), None, metadata);
             }

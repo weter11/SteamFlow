@@ -2676,6 +2676,9 @@ impl eframe::App for SteamLauncher {
                                     }
                                 }
                             });
+                        if let Some(warning) = crate::utils::validate_steam_runtime_runner_path(&self.launcher_config.steam_runtime_runner) {
+                            ui.colored_label(egui::Color32::YELLOW, warning);
+                        }
 
                         ui.add_space(4.0);
                         if ui.button("Install / Manage Windows Steam Runtime").clicked() {

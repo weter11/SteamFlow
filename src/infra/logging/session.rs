@@ -76,6 +76,8 @@ pub struct LaunchVerification {
     pub steam_runtime_policy: String,
     pub steam_runtime_source: String, // "default", "auto", "override"
     pub windows_steam_discovery_enabled: bool,
+    pub protonfixes_routed: bool,
+    pub rhai_fixup_applied: Option<String>,
     pub log_head: Vec<String>,
     pub log_tail: Vec<String>,
 }

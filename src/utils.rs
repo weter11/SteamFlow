@@ -3,6 +3,89 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunnerKind {
+    /// A real Proton tree: has a `proton` script AND a bundled `protonfixes/` python package.
+    Proton {
+        proton_script: PathBuf,
+        bundled_wine64: Option<PathBuf>,
+        has_protonfixes: bool,
+    },
+    /// Plain Wine / wine-tkg: a `wine`/`wine64` binary with no Proton script and no
+    /// bundled protonfixes package.
+    PlainWine {
+        wine64: PathBuf,
+        wine32: Option<PathBuf>,
+    },
+    Unknown,
+}
+
+pub fn classify_runner(runner_path: &Path) -> RunnerKind {
+    let root = if runner_path.is_file() {
+        if runner_path.file_name().and_then(|n| n.to_str()) == Some("proton") {
+            runner_path.parent().unwrap_or(runner_path).to_path_buf()
+        } else {
+            derive_runner_root(runner_path)
+        }
+    } else {
+        runner_path.to_path_buf()
+    };
+
+    let proton_script = root.join("proton");
+    let has_protonfixes = ["protonfixes", "files/protonfixes", "dist/protonfixes"]
+        .iter()
+        .any(|p| root.join(p).is_dir());
+    if proton_script.is_file() {
+        let bundled_wine64 = ["files/bin/wine64", "dist/bin/wine64", "bin/wine64", "files/bin/wine", "dist/bin/wine", "bin/wine"]
+            .iter()
+            .map(|p| root.join(p))
+            .find(|p| p.is_file());
+        return RunnerKind::Proton { proton_script, bundled_wine64, has_protonfixes };
+    }
+
+    if runner_path.is_file() {
+        if let Some(name) = runner_path.file_name().and_then(|n| n.to_str()) {
+            if name == "wine64" || name == "wine" {
+                let parent = runner_path.parent().unwrap_or(runner_path);
+                let wine32 = if name == "wine64" {
+                    let p = parent.join("wine");
+                    p.is_file().then_some(p)
+                } else {
+                    None
+                };
+                return RunnerKind::PlainWine { wine64: runner_path.to_path_buf(), wine32 };
+            }
+        }
+    }
+
+    if runner_path.is_dir() && !runner_path.join("proton").is_file() {
+        for candidate in ["bin/wine64", "bin/wine"] {
+            let wine = runner_path.join(candidate);
+            if wine.is_file() {
+                let wine32 = runner_path.join("bin/wine");
+                return RunnerKind::PlainWine {
+                    wine64: wine,
+                    wine32: wine32.is_file().then_some(wine32),
+                };
+            }
+        }
+    }
+
+    RunnerKind::Unknown
+}
+
+pub fn validate_steam_runtime_runner_path(runner_path: &Path) -> Option<String> {
+    if runner_path.as_os_str().is_empty() {
+        return None;
+    }
+    matches!(classify_runner(runner_path), RunnerKind::Unknown).then(|| {
+        format!(
+            "Steam Runtime Runner '{}' is not a recognized Proton or Wine runner.",
+            runner_path.display()
+        )
+    })
+}
+
 #[cfg(unix)]
 pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
     let prefix_str = wineprefix.to_string_lossy().to_string();
@@ -1486,5 +1569,66 @@ pub fn steam_wineprefix_for_game(
             .join("pfx")
     } else {
         resolve_master_wineprefix()
+    }
+}
+
+#[cfg(test)]
+mod runner_kind_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_proton_tree_with_bundled_wine() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("proton"), "#!/usr/bin/env python3").unwrap();
+        std::fs::create_dir_all(dir.path().join("files/protonfixes")).unwrap();
+        std::fs::create_dir_all(dir.path().join("files/bin")).unwrap();
+        std::fs::write(dir.path().join("files/bin/wine64"), "").unwrap();
+        match classify_runner(dir.path()) {
+            RunnerKind::Proton { proton_script, bundled_wine64: Some(wine), has_protonfixes } => {
+                assert_eq!(proton_script, dir.path().join("proton"));
+                assert_eq!(wine, dir.path().join("files/bin/wine64"));
+                assert!(has_protonfixes);
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_plain_wine_directory_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+        std::fs::write(dir.path().join("bin/wine64"), "").unwrap();
+        assert!(matches!(classify_runner(dir.path()), RunnerKind::PlainWine { .. }));
+        assert!(matches!(classify_runner(&dir.path().join("bin/wine64")), RunnerKind::PlainWine { .. }));
+    }
+
+    #[test]
+    fn classifies_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(classify_runner(dir.path()), RunnerKind::Unknown);
+    }
+
+    #[test]
+    fn support_matrix_routing_decisions() {
+        let proton = tempfile::tempdir().unwrap();
+        std::fs::write(proton.path().join("proton"), "").unwrap();
+        std::fs::create_dir_all(proton.path().join("protonfixes")).unwrap();
+        std::fs::create_dir_all(proton.path().join("files/bin")).unwrap();
+        std::fs::write(proton.path().join("files/bin/wine64"), "").unwrap();
+        let wine = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wine.path().join("bin")).unwrap();
+        std::fs::write(wine.path().join("bin/wine64"), "").unwrap();
+
+        let is_bg_bare = |p: &Path| match classify_runner(p) {
+            RunnerKind::Proton { bundled_wine64: Some(_), .. } | RunnerKind::PlainWine { .. } => true,
+            _ => false,
+        };
+        let game_uses_protonfixes = |p: &Path| matches!(classify_runner(p), RunnerKind::Proton { has_protonfixes: true, .. });
+        assert!(is_bg_bare(proton.path()) && game_uses_protonfixes(proton.path())); // row 1
+        assert!(is_bg_bare(wine.path()) && !game_uses_protonfixes(wine.path())); // row 2
+        assert!(is_bg_bare(proton.path()) && game_uses_protonfixes(proton.path())); // row 3
+        assert!(is_bg_bare(wine.path()) && !game_uses_protonfixes(wine.path())); // row 4
+        assert!(is_bg_bare(wine.path()) && game_uses_protonfixes(proton.path())); // row 5
+        assert!(is_bg_bare(proton.path()) && !game_uses_protonfixes(wine.path())); // row 6
     }
 }
