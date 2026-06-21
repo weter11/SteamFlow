@@ -122,6 +122,7 @@ pub enum AsyncOp {
     AuthFailed(String),
     UserProfileFetched(crate::models::UserProfile),
     SettingsSaved(bool),
+    WineControlPanelLaunched,
     ScanCompleted(u32, HashMap<u32, String>),
     MetadataFetched(u32, crate::steam_client::AppMetadata),
     UserConfigsFetched(crate::models::UserConfigStore),
@@ -589,6 +590,9 @@ impl SteamLauncher {
                     } else {
                         "Failed to save settings".to_string()
                     };
+                }
+                AsyncOp::WineControlPanelLaunched => {
+                    self.status = "Wine Control Panel launched".to_string();
                 }
                 AsyncOp::ScanCompleted(appid, installed_paths) => {
                     for g in &mut self.library {
@@ -2781,6 +2785,25 @@ impl eframe::App for SteamLauncher {
                                     });
                             });
                         }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.heading("Wine Tools");
+                        if ui.button("Open Wine Control Panel").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_wine_control_panel(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineControlPanelLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine Control Panel failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's control.exe using the default Proton version and SteamFlow's master Wine prefix.");
 
                         ui.add_space(8.0);
                         ui.separator();

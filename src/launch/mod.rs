@@ -80,6 +80,39 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     Ok(())
 }
 
+pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = build_runner_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    cmd.arg("control.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine Control Panel"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine Control Panel")?;
+    Ok(())
+}
+
 async fn download_steam_setup(path: &Path) -> Result<()> {
     tracing::info!("Downloading SteamSetup.exe...");
     let url = "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe";
