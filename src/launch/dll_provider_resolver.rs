@@ -53,6 +53,7 @@ impl DllProviderResolver {
     pub fn new() -> Self {
         Self {
             target_dlls: vec![
+                "d3d7".into(),
                 "d3d8".into(),
                 "d3d9".into(),
                 "dxgi".into(),
@@ -96,42 +97,30 @@ impl DllProviderResolver {
         } else {
              // Derive all potential runner scan roots
              let mut roots = Vec::new();
-             let subdirs = [
-                 "files/lib/wine/dxvk/x86_64-windows",
-                 "files/lib/wine/dxvk/i386-windows",
-                 "files/lib/wine/vkd3d/x86_64-windows",
-                 "files/lib/wine/vkd3d/i386-windows",
-                 "files/lib/wine/vkd3d-proton/x86_64-windows",
-                 "files/lib/wine/vkd3d-proton/i386-windows",
-                 "files/lib/wine/dxvk",
-                 "files/lib/wine/vkd3d",
-                 "files/lib/wine/vkd3d-proton",
-                 "files/lib64/wine/dxvk",
-                 "files/lib64/wine/vkd3d",
-                 "files/lib64/wine/vkd3d-proton",
-                 "dist/lib/wine/dxvk/x86_64-windows",
-                 "dist/lib/wine/dxvk/i386-windows",
-                 "dist/lib/wine/vkd3d/x86_64-windows",
-                 "dist/lib/wine/vkd3d/i386-windows",
-                 "dist/lib/wine/vkd3d-proton/x86_64-windows",
-                 "dist/lib/wine/vkd3d-proton/i386-windows",
-                 "dist/lib/wine/dxvk",
-                 "dist/lib/wine/vkd3d",
-                 "dist/lib/wine/vkd3d-proton",
-                 "lib/wine/dxvk/x86_64-windows",
-                 "lib/wine/dxvk/i386-windows",
-                 "lib/wine/vkd3d/x86_64-windows",
-                 "lib/wine/vkd3d/i386-windows",
-                 "lib/wine/vkd3d-proton/x86_64-windows",
-                 "lib/wine/vkd3d-proton/i386-windows",
-                 "lib/wine/dxvk",
-                 "lib/wine/vkd3d",
-                 "lib/wine/vkd3d-proton",
-                 "lib64/wine/dxvk",
-                 "lib64/wine/vkd3d",
-                 "lib64/wine/vkd3d-proton",
-             ];
-             for s in subdirs { roots.push(runner_root.join(s)); }
+             for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+                 // Component families
+                 for family in crate::proton::COMPONENT_FAMILIES {
+                     if *family == "vkd3d" { continue; }
+                     let family_root = runner_root.join(lib_subdir).join(family);
+                     roots.push(family_root.clone());
+                     for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                         roots.push(family_root.join(arch_dir));
+                     }
+                 }
+                 // Direct architecture subdirs (Modern Unified Layout)
+                 for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                     roots.push(runner_root.join(lib_subdir).join(arch_dir));
+                 }
+             }
+             // vkd3d in modern Proton 11+ is under files/lib/ (BASE_LIB)
+             for base_lib in crate::proton::UNIFIED_BASE_LIB_SUBDIRS {
+                 let family_root = runner_root.join(base_lib).join("vkd3d");
+                 roots.push(family_root.clone());
+                 for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                     roots.push(family_root.join(arch_dir));
+                     roots.push(runner_root.join(base_lib).join(arch_dir));
+                 }
+             }
              report.scan_roots = roots;
         }
 
@@ -153,6 +142,14 @@ impl DllProviderResolver {
         if let Some(ref c) = runner_components.dxvk {
             report.components_found.insert("dxvk".into(), ComponentFoundInfo {
                 family: "dxvk".into(),
+                version: c.version.clone(),
+                source: format!("{:?}", c.source),
+                matched_dll: None,
+            });
+        }
+        if let Some(ref c) = runner_components.d7vk {
+            report.components_found.insert("d7vk".into(), ComponentFoundInfo {
+                family: "d7vk".into(),
                 version: c.version.clone(),
                 source: format!("{:?}", c.source),
                 matched_dll: None,
@@ -200,6 +197,8 @@ impl DllProviderResolver {
                          if path.to_string_lossy().contains("vkd3d-proton") { "vkd3d-proton" } else { "vkd3d" }
                      } else if res.name.contains("nvapi") {
                          "nvapi"
+                     } else if res.name == "d3d7" {
+                         "d7vk"
                      } else {
                          "dxvk"
                      };
@@ -380,30 +379,55 @@ impl DllProviderResolver {
         let dll_filename = format!("{}.dll", dll_name);
 
         // Match DLL to component and look for it in runner root
+        let is_d7vk = dll_name == "d3d7";
+        if is_d7vk && components.d7vk.is_some() {
+            let mut relative_paths = Vec::new();
+            for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+                relative_paths.push(format!("{}/d7vk", lib_subdir));
+                for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                    relative_paths.push(format!("{}/d7vk/{}", lib_subdir, arch_dir));
+                    relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
+                }
+            }
+
+            match target_arch {
+                crate::models::ExecutableArchitecture::X86 => {
+                    relative_paths.retain(|p| p.contains("i386") || (!p.contains("x86_64") && !p.contains("-windows")));
+                }
+                crate::models::ExecutableArchitecture::X86_64 => {
+                    relative_paths.retain(|p| p.contains("x86_64") || (!p.contains("i386") && !p.contains("-windows")));
+                }
+                _ => {}
+            }
+
+            for rel in relative_paths {
+                let root = runner_root.join(rel);
+                let p = root.join(&dll_filename);
+                if p.exists() {
+                    tracing::trace!("Found runner component DLL at: {}", p.display());
+                    return Some(p);
+                }
+            }
+        }
+
         let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi");
         if is_dxvk && components.dxvk.is_some() {
-            let mut relative_paths = vec![
-                "lib/wine/dxvk/x86_64-windows",
-                "lib/wine/dxvk/i386-windows",
-                "files/lib/wine/dxvk/x86_64-windows",
-                "files/lib/wine/dxvk/i386-windows",
-                "dist/lib/wine/dxvk/x86_64-windows",
-                "dist/lib/wine/dxvk/i386-windows",
-                "lib/wine/dxvk",
-                "files/lib/wine/dxvk",
-                "dist/lib/wine/dxvk",
-                "files/lib64/wine/dxvk",
-                "lib64/wine/dxvk",
-                "dist/lib64/wine/dxvk",
-            ];
+            let mut relative_paths = Vec::new();
+            for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+                relative_paths.push(format!("{}/dxvk", lib_subdir));
+                for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                    relative_paths.push(format!("{}/dxvk/{}", lib_subdir, arch_dir));
+                    relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
+                }
+            }
 
             // Strictly filter by architecture
             match target_arch {
                 crate::models::ExecutableArchitecture::X86 => {
-                    relative_paths.retain(|p| p.contains("i386") || !p.contains("windows"));
+                    relative_paths.retain(|p| p.contains("i386") || (!p.contains("x86_64") && !p.contains("-windows")));
                 }
                 crate::models::ExecutableArchitecture::X86_64 => {
-                    relative_paths.retain(|p| p.contains("x86_64") || !p.contains("windows"));
+                    relative_paths.retain(|p| p.contains("x86_64") || (!p.contains("i386") && !p.contains("-windows")));
                 }
                 _ => {}
             }
@@ -420,24 +444,21 @@ impl DllProviderResolver {
 
         let is_nvapi = matches!(dll_name, "nvapi" | "nvapi64" | "nvofapi64");
         if is_nvapi && components.nvapi.is_some() {
-             let mut relative_paths = vec![
-                "lib/wine/nvapi/x86_64-windows",
-                "lib/wine/nvapi/i386-windows",
-                "files/lib/wine/nvapi/x86_64-windows",
-                "files/lib/wine/nvapi/i386-windows",
-                "dist/lib/wine/nvapi/x86_64-windows",
-                "dist/lib/wine/nvapi/i386-windows",
-                "lib/wine/nvapi",
-                "files/lib/wine/nvapi",
-                "dist/lib/wine/nvapi",
-            ];
+             let mut relative_paths = Vec::new();
+             for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+                 relative_paths.push(format!("{}/nvapi", lib_subdir));
+                 for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                     relative_paths.push(format!("{}/nvapi/{}", lib_subdir, arch_dir));
+                     relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
+                 }
+             }
 
             match target_arch {
                 crate::models::ExecutableArchitecture::X86 => {
-                    relative_paths.retain(|p| p.contains("i386") || !p.contains("windows"));
+                    relative_paths.retain(|p| p.contains("i386") || (!p.contains("x86_64") && !p.contains("-windows")));
                 }
                 crate::models::ExecutableArchitecture::X86_64 => {
-                    relative_paths.retain(|p| p.contains("x86_64") || !p.contains("windows"));
+                    relative_paths.retain(|p| p.contains("x86_64") || (!p.contains("i386") && !p.contains("-windows")));
                 }
                 _ => {}
             }
@@ -461,27 +482,21 @@ impl DllProviderResolver {
             };
 
             if use_proton && components.vkd3d_proton.is_some() {
-                let mut relative_paths = vec![
-                    "lib/wine/vkd3d-proton/x86_64-windows",
-                    "lib/wine/vkd3d-proton/i386-windows",
-                    "files/lib/wine/vkd3d-proton/x86_64-windows",
-                    "files/lib/wine/vkd3d-proton/i386-windows",
-                    "dist/lib/wine/vkd3d-proton/x86_64-windows",
-                    "dist/lib/wine/vkd3d-proton/i386-windows",
-                    "lib/wine/vkd3d-proton",
-                    "files/lib/wine/vkd3d-proton",
-                    "dist/lib/wine/vkd3d-proton",
-                    "lib64/wine/vkd3d-proton",
-                    "files/lib64/wine/vkd3d-proton",
-                    "dist/lib64/wine/vkd3d-proton",
-                ];
+                let mut relative_paths = Vec::new();
+                for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+                    relative_paths.push(format!("{}/vkd3d-proton", lib_subdir));
+                    for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                        relative_paths.push(format!("{}/vkd3d-proton/{}", lib_subdir, arch_dir));
+                        relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
+                    }
+                }
 
                 match target_arch {
                     crate::models::ExecutableArchitecture::X86 => {
-                        relative_paths.retain(|p| p.contains("i386") || !p.contains("windows"));
+                        relative_paths.retain(|p| p.contains("i386") || (!p.contains("x86_64") && !p.contains("-windows")));
                     }
                     crate::models::ExecutableArchitecture::X86_64 => {
-                        relative_paths.retain(|p| p.contains("x86_64") || !p.contains("windows"));
+                        relative_paths.retain(|p| p.contains("x86_64") || (!p.contains("i386") && !p.contains("-windows")));
                     }
                     _ => {}
                 }
@@ -497,27 +512,30 @@ impl DllProviderResolver {
             }
 
             if (!use_proton || d3d12_policy == &crate::models::D3D12ProviderPolicy::Auto) && components.vkd3d.is_some() {
-                let mut relative_paths = vec![
-                    "lib/wine/vkd3d/x86_64-windows",
-                    "lib/wine/vkd3d/i386-windows",
-                    "files/lib/wine/vkd3d/x86_64-windows",
-                    "files/lib/wine/vkd3d/i386-windows",
-                    "dist/lib/wine/vkd3d/x86_64-windows",
-                    "dist/lib/wine/vkd3d/i386-windows",
-                    "lib/wine/vkd3d",
-                    "files/lib/wine/vkd3d",
-                    "dist/lib/wine/vkd3d",
-                    "lib64/wine/vkd3d",
-                    "files/lib64/wine/vkd3d",
-                    "dist/lib64/wine/vkd3d",
-                ];
+                let mut relative_paths = Vec::new();
+                // vkd3d in modern Proton 11+ is under files/lib/ (BASE_LIB)
+                for lib_subdir in crate::proton::UNIFIED_BASE_LIB_SUBDIRS {
+                    relative_paths.push(format!("{}/vkd3d", lib_subdir));
+                    for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                        relative_paths.push(format!("{}/vkd3d/{}", lib_subdir, arch_dir));
+                        relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
+                    }
+                }
+                // Fallback for legacy vkd3d under lib/wine/
+                for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+                    relative_paths.push(format!("{}/vkd3d", lib_subdir));
+                    for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                        relative_paths.push(format!("{}/vkd3d/{}", lib_subdir, arch_dir));
+                        relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
+                    }
+                }
 
                 match target_arch {
                     crate::models::ExecutableArchitecture::X86 => {
-                        relative_paths.retain(|p| p.contains("i386") || !p.contains("windows"));
+                        relative_paths.retain(|p| p.contains("i386") || (!p.contains("x86_64") && !p.contains("-windows")));
                     }
                     crate::models::ExecutableArchitecture::X86_64 => {
-                        relative_paths.retain(|p| p.contains("x86_64") || !p.contains("windows"));
+                        relative_paths.retain(|p| p.contains("x86_64") || (!p.contains("i386") && !p.contains("-windows")));
                     }
                     _ => {}
                 }
@@ -646,5 +664,45 @@ mod tests {
         let d3d11 = res.iter().find(|r| r.name == "d3d11").unwrap();
         assert_eq!(d3d11.chosen_provider, DllProvider::None);
         assert!(d3d11.fallback_reason.is_some());
+    }
+
+    #[test]
+    fn test_modern_unified_layout_discovery() {
+        let tmp = tempdir().unwrap();
+        let runner_root = tmp.path().to_path_buf();
+
+        // Modern Proton 11 / CachyOS layout: files/lib/wine/x86_64-windows/
+        let unified_dir = runner_root.join("files/lib/wine/x86_64-windows");
+        fs::create_dir_all(&unified_dir).unwrap();
+
+        let d3d11_dll = unified_dir.join("d3d11.dll");
+        let dxgi_dll = unified_dir.join("dxgi.dll");
+        fs::write(&d3d11_dll, "d3d11 content").unwrap();
+        fs::write(&dxgi_dll, "dxgi content").unwrap();
+
+        let mut components = crate::utils::RunnerComponents::default();
+        // Even if components.dxvk is Some, it should look in the new paths
+        components.dxvk = Some(crate::utils::ComponentInfo {
+            version: "2.3".into(),
+            source: crate::utils::ComponentSource::BundledWithRunner,
+            path: None,
+        });
+
+        let resolver = DllProviderResolver::new();
+        let game_dir = Path::new("/tmp/game");
+        let arch = crate::models::ExecutableArchitecture::X86_64;
+
+        let (res, report) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Auto, &arch, None, None, None);
+
+        let d3d11_res = res.iter().find(|r| r.name == "d3d11").unwrap();
+        assert_eq!(d3d11_res.chosen_provider, DllProvider::Runner);
+        assert_eq!(d3d11_res.chosen_path.as_ref().unwrap(), &d3d11_dll);
+
+        let dxgi_res = res.iter().find(|r| r.name == "dxgi").unwrap();
+        assert_eq!(dxgi_res.chosen_provider, DllProvider::Runner);
+        assert_eq!(dxgi_res.chosen_path.as_ref().unwrap(), &dxgi_dll);
+
+        // Check if report scan roots include the new unified path
+        assert!(report.scan_roots.iter().any(|p| p.to_string_lossy().contains("files/lib/wine/x86_64-windows")));
     }
 }

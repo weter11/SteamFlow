@@ -201,6 +201,7 @@ pub fn setup_fake_steam_trap(config_dir: &Path) -> Result<PathBuf> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunnerComponents {
     pub dxvk: Option<ComponentInfo>,
+    pub d7vk: Option<ComponentInfo>,
     pub vkd3d_proton: Option<ComponentInfo>,
     pub vkd3d: Option<ComponentInfo>,
     pub nvapi: Option<ComponentInfo>,
@@ -251,8 +252,9 @@ pub fn detect_runner_components(
 ) -> RunnerComponents {
     let root = derive_runner_root(runner_path);
 
-    let (dxvk, vkd3d_proton, vkd3d, nvapi) = (
+    let (dxvk, d7vk, vkd3d_proton, vkd3d, nvapi) = (
         detect_dxvk(&root, wineprefix),
+        detect_d7vk(&root, wineprefix),
         detect_vkd3d_proton(&root, wineprefix),
         detect_vkd3d(&root, wineprefix),
         detect_nvapi(&root, wineprefix),
@@ -261,6 +263,7 @@ pub fn detect_runner_components(
 
     RunnerComponents {
         dxvk,
+        d7vk,
         vkd3d_proton,
         vkd3d,
         nvapi,
@@ -301,17 +304,17 @@ pub fn detect_prime_env() -> std::collections::HashMap<String, String> {
 
 // ── DXVK ────────────────────────────────────────────────────────────────────
 
-fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+fn detect_d7vk(root: &Path, _prefix: Option<&Path>) -> Option<ComponentInfo> {
     // 1. Bundled inside runner (Modern Wine-TKG layout)
-    let comp_subdirs = ["lib/wine/dxvk", "files/lib/wine/dxvk", "dist/lib/wine/dxvk"];
-    let required = ["d3d11.dll", "dxgi.dll", "d3d9.dll", "d3d8.dll", "d3d10core.dll"];
+    let comp_subdirs = ["lib/wine/d7vk", "files/lib/wine/d7vk", "dist/lib/wine/d7vk"];
+    let required = ["d3d7.dll"];
 
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
         if comp_path.is_dir() {
             // Check arch subfolders
-            for arch in ["x86_64-windows", "i386-windows"] {
-                let arch_path = comp_path.join(arch);
+            for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                let arch_path = comp_path.join(arch_dir);
                 if required.iter().all(|dll| arch_path.join(dll).exists()) {
                     let version = ["version", "../version"] // check in arch or component folder
                         .iter()
@@ -329,6 +332,89 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
                         path: Some(arch_path),
                     });
                 }
+            }
+        }
+    }
+
+    // Unified layout (Proton 11+ / CachyOS)
+    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 1. Bundled inside runner (Modern Wine-TKG layout)
+    let comp_subdirs = ["lib/wine/dxvk", "files/lib/wine/dxvk", "dist/lib/wine/dxvk"];
+    let required = ["d3d11.dll", "dxgi.dll", "d3d9.dll", "d3d8.dll", "d3d10core.dll"];
+
+    for subdir in comp_subdirs {
+        let comp_path = root.join(subdir);
+        if comp_path.is_dir() {
+            // Check arch subfolders
+            for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                let arch_path = comp_path.join(arch_dir);
+                if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                    let version = ["version", "../version"] // check in arch or component folder
+                        .iter()
+                        .filter_map(|v| {
+                            let p = arch_path.join(v);
+                            std::fs::read_to_string(p).ok()
+                        })
+                        .map(|s| parse_short_version(&s))
+                        .find(|s| s != "unknown")
+                        .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
+                    });
+                }
+            }
+        }
+    }
+
+    // Unified layout (Proton 11+ / CachyOS)
+    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
             }
         }
     }
@@ -385,8 +471,8 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
         if comp_path.is_dir() {
-            for arch in ["x86_64-windows", "i386-windows"] {
-                let arch_path = comp_path.join(arch);
+            for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                let arch_path = comp_path.join(arch_dir);
                 if required.iter().all(|dll| arch_path.join(dll).exists()) {
                     let version = ["version", "../version"]
                         .iter()
@@ -404,6 +490,58 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
                         path: Some(arch_path),
                     });
                 }
+            }
+        }
+    }
+
+    // Unified layout (Modern Proton 11+ has vkd3d under files/lib/)
+    for subdir in crate::proton::UNIFIED_BASE_LIB_SUBDIRS {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            for arch_path in [
+                root.join(subdir).join("vkd3d").join(arch_dir),
+                root.join(subdir).join(arch_dir),
+            ] {
+                if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
+                    });
+                }
+            }
+        }
+    }
+
+    // Legacy Unified layout
+    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
             }
         }
     }
@@ -468,9 +606,9 @@ fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
         let comp_path = root.join(subdir);
         if comp_path.is_dir() {
             // Check arch subfolders
-            for arch in ["x86_64-windows", "i386-windows"] {
-                let arch_path = comp_path.join(arch);
-                let dlls = if arch == "x86_64-windows" {
+            for (arch_name, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                let arch_path = comp_path.join(arch_dir);
+                let dlls = if *arch_name == "x86_64" {
                     vec!["nvapi64.dll"]
                 } else {
                     vec!["nvapi.dll"]
@@ -497,6 +635,36 @@ fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
         }
     }
 
+    // Unified layout
+    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+        for (arch_name, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            let dlls = if *arch_name == "x86_64" {
+                vec!["nvapi64.dll"]
+            } else {
+                vec!["nvapi.dll"]
+            };
+
+            if dlls.iter().all(|dll| arch_path.join(dll).exists()) {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
+            }
+        }
+    }
+
     // 2. Installed into WINEPREFIX
     if let Some(pfx) = prefix {
         let prefix_dlls = [
@@ -519,8 +687,8 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
         if comp_path.is_dir() {
-            for arch in ["x86_64-windows", "i386-windows"] {
-                let arch_path = comp_path.join(arch);
+            for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                let arch_path = comp_path.join(arch_dir);
                 if required.iter().all(|dll| arch_path.join(dll).exists()) {
                     let version = ["version", "../version"]
                         .iter()
@@ -538,6 +706,54 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
                         path: Some(arch_path),
                     });
                 }
+            }
+        }
+    }
+
+    // Unified layout (Modern Proton 11+ has vkd3d under files/lib/)
+    for subdir in crate::proton::UNIFIED_BASE_LIB_SUBDIRS {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join("vkd3d").join(arch_dir);
+            if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
+            }
+        }
+    }
+
+    // Legacy Unified layout
+    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            if required.iter().all(|dll| arch_path.join(dll).exists()) {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
             }
         }
     }
@@ -1046,8 +1262,9 @@ pub fn detect_exe_architecture(exe_path: &Path) -> crate::models::ExecutableArch
 }
 
 pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
-    let (dxvk, vkd3d_proton, vkd3d, nvapi) = (
+    let (dxvk, d7vk, vkd3d_proton, vkd3d, nvapi) = (
         detect_dxvk(path, None),
+        detect_d7vk(path, None),
         detect_vkd3d_proton(path, None),
         detect_vkd3d(path, None),
         detect_nvapi(path, None),
@@ -1055,6 +1272,7 @@ pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
 
     crate::utils::RunnerComponents {
         dxvk,
+        d7vk,
         vkd3d_proton,
         vkd3d,
         nvapi,
