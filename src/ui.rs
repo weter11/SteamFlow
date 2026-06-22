@@ -2792,42 +2792,49 @@ impl eframe::App for SteamLauncher {
                         }
 
                         // Show confirmation dialog if needed
-                        if let Some(ref confirm) = self.repair_confirm {
-                            ui.add_space(8.0);
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_width(300.0);
-                                if let Some(ref login_name) = confirm.game_name {
-                                    ui.label(egui::RichText::new(format!(
-                                        "⚠️ Repair will backup and replace your current Windows Steam installation.\n\n\
-                                        Steam account '{}' is logged in and will be preserved in the backup.\n\n\
-                                        Do you want to proceed?", login_name
-                                    )).color(egui::Color32::YELLOW));
-                                } else {
-                                    ui.label(egui::RichText::new(
-                                        "⚠️ Repair will backup and replace your current Windows Steam installation.\n\n\
-                                        Do you want to proceed?"
-                                    ).color(egui::Color32::YELLOW));
-                                }
+                        {
+                            let confirm = self.repair_confirm.take();
+                            if let Some(confirm) = confirm {
+                                let game_name = confirm.game_name.clone();
                                 ui.add_space(8.0);
-                                ui.horizontal(|ui| {
-                                    if ui.button("Yes, Repair").clicked() {
-                                        let config = self.launcher_config.clone();
-                                        let tx = self.operation_tx.clone();
-                                        self.repair_confirm = None;
-                                        self.runtime.spawn(async move {
-                                            let _ = tx.send(AsyncOp::SteamRepairProgress(crate::launch::RepairStatus::Starting));
-                                            if let Err(e) = crate::launch::repair_master_steam(&config, |status| {
-                                                let _ = tx.send(AsyncOp::SteamRepairProgress(status));
-                                            }).await {
-                                                let _ = tx.send(AsyncOp::SteamRepairProgress(crate::launch::RepairStatus::Failed(e.to_string())));
-                                            }
-                                        });
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.set_width(300.0);
+                                    if let Some(ref login_name) = game_name {
+                                        ui.label(egui::RichText::new(format!(
+                                            "⚠️ Repair will backup and replace your current Windows Steam installation.\n\n\
+                                            Steam account '{}' is logged in and will be preserved in the backup.\n\n\
+                                            Do you want to proceed?", login_name
+                                        )).color(egui::Color32::YELLOW));
+                                    } else {
+                                        ui.label(egui::RichText::new(
+                                            "⚠️ Repair will backup and replace your current Windows Steam installation.\n\n\
+                                            Do you want to proceed?"
+                                        ).color(egui::Color32::YELLOW));
                                     }
-                                    if ui.button("Cancel").clicked() {
-                                        self.repair_confirm = None;
-                                    }
+                                    ui.add_space(8.0);
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Yes, Repair").clicked() {
+                                            let config = self.launcher_config.clone();
+                                            let tx = self.operation_tx.clone();
+                                            self.runtime.spawn(async move {
+                                                let _ = tx.send(AsyncOp::SteamRepairProgress(crate::launch::RepairStatus::Starting));
+                                                if let Err(e) = crate::launch::repair_master_steam(&config, |status| {
+                                                    let _ = tx.send(AsyncOp::SteamRepairProgress(status));
+                                                }).await {
+                                                    let _ = tx.send(AsyncOp::SteamRepairProgress(crate::launch::RepairStatus::Failed(e.to_string())));
+                                                }
+                                            });
+                                        }
+                                        if ui.button("Cancel").clicked() {
+                                            // nothing to restore
+                                        }
+                                    });
                                 });
-                            });
+                                // Restore if not dismissed
+                                if self.repair_confirm.is_none() {
+                                    self.repair_confirm = Some(confirm);
+                                }
+                            }
                         }
 
                         ui.add_space(8.0);

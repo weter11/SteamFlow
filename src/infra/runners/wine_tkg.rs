@@ -318,7 +318,7 @@ impl Runner for WineTkgRunner {
                                             v.steam_runtime_milestone = "steam_process_exited_early".to_string();
                                         }
                                     }
-                                    break 'wait false;
+                                    break 'wait None;
                                 }
 
                                 // Signal 1: pid file (some Wine/Steam combos do write this)
@@ -365,7 +365,7 @@ impl Runner for WineTkgRunner {
                                     (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_timeout".to_string();
                                 }
                             }
-                            true
+                            None
                         };
 
                         // Post-ready grace period: verify Steam process is still alive after ready-signal
@@ -403,8 +403,8 @@ impl Runner for WineTkgRunner {
                                     false
                                 }
                             }
-                            // ready is true (timeout fallback) or false (crash during wait loop)
-                            other => other,
+                            // ready is None (crash during wait loop) - treat as false
+                            None => false,
                         };
 
                         if !ready {
