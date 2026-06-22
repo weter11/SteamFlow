@@ -240,17 +240,8 @@ impl Runner for WineTkgRunner {
 
                         tracing::info!("Using runner for background Steam: {}", steam_runner.display());
 
-                        let mut steam_cmd = match crate::utils::classify_runner(&steam_runner) {
-                            crate::utils::RunnerKind::PlainWine { .. } => crate::utils::build_runner_command(&steam_runner)
-                                .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?,
-                            crate::utils::RunnerKind::Proton { bundled_wine64: Some(wine64), .. } => Command::new(wine64),
-                            crate::utils::RunnerKind::Proton { bundled_wine64: None, .. } => {
-                                return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Steam Runtime Runner {} is a Proton tree but no bundled wine64 was found", steam_runner.display())));
-                            }
-                            crate::utils::RunnerKind::Unknown => {
-                                return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Steam Runtime Runner: {}", steam_runner.display())));
-                            }
-                        };
+                        let mut steam_cmd = crate::utils::build_bare_wine_command(&steam_runner)
+                                .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?;
                         steam_cmd.current_dir(&prefix_steam_dir);
                         steam_cmd
                             .arg("C:\\Program Files (x86)\\Steam\\steam.exe")

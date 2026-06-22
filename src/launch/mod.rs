@@ -10,7 +10,6 @@ mod verification_tests;
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context, anyhow};
 use crate::config::{config_dir, LauncherConfig};
-use crate::utils::build_runner_command;
 
 pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     let base_dir = config_dir()?;
@@ -31,7 +30,7 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     let library_root = PathBuf::from(&config.steam_library_path);
     let resolved_runner = crate::utils::resolve_runner(&runner_name, &library_root);
-    let mut cmd = build_runner_command(&resolved_runner)?;
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
 
     tracing::info!("Unified Master Steam resolution:");
     tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
@@ -85,7 +84,7 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
     let library_root = PathBuf::from(&config.steam_library_path);
     let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
-    let mut cmd = build_runner_command(&resolved_runner)?;
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
     let steam_cfg = crate::utils::get_master_steam_config();
 
     std::fs::create_dir_all(&steam_cfg.wine_prefix)

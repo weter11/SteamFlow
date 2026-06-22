@@ -180,6 +180,27 @@ pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
     bail!("Failed to resolve a valid runner binary from {}", runner_path.display())
 }
 
+/// Builds a command that points directly to a bare Wine binary, bypassing any
+/// Proton scripts or bootstrap logic. This is critical for background Steam
+/// management where we want minimal interference.
+pub fn build_bare_wine_command(runner_path: &Path) -> Result<Command> {
+    match classify_runner(runner_path) {
+        RunnerKind::PlainWine { wine64, .. } => Ok(Command::new(wine64)),
+        RunnerKind::Proton { bundled_wine64: Some(wine64), .. } => Ok(Command::new(wine64)),
+        RunnerKind::Proton { bundled_wine64: None, .. } => {
+            bail!("Proton tree {} has no bundled wine64", runner_path.display())
+        }
+        RunnerKind::Unknown => {
+            // Fallback for ad-hoc paths
+            if runner_path.is_file() {
+                Ok(Command::new(runner_path))
+            } else {
+                bail!("Could not resolve bare Wine binary from {}", runner_path.display())
+            }
+        }
+    }
+}
+
 pub fn resolve_runner(name: &str, library_root: &Path) -> PathBuf {
     let name_path = Path::new(name);
     if name_path.is_absolute() || name_path.exists() {
