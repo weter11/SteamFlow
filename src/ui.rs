@@ -125,6 +125,8 @@ pub enum AsyncOp {
     WineControlPanelLaunched,
     ScanCompleted(u32, HashMap<u32, String>),
     MasterSteamRepaired,
+    MasterSteamBackedUp,
+    MasterSteamRestored,
     MetadataFetched(u32, crate::steam_client::AppMetadata),
     UserConfigsFetched(crate::models::UserConfigStore),
     ProtonListFetched(Vec<crate::proton::ProtonPackage>, Vec<crate::proton::InstalledProton>),
@@ -186,6 +188,7 @@ pub struct SteamLauncher {
     last_scanned_appid: Option<u32>,
     available_gpus: Vec<crate::utils::DetectedGpu>,
     show_repair_confirmation: bool,
+    show_restore_confirmation: bool,
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
 }
@@ -272,6 +275,7 @@ impl SteamLauncher {
             last_scanned_appid: None,
             available_gpus: crate::utils::list_available_gpus(),
             show_repair_confirmation: false,
+            show_restore_confirmation: false,
             operation_tx,
             operation_rx,
         }
@@ -596,6 +600,12 @@ impl SteamLauncher {
                 }
                 AsyncOp::MasterSteamRepaired => {
                     self.status = "Windows Steam Runtime repaired successfully".to_string();
+                }
+                AsyncOp::MasterSteamBackedUp => {
+                    self.status = "Windows Steam Runtime backed up successfully".to_string();
+                }
+                AsyncOp::MasterSteamRestored => {
+                    self.status = "Windows Steam Runtime restored successfully".to_string();
                 }
                 AsyncOp::WineControlPanelLaunched => {
                     self.status = "Wine Control Panel launched".to_string();
@@ -2687,21 +2697,81 @@ impl eframe::App for SteamLauncher {
                         }
 
                         ui.add_space(4.0);
+                        let steam_cfg = crate::utils::get_master_steam_config();
+                        let prefix_exists = steam_cfg.root_dir.exists();
+                        let latest_backup = crate::launch::get_latest_backup();
+
                         ui.horizontal(|ui| {
-                            if ui.button("Install / Manage Windows Steam Runtime").clicked() {
-                                let config = self.launcher_config.clone();
-                                let tx = self.operation_tx.clone();
-                                self.runtime.spawn(async move {
-                                    if let Err(e) = crate::launch::install_master_steam(&config).await {
-                                        let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
-                                    }
-                                });
+                            if !prefix_exists {
+                                if ui.button("Install Windows Steam Runtime").clicked() {
+                                    let config = self.launcher_config.clone();
+                                    let tx = self.operation_tx.clone();
+                                    self.runtime.spawn(async move {
+                                        if let Err(e) = crate::launch::install_master_steam(&config).await {
+                                            let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
+                                        }
+                                    });
+                                }
+                            } else {
+                                if ui.button("Manage Windows Steam Runtime").clicked() {
+                                    let config = self.launcher_config.clone();
+                                    let tx = self.operation_tx.clone();
+                                    self.runtime.spawn(async move {
+                                        if let Err(e) = crate::launch::install_master_steam(&config).await {
+                                            let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
+                                        }
+                                    });
+                                }
+
+                                if ui.button("Repair / Reinstall").clicked() {
+                                    self.show_repair_confirmation = !self.show_repair_confirmation;
+                                }
+
+                                if ui.button("Backup Runtime").clicked() {
+                                    let tx = self.operation_tx.clone();
+                                    self.runtime.spawn(async move {
+                                        if let Err(e) = crate::launch::backup_master_steam().await {
+                                            let _ = tx.send(AsyncOp::Error(format!("Backup failed: {e}")));
+                                        } else {
+                                            let _ = tx.send(AsyncOp::MasterSteamBackedUp);
+                                        }
+                                    });
+                                }
                             }
 
-                            if ui.button("Repair Windows Steam Runtime").clicked() {
-                                self.show_repair_confirmation = !self.show_repair_confirmation;
+                            if let Some(backup_path) = latest_backup {
+                                if ui.button("Restore from Backup").clicked() {
+                                    self.show_restore_confirmation = !self.show_restore_confirmation;
+                                }
+                                ui.label(format!("Latest: {}", backup_path.file_name().unwrap_or_default().to_string_lossy()))
+                                    .on_hover_text(backup_path.to_string_lossy());
                             }
                         });
+
+                        if self.show_restore_confirmation {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.colored_label(egui::Color32::YELLOW, "⚠ Restoring will replace your current Steam prefix with the backup.");
+                                if prefix_exists {
+                                    ui.label("The current prefix will be moved to a temporary .old directory.");
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Confirm Restore").clicked() {
+                                        self.show_restore_confirmation = false;
+                                        let tx = self.operation_tx.clone();
+                                        self.runtime.spawn(async move {
+                                            if let Err(e) = crate::launch::restore_master_steam().await {
+                                                let _ = tx.send(AsyncOp::Error(format!("Restore failed: {e}")));
+                                            } else {
+                                                let _ = tx.send(AsyncOp::MasterSteamRestored);
+                                            }
+                                        });
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.show_restore_confirmation = false;
+                                    }
+                                });
+                            });
+                        }
 
                         if self.show_repair_confirmation {
                             egui::Frame::group(ui.style()).show(ui, |ui| {

@@ -17,6 +17,7 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     let steam_cfg = crate::utils::get_master_steam_config();
     let runtimes_dir = base_dir.join("runtimes");
     std::fs::create_dir_all(&runtimes_dir)?;
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)?;
 
     let setup_exe = runtimes_dir.join("SteamSetup.exe");
     if !setup_exe.exists() {
@@ -122,48 +123,109 @@ async fn download_steam_setup(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
+pub async fn backup_master_steam() -> Result<()> {
     let steam_cfg = crate::utils::get_master_steam_config();
-    tracing::info!("Starting repair for Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
+    if !steam_cfg.root_dir.exists() {
+        return Err(anyhow!("Master Steam prefix does not exist"));
+    }
+
+    tracing::info!("Backing up Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 
     // 1. Kill all processes
     crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
     crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
 
     // 2. Manage backups
-    if steam_cfg.root_dir.exists() {
-        let parent = steam_cfg.root_dir.parent().context("master steam root has no parent")?;
+    let parent = steam_cfg.root_dir.parent().context("master steam root has no parent")?;
 
-        // Find existing backups
-        if let Ok(entries) = std::fs::read_dir(parent) {
-            let mut backups: Vec<_> = entries.flatten()
-                .filter(|e| {
-                    e.file_name().to_string_lossy().starts_with("master_steam_prefix.bak.")
-                })
-                .map(|e| e.path())
-                .collect();
+    // Find existing backups
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        let mut backups: Vec<_> = entries.flatten()
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("master_steam_prefix.bak.")
+            })
+            .map(|e| e.path())
+            .collect();
 
-            // Keep at most 1 previous backup: delete all but the newest before creating a new one
-            backups.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        // Keep at most 1 previous backup: delete all but the newest before creating a new one
+        backups.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
 
-            // If we have any backups, delete all of them so we only have one after renaming
-            for old_bak in backups {
-                tracing::info!("Removing old backup: {}", old_bak.display());
-                let _ = std::fs::remove_dir_all(old_bak);
+        // If we have more than one, delete the oldest
+        if backups.len() >= 1 {
+            for i in 0..backups.len() {
+                tracing::info!("Removing old backup: {}", backups[i].display());
+                let _ = std::fs::remove_dir_all(&backups[i]);
             }
         }
+    }
 
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup_path = parent.join(format!("master_steam_prefix.bak.{}", timestamp));
+
+    tracing::info!("Moving {} to {}", steam_cfg.root_dir.display(), backup_path.display());
+    std::fs::rename(&steam_cfg.root_dir, &backup_path)
+        .context("failed to move prefix to backup")?;
+
+    Ok(())
+}
+
+pub fn get_latest_backup() -> Option<PathBuf> {
+    let steam_cfg = crate::utils::get_master_steam_config();
+    let parent = steam_cfg.root_dir.parent()?;
+
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        let mut backups: Vec<_> = entries.flatten()
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("master_steam_prefix.bak.")
+            })
+            .map(|e| e.path())
+            .collect();
+
+        backups.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        return backups.pop();
+    }
+    None
+}
+
+pub async fn restore_master_steam() -> Result<()> {
+    let latest_backup = get_latest_backup().ok_or_else(|| anyhow!("No backup found to restore"))?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    tracing::info!("Restoring Master Steam from {}", latest_backup.display());
+
+    // 1. Kill all processes in current prefix if it exists
+    if steam_cfg.wine_prefix.exists() {
+        crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
+        crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    }
+
+    // 2. Move current aside if it exists
+    if steam_cfg.root_dir.exists() {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let backup_path = parent.join(format!("master_steam_prefix.bak.{}", timestamp));
-
-        tracing::info!("Moving {} to {}", steam_cfg.root_dir.display(), backup_path.display());
-        std::fs::rename(&steam_cfg.root_dir, &backup_path)
-            .context("failed to move prefix to backup")?;
+        let old_path = steam_cfg.root_dir.with_extension(format!("old.{}", timestamp));
+        std::fs::rename(&steam_cfg.root_dir, &old_path)?;
     }
 
-    // 3. Re-install
+    // 3. Restore
+    std::fs::rename(latest_backup, &steam_cfg.root_dir)?;
+    Ok(())
+}
+
+pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
+    let steam_cfg = crate::utils::get_master_steam_config();
+    tracing::info!("Starting repair for Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
+
+    // 1. Backup existing (handles killing processes and rotation)
+    if steam_cfg.root_dir.exists() {
+        backup_master_steam().await?;
+    }
+
+    // 2. Re-install (handles directory creation)
     install_master_steam(config).await
 }
