@@ -324,19 +324,22 @@ impl Runner for WineTkgRunner {
                                 // Signal 1: pid file (some Wine/Steam combos do write this)
                                 if steam_pid_path.exists() {
                                     println!("✅ Steam ready after {}s (steam.pid found)", i + 1);
-                                    break 'wait true;
+                                    // Enter grace period: verify process is still alive after ready-signal
+                                    break 'wait Some("steam.pid found");
                                 }
 
                                 // Signal 2: .steampath in temp (Proton-style)
                                 if steam_pipe.exists() {
                                     println!("✅ Steam ready after {}s (.steampath found)", i + 1);
-                                    break 'wait true;
+                                    // Enter grace period: verify process is still alive after ready-signal
+                                    break 'wait Some(".steampath found");
                                 }
 
                                 // Signal 3: config.vdf written — Steam has finished early init
                                 if steam_config_vdf.exists() {
                                     println!("✅ Steam ready after {}s (config.vdf found)", i + 1);
-                                    break 'wait true;
+                                    // Enter grace period: verify process is still alive after ready-signal
+                                    break 'wait Some("config.vdf found");
                                 }
 
                                 // Signal 4: logs dir has multiple entries — Steam's subsystems are running
@@ -350,7 +353,8 @@ impl Runner for WineTkgRunner {
                                             (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_signal_observed".to_string();
                                         }
                                     }
-                                    break 'wait true;
+                                    // Enter grace period: verify process is still alive after ready-signal
+                                    break 'wait Some("log files found");
                                 }
 
                                 println!("  Waiting... {}s", i + 1);
@@ -364,13 +368,57 @@ impl Runner for WineTkgRunner {
                             true
                         };
 
+                        // Post-ready grace period: verify Steam process is still alive after ready-signal
+                        // This closes the false-positive gap where a ready-signal file exists but the
+                        // process has already crashed (e.g., steamerrorreporter appeared immediately)
+                        let ready = match ready {
+                            // ready is Option<&str> - Some(signal) means we got a signal and need grace check
+                            Some(signal) => {
+                                let grace_timeout = 2;
+                                println!("🔍 Verifying Steam process health ({}s grace period)...", grace_timeout);
+                                let mut process_healthy = true;
+                                
+                                for i in 0..grace_timeout {
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    
+                                    if let Ok(Some(status)) = steam_process.try_wait() {
+                                        println!("❌ FATAL: Steam process exited during grace period ({}s after {}): {}", i + 1, signal, status);
+                                        unsafe {
+                                            if !ctx.verification_ptr.is_null() {
+                                                let v = &mut *ctx.verification_ptr;
+                                                v.steam_runtime_exit_code = status.code();
+                                                v.steam_runtime_lifetime_ms = Some(start_time.elapsed().as_millis() as u64);
+                                                v.steam_runtime_milestone = "steam_process_exited_early".to_string();
+                                            }
+                                        }
+                                        process_healthy = false;
+                                        break;
+                                    }
+                                }
+                                
+                                if process_healthy {
+                                    println!("✅ Steam process confirmed healthy after ready-signal");
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            // ready is true (timeout fallback) or false (crash during wait loop)
+                            other => other,
+                        };
+
                         if !ready {
                             unsafe {
                                 if !ctx.verification_ptr.is_null() {
                                     (*ctx.verification_ptr).steam_auto_start_failed = true;
                                 }
                             }
-                            return Err(LaunchError::new(LaunchErrorKind::Process, "Background Steam crashed before the game could start"));
+                            return Err(LaunchError::new(
+                                LaunchErrorKind::Process,
+                                "Background Steam crashed before the game could start. \
+                                 This often indicates a corrupted Windows Steam install — \
+                                 try Settings → Repair / Reinstall Windows Steam Runtime"
+                            ));
                         }
                     }
         }
