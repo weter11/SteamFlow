@@ -303,7 +303,9 @@ impl Runner for WineTkgRunner {
                         let steam_config_vdf = prefix_steam_dir.join("config/config.vdf");
                         let steam_logs_dir   = prefix_steam_dir.join("logs");
 
-                        let ready = 'wait: {
+                        // Track what happened in the wait loop
+                        // (crash_detected, ready_signal): both false = timeout, first true = crash, second true = ready
+                        let (crash_detected, ready_signal) = 'wait: {
                             for i in 0..readiness_timeout {
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -318,25 +320,25 @@ impl Runner for WineTkgRunner {
                                             v.steam_runtime_milestone = "steam_process_exited_early".to_string();
                                         }
                                     }
-                                    break 'wait false;
+                                    break 'wait (true, false); // Crash detected, no ready signal
                                 }
 
                                 // Signal 1: pid file (some Wine/Steam combos do write this)
                                 if steam_pid_path.exists() {
                                     println!("✅ Steam ready after {}s (steam.pid found)", i + 1);
-                                    break 'wait true;
+                                    break 'wait (false, true); // No crash, ready signal found
                                 }
 
                                 // Signal 2: .steampath in temp (Proton-style)
                                 if steam_pipe.exists() {
                                     println!("✅ Steam ready after {}s (.steampath found)", i + 1);
-                                    break 'wait true;
+                                    break 'wait (false, true);
                                 }
 
                                 // Signal 3: config.vdf written — Steam has finished early init
                                 if steam_config_vdf.exists() {
                                     println!("✅ Steam ready after {}s (config.vdf found)", i + 1);
-                                    break 'wait true;
+                                    break 'wait (false, true);
                                 }
 
                                 // Signal 4: logs dir has multiple entries — Steam's subsystems are running
@@ -350,7 +352,7 @@ impl Runner for WineTkgRunner {
                                             (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_signal_observed".to_string();
                                         }
                                     }
-                                    break 'wait true;
+                                    break 'wait (false, true);
                                 }
 
                                 println!("  Waiting... {}s", i + 1);
@@ -361,16 +363,62 @@ impl Runner for WineTkgRunner {
                                     (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_timeout".to_string();
                                 }
                             }
+                            (false, false) // Timeout - no crash, no ready signal
+                        };
+
+                        // Post-ready grace period: verify Steam process is still alive after ready-signal
+                        // This closes the false-positive gap where a ready-signal file exists but the
+                        // process has already crashed (e.g., steamerrorreporter appeared immediately)
+                        let launch_allowed = if ready_signal {
+                            // We found a ready signal - run grace check to verify process is still alive
+                            let grace_timeout = 2;
+                            println!("🔍 Verifying Steam process health ({}s grace period)...", grace_timeout);
+                            let mut process_healthy = true;
+                            
+                            for i in 0..grace_timeout {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                
+                                if let Ok(Some(status)) = steam_process.try_wait() {
+                                    println!("❌ FATAL: Steam process exited during grace period ({}s): {}", i + 1, status);
+                                    unsafe {
+                                        if !ctx.verification_ptr.is_null() {
+                                            let v = &mut *ctx.verification_ptr;
+                                            v.steam_runtime_exit_code = status.code();
+                                            v.steam_runtime_lifetime_ms = Some(start_time.elapsed().as_millis() as u64);
+                                            v.steam_runtime_milestone = "steam_process_exited_early".to_string();
+                                        }
+                                    }
+                                    process_healthy = false;
+                                    break;
+                                }
+                            }
+                            
+                            if process_healthy {
+                                println!("✅ Steam process confirmed healthy after ready-signal");
+                                true
+                            } else {
+                                false
+                            }
+                        } else if crash_detected {
+                            // Process crashed during wait loop - don't launch
+                            false
+                        } else {
+                            // Timeout - proceed anyway (original behavior)
                             true
                         };
 
-                        if !ready {
+                        if !launch_allowed {
                             unsafe {
                                 if !ctx.verification_ptr.is_null() {
                                     (*ctx.verification_ptr).steam_auto_start_failed = true;
                                 }
                             }
-                            return Err(LaunchError::new(LaunchErrorKind::Process, "Background Steam crashed before the game could start"));
+                            return Err(LaunchError::new(
+                                LaunchErrorKind::Process,
+                                "Background Steam crashed before the game could start. \
+                                 This often indicates a corrupted Windows Steam install — \
+                                 try Settings → Repair / Reinstall Windows Steam Runtime"
+                            ));
                         }
                     }
         }

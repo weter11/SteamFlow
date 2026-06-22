@@ -98,6 +98,12 @@ struct ProtonRemoveConfirmState {
     affected_games: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SteamRepairConfirmState {
+    game_name: Option<String>,
+    // If game_name is Some, it's the Steam login display name stored in the prefix
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MainTab {
     Library,
@@ -131,6 +137,7 @@ pub enum AsyncOp {
     ProtonInstallComplete(String),
     ProtonInstallFailed(String, String),
     ProtonRemoved(String),
+    SteamRepairProgress(crate::launch::RepairStatus),
     Error(String),
 }
 
@@ -170,6 +177,7 @@ pub struct SteamLauncher {
     launch_selector: Option<LaunchSelectorState>,
     proton_manager: ProtonManagerState,
     proton_remove_confirm: Option<ProtonRemoveConfirmState>,
+    repair_confirm: Option<SteamRepairConfirmState>,
     current_tab: GameTab,
     main_tab: MainTab,
     account_data: Option<crate::steam_client::AccountData>,
@@ -255,6 +263,7 @@ impl SteamLauncher {
             launch_selector: None,
             proton_manager: ProtonManagerState::default(),
             proton_remove_confirm: None,
+            repair_confirm: None,
             current_tab: GameTab::Options,
             main_tab: MainTab::Library,
             account_data: None,
@@ -729,8 +738,65 @@ impl SteamLauncher {
                         self.status = err;
                     }
                 }
+                AsyncOp::SteamRepairProgress(status) => {
+                    match status {
+                        crate::launch::RepairStatus::Starting => {
+                            self.status = "Starting Steam repair...".to_string();
+                        }
+                        crate::launch::RepairStatus::StoppingProcesses => {
+                            self.status = "Stopping Steam processes...".to_string();
+                        }
+                        crate::launch::RepairStatus::CreatingBackup => {
+                            self.status = "Creating backup of existing prefix...".to_string();
+                        }
+                        crate::launch::RepairStatus::Installing => {
+                            self.status = "Installing Windows Steam Runtime...".to_string();
+                        }
+                        crate::launch::RepairStatus::Completed => {
+                            self.status = "Steam repair completed successfully".to_string();
+                            self.repair_confirm = None;
+                        }
+                        crate::launch::RepairStatus::Failed(err) => {
+                            self.status = format!("Steam repair failed: {}", err);
+                            self.repair_confirm = None;
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Detect if there's a logged-in Steam account in the master prefix by looking at config.vdf
+    fn detect_steam_login_in_prefix(&self) -> Option<String> {
+        let steam_cfg = crate::utils::get_master_steam_config();
+        let config_vdf = steam_cfg.root_dir
+            .join("Steam")
+            .join("config")
+            .join("config.vdf");
+        
+        if !config_vdf.exists() {
+            return None;
+        }
+
+        // Simple check for "PersonaName" in config.vdf
+        if let Ok(content) = std::fs::read_to_string(&config_vdf) {
+            for line in content.lines() {
+                let line = line.trim();
+                if line.contains("\"PersonaName\"") || line.contains("\"accountName\"") {
+                    // Extract the value
+                    if let Some(value_start) = line.find('"') {
+                        let remainder = &line[value_start + 1..];
+                        if let Some(value_end) = remainder.find('"') {
+                            let value = &remainder[..value_end];
+                            if !value.is_empty() && value != "Offline" {
+                                return Some(value.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn confirmation_validation_message(&self) -> Option<String> {
@@ -2687,6 +2753,95 @@ impl eframe::App for SteamLauncher {
                             self.runtime.spawn(async move {
                                 if let Err(e) = crate::launch::install_master_steam(&config).await {
                                     let _ = tx.send(AsyncOp::Error(format!("Runtime error: {e}")));
+                                }
+                            });
+                        }
+
+                        // Repair / Reinstall button
+                        let steam_cfg = crate::utils::get_master_steam_config();
+                        let has_existing_prefix = steam_cfg.root_dir.exists();
+                        let has_steam_exe = steam_cfg.steam_exe.is_some();
+
+                        if has_existing_prefix {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("⚠️ Existing Windows Steam install detected").color(egui::Color32::YELLOW));
+                        }
+
+                        let repair_clicked = ui.button("Repair / Reinstall Windows Steam Runtime").clicked();
+                        if repair_clicked {
+                            if has_existing_prefix && has_steam_exe {
+                                // Check if we have Steam login state stored
+                                let login_info = self.detect_steam_login_in_prefix();
+                                self.repair_confirm = Some(SteamRepairConfirmState {
+                                    game_name: login_info,
+                                });
+                            } else {
+                                // No existing prefix or no steam.exe, just do fresh install
+                                let config = self.launcher_config.clone();
+                                let tx = self.operation_tx.clone();
+                                // Use tokio::spawn to avoid borrow issues
+                                tokio::spawn(async move {
+                                    let _ = tx.send(AsyncOp::SteamRepairProgress(crate::launch::RepairStatus::Starting));
+                                    if let Err(e) = crate::launch::repair_master_steam(&config, |status| {
+                                        // Status updates are handled via the tx channel
+                                        let _ = tx.send(AsyncOp::SteamRepairProgress(status));
+                                    }).await {
+                                        let _ = tx.send(AsyncOp::SteamRepairProgress(crate::launch::RepairStatus::Failed(e.to_string())));
+                                    }
+                                });
+                            }
+                        }
+
+                        // Show confirmation dialog if needed
+                        // Use deferred actions to avoid borrow checker issues
+                        let mut deferred_repair_confirm = false;
+                        let mut deferred_start_repair = false;
+                        
+                        let pending_repair = self.repair_confirm.clone();
+                        if let Some(confirm) = pending_repair {
+                            ui.add_space(8.0);
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(300.0);
+                                let login_name = confirm.game_name.clone();
+                                if let Some(ref name) = login_name {
+                                    ui.label(egui::RichText::new(format!(
+                                        "⚠️ Repair will backup and replace your current Windows Steam installation.\n\n\
+                                        Steam account '{}' is logged in and will be preserved in the backup.\n\n\
+                                        Do you want to proceed?", name
+                                    )).color(egui::Color32::YELLOW));
+                                } else {
+                                    ui.label(egui::RichText::new(
+                                        "⚠️ Repair will backup and replace your current Windows Steam installation.\n\n\
+                                        Do you want to proceed?"
+                                    ).color(egui::Color32::YELLOW));
+                                }
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Yes, Repair").clicked() {
+                                        deferred_start_repair = true;
+                                        deferred_repair_confirm = true;
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        deferred_repair_confirm = true;
+                                    }
+                                });
+                            });
+                        }
+                        
+                        // Execute deferred actions after UI closure
+                        if deferred_repair_confirm {
+                            self.repair_confirm = None;
+                        }
+                        if deferred_start_repair {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            // Use tokio::spawn directly to avoid borrow of self
+                            tokio::spawn(async move {
+                                let _ = tx.send(AsyncOp::SteamRepairProgress(crate::launch::RepairStatus::Starting));
+                                if let Err(e) = crate::launch::repair_master_steam(&config, |status| {
+                                    let _ = tx.send(AsyncOp::SteamRepairProgress(status));
+                                }).await {
+                                    let _ = tx.send(AsyncOp::SteamRepairProgress(crate::launch::RepairStatus::Failed(e.to_string())));
                                 }
                             });
                         }

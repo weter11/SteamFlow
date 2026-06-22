@@ -12,6 +12,17 @@ use anyhow::{Result, Context, anyhow};
 use crate::config::{config_dir, LauncherConfig};
 use crate::utils::build_runner_command;
 
+/// Repair result enum for tracking repair progress
+#[derive(Debug, Clone)]
+pub enum RepairStatus {
+    Starting,
+    StoppingProcesses,
+    CreatingBackup,
+    Installing,
+    Completed,
+    Failed(String),
+}
+
 pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     let base_dir = config_dir()?;
     let steam_cfg = crate::utils::get_master_steam_config();
@@ -119,5 +130,98 @@ async fn download_steam_setup(path: &Path) -> Result<()> {
     let url = "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe";
     let response = reqwest::get(url).await?.bytes().await?;
     std::fs::write(path, response)?;
+    Ok(())
+}
+
+/// Repair the master Steam prefix by backing up the existing one and reinstalling.
+/// This function handles the complete repair flow including:
+/// - Stopping any running Steam/wine processes in the master prefix
+/// - Backing up the existing prefix (keeping at most 1 previous backup)
+/// - Re-running the install_master_steam flow against the fresh prefix
+///
+/// Returns a stream of RepairStatus updates for UI progress reporting.
+pub async fn repair_master_steam<F>(config: &LauncherConfig, mut on_status: F) -> Result<()>
+where
+    F: FnMut(RepairStatus),
+{
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    // Check if prefix exists
+    if !steam_cfg.root_dir.exists() {
+        tracing::info!("No existing master Steam prefix found, performing fresh install");
+        on_status(RepairStatus::Installing);
+        install_master_steam(config).await?;
+        on_status(RepairStatus::Completed);
+        return Ok(());
+    }
+
+    // Step 1: Stop any running Steam/wine processes in the master prefix
+    on_status(RepairStatus::StoppingProcesses);
+    tracing::info!("Stopping any running Steam/wine processes in master prefix");
+    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    // Give processes a moment to terminate
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Step 2: Create backup of existing prefix
+    on_status(RepairStatus::CreatingBackup);
+    tracing::info!("Backing up existing master Steam prefix");
+
+    // Find and remove any existing backup
+    if let Ok(entries) = std::fs::read_dir(&steam_cfg.root_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("master_steam_prefix.bak.") {
+                tracing::info!("Removing old backup: {}", name_str);
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    tracing::warn!("Failed to remove old backup {}: {}", name_str, e);
+                }
+            }
+        }
+    }
+
+    // Create new backup with timestamp
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup_path = steam_cfg.root_dir.with_file_name(format!("master_steam_prefix.bak.{}", timestamp));
+
+    if let Err(e) = std::fs::rename(&steam_cfg.root_dir, &backup_path) {
+        // If rename fails (e.g., different filesystem), try copy
+        tracing::warn!("Rename failed, attempting copy: {}", e);
+        copy_dir_all(&steam_cfg.root_dir, &backup_path)?;
+        if let Err(e) = std::fs::remove_dir_all(&steam_cfg.root_dir) {
+            tracing::warn!("Failed to remove original after copy: {}", e);
+        }
+    }
+
+    tracing::info!("Backup created at: {}", backup_path.display());
+
+    // Step 3: Re-run install_master_steam against the fresh prefix path
+    on_status(RepairStatus::Installing);
+    tracing::info!("Running fresh install of master Steam");
+
+    install_master_steam(config).await?;
+
+    on_status(RepairStatus::Completed);
+    tracing::info!("Master Steam repair completed successfully");
+    Ok(())
+}
+
+/// Copy a directory recursively
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
     Ok(())
 }
