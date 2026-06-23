@@ -240,17 +240,8 @@ impl Runner for WineTkgRunner {
 
                         tracing::info!("Using runner for background Steam: {}", steam_runner.display());
 
-                        let mut steam_cmd = match crate::utils::classify_runner(&steam_runner) {
-                            crate::utils::RunnerKind::PlainWine { .. } => crate::utils::build_runner_command(&steam_runner)
-                                .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?,
-                            crate::utils::RunnerKind::Proton { bundled_wine64: Some(wine64), .. } => Command::new(wine64),
-                            crate::utils::RunnerKind::Proton { bundled_wine64: None, .. } => {
-                                return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Steam Runtime Runner {} is a Proton tree but no bundled wine64 was found", steam_runner.display())));
-                            }
-                            crate::utils::RunnerKind::Unknown => {
-                                return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Steam Runtime Runner: {}", steam_runner.display())));
-                            }
-                        };
+                        let mut steam_cmd = crate::utils::build_bare_wine_command(&steam_runner)
+                                .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("Invalid Steam Runtime runner path: {}", steam_runner.display())).with_source(e))?;
                         steam_cmd.current_dir(&prefix_steam_dir);
                         steam_cmd
                             .arg("C:\\Program Files (x86)\\Steam\\steam.exe")
@@ -304,6 +295,7 @@ impl Runner for WineTkgRunner {
                         let steam_logs_dir   = prefix_steam_dir.join("logs");
 
                         let ready = 'wait: {
+                            let mut signal_msg = None;
                             for i in 0..readiness_timeout {
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -323,20 +315,20 @@ impl Runner for WineTkgRunner {
 
                                 // Signal 1: pid file (some Wine/Steam combos do write this)
                                 if steam_pid_path.exists() {
-                                    println!("✅ Steam ready after {}s (steam.pid found)", i + 1);
-                                    break 'wait true;
+                                    signal_msg = Some(format!("steam.pid found after {}s", i + 1));
+                                    break;
                                 }
 
                                 // Signal 2: .steampath in temp (Proton-style)
                                 if steam_pipe.exists() {
-                                    println!("✅ Steam ready after {}s (.steampath found)", i + 1);
-                                    break 'wait true;
+                                    signal_msg = Some(format!(".steampath found after {}s", i + 1));
+                                    break;
                                 }
 
                                 // Signal 3: config.vdf written — Steam has finished early init
                                 if steam_config_vdf.exists() {
-                                    println!("✅ Steam ready after {}s (config.vdf found)", i + 1);
-                                    break 'wait true;
+                                    signal_msg = Some(format!("config.vdf found after {}s", i + 1));
+                                    break;
                                 }
 
                                 // Signal 4: logs dir has multiple entries — Steam's subsystems are running
@@ -344,24 +336,45 @@ impl Runner for WineTkgRunner {
                                     .map(|d| d.count())
                                     .unwrap_or(0);
                                 if log_count >= 2 {
-                                    println!("✅ Steam ready after {}s ({} log files found)", i + 1, log_count);
+                                    signal_msg = Some(format!("{} log files found after {}s", log_count, i + 1));
                                     unsafe {
                                         if !ctx.verification_ptr.is_null() {
                                             (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_signal_observed".to_string();
                                         }
                                     }
-                                    break 'wait true;
+                                    break;
                                 }
 
                                 println!("  Waiting... {}s", i + 1);
                             }
-                            println!("⚠️ Steam did not signal ready after {}s, launching game anyway", readiness_timeout);
-                            unsafe {
-                                if !ctx.verification_ptr.is_null() {
-                                    (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_timeout".to_string();
+
+                            if let Some(msg) = signal_msg {
+                                println!("✅ Steam ready signal: {}", msg);
+
+                                // Grace period check: ensure it didn't crash immediately after signaling ready
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                if let Ok(Some(status)) = steam_process.try_wait() {
+                                    println!("❌ FATAL: Background Steam exited during grace period with: {}", status);
+                                    unsafe {
+                                        if !ctx.verification_ptr.is_null() {
+                                            let v = &mut *ctx.verification_ptr;
+                                            v.steam_runtime_exit_code = status.code();
+                                            v.steam_runtime_lifetime_ms = Some(start_time.elapsed().as_millis() as u64);
+                                            v.steam_runtime_milestone = "steam_process_exited_early".to_string();
+                                        }
+                                    }
+                                    break 'wait false;
                                 }
+                                true
+                            } else {
+                                println!("⚠️ Steam did not signal ready after {}s, launching game anyway", readiness_timeout);
+                                unsafe {
+                                    if !ctx.verification_ptr.is_null() {
+                                        (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_timeout".to_string();
+                                    }
+                                }
+                                true
                             }
-                            true
                         };
 
                         if !ready {
@@ -370,7 +383,10 @@ impl Runner for WineTkgRunner {
                                     (*ctx.verification_ptr).steam_auto_start_failed = true;
                                 }
                             }
-                            return Err(LaunchError::new(LaunchErrorKind::Process, "Background Steam crashed before the game could start"));
+                            return Err(LaunchError::new(
+                                LaunchErrorKind::Process,
+                                "Background Steam crashed before the game could start — this often indicates a corrupted Windows Steam install — try Settings → Repair / Reinstall Windows Steam Runtime"
+                            ));
                         }
                     }
         }
