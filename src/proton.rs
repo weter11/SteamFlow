@@ -42,6 +42,8 @@ pub const UNIFIED_BASE_LIB_SUBDIRS: &[&str] = &[
 pub const ARCH_SUBDIRS: &[(&str, &str)] = &[
     ("x86_64", "x86_64-windows"),
     ("i386", "i386-windows"),
+    ("x86_64", "x86_64-unix"),
+    ("i386", "i386-unix"),
 ];
 
 pub const COMPONENT_FAMILIES: &[&str] = &[

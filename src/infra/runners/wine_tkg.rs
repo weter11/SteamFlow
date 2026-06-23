@@ -694,7 +694,11 @@ impl Runner for WineTkgRunner {
         // the .dll.so PE loader stubs it needs to bridge into native DLLs.
         let active_runner = crate::utils::resolve_runner(proton, &library_root);
         let runner_root = crate::utils::derive_runner_root(&active_runner);
-        for lib_sub in crate::proton::UNIFIED_LIB_SUBDIRS {
+
+        let mut all_lib_dirs = crate::proton::UNIFIED_LIB_SUBDIRS.to_vec();
+        all_lib_dirs.extend_from_slice(crate::proton::UNIFIED_BASE_LIB_SUBDIRS);
+
+        for lib_sub in all_lib_dirs {
             let p = runner_root.join(lib_sub);
             if p.exists() {
                 let s = p.to_string_lossy().to_string();
