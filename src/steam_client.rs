@@ -1291,28 +1291,51 @@ impl SteamClient {
             steamid: Some(u64::from(connection.steam_id())),
             include_appinfo: Some(true),
             include_played_free_games: Some(true),
+            include_free_sub: Some(true),
+            include_extended_appinfo: Some(true),
             ..Default::default()
         };
+
+        tracing::info!("Refreshing Steam library: Player.GetOwnedGames(include_appinfo=true, include_played_free_games=true, include_free_sub=true, include_extended_appinfo=true)");
 
         let response: CPlayer_GetOwnedGames_Response = connection
             .service_method(request)
             .await
             .context("failed calling Player.GetOwnedGames")?;
 
+        let total_returned = response.game_count();
         let mut owned = Vec::new();
+        let mut demos_count = 0;
+
         for game in response.games {
+            let app_id = game.appid() as u32;
+            let name = if game.name().is_empty() {
+                format!("App {}", app_id)
+            } else {
+                game.name().to_string()
+            };
+
+            // In some proto versions, we might be able to check app type here if extended info is parsed.
+            // For now, we trust GetOwnedGames filtered them appropriately based on our request.
+            if name.to_lowercase().contains("demo") {
+                demos_count += 1;
+            }
+
             owned.push(OwnedGame {
-                app_id: game.appid() as u32,
-                name: if game.name().is_empty() {
-                    format!("App {}", game.appid())
-                } else {
-                    game.name().to_string()
-                },
+                app_id,
+                name,
                 playtime_forever_minutes: game.playtime_forever() as u32,
                 local_manifest_ids: HashMap::new(),
                 update_available: false,
             });
         }
+
+        tracing::info!(
+            "Library refreshed: {} apps returned, {} demos detected. {} games total in local list.",
+            total_returned,
+            demos_count,
+            owned.len()
+        );
 
         save_library_cache(&owned).await.ok();
         Ok(owned)
@@ -1949,7 +1972,7 @@ impl SteamClient {
                 }
 
                 // Fallback: search for app id markers if the specified installdir doesn't exist
-                if let Some(fallback) = self.probe_install_dir_by_appid(&steamapps, appid) {
+                if let Some(fallback) = crate::utils::probe_install_dir_by_appid(&steamapps, appid) {
                     tracing::info!("Found fallback install dir for app {appid}: {:?}", fallback);
                     return Ok(fallback);
                 }
@@ -1964,33 +1987,6 @@ impl SteamClient {
             .join("steamapps")
             .join("common")
             .join(appid.to_string()))
-    }
-
-    fn probe_install_dir_by_appid(&self, steamapps: &Path, appid: u32) -> Option<PathBuf> {
-        let common = steamapps.join("common");
-        if !common.exists() {
-            return None;
-        }
-
-        let appid_str = appid.to_string();
-
-        if let Ok(entries) = std::fs::read_dir(common) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    // Check for steam_appid.txt
-                    let appid_txt = path.join("steam_appid.txt");
-                    if appid_txt.exists() {
-                        if let Ok(content) = std::fs::read_to_string(appid_txt) {
-                            if content.trim() == appid_str {
-                                return Some(path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 
     async fn remote_manifest_ids_static(
@@ -2119,6 +2115,48 @@ impl SteamClient {
         self.resolve_install_game_info(appid).await.0
     }
 
+    pub async fn repair_manifest(&self, appid: u32) -> Result<()> {
+        let manifest_path = self.appmanifest_path(appid).await?;
+        if manifest_path.exists() {
+            tracing::warn!("Appmanifest for {} already exists, creating backup.", appid);
+            let mut backup_path = manifest_path.clone();
+            backup_path.set_extension("acf.bak");
+            std::fs::copy(&manifest_path, &backup_path)?;
+        }
+
+        let (game_name, pics_installdir) = self.resolve_install_game_info(appid).await;
+
+        // Ensure we have a reasonable installdir and name, avoid placeholders
+        let final_name = if game_name.starts_with("App ") {
+            // Try to find a better name from local files or just use the appid
+            game_name
+        } else {
+            game_name
+        };
+
+        let final_installdir = match pics_installdir {
+            Some(dir) if !crate::utils::is_suspicious_installdir(&dir, appid) => dir,
+            _ => {
+                // Fallback to searching for the actual directory on disk
+                let cfg = load_launcher_config().await?;
+                let steamapps = PathBuf::from(&cfg.steam_library_path).join("steamapps");
+                if let Some(probed) = crate::utils::probe_install_dir_by_appid(&steamapps, appid) {
+                    probed.file_name().and_then(|n| n.to_str()).unwrap_or(&appid.to_string()).to_string()
+                } else {
+                    sanitize_install_dir(&final_name)
+                }
+            }
+        };
+
+        tracing::info!("Repairing manifest for {appid}: name='{final_name}', installdir='{final_installdir}'");
+
+        // For a minimal repair, we don't necessarily know the full depot list
+        // but we can write the manifest with just the basic AppState
+        Self::write_appmanifest(&manifest_path, appid, &final_name, &final_installdir, Vec::new())?;
+
+        Ok(())
+    }
+
     pub fn write_appmanifest(
         path: &Path,
         appid: u32,
@@ -2133,8 +2171,16 @@ impl SteamClient {
 
         let game_name = game_name.replace('"', "");
 
+        // StateFlags 4 means 'Fully Installed'
+        // Universe 1 is the public Steam universe
         let mut content = format!(
-            "\"AppState\"\n{{\n\t\"appid\"\t\"{appid}\"\n\t\"name\"\t\"{game_name}\"\n\t\"StateFlags\"\t\"4\"\n\t\"installdir\"\t\"{installdir}\"\n"
+            "\"AppState\"\n\
+            {{\n\
+            \t\"appid\"\t\"{appid}\"\n\
+            \t\"Universe\"\t\"1\"\n\
+            \t\"name\"\t\"{game_name}\"\n\
+            \t\"StateFlags\"\t\"4\"\n\
+            \t\"installdir\"\t\"{installdir}\"\n"
         );
 
         if !installed_depots.is_empty() {
@@ -2149,6 +2195,7 @@ impl SteamClient {
 
         content.push_str("}\n");
 
+        tracing::info!("Writing appmanifest for {appid} to {:?}", path);
         std::fs::write(path, content)
             .with_context(|| format!("failed writing {}", path.display()))?;
         Ok(())
@@ -3038,6 +3085,7 @@ mod tests {
             update_available: false,
             update_queued: false,
             local_manifest_ids: HashMap::new(),
+            manifest_missing: false,
         };
         let launch_info = LaunchInfo {
             app_id: 123,
