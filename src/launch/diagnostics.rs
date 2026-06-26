@@ -25,7 +25,7 @@ pub fn apply_install_diagnostics(cmd: &mut Command) -> Result<()> {
     let log_file = File::create(&log_path)
         .context(format!("failed to create log file at {}", log_path.display()))?;
 
-    cmd.env("WINEDEBUG", "+process,+module,+loaddll,+msi,+shell");
+    cmd.env("WINEDEBUG", "+loaddll");
 
     // Redirect both stdout and stderr to the same file
     let log_file_clone = log_file.try_clone()?;
