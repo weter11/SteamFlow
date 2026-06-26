@@ -219,6 +219,7 @@ pub async fn restore_master_steam() -> Result<()> {
 
 // EXPERIMENTAL DIAGNOSTIC - DO NOT MERGE TO MAIN
 pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
+    // DIAGNOSTIC NOTE: This calls install_master_steam which applies experimental diagnostics
     let steam_cfg = crate::utils::get_master_steam_config();
     tracing::info!("Starting repair for Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 
