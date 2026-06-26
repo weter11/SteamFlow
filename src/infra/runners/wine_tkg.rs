@@ -11,6 +11,7 @@ pub struct WineTkgRunner;
 #[async_trait::async_trait]
 impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
+    // EXPERIMENTAL DIAGNOSTIC - DO NOT MERGE TO MAIN
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
@@ -264,6 +265,9 @@ impl Runner for WineTkgRunner {
                         println!("Program: {:?}", steam_cmd.get_program());
                         println!("Args: {:?}", steam_cmd.get_args().collect::<Vec<_>>());
                         println!("--------------------------");
+
+                        crate::launch::diagnostics::apply_install_diagnostics(&mut steam_cmd)
+                            .map_err(|e| LaunchError::new(LaunchErrorKind::Process, "failed to apply diagnostics").with_source(e))?;
 
                         // Record Steam runtime diagnostics
                         unsafe {
