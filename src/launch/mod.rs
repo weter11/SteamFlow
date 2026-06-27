@@ -3,6 +3,7 @@ pub mod stages;
 pub mod validators;
 pub mod dll_provider_resolver;
 pub mod fixups;
+pub mod diagnostics;
 
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context, anyhow};
@@ -65,6 +66,8 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     }
 
     tracing::info!("Launching Master Steam: {:?}", cmd);
+
+    let _ = diagnostics::apply_install_diagnostics(&mut cmd)?;
 
     let _child = cmd.spawn().context("Failed to spawn master steam process")?;
 

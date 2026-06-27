@@ -2585,7 +2585,16 @@ impl eframe::App for SteamLauncher {
                 .min_width(320.0)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.heading("Library");
+                        ui.horizontal(|ui| {
+                            ui.heading("Library");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("📂  Open Config Folder").on_hover_text("Open application configuration directory").clicked() {
+                                    if let Ok(dir) = crate::config::config_dir() {
+                                        let _ = webbrowser::open(&dir.to_string_lossy());
+                                    }
+                                }
+                            });
+                        });
                         ui.label("Steam Library Path");
                         ui.text_edit_singleline(&mut self.launcher_config.steam_library_path);
 
