@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, Context, anyhow};
 use crate::config::{config_dir, LauncherConfig};
 
-// EXPERIMENTAL DIAGNOSTIC - DO NOT MERGE TO MAIN
 pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     let base_dir = config_dir()?;
     let steam_cfg = crate::utils::get_master_steam_config();
@@ -68,7 +67,7 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     tracing::info!("Launching Master Steam: {:?}", cmd);
 
-    diagnostics::apply_install_diagnostics(&mut cmd)?;
+    let _ = diagnostics::apply_install_diagnostics(&mut cmd)?;
 
     let _child = cmd.spawn().context("Failed to spawn master steam process")?;
 
@@ -217,9 +216,7 @@ pub async fn restore_master_steam() -> Result<()> {
     Ok(())
 }
 
-// EXPERIMENTAL DIAGNOSTIC - DO NOT MERGE TO MAIN
 pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
-    // DIAGNOSTIC NOTE: This calls install_master_steam which applies experimental diagnostics
     let steam_cfg = crate::utils::get_master_steam_config();
     tracing::info!("Starting repair for Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 

@@ -1,0 +1,3 @@
+{
+  "winedebug": "+process,+seh,+msi,+setupapi,+heap,+file"
+}

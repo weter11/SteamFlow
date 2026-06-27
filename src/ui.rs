@@ -2588,11 +2588,9 @@ impl eframe::App for SteamLauncher {
                         ui.horizontal(|ui| {
                             ui.heading("Library");
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("📂  Open Logs").on_hover_text("Open diagnostics logs folder").clicked() {
+                                if ui.button("📂  Open Config Folder").on_hover_text("Open application configuration directory").clicked() {
                                     if let Ok(dir) = crate::config::config_dir() {
-                                        let log_dir = dir.join("logs");
-                                        let _ = std::fs::create_dir_all(&log_dir);
-                                        let _ = webbrowser::open(&log_dir.to_string_lossy());
+                                        let _ = webbrowser::open(&dir.to_string_lossy());
                                     }
                                 }
                             });
