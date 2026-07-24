@@ -814,11 +814,18 @@ impl Runner for WineTkgRunner {
             Some(&effective_game_prefix),
         );
 
-        // 1. Resolve DX8-11 policy (GraphicsBackendPolicy) - CONSERVATIVE
+        // 1. Resolve DX8-11 policy (GraphicsBackendPolicy).
+        // Auto now follows Proton's behaviour: if the selected runner bundles DXVK
+        // (wine-tkg / cachyos / Proton all do), enable it automatically. This is required
+        // for virtually all Windows D3D9/10/11 games (e.g. Portal 2 / Metro 2033 Redux) —
+        // without DXVK there is no d3d9.dll/d3d11.dll and the game crashes on a null D3D
+        // device. Users who need Wine's built-in D3D can pick the WineD3D policy or the
+        // per-game "Force WineD3D" toggle (used for 32-bit / OpenGL titles like Amnesia).
         let (policy_dxvk, force_builtin, strict_dxvk) = match glc.graphics_backend_policy {
-            // Auto is now conservative: it does NOT automatically enable DXVK
-            // even if detected on disk. It prefers default Wine behavior.
-            crate::models::GraphicsBackendPolicy::Auto => (false, false, false),
+            crate::models::GraphicsBackendPolicy::Auto => {
+                let auto = _components.dxvk.is_some();
+                (auto, false, auto)
+            }
             crate::models::GraphicsBackendPolicy::WineD3D => (false, true, false),
             crate::models::GraphicsBackendPolicy::DXVK => (true, false, true),
         };
