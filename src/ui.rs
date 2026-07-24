@@ -2920,6 +2920,18 @@ impl eframe::App for SteamLauncher {
                             self.draw_proton_manager(ui);
                         });
 
+                        ui.add_space(8.0);
+                        ui.separator();
+
+                        // Quick access to the SteamFlow config directory
+                        if ui.button("📁  Open Config Folder").clicked() {
+                            if let Ok(cfg_dir) = crate::config::config_dir() {
+                                let _ = std::process::Command::new("xdg-open")
+                                    .arg(&cfg_dir)
+                                    .spawn();
+                            }
+                        }
+
                         ui.add_space(16.0);
                         ui.separator();
                         if ui.button("💾  Save Settings").clicked() {
