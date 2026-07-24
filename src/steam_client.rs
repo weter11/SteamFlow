@@ -2609,13 +2609,28 @@ fn parse_launch_info_from_vdf(
         bail!("no suitable launch option found for app {appid}");
     }
 
-    // Sort options: prefer key "0", then by id
+    // Sort options: prefer key "0", then by id.
+    // On a Linux host, ALSO prefer a NativeLinux launch entry when one exists.
+    // Many Steam games ship both a Windows and a native Linux build; launching the
+    // native build through the Linux Steam client is far more reliable than running
+    // the Windows build under Wine/Proton (e.g. Portal 2 only works via the Linux
+    // Steam client, never the Windows one). Preferring NativeLinux here makes those
+    // games launch correctly out of the box instead of being forced through Wine.
+    #[cfg(target_os = "linux")]
+    let prefer_native = |t: &LaunchTarget| matches!(t, LaunchTarget::NativeLinux);
+    #[cfg(not(target_os = "linux"))]
+    let prefer_native = |t: &LaunchTarget| false;
     options.sort_by(|a, b| {
         if a.id == "0" {
             return std::cmp::Ordering::Less;
         }
         if b.id == "0" {
             return std::cmp::Ordering::Greater;
+        }
+        match (prefer_native(&a.target), prefer_native(&b.target)) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
         }
         a.id.cmp(&b.id)
     });

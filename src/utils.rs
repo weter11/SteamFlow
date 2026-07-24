@@ -1127,6 +1127,13 @@ pub fn build_dll_overrides(
         "steam_api=n".into(),
         "steam_api64=n".into(),
         "lsteamclient=".into(),
+        // AMD AGS (amd_ags_x64/x86.dll) frequently fails to load under Wine
+        // ("Could not map ... section .text, file probably truncated" -> the game's
+        // EXE import fails with STATUS_DLL_NOT_FOUND). Wine ships a working builtin
+        // stub, so force the builtin for these. This fixes Resident Evil 2 / RE:2
+        // and other Capcom/AMD-AGS titles without affecting real GPU behaviour.
+        "amd_ags_x64=b".into(),
+        "amd_ags_x86=b".into(),
     ];
 
     if no_overlay {
