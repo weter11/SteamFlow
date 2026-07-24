@@ -527,22 +527,31 @@ impl Runner for WineTkgRunner {
             || dx12_suppress
             || dx12_requires_overlay_suppress;
 
-        // lsteamclient.dll pre-launch check: when Steam Runtime is active,
-        // verify Steam files are present in the prefix. Without them,
-        // lsteamclient.dll will fail to load for Steamworks-dependent games.
-        let steam_runtime_active = ctx.user_config.as_ref()
-            .map(|c| c.steam_runtime_policy == crate::models::SteamRuntimePolicy::Enabled
-                || c.steam_runtime_policy == crate::models::SteamRuntimePolicy::Auto)
-            .unwrap_or(false);
-        if steam_runtime_active {
-            let steam_appid_path = effective_game_prefix.join("drive_c/Program Files (x86)/Steam/steam_appid.txt");
-            if !steam_appid_path.exists() {
-                tracing::warn!(
-                    "Steam Runtime is enabled but Steam files not found in prefix {}. Games using Steamworks API (lsteamclient.dll) will fail to launch.",
-                    effective_game_prefix.display()
+
+        // lsteamclient.dll pre-launch check: detect missing Steam files in prefix.
+        // Both AppID 2368470 and 57300 fail because lsteamclient.dll cannot be loaded
+        // when Windows Steam is not properly installed/running in the prefix.
+        // Check 1: Steam files present in prefix
+        // Check 2: Steam process running in prefix
+        // Check 3: If game requires Steam API, gate launch until both are satisfied.
+        let steam_appid_path = effective_game_prefix.join("drive_c/Program Files (x86)/Steam/steam_appid.txt");
+        let has_steam_files = steam_appid_path.exists();
+        let _ = steam_appid_path;
+
+        let master_steam_cfg = crate::utils::get_master_steam_config();
+        let steam_running_in_prefix = SteamClient::is_steam_running_in_prefix(&master_steam_cfg.wine_prefix);
+
+        if !has_steam_files || !steam_running_in_prefix {
+            tracing::warn!(
+                "Windows Steam is not properly set up in prefix {}: has_steam_files={}, steam_running={}.                  Games requiring Steamworks (lsteamclient.dll) will fail to launch.",
+                effective_game_prefix.display(), has_steam_files, steam_running_in_prefix
+            );
+            if ctx.user_config.as_ref().map(|c| c.requires_steam_api).unwrap_or(false) {
+                tracing::error!(
+                    "Game {} has 'requires_steam_api' set to true but Steam is not available in prefix.                      Either: (a) run Windows Steam in the prefix first, (b) verify Steam installation,                      or (c) disable 'Requires Steam API' in per-game settings.",
+                    ctx.app.app_id
                 );
             }
-            let _ = steam_appid_path;
         }
 
         // force_wined3d check: when set, DXVK is completely disabled.
