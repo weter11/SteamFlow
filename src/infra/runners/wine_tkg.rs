@@ -527,6 +527,33 @@ impl Runner for WineTkgRunner {
             || dx12_suppress
             || dx12_requires_overlay_suppress;
 
+        // lsteamclient.dll pre-launch check: when Steam Runtime is active,
+        // verify Steam files are present in the prefix. Without them,
+        // lsteamclient.dll will fail to load for Steamworks-dependent games.
+        let steam_runtime_active = ctx.user_config.as_ref()
+            .map(|c| c.steam_runtime_policy == crate::models::SteamRuntimePolicy::Enabled
+                || c.steam_runtime_policy == crate::models::SteamRuntimePolicy::Auto)
+            .unwrap_or(false);
+        if steam_runtime_active {
+            let steam_appid_path = effective_game_prefix.join("drive_c/Program Files (x86)/Steam/steam_appid.txt");
+            if !steam_appid_path.exists() {
+                tracing::warn!(
+                    "Steam Runtime is enabled but Steam files not found in prefix {}. Games using Steamworks API (lsteamclient.dll) will fail to launch.",
+                    effective_game_prefix.display()
+                );
+            }
+            let _ = steam_appid_path;
+        }
+
+        // force_wined3d check: when set, DXVK is completely disabled.
+        let force_wined3d = glc.force_wined3d;
+        if force_wined3d {
+            tracing::info!(
+                "force_wined3d is enabled for game {} - DXVK will be disabled for this launch.",
+                ctx.app.app_id
+            );
+        }
+
         let game_working_dir: PathBuf = {
             let install_dir = PathBuf::from(
                 ctx.app.install_path

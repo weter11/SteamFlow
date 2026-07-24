@@ -97,6 +97,8 @@ pub struct GraphicsLayerConfig {
     pub custom_vkd3d_path: Option<PathBuf>,
     #[serde(default)]
     pub custom_vkd3d_proton_path: Option<PathBuf>,
+    #[serde(default)]
+    pub force_wined3d: bool,
 }
 
 impl Default for GraphicsLayerConfig {
@@ -112,6 +114,7 @@ impl Default for GraphicsLayerConfig {
             custom_dxvk_path: None,
             custom_vkd3d_path: None,
             custom_vkd3d_proton_path: None,
+            force_wined3d: false,
         }
     }
 }
