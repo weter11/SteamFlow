@@ -2590,7 +2590,7 @@ impl eframe::App for SteamLauncher {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("📂  Open Config Folder").on_hover_text("Open application configuration directory").clicked() {
                                     if let Ok(dir) = crate::config::config_dir() {
-                                        let _ = webbrowser::open(&dir.to_string_lossy());
+                                        let _ = std::process::Command::new("xdg-open").arg(&dir).status().or_else(|_| std::process::Command::new("open").arg(&dir).status());
                                     }
                                 }
                             });

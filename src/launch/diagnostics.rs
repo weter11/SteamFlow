@@ -1,4 +1,7 @@
 //! Diagnostic capture utilities for Steam Runtime installation and repair.
+//
+// EXPERIMENTAL DIAGNOSTIC — This module is temporary and will be removed once
+// setupapi failure root-cause analysis is complete.
 //!
 //! This module provides a way to capture Wine traces and process output
 //! during the Master Steam installation flow. It is triggered by setting
@@ -6,9 +9,11 @@
 //!
 //! Configuration is loaded from `~/.config/SteamFlow/debug_parameters.json`.
 
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 use anyhow::{Result, Context};
 use crate::config::config_dir;
@@ -31,32 +36,35 @@ impl Default for DebugParameters {
     }
 }
 
-fn load_debug_parameters() -> DebugParameters {
-    let config_path = match config_dir() {
-        Ok(dir) => dir.join("debug_parameters.json"),
-        Err(_) => return DebugParameters::default(),
-    };
+fn load_debug_parameters() -> &'static DebugParameters {
+    static PARAMS: OnceLock<DebugParameters> = OnceLock::new();
+    PARAMS.get_or_init(|| {
+        let config_path = match config_dir() {
+            Ok(dir) => dir.join("debug_parameters.json"),
+            Err(_) => return DebugParameters::default(),
+        };
 
-    if !config_path.exists() {
-        return DebugParameters::default();
-    }
+        if !config_path.exists() {
+            return DebugParameters::default();
+        }
 
-    match std::fs::read_to_string(&config_path) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(params) => params,
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(params) => params,
+                Err(e) => {
+                    tracing::warn!("Failed to parse debug_parameters.json: {}. Using defaults.", e);
+                    DebugParameters::default()
+                }
+            },
             Err(e) => {
-                tracing::warn!("Failed to parse debug_parameters.json: {}. Using defaults.", e);
+                tracing::warn!("Failed to read debug_parameters.json: {}. Using defaults.", e);
                 DebugParameters::default()
             }
-        },
-        Err(e) => {
-            tracing::warn!("Failed to read debug_parameters.json: {}. Using defaults.", e);
-            DebugParameters::default()
         }
-    }
+    })
 }
 
-/// Applies diagnostic capture to the given command if opt-in flag is set.
+/// EXPERIMENTAL DIAGNOSTIC — temporary capture for Steam Runtime install root-cause analysis.
 ///
 /// Behavior:
 /// - Checks `STEAMFLOW_DIAGNOSE_INSTALL`. If not "1", returns `Ok(None)`.
@@ -87,6 +95,11 @@ pub fn apply_install_diagnostics(cmd: &mut Command) -> Result<Option<PathBuf>> {
 
     cmd.env("WINEDEBUG", &params.winedebug);
 
+    // Merge both stdout and stderr into a single File via dup'd fds.
+    // Both file descriptors refer to the same underlying file offset,
+    // so writes are serialized by the kernel's file position counter,
+    // preserving line-level atomicity per write(2) call.
+    // Wine line-buffers output, so this is safe in practice.
     let log_file_clone = log_file.try_clone()?;
     cmd.stdout(Stdio::from(log_file));
     cmd.stderr(Stdio::from(log_file_clone));
