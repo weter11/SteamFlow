@@ -1232,6 +1232,18 @@ impl SteamLauncher {
             changed = true;
         }
 
+        // Per-game runner override: allows using a different Compatibility Layer
+        // for this specific game without affecting other games or the Steam background runner.
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label("Compatibility Layer Override");
+        let mut game_runner = config.game_runner.clone().unwrap_or_default();
+        if ui.text_edit_singleline(&mut game_runner).changed() {
+            config.game_runner = if game_runner.trim().is_empty() { None } else { Some(game_runner.trim().to_string()) };
+            changed = true;
+        }
+        ui.label(egui::RichText::new("Leave empty to use the global Compatibility Layer setting.").weak());
+
         if changed {
             self.user_configs.insert(game.app_id, config);
             let store = self.user_configs.clone();

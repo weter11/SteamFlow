@@ -964,7 +964,16 @@ impl Runner for WineTkgRunner {
     async fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
-        let proton = if let Some(forced) = ctx.launcher_config
+        // Per-game runner override: if the user has set a specific Compatibility
+        // Layer for this game (e.g. CachyOS Proton), use it instead of the global
+        // proton_version setting. This allows wine-tkg for Steam background +
+        // CachyOS Proton for games in the same WINEPREFIX.
+        let effective_proton = if let Some(game_runner) = ctx.user_config.as_ref()
+            .and_then(|c| c.game_runner.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            game_runner
+        } else if let Some(forced) = ctx.launcher_config
             .game_configs
             .get(&ctx.app.app_id)
             .and_then(|c| c.forced_proton_version.as_ref())
@@ -975,7 +984,7 @@ impl Runner for WineTkgRunner {
                 .filter(|p| !p.is_empty())
                 .unwrap_or(ctx.launcher_config.proton_version.as_str())
         };
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let active_runner = crate::utils::resolve_runner(effective_proton, &library_root);
         let game_runner_kind = crate::utils::classify_runner(&active_runner);
         if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {
             return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Compatibility Layer path: {}", active_runner.display())));

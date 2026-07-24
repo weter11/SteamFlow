@@ -142,6 +142,12 @@ pub struct UserAppConfig {
     /// Per-game option: suppress Steam overlay for DX12 games where it causes black screens.
     #[serde(default)]
     pub dx12_suppress_overlay: bool,
+
+    /// Per-game override for the Compatibility Layer (runner) used to launch this game.
+    /// When set, this runner is used instead of the global proton_version setting.
+    /// Does not affect the Steam Runtime runner used for Windows Steam background.
+    #[serde(default)]
+    pub game_runner: Option<String>,
 }
 
 pub type UserConfigStore = HashMap<u32, UserAppConfig>;
@@ -161,6 +167,7 @@ impl Default for UserAppConfig {
             favorite: false,
             requires_steam_api: false,
             dx12_suppress_overlay: false,
+            game_runner: None,
         }
     }
 }
