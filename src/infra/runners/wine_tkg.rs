@@ -332,6 +332,21 @@ impl Runner for WineTkgRunner {
                         let steam_config_vdf = prefix_steam_dir.join("config/config.vdf");
                         let steam_logs_dir   = prefix_steam_dir.join("logs");
 
+                        // Steam readiness is NOT "a file appeared once". config.vdf is written
+                        // extremely early in boot (often within the first second on a cold
+                        // start), so treating its presence as "ready" produced false positives
+                        // ("Steam ready after 1s") while Steam was still initialising.
+                        //
+                        // Correct signal: the main Steam client process must be UP and stay up
+                        // for a sustained window (SUSTAINED_SECS). We watch for any of the
+                        // real "client reached main loop" markers (steam.pid / .steampath /
+                        // config.vdf) and only declare ready once that marker has been present
+                        // continuously for SUSTAINED_SECS while the process is still alive.
+                        // A process that crashes/restarts resets the timer, so crash loops are
+                        // never misread as "ready".
+                        const SUSTAINED_SECS: u64 = 6;
+                        let mut signal_first_seen: Option<std::time::Instant> = None;
+
                         let ready = 'wait: {
                             let mut signal_msg = None;
                             for i in 0..readiness_timeout {
@@ -351,39 +366,50 @@ impl Runner for WineTkgRunner {
                                     break 'wait false;
                                 }
 
-                                // Signal 1: pid file (some Wine/Steam combos do write this)
-                                if steam_pid_path.exists() {
-                                    signal_msg = Some(format!("steam.pid found after {}s", i + 1));
-                                    break;
+                                // Primary readiness markers: the main client process has
+                                // started (pid file, Proton .steampath pipe, or config.vdf).
+                                let signal_present =
+                                    steam_pid_path.exists() || steam_pipe.exists() || steam_config_vdf.exists();
+
+                                if signal_present {
+                                    match signal_first_seen {
+                                        None => {
+                                            signal_first_seen = Some(std::time::Instant::now());
+                                        }
+                                        Some(t0) => {
+                                            let elapsed = t0.elapsed().as_secs();
+                                            if elapsed >= SUSTAINED_SECS {
+                                                signal_msg = Some(format!(
+                                                    "Steam process stable for {}s (marker present since {}s)",
+                                                    SUSTAINED_SECS, i + 1
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Lost the marker (crashed / restarted) — restart the timer.
+                                    signal_first_seen = None;
                                 }
 
-                                // Signal 2: .steampath in temp (Proton-style)
-                                if steam_pipe.exists() {
-                                    signal_msg = Some(format!(".steampath found after {}s", i + 1));
-                                    break;
-                                }
-
-                                // Signal 3: config.vdf written — Steam has finished early init
-                                if steam_config_vdf.exists() {
-                                    signal_msg = Some(format!("config.vdf found after {}s", i + 1));
-                                    break;
-                                }
-
-                                // Signal 4: logs dir has multiple entries — Steam's subsystems are running
+                                // Secondary hint (NOT a trigger): subsystems logging.
                                 let log_count = std::fs::read_dir(&steam_logs_dir)
                                     .map(|d| d.count())
                                     .unwrap_or(0);
                                 if log_count >= 2 {
-                                    signal_msg = Some(format!("{} log files found after {}s", log_count, i + 1));
                                     unsafe {
                                         if !ctx.verification_ptr.is_null() {
-                                            (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_signal_observed".to_string();
+                                            (*ctx.verification_ptr).steam_runtime_milestone =
+                                                "steam_ready_signal_observed".to_string();
                                         }
                                     }
-                                    break;
                                 }
 
-                                println!("  Waiting... {}s", i + 1);
+                                println!(
+                                    "  Waiting... {}s (client marker: {})",
+                                    i + 1,
+                                    if signal_present { "present" } else { "absent" }
+                                );
                             }
 
                             if let Some(msg) = signal_msg {

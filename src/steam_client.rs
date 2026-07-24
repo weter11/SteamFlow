@@ -133,6 +133,12 @@ pub struct SteamClient {
     active_cm: Option<SocketAddr>,
     server_list: Option<ServerList>,
     pending_confirmations: Vec<ConfirmationPrompt>,
+    /// Set the moment we observe the CM connection drop (Steam resets the
+    /// WebSocket, or a heartbeat send fails with AlreadyClosed). A set value
+    /// means the held `connection` is a zombie and must be dropped + reconnected
+    /// before the next CM call, instead of being reused (which would otherwise
+    /// keep erroring with "Failed to send heartbeat: AlreadyClosed").
+    connection_dead_since: Option<Instant>,
 }
 
 impl SteamClient {
@@ -144,11 +150,15 @@ impl SteamClient {
             active_cm: None,
             server_list: None,
             pending_confirmations: Vec::new(),
+            connection_dead_since: None,
         })
     }
 
     pub fn is_authenticated(&self) -> bool {
-        self.connection.is_some()
+        // A connection marked dead (Steam reset the WebSocket / heartbeat failed with
+        // AlreadyClosed) is a zombie and must not be treated as usable; callers that
+        // hold &mut self should call connection_or_reconnect() to transparently recover.
+        self.connection.is_some() && self.connection_dead_since.is_none()
     }
 
     pub fn is_offline(&self) -> bool {
@@ -159,27 +169,45 @@ impl SteamClient {
         self.connection.as_ref()
     }
 
+    /// Mark the held CM connection as dead. Called when we observe a transport
+    /// reset (Steam rotates connection managers, or the WebSocket is closed with
+    /// ResetWithoutClosingHandshake / AlreadyClosed). The next guarded CM call
+    /// will drop the zombie handle and transparently reconnect.
+    pub fn mark_connection_dead(&mut self) {
+        if self.connection_dead_since.is_none() {
+            self.connection_dead_since = Some(Instant::now());
+        }
+        self.connection = None;
+    }
+
+    /// Return a live connection, transparently reconnecting if the previous one
+    /// was marked dead (Steam reset it). This prevents callers from reusing a
+    /// closed socket and stops the repeated "Failed to send heartbeat" spam.
+    pub async fn connection_or_reconnect(&mut self) -> Result<&Connection> {
+        if self.connection.is_none() {
+            self.connect().await?;
+        }
+        self.connection
+            .as_ref()
+            .context("steam connection not initialized")
+    }
+
     pub async fn logout(&mut self) -> Result<()> {
         self.connection = None;
+        self.connection_dead_since = None;
         self.state = LoginState::Connected;
         delete_session().await?;
         Ok(())
     }
 
     pub async fn get_app_ticket(&self, appid: u32) -> Result<Vec<u8>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        let connection = self.connection.as_ref().context("steam connection not initialized")?;
 
         let mut request = CMsgClientGetAppOwnershipTicket::new();
         request.set_app_id(appid);
 
         let response: steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse =
-            connection
-                .job(request)
-                .await
-                .context("failed requesting app ownership ticket")?;
+            connection.job(request).await.context("failed requesting app ownership ticket")?;
 
         let ticket = response.ticket().to_vec();
         if ticket.is_empty() {
@@ -292,6 +320,7 @@ impl SteamClient {
 
     pub fn invalidate_session(&mut self) {
         self.connection = None;
+        self.connection_dead_since = None;
         self.state = LoginState::Connected;
     }
 
