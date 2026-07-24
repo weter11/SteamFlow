@@ -162,13 +162,19 @@ impl Runner for WineTkgRunner {
                         let runner_canonical = runner_root.canonicalize().unwrap_or(runner_root);
 
                         if active_canonical != runner_canonical {
-                            return Err(LaunchError::new(
-                                LaunchErrorKind::Runner,
-                                format!(
-                                    "A wineserver is already running in this prefix using a different runtime ({:?}). Stop all running games and Wine processes before launching with a different Proton/Wine version, or enable per-game prefix mode.",
-                                    active_canonical
-                                )
-                            ));
+                            // A wineserver from a DIFFERENT runner is locked into this
+                            // prefix. If we launch anyway we get the classic
+                            // "wine client error: version mismatch ... wineserver is still running".
+                            // The correct fix (what Proton/Steam do) is to terminate the
+                            // stale server and let the new runner start its own. This is safe
+                            // because a server for another runner cannot serve this launch.
+                            tracing::warn!(
+                                "Stale wineserver (different runner {:?}) detected in prefix {}. Terminating it before launch.",
+                                active_canonical, steam_wineprefix.display()
+                            );
+                            crate::utils::kill_all_wine_in_prefix(&steam_wineprefix);
+                            // Give the old server a moment to release the prefix lock.
+                            std::thread::sleep(std::time::Duration::from_millis(500));
                         }
                     }
 
@@ -654,93 +660,96 @@ impl Runner for WineTkgRunner {
         if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {
             return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Compatibility Layer path: {}", active_runner_path.display())));
         }
-        // === Steam SDK shim repair ===
+        // === Steam SDK shim repair (SAFE) ===
         // Some games ship a broken/corrupt libsteam_api.so (observed: all-zero file,
-        // e.g. "An Arcade Full of Cats", AppID 2368470) which the dynamic loader rejects
-        // with "invalid ELF header" and aborts the launch. If the game's own libsteam_api.so
-        // is missing or not a valid ELF, repair it from the bundled Steam SDK shipped with the
-        // active compatibility layer (files/lib64 for 64-bit, files/lib for 32-bit).
+        // e.g. "An Arcade Full of Cats", AppID 2368470). That makes the dynamic loader
+        // reject it with "invalid ELF header" and abort the launch.
+        //
+        // CRITICAL: libsteam_api.so is the Steamworks SDK redist and is ABI/version
+        // specific to the game's build. Blindly copying ANY other libsteam_api.so
+        // (e.g. one bundled with a Proton layer) causes symbol mismatches such as
+        // "undefined symbol: SteamInternal_SteamAPI_Init" and still breaks the game.
+        //
+        // Therefore we ONLY repair when a candidate is BOTH a valid ELF AND exports the
+        // exact symbol the game imports. If no compatible shim exists, we remove the
+        // corrupt file and emit a clear error telling the user to Verify/Reinstall the
+        // game's files (the only correct source of the right SDK).
         {
-            let runner_root = crate::utils::derive_runner_root(&active_runner_path);
             let game_lib = game_working_dir.join("libsteam_api.so");
             let is_corrupt = if game_lib.exists() {
-                // A valid ELF starts with the magic bytes 0x7f 'E' 'L' 'F'.
                 std::fs::read(&game_lib).map(|b| b.len() < 4 || &b[0..4] != b"\x7fELF").unwrap_or(true)
             } else {
-                true
+                false
             };
+
             if is_corrupt {
-                let arch = match ctx.target_architecture {
-                    crate::models::ExecutableArchitecture::X86 => "lib",
-                    _ => "lib64",
+                // The symbol a native Linux Steamworks game imports from its shim.
+                let needed_symbol = "SteamInternal_SteamAPI_Init";
+
+                let mut sdk_candidates: Vec<PathBuf> = Vec::new();
+                if let Some(steam_dir) = crate::config::get_steam_root_hint() {
+                    let mut scan = |dir: &Path| {
+                        if let Ok(entries) = std::fs::read_dir(dir) {
+                            for entry in entries.flatten() {
+                                for cand in [
+                                    entry.path().join("files/lib64/libsteam_api.so"),
+                                    entry.path().join("files/lib/libsteam_api.so"),
+                                    entry.path().join("dist/lib64/libsteam_api.so"),
+                                    entry.path().join("dist/lib/libsteam_api.so"),
+                                ] {
+                                    if cand.exists() {
+                                        sdk_candidates.push(cand);
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    scan(&steam_dir.join("compatibilitytools.d"));
+                    scan(&steam_dir.join("steamapps/common"));
+                }
+
+                // A candidate is acceptable only if it is a valid ELF AND exports the
+                // exact symbol the game needs. Without symbol verification we would
+                // reintroduce the ABI-mismatch crash.
+                let exports_symbol = |cand: &Path, symbol: &str| -> bool {
+                    std::process::Command::new("readelf")
+                        .args(["-sW", cand.to_str().unwrap_or("")])
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .map(|out| out.contains(symbol))
+                        .unwrap_or(false)
                 };
-                // Candidate sources, in priority order:
-                //   1. The active runner's bundled Steam SDK (files/<arch> or dist/<arch>).
-                //   2. Any other installed Proton/compat-tool runner under the Steam compat dir.
-                //   3. The native Linux Steam client SDK shim (steamapps/common/Proton */files/<arch>).
-                let mut sdk_candidates: Vec<PathBuf> = vec![
-                    runner_root.join(format!("files/{}/libsteam_api.so", arch)),
-                    runner_root.join(format!("dist/{}/libsteam_api.so", arch)),
-                    runner_root.join("files/lib64/libsteam_api.so"),
-                    runner_root.join("files/lib/libsteam_api.so"),
-                ];
-
-                // Best-effort: walk the Steam compatibilitytools.d directory.
-                if let Some(steam_dir) = crate::config::get_steam_root_hint() {
-                    let compat_tools = steam_dir.join("compatibilitytools.d");
-                    if let Ok(entries) = std::fs::read_dir(&compat_tools) {
-                        for entry in entries.flatten() {
-                            let rt = entry.path();
-                            for cand in [
-                                rt.join(format!("files/{}/libsteam_api.so", arch)),
-                                rt.join(format!("dist/{}/libsteam_api.so", arch)),
-                                rt.join("files/lib64/libsteam_api.so"),
-                                rt.join("files/lib/libsteam_api.so"),
-                            ] {
-                                if cand.exists() {
-                                    sdk_candidates.push(cand);
-                                }
-                            }
-                        }
-                    }
-                }
-                // Fallback to native Steam client SDK shims discovered in steamapps/common.
-                if let Some(steam_dir) = crate::config::get_steam_root_hint() {
-                    let common = steam_dir.join("steamapps/common");
-                    if let Ok(entries) = std::fs::read_dir(&common) {
-                        for entry in entries.flatten() {
-                            for cand in [
-                                entry.path().join(format!("files/{}/libsteam_api.so", arch)),
-                                entry.path().join(format!("dist/{}/libsteam_api.so", arch)),
-                            ] {
-                                if cand.exists() {
-                                    sdk_candidates.push(cand);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Only copy from a candidate whose existing bytes are a valid ELF.
                 let valid_src = sdk_candidates.iter().find(|p| {
-                    std::fs::read(p).map(|b| b.len() >= 4 && &b[0..4] == b"\x7fELF").unwrap_or(false)
+                    std::fs::read(p)
+                        .map(|b| b.len() >= 4 && &b[0..4] == b"\x7fELF")
+                        .unwrap_or(false)
+                        && exports_symbol(p, needed_symbol)
                 });
-                if let Some(src) = valid_src {
-                    match std::fs::copy(src, &game_lib) {
-                        Ok(_) => tracing::warn!(
-                            "Repaired corrupt/missing libsteam_api.so for game {} from {}",
-                            ctx.app.app_id, src.display()
-                        ),
-                        Err(e) => tracing::error!(
-                            "Failed to repair libsteam_api.so for game {} from {}: {}",
-                            ctx.app.app_id, src.display(), e
-                        ),
+
+                match valid_src {
+                    Some(src) => {
+                        if let Err(e) = std::fs::copy(src, &game_lib) {
+                            tracing::error!(
+                                "Failed to repair libsteam_api.so for game {} from {}: {}",
+                                ctx.app.app_id, src.display(), e
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Repaired corrupt libsteam_api.so for game {} from {}",
+                                ctx.app.app_id, src.display()
+                            );
+                        }
                     }
-                } else {
-                    tracing::error!(
-                        "Game {} needs libsteam_api.so but it is missing/corrupt and no valid Steam SDK shim could be located on this system.                          The launch will fail with 'invalid ELF header'. Install a Proton/compat layer that bundles libsteam_api.so, or verify/reinstall the game.",
-                        ctx.app.app_id
-                    );
+                    None => {
+                        // No ABI-compatible shim: remove the corrupt file and tell the
+                        // user the only correct fix is to Verify/Reinstall game files.
+                        let _ = std::fs::remove_file(&game_lib);
+                        tracing::error!(
+                            "Game {} ships a corrupt libsteam_api.so and no ABI-compatible Steamworks SDK shim was found on this system.                              The launch will fail. Fix: in Steam, right-click the game -> Properties -> Installed Files -> 'Verify integrity of game files' (or reinstall).                              This restores the exact libsteam_api.so the game was built against.",
+                            ctx.app.app_id
+                        );
+                    }
                 }
             }
         }

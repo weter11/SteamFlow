@@ -90,6 +90,12 @@ pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
     std::fs::create_dir_all(&steam_cfg.wine_prefix)
         .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
 
+    // Kill any wineserver already locked into this prefix under a DIFFERENT runner.
+    // Mixing runners in one WINEPREFIX produces the classic
+    // "wine client error: version mismatch ... your wine binary was not upgraded correctly"
+    // because the new wine64 and the old wineserver disagree on the pipe protocol.
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
     cmd.arg("control.exe");
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
     cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
