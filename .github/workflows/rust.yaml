@@ -66,3 +66,6 @@ jobs:
     # Set to 'runs-on: ubuntu-24.04' and restore steps to re-enable Linux builds.
     runs-on: ubuntu-24.04
     if: false  # Explicitly disabled until native Linux build is properly separated
+    steps:
+      - name: No-op
+        run: echo "Windows build disabled"
