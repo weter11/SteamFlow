@@ -413,9 +413,22 @@ impl Runner for WineTkgRunner {
             .or_else(|| executable.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| install_dir.clone());
 
-        let app_id_str = ctx.app.app_id.to_string();
-        let app_id_path = game_working_dir.join("steam_appid.txt");
-        let _ = std::fs::write(&app_id_path, &app_id_str);
+        // Only write steam_appid.txt when the Windows Steam Runtime is actually in use.
+        // When the runtime is Disabled, writing it (and exposing STEAM_COMPAT_CLIENT_INSTALL_PATH
+        // in build_env) makes DRM-free games such as Amnesia: The Dark Descent (AppID 57300) try to
+        // init Steam and fail with "could not init steam", even though they don't need it.
+        let runtime_active_for_appid = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
+            Some(crate::models::SteamRuntimePolicy::Enabled) => true,
+            Some(crate::models::SteamRuntimePolicy::Disabled) => false,
+            Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+                ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false)
+            }
+        };
+        if runtime_active_for_appid {
+            let app_id_str = ctx.app.app_id.to_string();
+            let app_id_path = game_working_dir.join("steam_appid.txt");
+            let _ = std::fs::write(&app_id_path, &app_id_str);
+        }
 
         Ok(())
     }
@@ -467,22 +480,16 @@ impl Runner for WineTkgRunner {
 
         if effective_steam_runtime_for_gate {
             let master_steam_cfg = crate::utils::get_master_steam_config();
-            let steam_wineprefix = &master_steam_cfg.wine_prefix;
-            let steam_is_running = SteamClient::is_steam_running_in_prefix(steam_wineprefix);
+            let steam_wineprefix = master_steam_cfg.wine_prefix.clone();
+            let steam_is_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix);
 
             if !steam_is_running {
                 tracing::warn!(
-                    "Windows Steam Runtime is {:?} but Steam is not running in prefix {}.                      Game {} may fail if it requires Steam API (Steamworks).",
+                    "Windows Steam Runtime is {:?} but Steam is not running in prefix {}. Game {} may fail if it requires Steam API (Steamworks).",
                     steam_runtime_policy,
                     steam_wineprefix.display(),
                     ctx.app.app_id
                 );
-                if game_requires_steam_api {
-                    tracing::warn!(
-                        "Per-game setting: game {} has 'Requires Steam API' enabled.                          Ensure 'Use Windows Steam Runtime' is set to Enabled in Settings.",
-                        ctx.app.app_id
-                    );
-                }
             }
         }
 
@@ -528,29 +535,39 @@ impl Runner for WineTkgRunner {
             || dx12_requires_overlay_suppress;
 
 
-        // lsteamclient.dll pre-launch check: detect missing Steam files in prefix.
-        // Both AppID 2368470 and 57300 fail because lsteamclient.dll cannot be loaded
-        // when Windows Steam is not properly installed/running in the prefix.
-        // Check 1: Steam files present in prefix
-        // Check 2: Steam process running in prefix
-        // Check 3: If game requires Steam API, gate launch until both are satisfied.
-        let steam_appid_path = effective_game_prefix.join("drive_c/Program Files (x86)/Steam/steam_appid.txt");
-        let has_steam_files = steam_appid_path.exists();
-        let _ = steam_appid_path;
+        // Steamworks readiness gate (runs only when Windows Steam Runtime is required).
+        // This diagnoses the "lsteamclient.dll cannot be loaded" class of failures that hit
+        // Steamworks games such as An Arcade Full of Cats (AppID 2368470). It does NOT block
+        // the launch \u2014 it surfaces a clear, actionable warning so the user knows Windows
+        // Steam must be installed/running, rather than getting a silent "SteamAPI Initialization Failed".
+        if effective_steam_runtime_for_gate {
+            let master_steam_cfg = crate::utils::get_master_steam_config();
+            let steam_wineprefix = master_steam_cfg.wine_prefix.clone();
 
-        let master_steam_cfg = crate::utils::get_master_steam_config();
-        let steam_running_in_prefix = SteamClient::is_steam_running_in_prefix(&master_steam_cfg.wine_prefix);
+            // A real Windows Steam install always ships lsteamclient.dll in its install dir.
+            let steam_exe_dir = master_steam_cfg.steam_exe
+                .as_ref()
+                .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+            let has_lsteamclient = steam_exe_dir
+                .as_ref()
+                .map(|d| d.join("lsteamclient.dll").exists() || d.join("lsteamclient64.dll").exists())
+                .unwrap_or(false);
+            let steam_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix);
 
-        if !has_steam_files || !steam_running_in_prefix {
-            tracing::warn!(
-                "Windows Steam is not properly set up in prefix {}: has_steam_files={}, steam_running={}.                  Games requiring Steamworks (lsteamclient.dll) will fail to launch.",
-                effective_game_prefix.display(), has_steam_files, steam_running_in_prefix
-            );
-            if ctx.user_config.as_ref().map(|c| c.requires_steam_api).unwrap_or(false) {
-                tracing::error!(
-                    "Game {} has 'requires_steam_api' set to true but Steam is not available in prefix.                      Either: (a) run Windows Steam in the prefix first, (b) verify Steam installation,                      or (c) disable 'Requires Steam API' in per-game settings.",
-                    ctx.app.app_id
+            if !has_lsteamclient || !steam_running {
+                tracing::warn!(
+                    "Steamworks game {} may fail: Windows Steam not fully ready in prefix {} (lsteamclient present={}, running={}).",
+                    ctx.app.app_id,
+                    steam_wineprefix.display(),
+                    has_lsteamclient,
+                    steam_running,
                 );
+                if game_requires_steam_api {
+                    tracing::error!(
+                        "Game {} has 'Requires Steam API' enabled but Windows Steam is not available.                          Install/run Windows Steam (Settings -> 'Install / Manage Windows Steam Runtime')                          or set 'Use Windows Steam Runtime' to Enabled before launching.",
+                        ctx.app.app_id
+                    );
+                }
             }
         }
 
@@ -639,7 +656,10 @@ impl Runner for WineTkgRunner {
         let effective_dxvk = glc.dxvk_enabled || policy_dxvk;
 
         // If user explicitly selected WineD3D and didn't force DXVK, we use builtins.
-        let force_builtin_d3d = force_builtin && !effective_dxvk;
+        // force_wined3d (per-game "Force WineD3D") forces built-in D3D regardless of
+        // policy so DXVK/VKD3D are fully bypassed — needed for games like Amnesia that
+        // crash with DXVK or that only ship 32-bit binaries.
+        let force_builtin_d3d = (force_builtin || force_wined3d) && !effective_dxvk;
 
         // 2. Resolve DX12 policy (D3D12ProviderPolicy) - CONSERVATIVE
         let (policy_vkd3dp, policy_vkd3dw) = match glc.d3d12_policy {
@@ -649,8 +669,8 @@ impl Runner for WineTkgRunner {
             crate::models::D3D12ProviderPolicy::Vkd3dWine => (false, true),
         };
         // Manual overrides take precedence
-        let effective_vkd3d_proton = glc.vkd3d_proton_enabled || policy_vkd3dp;
-        let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
+        let effective_vkd3d_proton = (glc.vkd3d_proton_enabled || policy_vkd3dp) && !force_wined3d;
+        let effective_vkd3d = (glc.vkd3d_enabled || policy_vkd3dw) && !force_wined3d;
 
         // vkd3d-proton fallback: if VKD3D-Proton is requested but not
         // available in the runner, fall back to upstream VKD3D (Wine).
@@ -902,6 +922,8 @@ impl Runner for WineTkgRunner {
                     }
                 }
             } else {
+                // steam_exe present but per-game path is missing: fall back to a fake trap so the
+                // game still sees a Steam client path without crashing the launch wiring.
                 let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
                 let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
                     .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, "failed to setup fake steam trap").with_source(e))?;
@@ -915,15 +937,19 @@ impl Runner for WineTkgRunner {
                 }
             }
         } else {
-            let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
-            let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
-                .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, "failed to setup fake steam trap").with_source(e))?;
-            env.insert("STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(), fake_env.to_string_lossy().to_string());
+            // Windows Steam Runtime is Disabled: do NOT expose any Steam client path.
+            // A fake trap still makes DRM-free games (e.g. Amnesia: The Dark Descent, AppID 57300)
+            // attempt Steam init and fail with "could not init steam". Leaving the var unset lets
+            // them run standalone as the developer intended.
+            tracing::info!(
+                "Windows Steam Runtime disabled for game {} — not exposing STEAM_COMPAT_CLIENT_INSTALL_PATH",
+                ctx.app.app_id
+            );
             unsafe {
                 if !ctx.verification_ptr.is_null() {
                     let v = &mut *ctx.verification_ptr;
-                    v.steam_client_install_path_exposed_to_game = Some(fake_env.to_string_lossy().to_string());
-                    v.steam_client_install_path_source = Some("fake_trap".to_string());
+                    v.steam_client_install_path_exposed_to_game = None;
+                    v.steam_client_install_path_source = Some("none_disabled".to_string());
                 }
             }
         }

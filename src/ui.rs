@@ -1550,6 +1550,9 @@ impl SteamLauncher {
                 if ui.checkbox(&mut glc.nvapi_enabled, "Enable NVAPI").on_hover_text("Expose NVIDIA API to the game (requires runner support).").changed() {
                     gl_changed = true;
                 }
+                if ui.checkbox(&mut glc.force_wined3d, "Force WineD3D (disable DXVK/VKD3D)").on_hover_text("Use Wine's built-in OpenGL/D3D translation instead of DXVK/VKD3D. Useful for older games (e.g. Amnesia) that crash with DXVK, or for 32-bit-only titles that lack 64-bit driver support.").changed() {
+                    gl_changed = true;
+                }
             });
 
             if gl_changed {
@@ -3059,7 +3062,21 @@ impl eframe::App for SteamLauncher {
                                     }
 
                                     ui.vertical(|ui| {
-                                        ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
+                                        ui.horizontal(|ui| {
+                                            ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if let Some(install_path) = game.install_path.as_ref() {
+                                                    let path = std::path::PathBuf::from(install_path);
+                                                    if ui.add(egui::Button::new("📁").corner_radius(6.0).min_size(egui::vec2(28.0, 28.0)))
+                                                        .on_hover_text("Open game install folder")
+                                                        .clicked()
+                                                    {
+                                                        let _ = std::process::Command::new("xdg-open").arg(&path).status()
+                                                            .or_else(|_| std::process::Command::new("open").arg(&path).status());
+                                                    }
+                                                }
+                                            });
+                                        });
                                         ui.label(format!("AppID: {}", game.app_id));
 
                                         ui.add_space(20.0);
