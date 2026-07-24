@@ -1212,6 +1212,26 @@ impl SteamLauncher {
             }
         });
 
+        // Per-game: requires Steam API (informational — does not override global "Use Windows Steam Runtime")
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label("Game Requirements");
+        let mut requires_steam = config.requires_steam_api;
+        if ui.checkbox(&mut requires_steam, "Requires Steam API (Steamworks)").clicked() {
+            config.requires_steam_api = requires_steam;
+            changed = true;
+        }
+        if config.requires_steam_api {
+            ui.label("Steam API will be needed — ensure Windows Steam Runtime is enabled in Settings.");
+        }
+
+        // Per-game: DX12 overlay suppression
+        let mut dx12_suppress = config.dx12_suppress_overlay;
+        if ui.checkbox(&mut dx12_suppress, "Suppress overlay for DX12 games (prevent black screen)").clicked() {
+            config.dx12_suppress_overlay = dx12_suppress;
+            changed = true;
+        }
+
         if changed {
             self.user_configs.insert(game.app_id, config);
             let store = self.user_configs.clone();

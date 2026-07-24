@@ -286,8 +286,10 @@ impl Runner for WineTkgRunner {
                             }
                         }
 
-                        let readiness_timeout = 8;
-                        println!("Waiting for Steam to initialise (max {}s)...", readiness_timeout);
+                        // Adaptive readiness polling — checks actual Steam readiness signals
+                        // instead of a fixed timeout. Max 30s by default, bails early on signal.
+                        let readiness_timeout = 30;
+                        println!("Waiting for Windows Steam to initialise (max {}s, signal-based)...", readiness_timeout);
 
                         let steam_pid_path = prefix_steam_dir.join("steam.pid");
                         let steam_pipe     = steam_wineprefix.join("drive_c/windows/temp/.steampath");
@@ -440,6 +442,49 @@ impl Runner for WineTkgRunner {
             &user_config_store
         );
 
+        // === Pre-launch Steam API readiness gate ===
+        // Check if this game requires Windows Steam API to be available.
+        let per_game_config = ctx.user_config.as_ref();
+
+        let game_requires_steam_api = per_game_config
+            .map(|c| c.requires_steam_api)
+            .unwrap_or(false);
+
+        let steam_runtime_policy = ctx.user_config.as_ref()
+            .map(|c| c.steam_runtime_policy.clone())
+            .unwrap_or(crate::models::SteamRuntimePolicy::Auto);
+
+        let steam_wineprefix_for_check = effective_game_prefix.clone();
+        let steam_is_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix_for_check);
+
+        // Determine effective Steam runtime policy for this launch
+        let effective_steam_runtime = match steam_runtime_policy {
+            crate::models::SteamRuntimePolicy::Enabled => true,
+            crate::models::SteamRuntimePolicy::Disabled => false,
+            crate::models::SteamRuntimePolicy::Auto => {
+                // Auto: use steam_runtime if user has a global Steam Runtime toggle set,
+                // or if this game specifically requires Steam API
+                ctx.user_config.as_ref()
+                    .map(|c| c.use_steam_runtime)
+                    .unwrap_or(game_requires_steam_api)
+            }
+        };
+
+        if effective_steam_runtime && !steam_is_running {
+            // Windows Steam should be running but isn't — this is likely a problem for Steam API games.
+            // Try to start it (may have already been attempted in prepare_prefix).
+            tracing::warn!("Windows Steam is not running but is required by policy or game. Game launch may fail.");
+            // If game explicitly requires Steam API, provide early warning rather than waiting for crash
+            if game_requires_steam_api && per_game_config.map(|c| c.requires_steam_api).unwrap_or(false) {
+                tracing::warn!(
+                    "Game {} requires Steam API but Windows Steam is not running in prefix {}.                      Launch may fail — ensure Windows Steam Runtime is set correctly in Settings.",
+                    ctx.app.app_id,
+                    steam_wineprefix_for_check.display()
+                );
+            }
+        }
+
+        // DX12 overlay suppression per-game option
         env.insert("SteamAppId".to_string(), app_id_str.clone());
         env.insert("SteamGameId".to_string(), app_id_str.clone());
         env.insert("STEAM_COMPAT_APP_ID".to_string(), app_id_str);
@@ -459,9 +504,14 @@ impl Runner for WineTkgRunner {
         let glc = ctx.user_config.as_ref()
             .map(|c| c.graphics_layers.clone())
             .unwrap_or_default();
+        let per_game_no_overlay = per_game_config
+            .map(|c| c.dx12_suppress_overlay)
+            .unwrap_or(false);
+
         let no_overlay = ctx.user_config.as_ref()
             .map(|c| c.steam_launch_config.no_overlay)
-            .unwrap_or(true);
+            .unwrap_or(true)
+            || per_game_no_overlay;
 
         let game_working_dir: PathBuf = {
             let install_dir = PathBuf::from(

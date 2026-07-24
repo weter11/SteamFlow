@@ -9,7 +9,6 @@
 //!
 //! Configuration is loaded from `~/.config/SteamFlow/debug_parameters.json`.
 
-use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::fs::File;
 use std::path::PathBuf;

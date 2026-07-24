@@ -116,7 +116,7 @@ impl Default for GraphicsLayerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAppConfig {
     pub launch_options: String,                 // e.g. "-novid -console"
     pub env_variables: HashMap<String, String>, // e.g. {"MANGOHUD": "1"}
@@ -133,9 +133,37 @@ pub struct UserAppConfig {
     pub gpu_preference: Option<String>,
     pub hidden: bool,   // Future use
     pub favorite: bool, // Future use
+
+    /// Per-game flag: this game requires Windows Steam to be running for Steam API access.
+    /// Shown as informational indicator — does not override the global `Use Windows Steam Runtime` setting.
+    #[serde(default)]
+    pub requires_steam_api: bool,
+
+    /// Per-game option: suppress Steam overlay for DX12 games where it causes black screens.
+    #[serde(default)]
+    pub dx12_suppress_overlay: bool,
 }
 
 pub type UserConfigStore = HashMap<u32, UserAppConfig>;
+
+impl Default for UserAppConfig {
+    fn default() -> Self {
+        Self {
+            launch_options: String::new(),
+            env_variables: HashMap::new(),
+            use_steam_runtime: false,
+            steam_runtime_policy: SteamRuntimePolicy::Auto,
+            steam_prefix_mode: SteamPrefixMode::Shared,
+            steam_launch_config: SteamLaunchConfig::default(),
+            graphics_layers: GraphicsLayerConfig::default(),
+            gpu_preference: None,
+            hidden: false,
+            favorite: false,
+            requires_steam_api: false,
+            dx12_suppress_overlay: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionState {
