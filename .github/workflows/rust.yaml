@@ -60,21 +60,21 @@ jobs:
           path: target/debian/*.deb
           archive: false
 
-  steamflow-windows:
-    runs-on: windows-latest
+//  steamflow-windows:
+//    runs-on: windows-latest
 
-    steps:
-      - uses: actions/checkout@v6
+//    steps:
+//      - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+//      - name: Install Rust toolchain
+//        uses: dtolnay/rust-toolchain@stable
 
-      - name: Build SteamFlow (release)
-        run: cargo build --release
+//      - name: Build SteamFlow (release)
+//        run: cargo build --release
 
-      - name: Upload Windows binary
-        uses: actions/upload-artifact@v7
-        with:
-          name: steamflow-windows
-          path: target/release/steamflow.exe
-          archive: false
+//      - name: Upload Windows binary
+//        uses: actions/upload-artifact@v7
+//        with:
+//          name: steamflow-windows
+//          path: target/release/steamflow.exe
+//          archive: false
