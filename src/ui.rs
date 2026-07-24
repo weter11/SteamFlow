@@ -1212,6 +1212,26 @@ impl SteamLauncher {
             }
         });
 
+        // Per-game: requires Steam API (informational — does not override global "Use Windows Steam Runtime")
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label("Game Requirements");
+        let mut requires_steam = config.requires_steam_api;
+        if ui.checkbox(&mut requires_steam, "Requires Steam API (Steamworks)").clicked() {
+            config.requires_steam_api = requires_steam;
+            changed = true;
+        }
+        if config.requires_steam_api {
+            ui.label("Steam API will be needed — ensure Windows Steam Runtime is enabled in Settings.");
+        }
+
+        // Per-game: DX12 overlay suppression
+        let mut dx12_suppress = config.dx12_suppress_overlay;
+        if ui.checkbox(&mut dx12_suppress, "Suppress overlay for DX12 games (prevent black screen)").clicked() {
+            config.dx12_suppress_overlay = dx12_suppress;
+            changed = true;
+        }
+
         if changed {
             self.user_configs.insert(game.app_id, config);
             let store = self.user_configs.clone();
@@ -2585,7 +2605,16 @@ impl eframe::App for SteamLauncher {
                 .min_width(320.0)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.heading("Library");
+                        ui.horizontal(|ui| {
+                            ui.heading("Library");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("📂  Open Config Folder").on_hover_text("Open application configuration directory").clicked() {
+                                    if let Ok(dir) = crate::config::config_dir() {
+                                        let _ = std::process::Command::new("xdg-open").arg(&dir).status().or_else(|_| std::process::Command::new("open").arg(&dir).status());
+                                    }
+                                }
+                            });
+                        });
                         ui.label("Steam Library Path");
                         ui.text_edit_singleline(&mut self.launcher_config.steam_library_path);
 

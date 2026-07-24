@@ -286,8 +286,10 @@ impl Runner for WineTkgRunner {
                             }
                         }
 
-                        let readiness_timeout = 8;
-                        println!("Waiting for Steam to initialise (max {}s)...", readiness_timeout);
+                        // Adaptive readiness polling — checks actual Steam readiness signals
+                        // instead of a fixed timeout. Max 30s by default, bails early on signal.
+                        let readiness_timeout = 30;
+                        println!("Waiting for Windows Steam to initialise (max {}s, signal-based)...", readiness_timeout);
 
                         let steam_pid_path = prefix_steam_dir.join("steam.pid");
                         let steam_pipe     = steam_wineprefix.join("drive_c/windows/temp/.steampath");
@@ -440,6 +442,62 @@ impl Runner for WineTkgRunner {
             &user_config_store
         );
 
+        // === Pre-launch Steam API readiness check ===
+        // If Windows Steam Runtime is required for this launch, verify Steam is available
+        // (either already running or needs to be started). This gate runs BEFORE the game
+        // spawns so the user gets a clear warning rather than a silent crash with
+        // "SteamAPI Initialization Failed" in the logs.
+        let game_requires_steam_api = ctx.user_config.as_ref()
+            .map(|c| c.requires_steam_api)
+            .unwrap_or(false);
+
+        let steam_runtime_policy = ctx.user_config.as_ref()
+            .map(|c| c.steam_runtime_policy.clone())
+            .unwrap_or(crate::models::SteamRuntimePolicy::Auto);
+
+        let effective_steam_runtime_for_gate = match steam_runtime_policy {
+            crate::models::SteamRuntimePolicy::Enabled => true,
+            crate::models::SteamRuntimePolicy::Disabled => false,
+            crate::models::SteamRuntimePolicy::Auto => {
+                ctx.user_config.as_ref()
+                    .map(|c| c.use_steam_runtime)
+                    .unwrap_or(game_requires_steam_api)
+            }
+        };
+
+        if effective_steam_runtime_for_gate {
+            let master_steam_cfg = crate::utils::get_master_steam_config();
+            let steam_wineprefix = &master_steam_cfg.wine_prefix;
+            let steam_is_running = SteamClient::is_steam_running_in_prefix(steam_wineprefix);
+
+            if !steam_is_running {
+                tracing::warn!(
+                    "Windows Steam Runtime is {:?} but Steam is not running in prefix {}.                      Game {} may fail if it requires Steam API (Steamworks).",
+                    steam_runtime_policy,
+                    steam_wineprefix.display(),
+                    ctx.app.app_id
+                );
+                if game_requires_steam_api {
+                    tracing::warn!(
+                        "Per-game setting: game {} has 'Requires Steam API' enabled.                          Ensure 'Use Windows Steam Runtime' is set to Enabled in Settings.",
+                        ctx.app.app_id
+                    );
+                }
+            }
+        }
+
+        // DX12 overlay auto-suppression: when VKD3D is active (DX12 → Vulkan),
+        // Steam overlay causes black screens in most modern DX12 games.
+        // Auto-suppress unless the user has explicitly disabled no_overlay globally.
+        let glc = ctx.user_config.as_ref()
+            .map(|c| c.graphics_layers.clone())
+            .unwrap_or_default();
+        let dx12_requires_overlay_suppress = matches!(
+            glc.d3d12_policy,
+            crate::models::D3D12ProviderPolicy::Vkd3dProton |
+            crate::models::D3D12ProviderPolicy::Vkd3dWine
+        );
+
         env.insert("SteamAppId".to_string(), app_id_str.clone());
         env.insert("SteamGameId".to_string(), app_id_str.clone());
         env.insert("STEAM_COMPAT_APP_ID".to_string(), app_id_str);
@@ -459,9 +517,15 @@ impl Runner for WineTkgRunner {
         let glc = ctx.user_config.as_ref()
             .map(|c| c.graphics_layers.clone())
             .unwrap_or_default();
+        let dx12_suppress = ctx.user_config.as_ref()
+            .map(|c| c.dx12_suppress_overlay)
+            .unwrap_or(false);
+
         let no_overlay = ctx.user_config.as_ref()
             .map(|c| c.steam_launch_config.no_overlay)
-            .unwrap_or(true);
+            .unwrap_or(true)
+            || dx12_suppress
+            || dx12_requires_overlay_suppress;
 
         let game_working_dir: PathBuf = {
             let install_dir = PathBuf::from(

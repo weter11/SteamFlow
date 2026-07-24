@@ -7,7 +7,8 @@ pub struct BuildEnvironmentStage;
 impl PipelineStage for BuildEnvironmentStage {
     fn name(&self) -> &str { "BuildEnvironment" }
     async fn execute(&self, _ctx: &mut PipelineContext) -> std::result::Result<(), LaunchError> {
-        // Currently build_env is called internally by build_command in Runner
+        // Environment is built inside Runner::build_env(). This stage exists for
+        // future expansion (e.g. pre-launch Steam readiness gate, DX12 detection).
         Ok(())
     }
 }
