@@ -428,6 +428,19 @@ impl Runner for WineTkgRunner {
             let app_id_str = ctx.app.app_id.to_string();
             let app_id_path = game_working_dir.join("steam_appid.txt");
             let _ = std::fs::write(&app_id_path, &app_id_str);
+        } else {
+            // Runtime disabled: also remove any steam_appid.txt left behind by a previous
+            // launch. Steam's steam_api reads this file from the working directory and will
+            // attempt to init Steam even when the env vars are absent, so a stale artifact
+            // makes DRM-free games (e.g. Amnesia, AppID 57300) fail with "could not init steam".
+            let stale = game_working_dir.join("steam_appid.txt");
+            if stale.exists() {
+                let _ = std::fs::remove_file(&stale);
+                tracing::info!(
+                    "Removed stale steam_appid.txt from {} (Windows Steam Runtime disabled)",
+                    stale.display()
+                );
+            }
         }
 
         Ok(())
@@ -505,9 +518,22 @@ impl Runner for WineTkgRunner {
             crate::models::D3D12ProviderPolicy::Vkd3dWine
         );
 
-        env.insert("SteamAppId".to_string(), app_id_str.clone());
-        env.insert("SteamGameId".to_string(), app_id_str.clone());
-        env.insert("STEAM_COMPAT_APP_ID".to_string(), app_id_str);
+        // Only expose Steam identity vars when the Windows Steam Runtime is actually in use.
+        // When the runtime is Disabled, leaving these set (in addition to steam_appid.txt /
+        // STEAM_COMPAT_CLIENT_INSTALL_PATH) makes DRM-free games such as Amnesia: The Dark Descent
+        // (AppID 57300) attempt to initialize Steam and fail with "could not init steam".
+        let runtime_active_for_env = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
+            Some(crate::models::SteamRuntimePolicy::Enabled) => true,
+            Some(crate::models::SteamRuntimePolicy::Disabled) => false,
+            Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+                ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false)
+            }
+        };
+        if runtime_active_for_env {
+            env.insert("SteamAppId".to_string(), app_id_str.clone());
+            env.insert("SteamGameId".to_string(), app_id_str.clone());
+            env.insert("STEAM_COMPAT_APP_ID".to_string(), app_id_str.clone());
+        }
         env.insert("WINEPREFIX".to_string(), effective_game_prefix.to_string_lossy().to_string());
         env.insert("STEAM_COMPAT_DATA_PATH".to_string(), compat_data_path.to_string_lossy().to_string());
 
@@ -627,6 +653,96 @@ impl Runner for WineTkgRunner {
         let game_runner_kind = crate::utils::classify_runner(&active_runner_path);
         if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {
             return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Compatibility Layer path: {}", active_runner_path.display())));
+        }
+        // === Steam SDK shim repair ===
+        // Some games ship a broken/corrupt libsteam_api.so (observed: all-zero file,
+        // e.g. "An Arcade Full of Cats", AppID 2368470) which the dynamic loader rejects
+        // with "invalid ELF header" and aborts the launch. If the game's own libsteam_api.so
+        // is missing or not a valid ELF, repair it from the bundled Steam SDK shipped with the
+        // active compatibility layer (files/lib64 for 64-bit, files/lib for 32-bit).
+        {
+            let runner_root = crate::utils::derive_runner_root(&active_runner_path);
+            let game_lib = game_working_dir.join("libsteam_api.so");
+            let is_corrupt = if game_lib.exists() {
+                // A valid ELF starts with the magic bytes 0x7f 'E' 'L' 'F'.
+                std::fs::read(&game_lib).map(|b| b.len() < 4 || &b[0..4] != b"\x7fELF").unwrap_or(true)
+            } else {
+                true
+            };
+            if is_corrupt {
+                let arch = match ctx.target_architecture {
+                    crate::models::ExecutableArchitecture::X86 => "lib",
+                    _ => "lib64",
+                };
+                // Candidate sources, in priority order:
+                //   1. The active runner's bundled Steam SDK (files/<arch> or dist/<arch>).
+                //   2. Any other installed Proton/compat-tool runner under the Steam compat dir.
+                //   3. The native Linux Steam client SDK shim (steamapps/common/Proton */files/<arch>).
+                let mut sdk_candidates: Vec<PathBuf> = vec![
+                    runner_root.join(format!("files/{}/libsteam_api.so", arch)),
+                    runner_root.join(format!("dist/{}/libsteam_api.so", arch)),
+                    runner_root.join("files/lib64/libsteam_api.so"),
+                    runner_root.join("files/lib/libsteam_api.so"),
+                ];
+
+                // Best-effort: walk the Steam compatibilitytools.d directory.
+                if let Some(steam_dir) = crate::config::get_steam_root_hint() {
+                    let compat_tools = steam_dir.join("compatibilitytools.d");
+                    if let Ok(entries) = std::fs::read_dir(&compat_tools) {
+                        for entry in entries.flatten() {
+                            let rt = entry.path();
+                            for cand in [
+                                rt.join(format!("files/{}/libsteam_api.so", arch)),
+                                rt.join(format!("dist/{}/libsteam_api.so", arch)),
+                                rt.join("files/lib64/libsteam_api.so"),
+                                rt.join("files/lib/libsteam_api.so"),
+                            ] {
+                                if cand.exists() {
+                                    sdk_candidates.push(cand);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Fallback to native Steam client SDK shims discovered in steamapps/common.
+                if let Some(steam_dir) = crate::config::get_steam_root_hint() {
+                    let common = steam_dir.join("steamapps/common");
+                    if let Ok(entries) = std::fs::read_dir(&common) {
+                        for entry in entries.flatten() {
+                            for cand in [
+                                entry.path().join(format!("files/{}/libsteam_api.so", arch)),
+                                entry.path().join(format!("dist/{}/libsteam_api.so", arch)),
+                            ] {
+                                if cand.exists() {
+                                    sdk_candidates.push(cand);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Only copy from a candidate whose existing bytes are a valid ELF.
+                let valid_src = sdk_candidates.iter().find(|p| {
+                    std::fs::read(p).map(|b| b.len() >= 4 && &b[0..4] == b"\x7fELF").unwrap_or(false)
+                });
+                if let Some(src) = valid_src {
+                    match std::fs::copy(src, &game_lib) {
+                        Ok(_) => tracing::warn!(
+                            "Repaired corrupt/missing libsteam_api.so for game {} from {}",
+                            ctx.app.app_id, src.display()
+                        ),
+                        Err(e) => tracing::error!(
+                            "Failed to repair libsteam_api.so for game {} from {}: {}",
+                            ctx.app.app_id, src.display(), e
+                        ),
+                    }
+                } else {
+                    tracing::error!(
+                        "Game {} needs libsteam_api.so but it is missing/corrupt and no valid Steam SDK shim could be located on this system.                          The launch will fail with 'invalid ELF header'. Install a Proton/compat layer that bundles libsteam_api.so, or verify/reinstall the game.",
+                        ctx.app.app_id
+                    );
+                }
+            }
         }
         unsafe {
             if !ctx.verification_ptr.is_null() {
