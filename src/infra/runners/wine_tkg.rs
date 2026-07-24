@@ -8,24 +8,54 @@ use crate::launch::pipeline::{LaunchError, LaunchErrorKind};
 
 pub struct WineTkgRunner;
 
+/// True when the Windows Steam Runtime is Active for this launch (Enabled policy, or
+/// Auto policy with the legacy use_steam_runtime toggle on).
+fn runtime_active(ctx: &LaunchContext) -> bool {
+    match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
+        Some(crate::models::SteamRuntimePolicy::Enabled) => true,
+        Some(crate::models::SteamRuntimePolicy::Disabled) => false,
+        Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+            ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false)
+        }
+    }
+}
+
+/// Resolve the runner (Compatibility Layer) the game should launch under.
+///
+/// When the Windows Steam Runtime is Active, the background Steam process owns the
+/// shared WINEPREFIX and runs under `launcher_config.steam_runtime_runner`. If the game
+/// were launched under a DIFFERENT runner, two wineservers (different pipe protocols)
+/// would collide in the same prefix and the game would crash with
+/// "wine client error: version mismatch ... your wine binary was not upgraded correctly".
+/// To avoid that, when the runtime is active we force the game's compatibility layer to
+/// the runtime runner so both share a single wineserver — which is exactly why the
+/// "both wine-tkg" combination worked but "runtime=wine-tkg, game=proton" crashed.
+fn effective_game_proton(ctx: &LaunchContext) -> String {
+    if runtime_active(ctx) && !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+        return ctx.launcher_config.steam_runtime_runner.to_string_lossy().to_string();
+    }
+    if let Some(forced) = ctx.launcher_config
+        .game_configs
+        .get(&ctx.app.app_id)
+        .and_then(|c| c.forced_proton_version.as_ref())
+    {
+        return forced.clone();
+    }
+    ctx.proton_path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| ctx.launcher_config.proton_version.clone())
+}
+
 #[async_trait::async_trait]
 impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
+
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
-        let proton = if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced.as_str()
-        } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
-        };
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let proton = effective_game_proton(ctx);
+        let active_runner = crate::utils::resolve_runner(&proton, &library_root);
 
         let (use_steam_runtime, runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
             Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
@@ -634,19 +664,9 @@ impl Runner for WineTkgRunner {
         };
 
         // Resolve proton version for component detection and DLL path building
-        let proton = if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced.as_str()
-        } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
-        };
+        let proton = effective_game_proton(ctx);
 
-        let active_runner_path = crate::utils::resolve_runner(proton, &library_root);
+        let active_runner_path = crate::utils::resolve_runner(&proton, &library_root);
         if !active_runner_path.exists() {
             return Err(LaunchError::new(
                 LaunchErrorKind::Runner,
@@ -966,7 +986,7 @@ impl Runner for WineTkgRunner {
 
         // Also add the runner's main lib/wine directories so Wine can find
         // the .dll.so PE loader stubs it needs to bridge into native DLLs.
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let active_runner = crate::utils::resolve_runner(&proton, &library_root);
         let runner_root = crate::utils::derive_runner_root(&active_runner);
         for lib_sub in crate::proton::UNIFIED_LIB_SUBDIRS {
             let p = runner_root.join(lib_sub);
@@ -1180,27 +1200,24 @@ impl Runner for WineTkgRunner {
     async fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
-        // Per-game runner override: if the user has set a specific Compatibility
-        // Layer for this game (e.g. CachyOS Proton), use it instead of the global
-        // proton_version setting. This allows wine-tkg for Steam background +
-        // CachyOS Proton for games in the same WINEPREFIX.
-        let effective_proton = if let Some(game_runner) = ctx.user_config.as_ref()
+        // Per-game runner override: if the user has set a specific Compatibility Layer
+        // for this game (e.g. CachyOS Proton), use it instead of the global
+        // proton_version setting. However, when the Windows Steam Runtime is Active the
+        // background Steam owns the shared WINEPREFIX under `steam_runtime_runner`; the
+        // game must share that runner's wineserver, otherwise two runners collide in the
+        // same prefix and crash with "wine client error: version mismatch". So the
+        // runtime runner always wins when the runtime is active.
+        let effective_proton = if runtime_active(ctx) {
+            ctx.launcher_config.steam_runtime_runner.to_string_lossy().to_string()
+        } else if let Some(game_runner) = ctx.user_config.as_ref()
             .and_then(|c| c.game_runner.as_deref())
             .filter(|s| !s.is_empty())
         {
-            game_runner
-        } else if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced.as_str()
+            game_runner.to_string()
         } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
+            effective_game_proton(ctx)
         };
-        let active_runner = crate::utils::resolve_runner(effective_proton, &library_root);
+        let active_runner = crate::utils::resolve_runner(&effective_proton, &library_root);
         let game_runner_kind = crate::utils::classify_runner(&active_runner);
         if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {
             return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Compatibility Layer path: {}", active_runner.display())));
