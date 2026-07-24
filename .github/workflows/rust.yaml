@@ -61,7 +61,11 @@ jobs:
           archive: false
 
   steamflow-windows:
+    # Disabled: SteamFlow is a Linux-native launcher (uses xdg-open, egui/eframe).
+    # Windows cross-compilation is not supported in the current architecture.
+    # Set to 'runs-on: windows-latest' and remove 'if: false' below to re-enable.
     runs-on: windows-latest
+    if: false
 
     steps:
       - uses: actions/checkout@v6
