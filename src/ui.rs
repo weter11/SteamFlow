@@ -1501,6 +1501,42 @@ impl SteamLauncher {
 
             ui.add_space(8.0);
             ui.heading("Manual Overrides (advanced)");
+
+            // Smart Override button: resets D3D12 policy + manual overrides
+            // to values that match what the runner actually has available.
+            // If runner has vkd3d-proton but not vkd3d wine (or vice versa),
+            // auto-selects the available one as fallback.
+            if ui.button("⚡ Smart Override — match runner capabilities").on_hover_text(
+                "Resets D3D12 policy and manual overrides to match what this runner actually provides.                  Falls back from VKD3D-Proton to VKD3D-Wine (or vice versa) if the preferred one is not available."
+            ).clicked() {
+                let available = &self.runner_components;
+                let has_vkd3d_proton = available.as_ref().map(|c| c.vkd3d_proton.is_some()).unwrap_or(false);
+                let has_vkd3d = available.as_ref().map(|c| c.vkd3d.is_some()).unwrap_or(false);
+
+                // Reset D3D12 policy to Auto first
+                glc.d3d12_policy = crate::models::D3D12ProviderPolicy::Auto;
+
+                if has_vkd3d_proton {
+                    // Runner has VKD3D-Proton: enable that provider
+                    glc.vkd3d_proton_enabled = true;
+                    glc.vkd3d_enabled = false;
+                } else if has_vkd3d {
+                    // Runner has VKD3D (Wine) but not VKD3D-Proton: use Wine's
+                    glc.vkd3d_proton_enabled = false;
+                    glc.vkd3d_enabled = true;
+                } else {
+                    // Neither vkd3d-proton nor vkd3d available — disable both overrides
+                    glc.vkd3d_proton_enabled = false;
+                    glc.vkd3d_enabled = false;
+                }
+
+                // Reset other manual overrides to not forced
+                glc.dxvk_enabled = false;
+                glc.nvapi_enabled = true; // NVAPI enabled by default
+
+                gl_changed = true;
+            }
+
             ui.horizontal(|ui| {
                 if ui.checkbox(&mut glc.dxvk_enabled, "Force DXVK").on_hover_text("Always use DXVK for DX8-11, ignoring policy.").changed() {
                     gl_changed = true;

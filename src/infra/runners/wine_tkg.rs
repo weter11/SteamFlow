@@ -616,6 +616,35 @@ impl Runner for WineTkgRunner {
         let effective_vkd3d_proton = glc.vkd3d_proton_enabled || policy_vkd3dp;
         let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
 
+        // vkd3d-proton fallback: if VKD3D-Proton is requested but not
+        // available in the runner, fall back to upstream VKD3D (Wine).
+        // This happens when user selected VKD3D-Proton policy or forced it,
+        // but the runner doesn't bundle VKD3D-Proton DLLs.
+        let effective_vkd3d_proton = if effective_vkd3d_proton && _components.vkd3d_proton.is_none() {
+            if _components.vkd3d.is_some() {
+                tracing::info!(
+                    "VKD3D-Proton not found in runner '{}', falling back to VKD3D (Wine).",
+                    active_runner_path.display()
+                );
+            }
+            false
+        } else {
+            effective_vkd3d_proton
+        };
+
+        // Similarly, if VKD3D-Wine is forced but not available, fall back to VKD3D-Proton if present.
+        let effective_vkd3d = if effective_vkd3d && _components.vkd3d.is_none() {
+            if _components.vkd3d_proton.is_some() {
+                tracing::info!(
+                    "VKD3D (Wine) not found in runner '{}', falling back to VKD3D-Proton.",
+                    active_runner_path.display()
+                );
+            }
+            false
+        } else {
+            effective_vkd3d
+        };
+
         // NVAPI Support
         let nvapi_enabled_cfg = ctx.user_config.as_ref().map(|c| c.graphics_layers.nvapi_enabled).unwrap_or(true);
         let nvapi_active = _components.nvapi.is_some() && nvapi_enabled_cfg;
