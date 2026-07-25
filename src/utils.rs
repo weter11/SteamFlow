@@ -407,7 +407,7 @@ pub fn runner_experimental_warning(runner_path: &Path) -> Option<String> {
         let ver = String::from_utf8_lossy(&output.stdout).to_lowercase();
         if ver.contains("cachyos") || ver.contains("cachy") {
             return Some(
-                "The selected runner's Wine is a CachyOS (experimental) build. Under Wine,                  its embedded CEF web views (Steam Store / Community / login page) fail network                  detection and show \"cant connect to steam network\" even though the Steam                  client is online. Prefer a stable runner (wine-tkg or Proton-GE) for Windows                  Steam until this is resolved."
+                "The selected runner's Wine is a CachyOS (experimental) build. These builds break Windows Steam\'s network connection (\"cant connect to steam network\"), while stable runners (wine-tkg, Proton-GE) connect fine. Prefer a stable runner for Windows Steam until this is resolved."
                     .to_string(),
             );
         }
@@ -419,7 +419,7 @@ pub fn runner_experimental_warning(runner_path: &Path) -> Option<String> {
         .to_lowercase();
     if name.contains("cachyos") || name.contains("cachy") {
         return Some(
-            "The selected runner looks like an experimental CachyOS build. Under Wine, its              embedded CEF web views can fail network detection (\"cant connect to steam              network\") even though the Steam client itself is online. Prefer a stable runner              (wine-tkg or Proton-GE) for Windows Steam."
+            "The selected runner looks like an experimental CachyOS build. These builds can break Windows Steam\'s network connection (\"cant connect to steam network\"). Prefer a stable runner (wine-tkg or Proton-GE) for Windows Steam."
                 .to_string(),
         );
     }
