@@ -1259,6 +1259,7 @@ pub struct MasterSteamConfig {
     pub wine_prefix: PathBuf,   // e.g. root_dir or root_dir/pfx
     pub layout_kind: String,    // "root" or "pfx"
     pub steam_exe: Option<PathBuf>,
+    pub client_snapshot_dir: PathBuf, // known-good Windows Steam client snapshot
 }
 
 pub fn get_master_steam_config() -> MasterSteamConfig {
@@ -1278,11 +1279,14 @@ pub fn get_master_steam_config() -> MasterSteamConfig {
 
     let steam_exe = find_steam_exe_in_prefix(&wine_prefix);
 
+    let client_snapshot_dir = root_dir.join("client_snapshot");
+
     MasterSteamConfig {
         root_dir,
         wine_prefix,
         layout_kind,
         steam_exe,
+        client_snapshot_dir,
     }
 }
 
