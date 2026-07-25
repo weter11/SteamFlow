@@ -407,7 +407,7 @@ pub fn runner_experimental_warning(runner_path: &Path) -> Option<String> {
         let ver = String::from_utf8_lossy(&output.stdout).to_lowercase();
         if ver.contains("cachyos") || ver.contains("cachy") {
             return Some(
-                "The selected runner's Wine is a CachyOS (experimental) build. These builds break Windows Steam\'s network connection (\"cant connect to steam network\"), while stable runners (wine-tkg, Proton-GE) connect fine. Prefer a stable runner for Windows Steam until this is resolved."
+                "The selected runner's Wine is a CachyOS (experimental) build. This CachyOS-patched Wine breaks Windows Steam\'s network connection (\"cant connect to steam network\"). Use a Proton build on TkG-patched Wine (e.g. proton_tkg) or stable wine-tkg instead - both connect fine and keep Proton\'s game patches available."
                     .to_string(),
             );
         }
@@ -419,7 +419,7 @@ pub fn runner_experimental_warning(runner_path: &Path) -> Option<String> {
         .to_lowercase();
     if name.contains("cachyos") || name.contains("cachy") {
         return Some(
-            "The selected runner looks like an experimental CachyOS build. These builds can break Windows Steam\'s network connection (\"cant connect to steam network\"). Prefer a stable runner (wine-tkg or Proton-GE) for Windows Steam."
+            "The selected runner looks like an experimental CachyOS build. This CachyOS-patched Wine can break Windows Steam\'s network connection (\"cant connect to steam network\"). Use a Proton build on TkG-patched Wine (e.g. proton_tkg) or stable wine-tkg instead."
                 .to_string(),
         );
     }
