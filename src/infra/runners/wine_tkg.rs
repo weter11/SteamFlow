@@ -1238,18 +1238,31 @@ impl Runner for WineTkgRunner {
 
         // Per-game runner override: if the user has set a specific Compatibility Layer
         // for this game (e.g. CachyOS Proton), use it instead of the global
-        // proton_version setting. However, when the Windows Steam Runtime is Active the
-        // background Steam owns the shared WINEPREFIX under `steam_runtime_runner`; the
-        // game must share that runner's wineserver, otherwise two runners collide in the
-        // same prefix and crash with "wine client error: version mismatch". So the
-        // runtime runner always wins when the runtime is active.
-        let effective_proton = if runtime_active(ctx) {
-            ctx.launcher_config.steam_runtime_runner.to_string_lossy().to_string()
-        } else if let Some(game_runner) = ctx.user_config.as_ref()
+        // proton_version setting.
+        //
+        // The Windows Steam Runtime (Active) only forces the game runner to
+        // match the runtime runner when the runtime runner is Proton — sharing
+        // a wineserver between two Proton instances is valid. When the runtime
+        // runner is plain wine (e.g. wine-tkg for the background Steam client),
+        // the game keeps its own proton/runner — wine and Proton use different
+        // wineserver IPC protocols and cannot share a prefix.
+        // Additionally, a per-game `game_runner` override (set by the user)
+        // always takes precedence regardless of runtime state.
+        let effective_proton = if let Some(game_runner) = ctx.user_config.as_ref()
             .and_then(|c| c.game_runner.as_deref())
             .filter(|s| !s.is_empty())
         {
             game_runner.to_string()
+        } else if runtime_active(ctx) {
+            let runtime_runner = ctx.launcher_config.steam_runtime_runner.clone();
+            if !matches!(
+                crate::utils::classify_runner(&runtime_runner),
+                crate::utils::RunnerKind::PlainWine { .. }
+            ) {
+                runtime_runner.to_string_lossy().to_string()
+            } else {
+                effective_game_proton(ctx)
+            }
         } else {
             effective_game_proton(ctx)
         };
