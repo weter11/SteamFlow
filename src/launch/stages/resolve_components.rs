@@ -31,6 +31,27 @@ impl Runner for NativeRunner {
         let exe_rel = ctx.launch_info.executable.replace('\\', "/");
         let executable = PathBuf::from(install_path).join(&exe_rel);
 
+        // Native Linux binaries are launched directly (no wine wrapper), so the file
+        // MUST carry the executable bit. Steam normally sets this on install, but a
+        // reinstall, restore, or a missing bit leaves it non-executable and the later
+        // Preflight "Runner Executability" check fails with "Runner binary is not
+        // executable". Ensure it here so native launches don't break.
+        if executable.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&executable) {
+                    let mode = meta.permissions().mode();
+                    if (mode & 0o111) == 0 {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(mode | 0o755);
+                        let _ = std::fs::set_permissions(&executable, perms);
+                        tracing::info!("chmod +x native executable: {}", executable.display());
+                    }
+                }
+            }
+        }
+
         spec.program = executable;
         spec.args = ctx.launch_info.arguments.split_whitespace().map(|s| s.to_string()).collect();
         spec.cwd = Some(PathBuf::from(install_path));

@@ -130,26 +130,6 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     let _child = cmd.spawn().context("Failed to spawn master steam process")?;
 
-    // Lock the Windows Steam client so Proton-based runners cannot trigger the
-    // in-client self-updater (which installs a client that then fails to connect
-    // to the Steam network). On the wine-tkg path this snapshots the freshly
-    // installed/updated GOOD client and freezes it read-only; launching under
-    // Proton later restores this snapshot and keeps it frozen.
-    if config.windows_steam_lock_client {
-        if let Some(ref steam_exe) = steam_cfg.steam_exe {
-            if let Some(steam_dir) = steam_exe.parent() {
-                // Only snapshot when installing/updating under wine-tkg (the known-good
-                // source). If the user first installs under Proton, that client may already
-                // be a broken self-update; snapshotting it would preserve the break. The
-                // freeze+restore lock still always applies so Proton can't update later.
-                if !is_proton {
-                    crate::steam_client::SteamClient::snapshot_good_client(steam_dir);
-                }
-                crate::steam_client::SteamClient::freeze_client(steam_dir);
-            }
-        }
-    }
-
     Ok(())
 }
 

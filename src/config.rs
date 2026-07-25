@@ -26,8 +26,6 @@ pub struct LauncherConfig {
     pub use_shared_compat_data: bool,
     #[serde(default = "crate::models::default_true")]
     pub windows_steam_discovery_enabled: bool,
-    #[serde(default = "crate::models::default_true")]
-    pub windows_steam_lock_client: bool,
     #[serde(default)]
     pub preferred_launch_options: HashMap<u32, String>,
     #[serde(default)]
@@ -62,7 +60,6 @@ impl Default for LauncherConfig {
             enable_cloud_sync: true,
             use_shared_compat_data: false,
             windows_steam_discovery_enabled: true,
-            windows_steam_lock_client: true,
             preferred_launch_options: HashMap::new(),
             game_configs: HashMap::new(),
         }

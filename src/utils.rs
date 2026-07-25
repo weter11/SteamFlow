@@ -387,48 +387,6 @@ pub fn detect_runner_components(
     }
 }
 
-/// Probes the runner's Wine binary for CachyOS-patched builds. Empirically: under
-/// CachyOS-patched Wine, Windows Steam fails to connect to the Steam network
-/// ("cant connect to steam network") even when the self-update is fully blocked
-/// (SteamFlow freezes the client read-only so no update is installed) - i.e. the
-/// network failure is caused by CachyOS's Wine itself, NOT by a bad client version.
-/// wine-tkg does not have this problem. The CEF log lines "WSALookupServiceBegin
-/// failed" / "CRL Verification failed" are benign noise present on EVERY runner and
-/// are NOT the cause. Returns a warning, or None if the runner is not CachyOS.
-pub fn runner_experimental_warning(runner_path: &Path) -> Option<String> {
-    let wine_bin = match classify_runner(runner_path) {
-        RunnerKind::PlainWine { wine64, .. } => wine64,
-        RunnerKind::Proton { bundled_wine64: Some(wine64), .. } => wine64,
-        RunnerKind::Proton { bundled_wine64: None, .. } => return None,
-        RunnerKind::Unknown => return None,
-    };
-
-    // CachyOS-patched Wine prints "wine-X.Y (CachyOS)" from `--version` and, at
-    // runtime, the loader_init banner "this wine contains many experimental patches".
-    if let Ok(output) = std::process::Command::new(&wine_bin).arg("--version").output() {
-        let ver = String::from_utf8_lossy(&output.stdout).to_lowercase();
-        if ver.contains("cachyos") || ver.contains("cachy") {
-            return Some(
-                "The selected runner's Wine is a CachyOS (experimental) build. This CachyOS-patched Wine breaks Windows Steam\'s network connection (\"cant connect to steam network\") on its own - it fails even when the client self-update is fully blocked, so it is NOT the self-update that breaks it. Use wine-tkg (or a non-CachyOS Proton build) instead; SteamFlow\'s client freeze cannot fix CachyOS\'s broken networking."
-                    .to_string(),
-            );
-        }
-    }
-
-    // Fallback: flag by runner directory name (e.g. .../proton-cachyos-...).
-    let name = runner_path
-        .to_string_lossy()
-        .to_lowercase();
-    if name.contains("cachyos") || name.contains("cachy") {
-        return Some(
-            "The selected runner looks like an experimental CachyOS build. This CachyOS-patched Wine breaks Windows Steam\'s network connection (\"cant connect to steam network\") on its own - it fails even with the self-update blocked. Use wine-tkg (or a non-CachyOS Proton build) instead."
-                .to_string(),
-        );
-    }
-
-    None
-}
-
 /// Detects NVIDIA Optimus / hybrid graphics and returns the env vars needed
 /// to force the discrete NVIDIA GPU. Returns empty map on non-hybrid systems.
 pub fn detect_prime_env() -> std::collections::HashMap<String, String> {
@@ -1258,7 +1216,6 @@ pub struct MasterSteamConfig {
     pub wine_prefix: PathBuf,   // e.g. root_dir or root_dir/pfx
     pub layout_kind: String,    // "root" or "pfx"
     pub steam_exe: Option<PathBuf>,
-    pub client_snapshot_dir: PathBuf, // known-good Windows Steam client snapshot
 }
 
 pub fn get_master_steam_config() -> MasterSteamConfig {
@@ -1278,14 +1235,11 @@ pub fn get_master_steam_config() -> MasterSteamConfig {
 
     let steam_exe = find_steam_exe_in_prefix(&wine_prefix);
 
-    let client_snapshot_dir = root_dir.join("client_snapshot");
-
     MasterSteamConfig {
         root_dir,
         wine_prefix,
         layout_kind,
         steam_exe,
-        client_snapshot_dir,
     }
 }
 
@@ -1693,36 +1647,6 @@ mod runner_kind_tests {
     fn classifies_unknown() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(classify_runner(dir.path()), RunnerKind::Unknown);
-    }
-
-    #[test]
-    fn experimental_warning_flags_cachyos_wine() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("bin")).unwrap();
-        let wine = dir.path().join("bin/wine");
-        // Fake wine that self-identifies as a CachyOS (experimental) build.
-        std::fs::write(&wine, "#!/bin/sh\necho 'wine-11.0 (CachyOS)'\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&wine).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&wine, perms).unwrap();
-        }
-        let warn = runner_experimental_warning(&wine);
-        assert!(warn.is_some(), "CachyOS wine should be flagged experimental");
-        assert!(warn.unwrap().to_lowercase().contains("cachyos"));
-
-        // A non-experimental self-id should NOT warn.
-        std::fs::write(&wine, "#!/bin/sh\necho 'wine-9.0 (Staging)'\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&wine).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&wine, perms).unwrap();
-        }
-        assert!(runner_experimental_warning(&wine).is_none(), "stable wine should not warn");
     }
 
     #[test]

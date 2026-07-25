@@ -15,7 +15,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::str::FromStr;
 use std::time::Instant;
@@ -2337,134 +2336,6 @@ impl SteamClient {
         }
     }
 
-    /// Snapshots the current Windows Steam client (the known-good one installed under
-    /// wine-tkg) into the master prefix's client_snapshot dir. Restored before every
-    /// Proton launch so a Proton-triggered self-update (which `BootStrapperForceSelfUpdate`
-    /// alone cannot stop) is undone on the next run. Call this once after a successful
-    /// wine-tkg install/update.
-    pub fn snapshot_good_client(steam_dir: &Path) {
-        let resolved = crate::utils::get_master_steam_config();
-        let Some(cfg_dir) = resolved.steam_exe.as_ref().and_then(|e| e.parent().map(|p| p.to_path_buf()))
-        else { return; };
-        let src = if steam_dir.exists() { steam_dir } else { &cfg_dir };
-        let snapshot_dir = &resolved.client_snapshot_dir;
-
-        let _ = std::fs::remove_dir_all(snapshot_dir);
-        if let Err(e) = std::fs::create_dir_all(snapshot_dir) {
-            tracing::warn!("snapshot: cannot create {}: {}", snapshot_dir.display(), e);
-            return;
-        }
-        for entry in ["package", "bin", "steam.exe", "Steam.dll", "steam.cfg", "SteamService.exe", "streaming_client.exe", "GameOverlayRenderer.dll", "GameOverlayRenderer64.dll"] {
-            let from = src.join(entry);
-            if !from.exists() { continue; }
-            let to = snapshot_dir.join(entry);
-            let res = if from.is_dir() {
-                Self::copy_dir_all(&from, &to)
-            } else {
-                if let Some(parent) = to.parent() { let _ = std::fs::create_dir_all(parent); }
-                std::fs::copy(&from, &to).map(|_| ())
-            };
-            if let Err(e) = res { tracing::warn!("snapshot: skip {}: {}", entry, e); }
-        }
-        tracing::info!("snapshotted known-good Windows Steam client -> {}", snapshot_dir.display());
-    }
-
-    /// Restores the snapshotted good client over the live one. Undoes any Proton-triggered
-    /// self-update that left a broken client. No-op if no snapshot exists.
-    pub fn restore_client_snapshot(steam_dir: &Path) {
-        let snapshot_dir = &crate::utils::get_master_steam_config().client_snapshot_dir;
-        if !snapshot_dir.exists() { return; }
-        Self::unfreeze_client(steam_dir); // clear read-only before overwriting
-        for entry in ["package", "bin", "steam.exe", "Steam.dll", "steam.cfg", "SteamService.exe", "streaming_client.exe", "GameOverlayRenderer.dll", "GameOverlayRenderer64.dll"] {
-            let from = snapshot_dir.join(entry);
-            if !from.exists() { continue; }
-            let to = steam_dir.join(entry);
-            let res = if from.is_dir() {
-                let _ = std::fs::remove_dir_all(&to);
-                Self::copy_dir_all(&from, &to)
-            } else {
-                if let Some(parent) = to.parent() { let _ = std::fs::create_dir_all(parent); }
-                std::fs::copy(&from, &to).map(|_| ())
-            };
-            if let Err(e) = res { tracing::warn!("restore: skip {}: {}", entry, e); }
-        }
-        tracing::info!("restored known-good Windows Steam client from snapshot");
-    }
-
-    /// Makes the Windows Steam client read-only so the in-client self-updater cannot
-    /// replace the client files (it crashes/aborts on read-only targets, leaving the
-    /// good client in place). Also re-asserts BootStrapperForceSelfUpdate=disable.
-    pub fn freeze_client(steam_dir: &Path) {
-        Self::ensure_no_self_update(steam_dir);
-        for entry in ["package", "bin", "steam.exe", "Steam.dll", "SteamService.exe", "streaming_client.exe", "GameOverlayRenderer.dll", "GameOverlayRenderer64.dll"] {
-            let p = steam_dir.join(entry);
-            if !p.exists() { continue; }
-            Self::set_readonly(&p, true);
-        }
-        tracing::info!("froze Windows Steam client (read-only) to block self-update");
-    }
-
-    /// Re-enables writes on the client (used before a deliberate update / uninstall).
-    pub fn unfreeze_client(steam_dir: &Path) {
-        for entry in ["package", "bin", "steam.exe", "Steam.dll", "SteamService.exe", "streaming_client.exe", "GameOverlayRenderer.dll", "GameOverlayRenderer64.dll"] {
-            let p = steam_dir.join(entry);
-            if !p.exists() { continue; }
-            Self::set_readonly(&p, false);
-        }
-    }
-
-    /// Full preparation before launching Windows Steam under a Proton wine: restore the
-    /// known-good client (undo any prior Proton self-update) and freeze it so Proton's
-    /// updater cannot replace it again.
-    pub fn lock_windows_steam_for_proton(steam_dir: &Path) {
-        Self::restore_client_snapshot(steam_dir);
-        Self::freeze_client(steam_dir);
-    }
-
-    /// Copies a directory tree recursively.
-    fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dst)?;
-        for ent in std::fs::read_dir(src)? {
-            let ent = ent?;
-            let ty = ent.file_type()?;
-            let target = dst.join(ent.file_name());
-            if ty.is_dir() {
-                Self::copy_dir_all(&ent.path(), &target)?;
-            } else {
-                std::fs::copy(ent.path(), &target)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Sets (or clears) the read-only; directories are kept writable so later unfreezing
-    /// (and normal operation) can still write metadata. The updater replaces FILES, so
-    /// read-only files alone are enough to block it.
-    fn set_readonly(path: &Path, readonly: bool) {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if readonly { 0o444 } else { 0o644 };
-        if path.is_dir() {
-            Self::walkdir_readonly(path, mode);
-        } else {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
-        }
-    }
-
-    /// Recursively applies read-only mode to every FILE under a directory, leaving
-    /// directories themselves writable.
-    fn walkdir_readonly(dir: &Path, mode: u32) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for ent in entries.flatten() {
-                let p = ent.path();
-                if p.is_dir() {
-                    Self::walkdir_readonly(&p, mode);
-                } else {
-                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode));
-                }
-            }
-        }
-    }
-
     /// The single canonical entry point for launching a game process.
     /// This function orchestrates the launch via a staged pipeline and the appropriate runner.
     /// Bypassing this for production launches is strictly forbidden.
@@ -3250,26 +3121,6 @@ mod tests {
         SteamClient::ensure_no_self_update(dir.path());
         let content2 = std::fs::read_to_string(&cfg).unwrap();
         assert_eq!(content2.matches("BootStrapperForceSelfUpdate=disable").count(), 1, "must not duplicate");
-    }
-
-    #[test]
-    fn freeze_makes_client_readonly_and_restore_recovers() {
-        let dir = tempfile::tempdir().unwrap();
-        let pkg = dir.path().join("package");
-        std::fs::create_dir_all(&pkg).unwrap();
-        std::fs::write(pkg.join("steam_client_win64.installed"), "build").unwrap();
-        std::fs::write(dir.path().join("steam.cfg"), "SteamDefaultDialog=Friends\n").unwrap();
-
-        // Freeze
-        SteamClient::freeze_client(dir.path());
-        let meta = std::fs::metadata(pkg.join("steam_client_win64.installed")).unwrap();
-        assert_eq!(meta.permissions().readonly(), true, "client file must be read-only after freeze");
-
-        // Snapshot (uses MasterSteamConfig; ensure client_snapshot_dir is under a writable base)
-        // We cannot easily override config_dir in unit test, so just verify freeze/unfreeze roundtrip.
-        SteamClient::unfreeze_client(dir.path());
-        let meta2 = std::fs::metadata(pkg.join("steam_client_win64.installed")).unwrap();
-        assert_eq!(meta2.permissions().readonly(), false, "client file must be writable after unfreeze");
     }
 
     #[test]

@@ -208,15 +208,7 @@ impl Runner for WineTkgRunner {
                         }
                     }
 
-                    // Lock the Windows Steam client before launching it for a game:
-                    // restore the known-good (wine-tkg-installed) client snapshot and
-                    // freeze it read-only so Proton's in-client self-updater cannot
-                    // replace it with a build that fails to connect to the Steam network.
-                    if ctx.launcher_config.windows_steam_lock_client {
-                        SteamClient::lock_windows_steam_for_proton(&prefix_steam_dir);
-                    } else {
-                        SteamClient::write_headless_steam_cfg(&prefix_steam_dir);
-                    }
+                    SteamClient::write_headless_steam_cfg(&prefix_steam_dir);
 
                     let slc = ctx.user_config.as_ref()
                         .map(|c| c.steam_launch_config.clone())

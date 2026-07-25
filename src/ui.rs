@@ -1566,31 +1566,6 @@ impl SteamLauncher {
             }
 
             ui.add_space(8.0);
-            // Warn when the selected runner's Wine is an experimental build (e.g. CachyOS)
-            // that is known to break the embedded CEF web views under Wine.
-            let effective_runner = {
-                let library_root = PathBuf::from(&self.launcher_config.steam_library_path);
-                let name = self
-                    .launcher_config
-                    .game_configs
-                    .get(&game.app_id)
-                    .and_then(|c| c.forced_proton_version.as_ref())
-                    .cloned()
-                    .unwrap_or_else(|| self.launcher_config.proton_version.clone());
-                crate::utils::resolve_runner(&name, &library_root)
-            };
-            if let Some(warning) = crate::utils::runner_experimental_warning(&effective_runner) {
-                egui::Frame::group(ui.style())
-                    .fill(egui::Color32::from_rgb(60, 30, 10))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 140, 40)))
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(egui::Color32::from_rgb(255, 180, 60), "⚠ Experimental runner");
-                            ui.label(egui::RichText::new(&warning).color(egui::Color32::LIGHT_GRAY));
-                        });
-                    });
-                ui.add_space(8.0);
-            }
 
             if let Some(components) = &self.runner_components {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -2800,19 +2775,6 @@ impl eframe::App for SteamLauncher {
                             });
                         if let Some(warning) = crate::utils::validate_steam_runtime_runner_path(&self.launcher_config.steam_runtime_runner) {
                             ui.colored_label(egui::Color32::YELLOW, warning);
-                        }
-                        // Warn when the global Steam Runtime Runner's Wine is an
-                        // experimental build (e.g. CachyOS) that breaks CEF web views.
-                        if let Some(warning) = crate::utils::runner_experimental_warning(&self.launcher_config.steam_runtime_runner) {
-                            egui::Frame::group(ui.style())
-                                .fill(egui::Color32::from_rgb(60, 30, 10))
-                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 140, 40)))
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.colored_label(egui::Color32::from_rgb(255, 180, 60), "⚠ Experimental runner");
-                                        ui.label(egui::RichText::new(&warning).color(egui::Color32::LIGHT_GRAY));
-                                    });
-                                });
                         }
 
                         ui.add_space(4.0);
