@@ -164,17 +164,56 @@ pub async fn list_available() -> Result<Vec<ProtonPackage>> {
 fn release_to_package(release: &GithubRelease, src: &GithubSource, arch_tag: &str) -> Option<ProtonPackage> {
     let is_cachy = src.repo == "CachyOS/proton-cachyos";
 
-    let asset = release.assets.iter().find(|a| {
+    // Pass 1: exact arch match (e.g. x86_64_v3 for x86_64_v3 host).
+    // Pass 2: baseline x86_64 or build with no arch suffix.
+    // Pass 3: any remaining matching build (fallback).
+    let candidates: Vec<_> = release.assets.iter().filter(|a| {
         if a.browser_download_url.contains("/archive/refs/tags/") {
             return false;
         }
+        a.name.ends_with(src.ext)
+    }).collect();
 
-        if is_cachy {
-            a.name.ends_with(&format!("{arch_tag}{}", src.ext))
-        } else {
-            a.name.ends_with(src.ext)
+    let lower_tag = arch_tag.to_lowercase();
+    let mut picked: Option<&GithubAsset> = None;
+    for pass in 0u32..3 {
+        for a in &candidates {
+            if picked.is_some() { break; }
+            let name_lower = a.name.to_lowercase();
+            let is_aarch64 = name_lower.contains("-aarch64") || name_lower.contains("-arm64");
+            let has_v3 = name_lower.contains("x86_64_v3");
+            let has_base = name_lower.contains("x86_64") && !has_v3;
+            let has_no_arch = !has_base && !has_v3 && !is_aarch64;
+
+            let matches = match pass {
+                0 => {
+                    // Exact: x86_64_v3 asset for x86_64_v3 host, etc.
+                    (arch_tag == "x86_64_v3" && has_v3)
+                    || (arch_tag == "x86_64" && has_base)
+                    || (arch_tag == "aarch64" && is_aarch64)
+                    || (arch_tag == "arm64" && is_aarch64)
+                },
+                1 => {
+                    // Baseline: x86_64 host gets x86_64 or no-arch; arm host gets no-arch.
+                    (arch_tag == "x86_64" && has_base)
+                    || (arch_tag == "x86_64" && has_no_arch)
+                    || ((arch_tag == "aarch64" || arch_tag == "arm64") && has_no_arch)
+                },
+                _ => {
+                    // Fallback: any non-aarch64 asset for x86_64 host; any asset for arm.
+                    if arch_tag == "x86_64" || arch_tag == "x86_64_v3" {
+                        !is_aarch64
+                    } else {
+                        true
+                    }
+                }
+            };
+            if matches {
+                picked = Some(*a);
+            }
         }
-    })?;
+    }
+    let asset = picked?;
 
     let label = if is_cachy {
         format!("{} ({} — {} optimized)", src.label, arch_tag, if arch_tag == "x86_64_v3" { "AVX2" } else { "baseline" })

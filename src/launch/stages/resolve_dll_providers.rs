@@ -31,8 +31,18 @@ impl PipelineStage for ResolveDllProvidersStage {
 
         // We need runner components. This implies ResolveComponentsStage must have run.
         // Actually, we can just detect them here or ensure ResolveComponentsStage provides them.
-        let proton_path = ctx.proton_path.as_deref().unwrap_or("wine");
-        let library_root = ctx.launcher_config.as_ref().map(|c| PathBuf::from(&c.steam_library_path)).unwrap_or_default();
+        //
+        // NOTE: previously this used `ctx.proton_path.as_deref().unwrap_or("wine")` directly.
+        // ctx.proton_path is always None from every current UI launch call site, so this
+        // silently fell back to the literal string "wine" on every launch — ignoring both
+        // the per-game `forced_proton_version` override AND the global `proton_version`
+        // default. That meant DLL/component detection (DXVK/VKD3D/NVAPI) could run against
+        // a different runner than the one WineTkgRunner::build_command actually launches.
+        // resolve_effective_proton_name() uses the same precedence as build_env/build_command.
+        let launcher_config = ctx.launcher_config.as_ref()
+            .ok_or_else(|| LaunchError::new(LaunchErrorKind::Validation, "launcher_config missing"))?;
+        let proton_path = crate::utils::resolve_effective_proton_name(app.app_id, launcher_config, ctx.proton_path.as_deref());
+        let library_root = PathBuf::from(&launcher_config.steam_library_path);
         let resolved_runner = crate::utils::resolve_runner(proton_path, &library_root);
 
         // Resolve WINEPREFIX for component detection

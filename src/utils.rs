@@ -88,6 +88,22 @@ pub fn validate_steam_runtime_runner_path(runner_path: &Path) -> Option<String> 
 
 #[cfg(unix)]
 pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
+    detect_active_wineserver_runtime_filtered(wineprefix, false)
+}
+
+/// Scans `/proc` for a wine/wineserver process whose environment references
+/// `wineprefix`, and returns the path to its `exe`.
+///
+/// When `exclude_steam` is true, processes whose cmdline contains `steam.exe`
+/// are ignored. In the split-runtime architecture the background Windows
+/// Steam client runs under `steam_runtime_runner` while the game uses a
+/// different runner — both in the same `WINEPREFIX` in Shared mode.
+/// The Steam client is expected and not a conflict.
+#[cfg(unix)]
+pub fn detect_active_wineserver_runtime_filtered(
+    wineprefix: &Path,
+    exclude_steam: bool,
+) -> Option<PathBuf> {
     let prefix_str = wineprefix.to_string_lossy().to_string();
     let proc_dir = std::fs::read_dir("/proc").ok()?;
     for entry in proc_dir.flatten() {
@@ -95,15 +111,17 @@ pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
         if !pid_path.file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.chars().all(|c| c.is_ascii_digit()))
-            .unwrap_or(false) { continue; }
-        let environ = std::fs::read(pid_path.join("environ")).ok()?;
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(pid_path.join("environ")) else { continue; };
         let environ_str = String::from_utf8_lossy(&environ);
         if !environ_str.contains(&prefix_str) { continue; }
-        // Check if this is a wine process
-        let cmdline = std::fs::read(pid_path.join("cmdline")).ok()?;
-        let cmdline_str = String::from_utf8_lossy(&cmdline);
-        if !cmdline_str.to_lowercase().contains("wine") { continue; }
-        // Read the actual binary
+        let Ok(cmdline) = std::fs::read(pid_path.join("cmdline")) else { continue; };
+        let cmdline_str = String::from_utf8_lossy(&cmdline).to_lowercase();
+        if !cmdline_str.contains("wine") { continue; }
+        if exclude_steam && cmdline_str.contains("steam.exe") { continue; }
         if let Ok(exe) = std::fs::read_link(pid_path.join("exe")) {
             return Some(exe);
         }
@@ -113,6 +131,56 @@ pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
 
 #[cfg(not(unix))]
 pub fn detect_active_wineserver_runtime(_wineprefix: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(unix))]
+pub fn detect_active_wineserver_runtime_filtered(_wineprefix: &Path, _exclude_steam: bool) -> Option<PathBuf> {
+    None
+}
+
+/// Detect a wineserver belonging to a specific runner that is running in the given prefix.
+/// Returns the path to the wineserver binary (from that runner's tree) if found.
+/// Unlike detect_active_wineserver_runtime, this accepts a runner_path to scope the match:
+/// only a wineserver whose runner root matches the given runner is returned.
+/// This lets the caller distinguish "the active wineserver belongs to the game's own runner"
+/// (no conflict) from "a different runner's wineserver is active" (conflict).
+#[cfg(unix)]
+pub fn detect_wineserver_for_runner(
+    wineprefix: &Path,
+    runner_path: &Path,
+) -> Option<PathBuf> {
+    let prefix_str = wineprefix.to_string_lossy().to_string();
+    let runner_root = derive_runner_root(runner_path);
+    let runner_root_lossy = runner_root.to_string_lossy().to_string();
+    let proc_dir = std::fs::read_dir("/proc").ok()?;
+    for entry in proc_dir.flatten() {
+        let pid_path = entry.path();
+        if !pid_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let environ = std::fs::read(pid_path.join("environ")).ok()?;
+        let environ_str = String::from_utf8_lossy(&environ);
+        if !environ_str.contains(&prefix_str) {
+            continue;
+        }
+        let cmdline = std::fs::read(pid_path.join("cmdline")).ok()?;
+        let cmdline_str = String::from_utf8_lossy(&cmdline);
+        if !cmdline_str.to_lowercase().contains("wineserver") {
+            continue;
+        }
+        if let Ok(exe) = std::fs::read_link(pid_path.join("exe")) {
+            let exe_str = exe.to_string_lossy().to_string();
+            if exe_str.contains(&runner_root_lossy) {
+                return Some(exe);
+            }
+        }
+    }
     None
 }
 
@@ -145,6 +213,42 @@ pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
     }
 }
 
+
+/// Kill only wineserver processes in a prefix that belong to a specific runner.
+/// Unlike kill_all_wine_in_prefix, this preserves wine processes for other runners
+/// (e.g., a background Steam client running under wine-tkg should survive when
+/// proton-cachyos kills its own stale wineserver).
+#[cfg(unix)]
+pub fn kill_wineserver_in_prefix(wineprefix: &Path) {
+    let prefix_str = wineprefix.to_string_lossy().to_string();
+    if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+        for entry in proc_dir.flatten() {
+            let pid_path = entry.path();
+            let Some(pid_str) = pid_path.file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+            else { continue };
+            let environ = match std::fs::read(pid_path.join("environ")) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if !String::from_utf8_lossy(&environ).contains(&prefix_str) { continue }
+            let cmdline = match std::fs::read(pid_path.join("cmdline")) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let cmdline_str = String::from_utf8_lossy(&cmdline);
+            // Only kill wineserver, not steam.exe or other wine processes
+            if !cmdline_str.to_lowercase().contains("wineserver") { continue }
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGTERM); }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill_wineserver_in_prefix(_wineprefix: &Path) {}
 
 pub fn build_runner_command(runner_path: &Path) -> Result<Command> {
     let mut final_path = runner_path.to_path_buf();
@@ -198,6 +302,37 @@ pub fn build_bare_wine_command(runner_path: &Path) -> Result<Command> {
                 bail!("Could not resolve bare Wine binary from {}", runner_path.display())
             }
         }
+    }
+}
+
+/// Resolves the effective Proton/Wine runner *name* (not yet an absolute path)
+/// that will be used to launch `app_id`, using the same precedence as
+/// `WineTkgRunner::effective_game_proton`:
+///   1. the per-game override (`LauncherConfig.game_configs[app_id].forced_proton_version`)
+///   2. an explicit `proton_path` passed into this launch (`PipelineContext::proton_path`)
+///   3. the global default (`LauncherConfig.proton_version`)
+///
+/// IMPORTANT: this must stay in sync with the resolution logic inside
+/// `WineTkgRunner::effective_game_proton`. Any pipeline stage that needs
+/// to know "which runner is this game actually using" (e.g. DLL/component
+/// detection in ResolveDllProvidersStage) should call this instead of
+/// re-deriving it, or it can silently disagree with the runner that
+/// actually launches the process.
+pub fn resolve_effective_proton_name<'a>(
+    app_id: u32,
+    launcher_config: &'a crate::config::LauncherConfig,
+    ctx_proton_path: Option<&'a str>,
+) -> &'a str {
+    if let Some(forced) = launcher_config
+        .game_configs
+        .get(&app_id)
+        .and_then(|c| c.forced_proton_version.as_ref())
+    {
+        forced.as_str()
+    } else {
+        ctx_proton_path
+            .filter(|p| !p.is_empty())
+            .unwrap_or(launcher_config.proton_version.as_str())
     }
 }
 

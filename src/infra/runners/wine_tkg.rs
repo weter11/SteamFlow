@@ -31,20 +31,29 @@ fn runtime_active(ctx: &LaunchContext) -> bool {
 /// the runtime runner so both share a single wineserver — which is exactly why the
 /// "both wine-tkg" combination worked but "runtime=wine-tkg, game=proton" crashed.
 fn effective_game_proton(ctx: &LaunchContext) -> String {
+    // When Steam Runtime is active AND the runtime runner is itself a Proton
+    // (not plain wine), force the game to use the same runner so both
+    // Steam and the game share a single wineserver in Shared prefix mode.
+    // This mirrors what Valve's official Proton does.
+    //
+    // When the runtime runner is plain wine (e.g. wine-tkg for the background
+    // Steam client) we must NOT override the game's proton — the game's
+    // proton (GE-Proton etc.) and wine-tkg use different wineserver IPC
+    // protocols and cannot share a prefix.
     if runtime_active(ctx) && !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
-        return ctx.launcher_config.steam_runtime_runner.to_string_lossy().to_string();
+        let runtime_runner = ctx.launcher_config.steam_runtime_runner.clone();
+        if !matches!(crate::utils::classify_runner(&runtime_runner), crate::utils::RunnerKind::PlainWine { .. }) {
+            return runtime_runner.to_string_lossy().to_string();
+        }
+        // Runtime runner is plain wine (e.g. wine-tkg for Steam background).
+        // Fall through to the game's own proton — do NOT override it with wine.
     }
-    if let Some(forced) = ctx.launcher_config
-        .game_configs
-        .get(&ctx.app.app_id)
-        .and_then(|c| c.forced_proton_version.as_ref())
-    {
-        return forced.clone();
-    }
-    ctx.proton_path
-        .clone()
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| ctx.launcher_config.proton_version.clone())
+    crate::utils::resolve_effective_proton_name(
+        ctx.app.app_id,
+        &ctx.launcher_config,
+        ctx.proton_path.as_deref(),
+    )
+    .to_string()
 }
 
 #[async_trait::async_trait]
@@ -184,27 +193,24 @@ impl Runner for WineTkgRunner {
             tracing::debug!("Runtime Steam dir : {}", prefix_steam_dir.display());
                     tracing::debug!("Runtime WINEPREFIX : {}", steam_wineprefix.display());
 
-                    if let Some(active_wine) = crate::utils::detect_active_wineserver_runtime(&steam_wineprefix) {
-                        let active_root = crate::utils::derive_runner_root(&active_wine);
-                        let runner_root = crate::utils::derive_runner_root(&active_runner);
+                    if !matches!(crate::utils::classify_runner(&active_runner), crate::utils::RunnerKind::Unknown) {
+                        if let Some(active_wine) =
+                            crate::utils::detect_wineserver_for_runner(&steam_wineprefix, &active_runner)
+                        {
+                            let active_root = crate::utils::derive_runner_root(&active_wine);
+                            let runner_root = crate::utils::derive_runner_root(&active_runner);
 
-                        let active_canonical = active_root.canonicalize().unwrap_or(active_root);
-                        let runner_canonical = runner_root.canonicalize().unwrap_or(runner_root);
+                            let active_canonical = active_root.canonicalize().unwrap_or(active_root);
+                            let runner_canonical = runner_root.canonicalize().unwrap_or(runner_root);
 
-                        if active_canonical != runner_canonical {
-                            // A wineserver from a DIFFERENT runner is locked into this
-                            // prefix. If we launch anyway we get the classic
-                            // "wine client error: version mismatch ... wineserver is still running".
-                            // The correct fix (what Proton/Steam do) is to terminate the
-                            // stale server and let the new runner start its own. This is safe
-                            // because a server for another runner cannot serve this launch.
-                            tracing::warn!(
-                                "Stale wineserver (different runner {:?}) detected in prefix {}. Terminating it before launch.",
-                                active_canonical, steam_wineprefix.display()
-                            );
-                            crate::utils::kill_all_wine_in_prefix(&steam_wineprefix);
-                            // Give the old server a moment to release the prefix lock.
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            if active_canonical != runner_canonical {
+                                tracing::warn!(
+                                    "Stale wineserver (different runner {:?}) detected in prefix {}. Terminating it before launch.",
+                                    active_canonical, steam_wineprefix.display()
+                                );
+                                crate::utils::kill_wineserver_in_prefix(&steam_wineprefix);
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                            }
                         }
                     }
 
@@ -1232,18 +1238,31 @@ impl Runner for WineTkgRunner {
 
         // Per-game runner override: if the user has set a specific Compatibility Layer
         // for this game (e.g. CachyOS Proton), use it instead of the global
-        // proton_version setting. However, when the Windows Steam Runtime is Active the
-        // background Steam owns the shared WINEPREFIX under `steam_runtime_runner`; the
-        // game must share that runner's wineserver, otherwise two runners collide in the
-        // same prefix and crash with "wine client error: version mismatch". So the
-        // runtime runner always wins when the runtime is active.
-        let effective_proton = if runtime_active(ctx) {
-            ctx.launcher_config.steam_runtime_runner.to_string_lossy().to_string()
-        } else if let Some(game_runner) = ctx.user_config.as_ref()
+        // proton_version setting.
+        //
+        // The Windows Steam Runtime (Active) only forces the game runner to
+        // match the runtime runner when the runtime runner is Proton — sharing
+        // a wineserver between two Proton instances is valid. When the runtime
+        // runner is plain wine (e.g. wine-tkg for the background Steam client),
+        // the game keeps its own proton/runner — wine and Proton use different
+        // wineserver IPC protocols and cannot share a prefix.
+        // Additionally, a per-game `game_runner` override (set by the user)
+        // always takes precedence regardless of runtime state.
+        let effective_proton = if let Some(game_runner) = ctx.user_config.as_ref()
             .and_then(|c| c.game_runner.as_deref())
             .filter(|s| !s.is_empty())
         {
             game_runner.to_string()
+        } else if runtime_active(ctx) {
+            let runtime_runner = ctx.launcher_config.steam_runtime_runner.clone();
+            if !matches!(
+                crate::utils::classify_runner(&runtime_runner),
+                crate::utils::RunnerKind::PlainWine { .. }
+            ) {
+                runtime_runner.to_string_lossy().to_string()
+            } else {
+                effective_game_proton(ctx)
+            }
         } else {
             effective_game_proton(ctx)
         };
