@@ -184,27 +184,24 @@ impl Runner for WineTkgRunner {
             tracing::debug!("Runtime Steam dir : {}", prefix_steam_dir.display());
                     tracing::debug!("Runtime WINEPREFIX : {}", steam_wineprefix.display());
 
-                    if let Some(active_wine) = crate::utils::detect_active_wineserver_runtime(&steam_wineprefix) {
-                        let active_root = crate::utils::derive_runner_root(&active_wine);
-                        let runner_root = crate::utils::derive_runner_root(&active_runner);
+                    if !matches!(crate::utils::classify_runner(&active_runner), crate::utils::RunnerKind::Unknown) {
+                        if let Some(active_wine) =
+                            crate::utils::detect_wineserver_for_runner(&steam_wineprefix, &active_runner)
+                        {
+                            let active_root = crate::utils::derive_runner_root(&active_wine);
+                            let runner_root = crate::utils::derive_runner_root(&active_runner);
 
-                        let active_canonical = active_root.canonicalize().unwrap_or(active_root);
-                        let runner_canonical = runner_root.canonicalize().unwrap_or(runner_root);
+                            let active_canonical = active_root.canonicalize().unwrap_or(active_root);
+                            let runner_canonical = runner_root.canonicalize().unwrap_or(runner_root);
 
-                        if active_canonical != runner_canonical {
-                            // A wineserver from a DIFFERENT runner is locked into this
-                            // prefix. If we launch anyway we get the classic
-                            // "wine client error: version mismatch ... wineserver is still running".
-                            // The correct fix (what Proton/Steam do) is to terminate the
-                            // stale server and let the new runner start its own. This is safe
-                            // because a server for another runner cannot serve this launch.
-                            tracing::warn!(
-                                "Stale wineserver (different runner {:?}) detected in prefix {}. Terminating it before launch.",
-                                active_canonical, steam_wineprefix.display()
-                            );
-                            crate::utils::kill_all_wine_in_prefix(&steam_wineprefix);
-                            // Give the old server a moment to release the prefix lock.
-                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            if active_canonical != runner_canonical {
+                                tracing::warn!(
+                                    "Stale wineserver (different runner {:?}) detected in prefix {}. Terminating it before launch.",
+                                    active_canonical, steam_wineprefix.display()
+                                );
+                                crate::utils::kill_wineserver_in_prefix(&steam_wineprefix);
+                                std::thread::sleep(std::time::Duration::from_millis(500));
+                            }
                         }
                     }
 
