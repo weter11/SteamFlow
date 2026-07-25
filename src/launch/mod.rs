@@ -26,21 +26,43 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
         return Err(anyhow!("No Steam Runtime Runner selected in Global Settings"));
     }
 
-    let library_root = PathBuf::from(&config.steam_library_path);
+        let library_root = PathBuf::from(&config.steam_library_path);
     let resolved_runner = crate::utils::resolve_runner(&runner_name, &library_root);
-    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let runner_kind = crate::utils::classify_runner(&resolved_runner);
+    let is_proton = matches!(runner_kind, crate::utils::RunnerKind::Proton { .. });
 
-    tracing::info!("Unified Master Steam resolution:");
-    tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
-    tracing::info!("  - Wine Prefix: {}", steam_cfg.wine_prefix.display());
-    tracing::info!("  - Layout Kind: {}", steam_cfg.layout_kind);
-    if let Some(ref exe) = steam_cfg.steam_exe {
-        tracing::info!("  - Steam Exe: {}", exe.display());
-        cmd.arg(exe);
+    // How we launch Master Steam depends on the runner kind:
+    //  * Plain Wine (wine-tkg): launch the Steam EXE directly and feed it the
+    //    "fake_env" trap (dummy steam/steam.sh) via STEAM_COMPAT_CLIENT_INSTALL_PATH
+    //    plus steamclient/steam_api=n overrides. This is the original hack that stops
+    //    Wine-Steam from hijacking the Linux Steam client.
+    //  * Proton: MUST be launched through `proton run`. STEAM_COMPAT_CLIENT_INSTALL_PATH
+    //    must point at the REAL Windows Steam client directory. Proton's bootstrap reads
+    //    that var to locate/update the Steam client; pointing it at the fake trap makes
+    //    Steam believe its client binaries are missing -> "reinstall steam". So for Proton
+    //    we omit the trap and point the client path at C:\\Program Files (x86)\\Steam.
+    let mut cmd = if is_proton {
+        let mut c = crate::utils::build_runner_command(&resolved_runner)?; // -> `proton run`
+        if let Some(ref exe) = steam_cfg.steam_exe {
+            let win = crate::utils::to_windows_path(&exe);
+            tracing::info!("  - Steam Exe (proton run): {}", win);
+            c.arg(win);
+        } else {
+            tracing::info!("  - Steam Exe: NOT FOUND (running installer)");
+            c.arg(&setup_exe);
+        }
+        c
     } else {
-        tracing::info!("  - Steam Exe: NOT FOUND (running installer)");
-        cmd.arg(setup_exe);
-    }
+        let mut c = crate::utils::build_bare_wine_command(&resolved_runner)?;
+        if let Some(ref exe) = steam_cfg.steam_exe {
+            tracing::info!("  - Steam Exe: {}", exe.display());
+            c.arg(exe);
+        } else {
+            tracing::info!("  - Steam Exe: NOT FOUND (running installer)");
+            c.arg(setup_exe);
+        }
+        c
+    };
 
     // Arguments
     cmd.arg("-tcp");
@@ -51,9 +73,27 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
     cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
-    let fake_env = crate::utils::setup_fake_steam_trap(&base_dir)?;
-    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
-    cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+    if is_proton {
+        // Proton manages the Steam client path itself. Point it at the real Windows
+        // Steam client dir (where the user installed/launched Windows Steam).
+        let client_path = steam_cfg
+            .steam_exe
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("C:\\Program Files (x86)\\Steam"));
+        let client_win = crate::utils::to_windows_path(&client_path);
+        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &client_win);
+        tracing::info!(
+            "Proton Steam launch: STEAM_COMPAT_CLIENT_INSTALL_PATH={} (real client, no fake trap)",
+            client_win
+        );
+        // Do NOT disable steamclient/steam_api for the Steam process — Proton needs its
+        // own client DLLs and adds lsteamclient=d for games on its own.
+    } else {
+        let fake_env = crate::utils::setup_fake_steam_trap(&base_dir)?;
+        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
+        cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+    }
 
     if let Ok(display) = std::env::var("DISPLAY") {
         cmd.env("DISPLAY", display);
