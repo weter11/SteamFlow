@@ -79,6 +79,13 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     // Arguments
     cmd.arg("-tcp");
     cmd.arg("-cef-disable-gpu-compositing");
+    // Harden the CEF/webhelper renderer under Wine/Proton. The background
+    // self-update + GPU-accelerated CEF is the usual cause of Steam crashing
+    // shortly after launch under Proton; disabling GPU compositing/sandbox
+    // keeps the client stable. Steam forwards these to the real client
+    // (visible in bootstrap_log.txt).
+    cmd.arg("-cef-disable-gpu");
+    cmd.arg("-no-cef-sandbox");
 
     // Environment Variables
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
