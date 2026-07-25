@@ -387,12 +387,15 @@ pub fn detect_runner_components(
     }
 }
 
-/// Probes the runner's Wine binary for builds that self-identify as experimental /
-/// testing. Such builds (e.g. CachyOS-patched Wine) are known to regress the embedded
-/// CEF web views under Wine (the "WSALookupServiceBegin failed" / "CRL Verification
-/// failed" errors that surface as "cant connect to steam network" even though the
-/// Steam client itself is online). Returns a human-readable warning, or None if the
-/// runner looks like a normal stable build.
+/// Probes the runner's Wine binary for CachyOS-patched builds. Under CachyOS (and other
+/// Proton wines that trigger Steam's in-client self-updater), Steam downloads a fresh
+/// client that then fails to connect to the network ("cant connect to steam network").
+/// The reliable fix is to disable the self-update (BootStrapperForceSelfUpdate=disable,
+/// which SteamFlow now enforces via ensure_no_self_update) and keep the known-good
+/// client that wine-tkg installed. wine-tkg does not trigger the update and works.
+/// The CEF log lines "WSALookupServiceBegin failed" / "CRL Verification failed" are
+/// benign noise present on EVERY runner and are NOT the cause. Returns a warning, or
+/// None if the runner is not a CachyOS build.
 pub fn runner_experimental_warning(runner_path: &Path) -> Option<String> {
     let wine_bin = match classify_runner(runner_path) {
         RunnerKind::PlainWine { wine64, .. } => wine64,
@@ -407,7 +410,7 @@ pub fn runner_experimental_warning(runner_path: &Path) -> Option<String> {
         let ver = String::from_utf8_lossy(&output.stdout).to_lowercase();
         if ver.contains("cachyos") || ver.contains("cachy") {
             return Some(
-                "The selected runner's Wine is a CachyOS (experimental) build. This CachyOS-patched Wine breaks Windows Steam\'s network connection (\"cant connect to steam network\"). Use a Proton build on TkG-patched Wine (e.g. proton_tkg) or stable wine-tkg instead - both connect fine and keep Proton\'s game patches available."
+                "The selected runner's Wine is a CachyOS (experimental) build. This CachyOS-patched Wine makes Steam\'s in-client self-updater replace the client with a build that fails to connect (\"cant connect to steam network\"). SteamFlow now disables the self-update (BootStrapperForceSelfUpdate=disable); if it still updates, run Windows Steam once under wine-tkg to install a known-good client, then launch under this runner without updating."
                     .to_string(),
             );
         }
@@ -419,7 +422,7 @@ pub fn runner_experimental_warning(runner_path: &Path) -> Option<String> {
         .to_lowercase();
     if name.contains("cachyos") || name.contains("cachy") {
         return Some(
-            "The selected runner looks like an experimental CachyOS build. This CachyOS-patched Wine can break Windows Steam\'s network connection (\"cant connect to steam network\"). Use a Proton build on TkG-patched Wine (e.g. proton_tkg) or stable wine-tkg instead."
+            "The selected runner looks like an experimental CachyOS build. This CachyOS-patched Wine can make Steam\'s self-updater install a client that fails to connect (\"cant connect to steam network\"). SteamFlow disables the self-update; if it still updates, use wine-tkg to install a known-good client first."
                 .to_string(),
         );
     }

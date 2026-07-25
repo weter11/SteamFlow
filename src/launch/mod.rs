@@ -16,6 +16,17 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     std::fs::create_dir_all(&runtimes_dir)?;
     std::fs::create_dir_all(&steam_cfg.wine_prefix)?;
 
+    // Pin the Windows Steam client so Proton-based runners cannot trigger the in-client
+    // self-updater. Under Proton wines (proton-tkg, proton-cachyos) Steam's updater
+    // downloads a fresh client and the resulting build then fails to connect to the
+    // Steam network ("cant connect to steam network"); wine-tkg does not trigger the
+    // update and works. Disabling the self-update keeps the known-good client in place.
+    if let Some(ref steam_exe) = steam_cfg.steam_exe {
+        if let Some(steam_dir) = steam_exe.parent() {
+            crate::steam_client::SteamClient::ensure_no_self_update(steam_dir);
+        }
+    }
+
     // Clear any Steam/wine processes still locked into the master prefix. A leftover
     // steam.exe / SteamService from a previous (failed) launch makes SteamSetup report
     // "steam already running, close it and continue installation" and blocks the install.
