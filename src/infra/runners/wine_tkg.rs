@@ -31,16 +31,29 @@ fn runtime_active(ctx: &LaunchContext) -> bool {
 /// the runtime runner so both share a single wineserver — which is exactly why the
 /// "both wine-tkg" combination worked but "runtime=wine-tkg, game=proton" crashed.
 fn effective_game_proton(ctx: &LaunchContext) -> String {
-    // For Steam Runtime launches the "runner" is a Proton, so the proton
-    // name is the effective runner name. When Steam Runtime is inactive
-    // we fall back to the game runner or default — both are plain wine
-    // runners whose names resolve identically through resolve_runner().
-    let name = crate::utils::resolve_effective_proton_name(
+    // When Steam Runtime is active AND the runtime runner is itself a Proton
+    // (not plain wine), force the game to use the same runner so both
+    // Steam and the game share a single wineserver in Shared prefix mode.
+    // This mirrors what Valve's official Proton does.
+    //
+    // When the runtime runner is plain wine (e.g. wine-tkg for the background
+    // Steam client) we must NOT override the game's proton — the game's
+    // proton (GE-Proton etc.) and wine-tkg use different wineserver IPC
+    // protocols and cannot share a prefix.
+    if runtime_active(ctx) && !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+        let runtime_runner = ctx.launcher_config.steam_runtime_runner.clone();
+        if !matches!(crate::utils::classify_runner(&runtime_runner), crate::utils::RunnerKind::PlainWine { .. }) {
+            return runtime_runner.to_string_lossy().to_string();
+        }
+        // Runtime runner is plain wine (e.g. wine-tkg for Steam background).
+        // Fall through to the game's own proton — do NOT override it with wine.
+    }
+    crate::utils::resolve_effective_proton_name(
         ctx.app.app_id,
         &ctx.launcher_config,
         ctx.proton_path.as_deref(),
-    );
-    name.to_string()
+    )
+    .to_string()
 }
 
 #[async_trait::async_trait]
