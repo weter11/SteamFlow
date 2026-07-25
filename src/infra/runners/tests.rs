@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::infra::runners::{LaunchContext, CommandSpec, Runner, WineTkgRunner};
-    use crate::models::LibraryGame;
+    use crate::models::{LibraryGame, UserAppConfig, SteamRuntimePolicy};
     use crate::steam_client::{LaunchInfo, LaunchTarget};
     use crate::config::LauncherConfig;
     use std::path::PathBuf;
@@ -153,8 +153,20 @@ mod tests {
         fs::write(proton_path.join("bin/wine64"), "").unwrap();
         ctx.proton_path = Some(proton_path.to_string_lossy().to_string());
 
-        // build_env should succeed without real filesystem
+        // build_env should succeed without real filesystem.
+        // With steam_runtime_policy = Disabled (default when no user_config), Steam identity
+        // vars must NOT be injected (otherwise DRM-free games try to init Steam and fail).
         let env = runner.build_env(&ctx).await.unwrap();
-        assert_eq!(env.get("SteamAppId").unwrap(), "123");
+        assert!(env.get("SteamAppId").is_none(), "SteamAppId must be absent when runtime disabled");
+
+        // When the Windows Steam Runtime is Enabled, Steam identity vars ARE injected.
+        let mut ctx_enabled = ctx.clone();
+        ctx_enabled.user_config = Some({
+            let mut c = crate::models::UserAppConfig::default();
+            c.steam_runtime_policy = crate::models::SteamRuntimePolicy::Enabled;
+            c
+        });
+        let env_enabled = runner.build_env(&ctx_enabled).await.unwrap();
+        assert_eq!(env_enabled.get("SteamAppId").unwrap(), "123");
     }
 }

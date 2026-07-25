@@ -85,6 +85,26 @@ pub fn detect_steam_path() -> Option<PathBuf> {
     }
 }
 
+/// Returns the Steam install root that contains `compatibilitytools.d` and
+/// `steamapps/common` (where Steam SDK shims such as libsteam_api.so live).
+/// On Linux this is typically ~/.local/share/Steam (with ~/.steam/steam often a
+/// symlink to it). Best-effort fallback source when a game's own Steam SDK shim
+/// is missing or corrupt and must be repaired from another location.
+pub fn get_steam_root_hint() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let candidates = [
+        PathBuf::from(&home).join(".local/share/Steam"),
+        PathBuf::from(&home).join(".steam/steam"),
+        PathBuf::from(&home).join(".steam/root"),
+    ];
+    for c in &candidates {
+        if c.join("compatibilitytools.d").is_dir() || c.join("steamapps/common").is_dir() {
+            return Some(c.clone());
+        }
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
 pub fn config_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".config/SteamFlow"))

@@ -8,24 +8,54 @@ use crate::launch::pipeline::{LaunchError, LaunchErrorKind};
 
 pub struct WineTkgRunner;
 
+/// True when the Windows Steam Runtime is Active for this launch (Enabled policy, or
+/// Auto policy with the legacy use_steam_runtime toggle on).
+fn runtime_active(ctx: &LaunchContext) -> bool {
+    match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
+        Some(crate::models::SteamRuntimePolicy::Enabled) => true,
+        Some(crate::models::SteamRuntimePolicy::Disabled) => false,
+        Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+            ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false)
+        }
+    }
+}
+
+/// Resolve the runner (Compatibility Layer) the game should launch under.
+///
+/// When the Windows Steam Runtime is Active, the background Steam process owns the
+/// shared WINEPREFIX and runs under `launcher_config.steam_runtime_runner`. If the game
+/// were launched under a DIFFERENT runner, two wineservers (different pipe protocols)
+/// would collide in the same prefix and the game would crash with
+/// "wine client error: version mismatch ... your wine binary was not upgraded correctly".
+/// To avoid that, when the runtime is active we force the game's compatibility layer to
+/// the runtime runner so both share a single wineserver — which is exactly why the
+/// "both wine-tkg" combination worked but "runtime=wine-tkg, game=proton" crashed.
+fn effective_game_proton(ctx: &LaunchContext) -> String {
+    if runtime_active(ctx) && !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+        return ctx.launcher_config.steam_runtime_runner.to_string_lossy().to_string();
+    }
+    if let Some(forced) = ctx.launcher_config
+        .game_configs
+        .get(&ctx.app.app_id)
+        .and_then(|c| c.forced_proton_version.as_ref())
+    {
+        return forced.clone();
+    }
+    ctx.proton_path
+        .clone()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| ctx.launcher_config.proton_version.clone())
+}
+
 #[async_trait::async_trait]
 impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
+
     async fn prepare_prefix(&self, ctx: &LaunchContext) -> std::result::Result<(), LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
-        let proton = if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced.as_str()
-        } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
-        };
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let proton = effective_game_proton(ctx);
+        let active_runner = crate::utils::resolve_runner(&proton, &library_root);
 
         let (use_steam_runtime, runtime_source) = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
             Some(crate::models::SteamRuntimePolicy::Enabled) => (true, "override"),
@@ -162,13 +192,19 @@ impl Runner for WineTkgRunner {
                         let runner_canonical = runner_root.canonicalize().unwrap_or(runner_root);
 
                         if active_canonical != runner_canonical {
-                            return Err(LaunchError::new(
-                                LaunchErrorKind::Runner,
-                                format!(
-                                    "A wineserver is already running in this prefix using a different runtime ({:?}). Stop all running games and Wine processes before launching with a different Proton/Wine version, or enable per-game prefix mode.",
-                                    active_canonical
-                                )
-                            ));
+                            // A wineserver from a DIFFERENT runner is locked into this
+                            // prefix. If we launch anyway we get the classic
+                            // "wine client error: version mismatch ... wineserver is still running".
+                            // The correct fix (what Proton/Steam do) is to terminate the
+                            // stale server and let the new runner start its own. This is safe
+                            // because a server for another runner cannot serve this launch.
+                            tracing::warn!(
+                                "Stale wineserver (different runner {:?}) detected in prefix {}. Terminating it before launch.",
+                                active_canonical, steam_wineprefix.display()
+                            );
+                            crate::utils::kill_all_wine_in_prefix(&steam_wineprefix);
+                            // Give the old server a moment to release the prefix lock.
+                            std::thread::sleep(std::time::Duration::from_millis(500));
                         }
                     }
 
@@ -296,6 +332,21 @@ impl Runner for WineTkgRunner {
                         let steam_config_vdf = prefix_steam_dir.join("config/config.vdf");
                         let steam_logs_dir   = prefix_steam_dir.join("logs");
 
+                        // Steam readiness is NOT "a file appeared once". config.vdf is written
+                        // extremely early in boot (often within the first second on a cold
+                        // start), so treating its presence as "ready" produced false positives
+                        // ("Steam ready after 1s") while Steam was still initialising.
+                        //
+                        // Correct signal: the main Steam client process must be UP and stay up
+                        // for a sustained window (SUSTAINED_SECS). We watch for any of the
+                        // real "client reached main loop" markers (steam.pid / .steampath /
+                        // config.vdf) and only declare ready once that marker has been present
+                        // continuously for SUSTAINED_SECS while the process is still alive.
+                        // A process that crashes/restarts resets the timer, so crash loops are
+                        // never misread as "ready".
+                        const SUSTAINED_SECS: u64 = 6;
+                        let mut signal_first_seen: Option<std::time::Instant> = None;
+
                         let ready = 'wait: {
                             let mut signal_msg = None;
                             for i in 0..readiness_timeout {
@@ -315,39 +366,50 @@ impl Runner for WineTkgRunner {
                                     break 'wait false;
                                 }
 
-                                // Signal 1: pid file (some Wine/Steam combos do write this)
-                                if steam_pid_path.exists() {
-                                    signal_msg = Some(format!("steam.pid found after {}s", i + 1));
-                                    break;
+                                // Primary readiness markers: the main client process has
+                                // started (pid file, Proton .steampath pipe, or config.vdf).
+                                let signal_present =
+                                    steam_pid_path.exists() || steam_pipe.exists() || steam_config_vdf.exists();
+
+                                if signal_present {
+                                    match signal_first_seen {
+                                        None => {
+                                            signal_first_seen = Some(std::time::Instant::now());
+                                        }
+                                        Some(t0) => {
+                                            let elapsed = t0.elapsed().as_secs();
+                                            if elapsed >= SUSTAINED_SECS {
+                                                signal_msg = Some(format!(
+                                                    "Steam process stable for {}s (marker present since {}s)",
+                                                    SUSTAINED_SECS, i + 1
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Lost the marker (crashed / restarted) — restart the timer.
+                                    signal_first_seen = None;
                                 }
 
-                                // Signal 2: .steampath in temp (Proton-style)
-                                if steam_pipe.exists() {
-                                    signal_msg = Some(format!(".steampath found after {}s", i + 1));
-                                    break;
-                                }
-
-                                // Signal 3: config.vdf written — Steam has finished early init
-                                if steam_config_vdf.exists() {
-                                    signal_msg = Some(format!("config.vdf found after {}s", i + 1));
-                                    break;
-                                }
-
-                                // Signal 4: logs dir has multiple entries — Steam's subsystems are running
+                                // Secondary hint (NOT a trigger): subsystems logging.
                                 let log_count = std::fs::read_dir(&steam_logs_dir)
                                     .map(|d| d.count())
                                     .unwrap_or(0);
                                 if log_count >= 2 {
-                                    signal_msg = Some(format!("{} log files found after {}s", log_count, i + 1));
                                     unsafe {
                                         if !ctx.verification_ptr.is_null() {
-                                            (*ctx.verification_ptr).steam_runtime_milestone = "steam_ready_signal_observed".to_string();
+                                            (*ctx.verification_ptr).steam_runtime_milestone =
+                                                "steam_ready_signal_observed".to_string();
                                         }
                                     }
-                                    break;
                                 }
 
-                                println!("  Waiting... {}s", i + 1);
+                                println!(
+                                    "  Waiting... {}s (client marker: {})",
+                                    i + 1,
+                                    if signal_present { "present" } else { "absent" }
+                                );
                             }
 
                             if let Some(msg) = signal_msg {
@@ -413,9 +475,35 @@ impl Runner for WineTkgRunner {
             .or_else(|| executable.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| install_dir.clone());
 
-        let app_id_str = ctx.app.app_id.to_string();
-        let app_id_path = game_working_dir.join("steam_appid.txt");
-        let _ = std::fs::write(&app_id_path, &app_id_str);
+        // Only write steam_appid.txt when the Windows Steam Runtime is actually in use.
+        // When the runtime is Disabled, writing it (and exposing STEAM_COMPAT_CLIENT_INSTALL_PATH
+        // in build_env) makes DRM-free games such as Amnesia: The Dark Descent (AppID 57300) try to
+        // init Steam and fail with "could not init steam", even though they don't need it.
+        let runtime_active_for_appid = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
+            Some(crate::models::SteamRuntimePolicy::Enabled) => true,
+            Some(crate::models::SteamRuntimePolicy::Disabled) => false,
+            Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+                ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false)
+            }
+        };
+        if runtime_active_for_appid {
+            let app_id_str = ctx.app.app_id.to_string();
+            let app_id_path = game_working_dir.join("steam_appid.txt");
+            let _ = std::fs::write(&app_id_path, &app_id_str);
+        } else {
+            // Runtime disabled: also remove any steam_appid.txt left behind by a previous
+            // launch. Steam's steam_api reads this file from the working directory and will
+            // attempt to init Steam even when the env vars are absent, so a stale artifact
+            // makes DRM-free games (e.g. Amnesia, AppID 57300) fail with "could not init steam".
+            let stale = game_working_dir.join("steam_appid.txt");
+            if stale.exists() {
+                let _ = std::fs::remove_file(&stale);
+                tracing::info!(
+                    "Removed stale steam_appid.txt from {} (Windows Steam Runtime disabled)",
+                    stale.display()
+                );
+            }
+        }
 
         Ok(())
     }
@@ -467,22 +555,16 @@ impl Runner for WineTkgRunner {
 
         if effective_steam_runtime_for_gate {
             let master_steam_cfg = crate::utils::get_master_steam_config();
-            let steam_wineprefix = &master_steam_cfg.wine_prefix;
-            let steam_is_running = SteamClient::is_steam_running_in_prefix(steam_wineprefix);
+            let steam_wineprefix = master_steam_cfg.wine_prefix.clone();
+            let steam_is_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix);
 
             if !steam_is_running {
                 tracing::warn!(
-                    "Windows Steam Runtime is {:?} but Steam is not running in prefix {}.                      Game {} may fail if it requires Steam API (Steamworks).",
+                    "Windows Steam Runtime is {:?} but Steam is not running in prefix {}. Game {} may fail if it requires Steam API (Steamworks).",
                     steam_runtime_policy,
                     steam_wineprefix.display(),
                     ctx.app.app_id
                 );
-                if game_requires_steam_api {
-                    tracing::warn!(
-                        "Per-game setting: game {} has 'Requires Steam API' enabled.                          Ensure 'Use Windows Steam Runtime' is set to Enabled in Settings.",
-                        ctx.app.app_id
-                    );
-                }
             }
         }
 
@@ -498,9 +580,22 @@ impl Runner for WineTkgRunner {
             crate::models::D3D12ProviderPolicy::Vkd3dWine
         );
 
-        env.insert("SteamAppId".to_string(), app_id_str.clone());
-        env.insert("SteamGameId".to_string(), app_id_str.clone());
-        env.insert("STEAM_COMPAT_APP_ID".to_string(), app_id_str);
+        // Only expose Steam identity vars when the Windows Steam Runtime is actually in use.
+        // When the runtime is Disabled, leaving these set (in addition to steam_appid.txt /
+        // STEAM_COMPAT_CLIENT_INSTALL_PATH) makes DRM-free games such as Amnesia: The Dark Descent
+        // (AppID 57300) attempt to initialize Steam and fail with "could not init steam".
+        let runtime_active_for_env = match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
+            Some(crate::models::SteamRuntimePolicy::Enabled) => true,
+            Some(crate::models::SteamRuntimePolicy::Disabled) => false,
+            Some(crate::models::SteamRuntimePolicy::Auto) | None => {
+                ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false)
+            }
+        };
+        if runtime_active_for_env {
+            env.insert("SteamAppId".to_string(), app_id_str.clone());
+            env.insert("SteamGameId".to_string(), app_id_str.clone());
+            env.insert("STEAM_COMPAT_APP_ID".to_string(), app_id_str.clone());
+        }
         env.insert("WINEPREFIX".to_string(), effective_game_prefix.to_string_lossy().to_string());
         env.insert("STEAM_COMPAT_DATA_PATH".to_string(), compat_data_path.to_string_lossy().to_string());
 
@@ -527,6 +622,52 @@ impl Runner for WineTkgRunner {
             || dx12_suppress
             || dx12_requires_overlay_suppress;
 
+
+        // Steamworks readiness gate (runs only when Windows Steam Runtime is required).
+        // This diagnoses the "lsteamclient.dll cannot be loaded" class of failures that hit
+        // Steamworks games such as An Arcade Full of Cats (AppID 2368470). It does NOT block
+        // the launch \u2014 it surfaces a clear, actionable warning so the user knows Windows
+        // Steam must be installed/running, rather than getting a silent "SteamAPI Initialization Failed".
+        if effective_steam_runtime_for_gate {
+            let master_steam_cfg = crate::utils::get_master_steam_config();
+            let steam_wineprefix = master_steam_cfg.wine_prefix.clone();
+
+            // A real Windows Steam install always ships lsteamclient.dll in its install dir.
+            let steam_exe_dir = master_steam_cfg.steam_exe
+                .as_ref()
+                .and_then(|e| e.parent().map(|p| p.to_path_buf()));
+            let has_lsteamclient = steam_exe_dir
+                .as_ref()
+                .map(|d| d.join("lsteamclient.dll").exists() || d.join("lsteamclient64.dll").exists())
+                .unwrap_or(false);
+            let steam_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix);
+
+            if !has_lsteamclient || !steam_running {
+                tracing::warn!(
+                    "Steamworks game {} may fail: Windows Steam not fully ready in prefix {} (lsteamclient present={}, running={}).",
+                    ctx.app.app_id,
+                    steam_wineprefix.display(),
+                    has_lsteamclient,
+                    steam_running,
+                );
+                if game_requires_steam_api {
+                    tracing::error!(
+                        "Game {} has 'Requires Steam API' enabled but Windows Steam is not available.                          Install/run Windows Steam (Settings -> 'Install / Manage Windows Steam Runtime')                          or set 'Use Windows Steam Runtime' to Enabled before launching.",
+                        ctx.app.app_id
+                    );
+                }
+            }
+        }
+
+        // force_wined3d check: when set, DXVK is completely disabled.
+        let force_wined3d = glc.force_wined3d;
+        if force_wined3d {
+            tracing::info!(
+                "force_wined3d is enabled for game {} - DXVK will be disabled for this launch.",
+                ctx.app.app_id
+            );
+        }
+
         let game_working_dir: PathBuf = {
             let install_dir = PathBuf::from(
                 ctx.app.install_path
@@ -549,19 +690,9 @@ impl Runner for WineTkgRunner {
         };
 
         // Resolve proton version for component detection and DLL path building
-        let proton = if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
-        {
-            forced.as_str()
-        } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
-        };
+        let proton = effective_game_proton(ctx);
 
-        let active_runner_path = crate::utils::resolve_runner(proton, &library_root);
+        let active_runner_path = crate::utils::resolve_runner(&proton, &library_root);
         if !active_runner_path.exists() {
             return Err(LaunchError::new(
                 LaunchErrorKind::Runner,
@@ -574,6 +705,99 @@ impl Runner for WineTkgRunner {
         let game_runner_kind = crate::utils::classify_runner(&active_runner_path);
         if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {
             return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Compatibility Layer path: {}", active_runner_path.display())));
+        }
+        // === Steam SDK shim repair (SAFE) ===
+        // Some games ship a broken/corrupt libsteam_api.so (observed: all-zero file,
+        // e.g. "An Arcade Full of Cats", AppID 2368470). That makes the dynamic loader
+        // reject it with "invalid ELF header" and abort the launch.
+        //
+        // CRITICAL: libsteam_api.so is the Steamworks SDK redist and is ABI/version
+        // specific to the game's build. Blindly copying ANY other libsteam_api.so
+        // (e.g. one bundled with a Proton layer) causes symbol mismatches such as
+        // "undefined symbol: SteamInternal_SteamAPI_Init" and still breaks the game.
+        //
+        // Therefore we ONLY repair when a candidate is BOTH a valid ELF AND exports the
+        // exact symbol the game imports. If no compatible shim exists, we remove the
+        // corrupt file and emit a clear error telling the user to Verify/Reinstall the
+        // game's files (the only correct source of the right SDK).
+        {
+            let game_lib = game_working_dir.join("libsteam_api.so");
+            let is_corrupt = if game_lib.exists() {
+                std::fs::read(&game_lib).map(|b| b.len() < 4 || &b[0..4] != b"\x7fELF").unwrap_or(true)
+            } else {
+                false
+            };
+
+            if is_corrupt {
+                // The symbol a native Linux Steamworks game imports from its shim.
+                let needed_symbol = "SteamInternal_SteamAPI_Init";
+
+                let mut sdk_candidates: Vec<PathBuf> = Vec::new();
+                if let Some(steam_dir) = crate::config::get_steam_root_hint() {
+                    let mut scan = |dir: &Path| {
+                        if let Ok(entries) = std::fs::read_dir(dir) {
+                            for entry in entries.flatten() {
+                                for cand in [
+                                    entry.path().join("files/lib64/libsteam_api.so"),
+                                    entry.path().join("files/lib/libsteam_api.so"),
+                                    entry.path().join("dist/lib64/libsteam_api.so"),
+                                    entry.path().join("dist/lib/libsteam_api.so"),
+                                ] {
+                                    if cand.exists() {
+                                        sdk_candidates.push(cand);
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    scan(&steam_dir.join("compatibilitytools.d"));
+                    scan(&steam_dir.join("steamapps/common"));
+                }
+
+                // A candidate is acceptable only if it is a valid ELF AND exports the
+                // exact symbol the game needs. Without symbol verification we would
+                // reintroduce the ABI-mismatch crash.
+                let exports_symbol = |cand: &Path, symbol: &str| -> bool {
+                    std::process::Command::new("readelf")
+                        .args(["-sW", cand.to_str().unwrap_or("")])
+                        .output()
+                        .ok()
+                        .and_then(|o| String::from_utf8(o.stdout).ok())
+                        .map(|out| out.contains(symbol))
+                        .unwrap_or(false)
+                };
+                let valid_src = sdk_candidates.iter().find(|p| {
+                    std::fs::read(p)
+                        .map(|b| b.len() >= 4 && &b[0..4] == b"\x7fELF")
+                        .unwrap_or(false)
+                        && exports_symbol(p, needed_symbol)
+                });
+
+                match valid_src {
+                    Some(src) => {
+                        if let Err(e) = std::fs::copy(src, &game_lib) {
+                            tracing::error!(
+                                "Failed to repair libsteam_api.so for game {} from {}: {}",
+                                ctx.app.app_id, src.display(), e
+                            );
+                        } else {
+                            tracing::warn!(
+                                "Repaired corrupt libsteam_api.so for game {} from {}",
+                                ctx.app.app_id, src.display()
+                            );
+                        }
+                    }
+                    None => {
+                        // No ABI-compatible shim: remove the corrupt file and tell the
+                        // user the only correct fix is to Verify/Reinstall game files.
+                        let _ = std::fs::remove_file(&game_lib);
+                        tracing::error!(
+                            "Game {} ships a corrupt libsteam_api.so and no ABI-compatible Steamworks SDK shim was found on this system.                              The launch will fail. Fix: in Steam, right-click the game -> Properties -> Installed Files -> 'Verify integrity of game files' (or reinstall).                              This restores the exact libsteam_api.so the game was built against.",
+                            ctx.app.app_id
+                        );
+                    }
+                }
+            }
         }
         unsafe {
             if !ctx.verification_ptr.is_null() {
@@ -590,10 +814,14 @@ impl Runner for WineTkgRunner {
             Some(&effective_game_prefix),
         );
 
-        // 1. Resolve DX8-11 policy (GraphicsBackendPolicy) - CONSERVATIVE
+        // 1. Resolve DX8-11 policy (GraphicsBackendPolicy) - CONSERVATIVE.
+        // Auto does NOT automatically enable DXVK. Empirical testing shows DXVK breaks
+        // several titles on this setup (e.g. Metro 2033 Redux crashes during boot under
+        // DXVK, and native-Linux games such as Portal 2 must not be forced through Wine's
+        // D3D path at all). Wine's built-in D3D (or per-game "Force WineD3D") is the safe
+        // default; the user opts into DXVK explicitly via the DXVK policy or per-game
+        // override when a specific game needs it.
         let (policy_dxvk, force_builtin, strict_dxvk) = match glc.graphics_backend_policy {
-            // Auto is now conservative: it does NOT automatically enable DXVK
-            // even if detected on disk. It prefers default Wine behavior.
             crate::models::GraphicsBackendPolicy::Auto => (false, false, false),
             crate::models::GraphicsBackendPolicy::WineD3D => (false, true, false),
             crate::models::GraphicsBackendPolicy::DXVK => (true, false, true),
@@ -603,7 +831,10 @@ impl Runner for WineTkgRunner {
         let effective_dxvk = glc.dxvk_enabled || policy_dxvk;
 
         // If user explicitly selected WineD3D and didn't force DXVK, we use builtins.
-        let force_builtin_d3d = force_builtin && !effective_dxvk;
+        // force_wined3d (per-game "Force WineD3D") forces built-in D3D regardless of
+        // policy so DXVK/VKD3D are fully bypassed — needed for games like Amnesia that
+        // crash with DXVK or that only ship 32-bit binaries.
+        let force_builtin_d3d = (force_builtin || force_wined3d) && !effective_dxvk;
 
         // 2. Resolve DX12 policy (D3D12ProviderPolicy) - CONSERVATIVE
         let (policy_vkd3dp, policy_vkd3dw) = match glc.d3d12_policy {
@@ -613,8 +844,37 @@ impl Runner for WineTkgRunner {
             crate::models::D3D12ProviderPolicy::Vkd3dWine => (false, true),
         };
         // Manual overrides take precedence
-        let effective_vkd3d_proton = glc.vkd3d_proton_enabled || policy_vkd3dp;
-        let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
+        let effective_vkd3d_proton = (glc.vkd3d_proton_enabled || policy_vkd3dp) && !force_wined3d;
+        let effective_vkd3d = (glc.vkd3d_enabled || policy_vkd3dw) && !force_wined3d;
+
+        // vkd3d-proton fallback: if VKD3D-Proton is requested but not
+        // available in the runner, fall back to upstream VKD3D (Wine).
+        // This happens when user selected VKD3D-Proton policy or forced it,
+        // but the runner doesn't bundle VKD3D-Proton DLLs.
+        let effective_vkd3d_proton = if effective_vkd3d_proton && _components.vkd3d_proton.is_none() {
+            if _components.vkd3d.is_some() {
+                tracing::info!(
+                    "VKD3D-Proton not found in runner '{}', falling back to VKD3D (Wine).",
+                    active_runner_path.display()
+                );
+            }
+            false
+        } else {
+            effective_vkd3d_proton
+        };
+
+        // Similarly, if VKD3D-Wine is forced but not available, fall back to VKD3D-Proton if present.
+        let effective_vkd3d = if effective_vkd3d && _components.vkd3d.is_none() {
+            if _components.vkd3d_proton.is_some() {
+                tracing::info!(
+                    "VKD3D (Wine) not found in runner '{}', falling back to VKD3D-Proton.",
+                    active_runner_path.display()
+                );
+            }
+            false
+        } else {
+            effective_vkd3d
+        };
 
         // NVAPI Support
         let nvapi_enabled_cfg = ctx.user_config.as_ref().map(|c| c.graphics_layers.nvapi_enabled).unwrap_or(true);
@@ -756,7 +1016,7 @@ impl Runner for WineTkgRunner {
 
         // Also add the runner's main lib/wine directories so Wine can find
         // the .dll.so PE loader stubs it needs to bridge into native DLLs.
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let active_runner = crate::utils::resolve_runner(&proton, &library_root);
         let runner_root = crate::utils::derive_runner_root(&active_runner);
         for lib_sub in crate::proton::UNIFIED_LIB_SUBDIRS {
             let p = runner_root.join(lib_sub);
@@ -837,6 +1097,8 @@ impl Runner for WineTkgRunner {
                     }
                 }
             } else {
+                // steam_exe present but per-game path is missing: fall back to a fake trap so the
+                // game still sees a Steam client path without crashing the launch wiring.
                 let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
                 let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
                     .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, "failed to setup fake steam trap").with_source(e))?;
@@ -850,15 +1112,19 @@ impl Runner for WineTkgRunner {
                 }
             }
         } else {
-            let config_dir = crate::config::config_dir().map_err(|e| LaunchError::new(LaunchErrorKind::Environment, "failed to get config dir").with_source(e))?;
-            let fake_env = crate::utils::setup_fake_steam_trap(&config_dir)
-                .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, "failed to setup fake steam trap").with_source(e))?;
-            env.insert("STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(), fake_env.to_string_lossy().to_string());
+            // Windows Steam Runtime is Disabled: do NOT expose any Steam client path.
+            // A fake trap still makes DRM-free games (e.g. Amnesia: The Dark Descent, AppID 57300)
+            // attempt Steam init and fail with "could not init steam". Leaving the var unset lets
+            // them run standalone as the developer intended.
+            tracing::info!(
+                "Windows Steam Runtime disabled for game {} — not exposing STEAM_COMPAT_CLIENT_INSTALL_PATH",
+                ctx.app.app_id
+            );
             unsafe {
                 if !ctx.verification_ptr.is_null() {
                     let v = &mut *ctx.verification_ptr;
-                    v.steam_client_install_path_exposed_to_game = Some(fake_env.to_string_lossy().to_string());
-                    v.steam_client_install_path_source = Some("fake_trap".to_string());
+                    v.steam_client_install_path_exposed_to_game = None;
+                    v.steam_client_install_path_source = Some("none_disabled".to_string());
                 }
             }
         }
@@ -964,18 +1230,24 @@ impl Runner for WineTkgRunner {
     async fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
-        let proton = if let Some(forced) = ctx.launcher_config
-            .game_configs
-            .get(&ctx.app.app_id)
-            .and_then(|c| c.forced_proton_version.as_ref())
+        // Per-game runner override: if the user has set a specific Compatibility Layer
+        // for this game (e.g. CachyOS Proton), use it instead of the global
+        // proton_version setting. However, when the Windows Steam Runtime is Active the
+        // background Steam owns the shared WINEPREFIX under `steam_runtime_runner`; the
+        // game must share that runner's wineserver, otherwise two runners collide in the
+        // same prefix and crash with "wine client error: version mismatch". So the
+        // runtime runner always wins when the runtime is active.
+        let effective_proton = if runtime_active(ctx) {
+            ctx.launcher_config.steam_runtime_runner.to_string_lossy().to_string()
+        } else if let Some(game_runner) = ctx.user_config.as_ref()
+            .and_then(|c| c.game_runner.as_deref())
+            .filter(|s| !s.is_empty())
         {
-            forced.as_str()
+            game_runner.to_string()
         } else {
-            ctx.proton_path.as_deref()
-                .filter(|p| !p.is_empty())
-                .unwrap_or(ctx.launcher_config.proton_version.as_str())
+            effective_game_proton(ctx)
         };
-        let active_runner = crate::utils::resolve_runner(proton, &library_root);
+        let active_runner = crate::utils::resolve_runner(&effective_proton, &library_root);
         let game_runner_kind = crate::utils::classify_runner(&active_runner);
         if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {
             return Err(LaunchError::new(LaunchErrorKind::Runner, format!("Unknown Compatibility Layer path: {}", active_runner.display())));

@@ -1232,6 +1232,18 @@ impl SteamLauncher {
             changed = true;
         }
 
+        // Per-game runner override: allows using a different Compatibility Layer
+        // for this specific game without affecting other games or the Steam background runner.
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label("Compatibility Layer Override");
+        let mut game_runner = config.game_runner.clone().unwrap_or_default();
+        if ui.text_edit_singleline(&mut game_runner).changed() {
+            config.game_runner = if game_runner.trim().is_empty() { None } else { Some(game_runner.trim().to_string()) };
+            changed = true;
+        }
+        ui.label(egui::RichText::new("Leave empty to use the global Compatibility Layer setting.").weak());
+
         if changed {
             self.user_configs.insert(game.app_id, config);
             let store = self.user_configs.clone();
@@ -1489,6 +1501,42 @@ impl SteamLauncher {
 
             ui.add_space(8.0);
             ui.heading("Manual Overrides (advanced)");
+
+            // Smart Override button: resets D3D12 policy + manual overrides
+            // to values that match what the runner actually has available.
+            // If runner has vkd3d-proton but not vkd3d wine (or vice versa),
+            // auto-selects the available one as fallback.
+            if ui.button("⚡ Smart Override — match runner capabilities").on_hover_text(
+                "Resets D3D12 policy and manual overrides to match what this runner actually provides.                  Falls back from VKD3D-Proton to VKD3D-Wine (or vice versa) if the preferred one is not available."
+            ).clicked() {
+                let available = &self.runner_components;
+                let has_vkd3d_proton = available.as_ref().map(|c| c.vkd3d_proton.is_some()).unwrap_or(false);
+                let has_vkd3d = available.as_ref().map(|c| c.vkd3d.is_some()).unwrap_or(false);
+
+                // Reset D3D12 policy to Auto first
+                glc.d3d12_policy = crate::models::D3D12ProviderPolicy::Auto;
+
+                if has_vkd3d_proton {
+                    // Runner has VKD3D-Proton: enable that provider
+                    glc.vkd3d_proton_enabled = true;
+                    glc.vkd3d_enabled = false;
+                } else if has_vkd3d {
+                    // Runner has VKD3D (Wine) but not VKD3D-Proton: use Wine's
+                    glc.vkd3d_proton_enabled = false;
+                    glc.vkd3d_enabled = true;
+                } else {
+                    // Neither vkd3d-proton nor vkd3d available — disable both overrides
+                    glc.vkd3d_proton_enabled = false;
+                    glc.vkd3d_enabled = false;
+                }
+
+                // Reset other manual overrides to not forced
+                glc.dxvk_enabled = false;
+                glc.nvapi_enabled = true; // NVAPI enabled by default
+
+                gl_changed = true;
+            }
+
             ui.horizontal(|ui| {
                 if ui.checkbox(&mut glc.dxvk_enabled, "Force DXVK").on_hover_text("Always use DXVK for DX8-11, ignoring policy.").changed() {
                     gl_changed = true;
@@ -1500,6 +1548,9 @@ impl SteamLauncher {
                     gl_changed = true;
                 }
                 if ui.checkbox(&mut glc.nvapi_enabled, "Enable NVAPI").on_hover_text("Expose NVIDIA API to the game (requires runner support).").changed() {
+                    gl_changed = true;
+                }
+                if ui.checkbox(&mut glc.force_wined3d, "Force WineD3D (disable DXVK/VKD3D)").on_hover_text("Use Wine's built-in OpenGL/D3D translation instead of DXVK/VKD3D. Useful for older games (e.g. Amnesia) that crash with DXVK, or for 32-bit-only titles that lack 64-bit driver support.").changed() {
                     gl_changed = true;
                 }
             });
@@ -1515,6 +1566,7 @@ impl SteamLauncher {
             }
 
             ui.add_space(8.0);
+
             if let Some(components) = &self.runner_components {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.label(egui::RichText::new("Detected Graphics Components").strong());
@@ -3011,7 +3063,21 @@ impl eframe::App for SteamLauncher {
                                     }
 
                                     ui.vertical(|ui| {
-                                        ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
+                                        ui.horizontal(|ui| {
+                                            ui.heading(egui::RichText::new(game.name.clone()).size(30.0).strong());
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                if let Some(install_path) = game.install_path.as_ref() {
+                                                    let path = std::path::PathBuf::from(install_path);
+                                                    if ui.add(egui::Button::new("📁").corner_radius(6.0).min_size(egui::vec2(28.0, 28.0)))
+                                                        .on_hover_text("Open game install folder")
+                                                        .clicked()
+                                                    {
+                                                        let _ = std::process::Command::new("xdg-open").arg(&path).status()
+                                                            .or_else(|_| std::process::Command::new("open").arg(&path).status());
+                                                    }
+                                                }
+                                            });
+                                        });
                                         ui.label(format!("AppID: {}", game.app_id));
 
                                         ui.add_space(20.0);

@@ -335,6 +335,19 @@ impl std::fmt::Display for ComponentSource {
     }
 }
 
+/// Convert a (possibly Unix) path into a Windows-style path string (backslashes,
+/// drive-letter form when it sits under a Wine prefix's drive_c). Used for env vars
+/// such as STEAM_COMPAT_CLIENT_INSTALL_PATH that Proton expects in `C:\\...` form.
+pub fn to_windows_path(path: &Path) -> String {
+    let s = path.to_string_lossy().replace('/', "\\");
+    // If this looks like a Wine prefix dosdevice path, normalise to a C:\ drive letter.
+    if let Some(idx) = s.to_lowercase().find("drive_c") {
+        let rest = &s[idx + "drive_c".len()..];
+        return format!("C:{}", rest);
+    }
+    s
+}
+
 pub fn derive_runner_root(binary_path: &Path) -> PathBuf {
     let parent = if binary_path.is_file() {
         binary_path.parent().unwrap_or(binary_path)
@@ -1127,6 +1140,13 @@ pub fn build_dll_overrides(
         "steam_api=n".into(),
         "steam_api64=n".into(),
         "lsteamclient=".into(),
+        // AMD AGS (amd_ags_x64/x86.dll) frequently fails to load under Wine
+        // ("Could not map ... section .text, file probably truncated" -> the game's
+        // EXE import fails with STATUS_DLL_NOT_FOUND). Wine ships a working builtin
+        // stub, so force the builtin for these. This fixes Resident Evil 2 / RE:2
+        // and other Capcom/AMD-AGS titles without affecting real GPU behaviour.
+        "amd_ags_x64=b".into(),
+        "amd_ags_x86=b".into(),
     ];
 
     if no_overlay {

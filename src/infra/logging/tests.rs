@@ -135,6 +135,7 @@ mod tests {
             custom_dxvk_path: None,
             custom_vkd3d_path: None,
             custom_vkd3d_proton_path: None,
+            force_wined3d: false,
         };
 
         let warnings = check_environment_sanity(&env, "Wine", Some(&config));

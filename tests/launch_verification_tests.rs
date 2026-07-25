@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use tempfile::tempdir;
 
-use crate::launch::pipeline::{PipelineContext, LaunchPipeline, LaunchError, LaunchErrorKind};
-use crate::infra::logging::{LaunchSession, EventLogger};
-use crate::infra::runners::{Runner, CommandSpec, LaunchContext};
+use steamflow::launch::pipeline::{PipelineContext, LaunchPipeline, LaunchError, LaunchErrorKind};
+use steamflow::infra::logging::{LaunchSession, EventLogger};
+use steamflow::infra::runners::{Runner, CommandSpec, LaunchContext};
 
 struct MockRunner {
     exit_immediately: bool,
@@ -38,7 +38,7 @@ impl Runner for MockRunner {
 #[tokio::test]
 async fn test_launch_verification_early_exit() {
     let mut pipeline = LaunchPipeline::new();
-    pipeline.add_stage(Box::new(crate::launch::stages::spawn_process::SpawnProcessStage));
+    pipeline.add_stage(Box::new(steamflow::launch::stages::spawn_process::SpawnProcessStage));
 
     let tmp = tempdir().unwrap();
     let session = LaunchSession::new(tmp.path());
@@ -70,7 +70,7 @@ async fn test_launch_verification_early_exit() {
 #[tokio::test]
 async fn test_launch_verification_success() {
     let mut pipeline = LaunchPipeline::new();
-    pipeline.add_stage(Box::new(crate::launch::stages::spawn_process::SpawnProcessStage));
+    pipeline.add_stage(Box::new(steamflow::launch::stages::spawn_process::SpawnProcessStage));
 
     let tmp = tempdir().unwrap();
     let session = LaunchSession::new(tmp.path());
@@ -105,10 +105,10 @@ async fn test_launch_verification_success() {
 
 #[tokio::test]
 async fn test_background_steam_grace_period_failure() {
-    use crate::infra::runners::wine_tkg::WineTkgRunner;
-    use crate::config::LauncherConfig;
-    use crate::models::{LibraryGame, UserAppConfig, SteamRuntimePolicy};
-    use crate::steam_client::{LaunchInfo, LaunchTarget};
+    use steamflow::infra::runners::wine_tkg::WineTkgRunner;
+    use steamflow::config::LauncherConfig;
+    use steamflow::models::{LibraryGame, UserAppConfig, SteamRuntimePolicy};
+    use steamflow::steam_client::{LaunchInfo, LaunchTarget};
     use std::fs;
 
     let tmp = tempdir().unwrap();
@@ -165,14 +165,14 @@ async fn test_background_steam_grace_period_failure() {
     };
 
     // We need to set up the master prefix env so get_master_steam_config find it
-    // But get_master_steam_config uses crate::config::config_dir()
+    // But get_master_steam_config uses steamflow::config::config_dir()
     // We can't easily mock config_dir() without changing global state or using a mock.
     // However, WineTkgRunner::prepare_prefix calls get_master_steam_config().
 
     // For this test, we want to verify the logic in prepare_prefix.
     // We'll use a WineTkgRunner and call prepare_prefix directly.
 
-    let mut verification = crate::infra::logging::LaunchVerification::default();
+    let mut verification = steamflow::infra::logging::LaunchVerification::default();
     let ctx = LaunchContext {
         app,
         launch_info: LaunchInfo {
@@ -187,7 +187,7 @@ async fn test_background_steam_grace_period_failure() {
         launcher_config: config,
         user_config: Some(user_config),
         proton_path: Some(runner_dir.to_string_lossy().to_string()),
-        target_architecture: crate::models::ExecutableArchitecture::X86_64,
+        target_architecture: steamflow::models::ExecutableArchitecture::X86_64,
         dll_resolutions: Vec::new(),
         fixup_result: None,
         verification_ptr: &mut verification as *mut _,

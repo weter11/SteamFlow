@@ -133,6 +133,12 @@ pub struct SteamClient {
     active_cm: Option<SocketAddr>,
     server_list: Option<ServerList>,
     pending_confirmations: Vec<ConfirmationPrompt>,
+    /// Set the moment we observe the CM connection drop (Steam resets the
+    /// WebSocket, or a heartbeat send fails with AlreadyClosed). A set value
+    /// means the held `connection` is a zombie and must be dropped + reconnected
+    /// before the next CM call, instead of being reused (which would otherwise
+    /// keep erroring with "Failed to send heartbeat: AlreadyClosed").
+    connection_dead_since: Option<Instant>,
 }
 
 impl SteamClient {
@@ -144,11 +150,15 @@ impl SteamClient {
             active_cm: None,
             server_list: None,
             pending_confirmations: Vec::new(),
+            connection_dead_since: None,
         })
     }
 
     pub fn is_authenticated(&self) -> bool {
-        self.connection.is_some()
+        // A connection marked dead (Steam reset the WebSocket / heartbeat failed with
+        // AlreadyClosed) is a zombie and must not be treated as usable; callers that
+        // hold &mut self should call connection_or_reconnect() to transparently recover.
+        self.connection.is_some() && self.connection_dead_since.is_none()
     }
 
     pub fn is_offline(&self) -> bool {
@@ -159,27 +169,45 @@ impl SteamClient {
         self.connection.as_ref()
     }
 
+    /// Mark the held CM connection as dead. Called when we observe a transport
+    /// reset (Steam rotates connection managers, or the WebSocket is closed with
+    /// ResetWithoutClosingHandshake / AlreadyClosed). The next guarded CM call
+    /// will drop the zombie handle and transparently reconnect.
+    pub fn mark_connection_dead(&mut self) {
+        if self.connection_dead_since.is_none() {
+            self.connection_dead_since = Some(Instant::now());
+        }
+        self.connection = None;
+    }
+
+    /// Return a live connection, transparently reconnecting if the previous one
+    /// was marked dead (Steam reset it). This prevents callers from reusing a
+    /// closed socket and stops the repeated "Failed to send heartbeat" spam.
+    pub async fn connection_or_reconnect(&mut self) -> Result<&Connection> {
+        if self.connection.is_none() {
+            self.connect().await?;
+        }
+        self.connection
+            .as_ref()
+            .context("steam connection not initialized")
+    }
+
     pub async fn logout(&mut self) -> Result<()> {
         self.connection = None;
+        self.connection_dead_since = None;
         self.state = LoginState::Connected;
         delete_session().await?;
         Ok(())
     }
 
     pub async fn get_app_ticket(&self, appid: u32) -> Result<Vec<u8>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        let connection = self.connection.as_ref().context("steam connection not initialized")?;
 
         let mut request = CMsgClientGetAppOwnershipTicket::new();
         request.set_app_id(appid);
 
         let response: steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse =
-            connection
-                .job(request)
-                .await
-                .context("failed requesting app ownership ticket")?;
+            connection.job(request).await.context("failed requesting app ownership ticket")?;
 
         let ticket = response.ticket().to_vec();
         if ticket.is_empty() {
@@ -292,6 +320,7 @@ impl SteamClient {
 
     pub fn invalidate_session(&mut self) {
         self.connection = None;
+        self.connection_dead_since = None;
         self.state = LoginState::Connected;
     }
 
@@ -2256,18 +2285,55 @@ impl SteamClient {
     }
 
     /// Writes a steam.cfg into the Steam directory that minimises UI on startup.
+    /// Delegates to `ensure_no_self_update` so the self-update pin is always enforced
+    /// even when a steam.cfg already exists (e.g. written by the updater or the user).
     pub fn write_headless_steam_cfg(steam_dir: &Path) {
+        Self::ensure_no_self_update(steam_dir);
+    }
+
+    /// Ensures the Windows Steam client will NOT self-update. Proton-based wines
+    /// (proton-tkg, proton-cachyos) otherwise trigger Steam's in-client updater, which
+    /// downloads a fresh client that then fails to connect to the Steam network
+    /// ("cant connect to steam network"). wine-tkg does not trigger the update and works.
+    ///
+    /// Unlike `write_headless_steam_cfg`, this does NOT skip an existing file: it merges
+    /// `BootStrapperForceSelfUpdate=disable` into whatever steam.cfg is present (including
+    /// one the updater or the user wrote) so the pin is always enforced.
+    pub fn ensure_no_self_update(steam_dir: &Path) {
         let cfg_path = steam_dir.join("steam.cfg");
-        // Only write if not already present to avoid overwriting user config
-        if cfg_path.exists() {
-            return;
+        let mut lines: Vec<String> = if cfg_path.exists() {
+            std::fs::read_to_string(&cfg_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.trim_end().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let has_disable = lines
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case("BootStrapperForceSelfUpdate=disable"));
+        if !has_disable {
+            lines.push("BootStrapperForceSelfUpdate=disable".to_string());
         }
-        let content = "\
-BootStrapperForceSelfUpdate=disable
-SteamDefaultDialog=Friends
-NoSavePersonalInfo=1
-";
-        let _ = std::fs::write(&cfg_path, content);
+
+        // Preserve other sane headless defaults if absent.
+        for wanted in ["SteamDefaultDialog=Friends", "NoSavePersonalInfo=1"] {
+            if !lines.iter().any(|l| l.eq_ignore_ascii_case(wanted)) {
+                lines.push(wanted.to_string());
+            }
+        }
+
+        let content = format!("{}
+", lines.join("
+"));
+        if let Err(e) = std::fs::write(&cfg_path, content) {
+            tracing::warn!("failed to write steam.cfg self-update disable: {}", e);
+        } else {
+            tracing::info!("steam.cfg pinned: BootStrapperForceSelfUpdate=disable ({})", cfg_path.display());
+        }
     }
 
     /// The single canonical entry point for launching a game process.
@@ -2580,13 +2646,28 @@ fn parse_launch_info_from_vdf(
         bail!("no suitable launch option found for app {appid}");
     }
 
-    // Sort options: prefer key "0", then by id
+    // Sort options: prefer key "0", then by id.
+    // On a Linux host, ALSO prefer a NativeLinux launch entry when one exists.
+    // Many Steam games ship both a Windows and a native Linux build; launching the
+    // native build through the Linux Steam client is far more reliable than running
+    // the Windows build under Wine/Proton (e.g. Portal 2 only works via the Linux
+    // Steam client, never the Windows one). Preferring NativeLinux here makes those
+    // games launch correctly out of the box instead of being forced through Wine.
+    #[cfg(target_os = "linux")]
+    let prefer_native = |t: &LaunchTarget| matches!(t, LaunchTarget::NativeLinux);
+    #[cfg(not(target_os = "linux"))]
+    let prefer_native = |t: &LaunchTarget| false;
     options.sort_by(|a, b| {
         if a.id == "0" {
             return std::cmp::Ordering::Less;
         }
         if b.id == "0" {
             return std::cmp::Ordering::Greater;
+        }
+        match (prefer_native(&a.target), prefer_native(&b.target)) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
         }
         a.id.cmp(&b.id)
     });
@@ -3024,6 +3105,33 @@ fn extract_quoted_values(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_no_self_update_merges_into_existing_cfg() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("steam.cfg");
+        // Simulate an updater-written cfg that lacks the disable flag.
+        std::fs::write(&cfg, "SteamDefaultDialog=Friends\n").unwrap();
+        SteamClient::ensure_no_self_update(dir.path());
+        let content = std::fs::read_to_string(&cfg).unwrap();
+        assert!(content.contains("BootStrapperForceSelfUpdate=disable"), "must add disable flag: {}", content);
+        assert!(content.contains("SteamDefaultDialog=Friends"), "must preserve existing lines");
+
+        // Idempotent: a second call must not duplicate the disable line.
+        SteamClient::ensure_no_self_update(dir.path());
+        let content2 = std::fs::read_to_string(&cfg).unwrap();
+        assert_eq!(content2.matches("BootStrapperForceSelfUpdate=disable").count(), 1, "must not duplicate");
+    }
+
+    #[test]
+    fn ensure_no_self_update_creates_cfg_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        SteamClient::ensure_no_self_update(dir.path());
+        let content = std::fs::read_to_string(dir.path().join("steam.cfg")).unwrap();
+        assert!(content.contains("BootStrapperForceSelfUpdate=disable"));
+        assert!(content.contains("NoSavePersonalInfo=1"));
+    }
+
 
     #[tokio::test]
     async fn test_legacy_path_blocks_windows_proton() {

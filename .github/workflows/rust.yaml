@@ -60,21 +60,12 @@ jobs:
           path: target/debian/*.deb
           archive: false
 
-//  steamflow-windows:
-//    runs-on: windows-latest
-
-//    steps:
-//      - uses: actions/checkout@v6
-
-//      - name: Install Rust toolchain
-//        uses: dtolnay/rust-toolchain@stable
-
-//      - name: Build SteamFlow (release)
-//        run: cargo build --release
-
-//      - name: Upload Windows binary
-//        uses: actions/upload-artifact@v7
-//        with:
-//          name: steamflow-windows
-//          path: target/release/steamflow.exe
-//          archive: false
+  steamflow-windows:
+    # Disabled: SteamFlow is a Linux-native launcher (uses xdg-open, egui/eframe).
+    # Windows cross-compilation is not supported in the current architecture.
+    # Set to 'runs-on: ubuntu-24.04' and restore steps to re-enable Linux builds.
+    runs-on: ubuntu-24.04
+    if: false  # Explicitly disabled until native Linux build is properly separated
+    steps:
+      - name: No-op
+        run: echo "Windows build disabled"

@@ -16,6 +16,23 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     std::fs::create_dir_all(&runtimes_dir)?;
     std::fs::create_dir_all(&steam_cfg.wine_prefix)?;
 
+    // Pin the Windows Steam client so Proton-based runners cannot trigger the in-client
+    // self-updater. Under Proton wines (proton-tkg, proton-cachyos) Steam's updater
+    // downloads a fresh client and the resulting build then fails to connect to the
+    // Steam network ("cant connect to steam network"); wine-tkg does not trigger the
+    // update and works. Disabling the self-update keeps the known-good client in place.
+    if let Some(ref steam_exe) = steam_cfg.steam_exe {
+        if let Some(steam_dir) = steam_exe.parent() {
+            crate::steam_client::SteamClient::ensure_no_self_update(steam_dir);
+        }
+    }
+
+    // Clear any Steam/wine processes still locked into the master prefix. A leftover
+    // steam.exe / SteamService from a previous (failed) launch makes SteamSetup report
+    // "steam already running, close it and continue installation" and blocks the install.
+    // Killing first ensures a clean bootstrap.
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
     let setup_exe = runtimes_dir.join("SteamSetup.exe");
     if !setup_exe.exists() {
         download_steam_setup(&setup_exe).await?;
@@ -26,14 +43,27 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
         return Err(anyhow!("No Steam Runtime Runner selected in Global Settings"));
     }
 
-    let library_root = PathBuf::from(&config.steam_library_path);
+        let library_root = PathBuf::from(&config.steam_library_path);
     let resolved_runner = crate::utils::resolve_runner(&runner_name, &library_root);
+    let runner_kind = crate::utils::classify_runner(&resolved_runner);
+    let is_proton = matches!(runner_kind, crate::utils::RunnerKind::Proton { .. });
+
+    // Launch Windows Steam with the BARE Wine binary of the selected runner — exactly how
+    // a plain wine-tkg launch works. We deliberately do NOT use the `proton run` script:
+    // `proton run` is designed to execute inside Steam's runtime container (pressure-vessel)
+    // and dies with SIGSYS ("Bad system call (core dumped)") when spawned directly. Bare
+    // wine (whether wine-tkg's or Proton's bundled wine binary) launches Windows Steam fine.
+    //
+    // STEAM_COMPAT_CLIENT_INSTALL_PATH:
+    //  * Plain Wine (wine-tkg): point at the fake_env trap (dummy steam/steam.sh). This is
+    //    the original hack that keeps Wine-Steam from hijacking the Linux Steam client, and
+    //    it disables steamclient/steam_api on the Steam process. This combination is known
+    //    to work for wine-tkg.
+    //  * Proton (bare wine): point at the REAL Windows Steam client dir. Under bare wine the
+    //    STEAM_COMPAT_* vars are mostly inert, but pointing at the real client is correct and
+    //    we must NOT disable steamclient/steam_api (Steam needs its own client DLLs).
     let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
 
-    tracing::info!("Unified Master Steam resolution:");
-    tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
-    tracing::info!("  - Wine Prefix: {}", steam_cfg.wine_prefix.display());
-    tracing::info!("  - Layout Kind: {}", steam_cfg.layout_kind);
     if let Some(ref exe) = steam_cfg.steam_exe {
         tracing::info!("  - Steam Exe: {}", exe.display());
         cmd.arg(exe);
@@ -45,15 +75,44 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     // Arguments
     cmd.arg("-tcp");
     cmd.arg("-cef-disable-gpu-compositing");
+    // Harden the CEF/webhelper renderer under Wine/Proton. The background
+    // self-update + GPU-accelerated CEF is the usual cause of Steam crashing
+    // shortly after launch under Proton; disabling GPU compositing/sandbox
+    // keeps the client stable. Steam forwards these to the real client
+    // (visible in bootstrap_log.txt).
+    cmd.arg("-cef-disable-gpu");
+    cmd.arg("-no-cef-sandbox");
 
     // Environment Variables
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
     cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
     cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
-    let fake_env = crate::utils::setup_fake_steam_trap(&base_dir)?;
-    cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
-    cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+    if is_proton {
+        // Bare-wine Proton launch: point STEAM_COMPAT_CLIENT_INSTALL_PATH at the REAL
+        // Windows Steam client dir (where the user installed/launched Windows Steam).
+        // Under bare wine this var is mostly inert, but it is correct, and crucially we
+        // must NOT disable steamclient/steam_api on the Steam process (Steam needs its
+        // own client DLLs so games see a live Windows Steam for achievements/etc.).
+        let client_path = steam_cfg
+            .steam_exe
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("C:\\Program Files (x86)\\Steam"));
+        let client_win = crate::utils::to_windows_path(&client_path);
+        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &client_win);
+        tracing::info!(
+            "Proton (bare wine) Steam launch: STEAM_COMPAT_CLIENT_INSTALL_PATH={} (real client)",
+            client_win
+        );
+    } else {
+        // Plain wine-tkg: the original working hack. The fake_env trap (dummy
+        // steam/steam.sh) plus steamclient/steam_api=n keeps Wine-Steam from hijacking
+        // the Linux Steam client. Known to work for wine-tkg.
+        let fake_env = crate::utils::setup_fake_steam_trap(&base_dir)?;
+        cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
+        cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
+    }
 
     if let Ok(display) = std::env::var("DISPLAY") {
         cmd.env("DISPLAY", display);
@@ -71,13 +130,6 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     let _child = cmd.spawn().context("Failed to spawn master steam process")?;
 
-    // We don't wait here because it's a background process or interactive installer
-    // But for the installer, maybe we should? The prompt doesn't specify.
-    // "Run SteamSetup.exe (Interactive, NO /S flag)."
-    // If it's interactive, we probably should NOT block the main thread.
-    // However, this is called from an async task in ui.rs, so it's fine to block that task if needed.
-    // But usually we want to let the user continue using the app.
-
     Ok(())
 }
 
@@ -89,6 +141,12 @@ pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
 
     std::fs::create_dir_all(&steam_cfg.wine_prefix)
         .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    // Kill any wineserver already locked into this prefix under a DIFFERENT runner.
+    // Mixing runners in one WINEPREFIX produces the classic
+    // "wine client error: version mismatch ... your wine binary was not upgraded correctly"
+    // because the new wine64 and the old wineserver disagree on the pipe protocol.
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
 
     cmd.arg("control.exe");
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);

@@ -97,6 +97,8 @@ pub struct GraphicsLayerConfig {
     pub custom_vkd3d_path: Option<PathBuf>,
     #[serde(default)]
     pub custom_vkd3d_proton_path: Option<PathBuf>,
+    #[serde(default)]
+    pub force_wined3d: bool,
 }
 
 impl Default for GraphicsLayerConfig {
@@ -112,6 +114,7 @@ impl Default for GraphicsLayerConfig {
             custom_dxvk_path: None,
             custom_vkd3d_path: None,
             custom_vkd3d_proton_path: None,
+            force_wined3d: false,
         }
     }
 }
@@ -142,6 +145,12 @@ pub struct UserAppConfig {
     /// Per-game option: suppress Steam overlay for DX12 games where it causes black screens.
     #[serde(default)]
     pub dx12_suppress_overlay: bool,
+
+    /// Per-game override for the Compatibility Layer (runner) used to launch this game.
+    /// When set, this runner is used instead of the global proton_version setting.
+    /// Does not affect the Steam Runtime runner used for Windows Steam background.
+    #[serde(default)]
+    pub game_runner: Option<String>,
 }
 
 pub type UserConfigStore = HashMap<u32, UserAppConfig>;
@@ -161,6 +170,7 @@ impl Default for UserAppConfig {
             favorite: false,
             requires_steam_api: false,
             dx12_suppress_overlay: false,
+            game_runner: None,
         }
     }
 }
