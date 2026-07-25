@@ -37,44 +37,29 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     let runner_kind = crate::utils::classify_runner(&resolved_runner);
     let is_proton = matches!(runner_kind, crate::utils::RunnerKind::Proton { .. });
 
-    // How we launch Master Steam depends on the runner kind:
-    //  * Plain Wine (wine-tkg): launch the Steam EXE directly and feed it the
-    //    "fake_env" trap (dummy steam/steam.sh) via STEAM_COMPAT_CLIENT_INSTALL_PATH
-    //    plus steamclient/steam_api=n overrides. This is the original hack that stops
-    //    Wine-Steam from hijacking the Linux Steam client.
-    //  * Proton: MUST be launched through `proton run`. STEAM_COMPAT_CLIENT_INSTALL_PATH
-    //    must point at the REAL Windows Steam client directory. Proton's bootstrap reads
-    //    that var to locate/update the Steam client; pointing it at the fake trap makes
-    //    Steam believe its client binaries are missing -> "reinstall steam". So for Proton
-    //    we omit the trap and point the client path at C:\\Program Files (x86)\\Steam.
-    let mut cmd = if is_proton {
-        // Launch Windows Steam through Proton. Proton's `run()` engages its steam
-        // bootstrap only when the target is its OWN stub at
-        // C:\windows\system32\steam.exe (the branch that bootstraps the real client from
-        // STEAM_COMPAT_CLIENT_INSTALL_PATH). Passing the real
-        // Program Files (x86)\Steam\steam.exe directly makes Steam validate steam.cfg
-        // itself -> "reinstall steam"; and passing NO exe at all makes Proton build an
-        // empty wine argv (no-op, no log). So we always target the system32 stub.
-        let mut c = crate::utils::build_runner_command(&resolved_runner)?; // -> `proton run`
-        if steam_cfg.steam_exe.is_some() {
-            tracing::info!("  - Steam client installed: launching Proton steam stub (C:\\windows\\system32\\steam.exe)");
-            c.arg("c:\\windows\\system32\\steam.exe");
-        } else {
-            tracing::info!("  - Steam client NOT found: running installer via `proton run`");
-            c.arg(&setup_exe);
-        }
-        c
+    // Launch Windows Steam with the BARE Wine binary of the selected runner — exactly how
+    // a plain wine-tkg launch works. We deliberately do NOT use the `proton run` script:
+    // `proton run` is designed to execute inside Steam's runtime container (pressure-vessel)
+    // and dies with SIGSYS ("Bad system call (core dumped)") when spawned directly. Bare
+    // wine (whether wine-tkg's or Proton's bundled wine binary) launches Windows Steam fine.
+    //
+    // STEAM_COMPAT_CLIENT_INSTALL_PATH:
+    //  * Plain Wine (wine-tkg): point at the fake_env trap (dummy steam/steam.sh). This is
+    //    the original hack that keeps Wine-Steam from hijacking the Linux Steam client, and
+    //    it disables steamclient/steam_api on the Steam process. This combination is known
+    //    to work for wine-tkg.
+    //  * Proton (bare wine): point at the REAL Windows Steam client dir. Under bare wine the
+    //    STEAM_COMPAT_* vars are mostly inert, but pointing at the real client is correct and
+    //    we must NOT disable steamclient/steam_api (Steam needs its own client DLLs).
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+
+    if let Some(ref exe) = steam_cfg.steam_exe {
+        tracing::info!("  - Steam Exe: {}", exe.display());
+        cmd.arg(exe);
     } else {
-        let mut c = crate::utils::build_bare_wine_command(&resolved_runner)?;
-        if let Some(ref exe) = steam_cfg.steam_exe {
-            tracing::info!("  - Steam Exe: {}", exe.display());
-            c.arg(exe);
-        } else {
-            tracing::info!("  - Steam Exe: NOT FOUND (running installer)");
-            c.arg(setup_exe);
-        }
-        c
-    };
+        tracing::info!("  - Steam Exe: NOT FOUND (running installer)");
+        cmd.arg(setup_exe);
+    }
 
     // Arguments
     cmd.arg("-tcp");
@@ -93,8 +78,11 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
 
     if is_proton {
-        // Proton manages the Steam client path itself. Point it at the real Windows
-        // Steam client dir (where the user installed/launched Windows Steam).
+        // Bare-wine Proton launch: point STEAM_COMPAT_CLIENT_INSTALL_PATH at the REAL
+        // Windows Steam client dir (where the user installed/launched Windows Steam).
+        // Under bare wine this var is mostly inert, but it is correct, and crucially we
+        // must NOT disable steamclient/steam_api on the Steam process (Steam needs its
+        // own client DLLs so games see a live Windows Steam for achievements/etc.).
         let client_path = steam_cfg
             .steam_exe
             .as_ref()
@@ -103,12 +91,13 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
         let client_win = crate::utils::to_windows_path(&client_path);
         cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &client_win);
         tracing::info!(
-            "Proton Steam launch: STEAM_COMPAT_CLIENT_INSTALL_PATH={} (real client, no fake trap)",
+            "Proton (bare wine) Steam launch: STEAM_COMPAT_CLIENT_INSTALL_PATH={} (real client)",
             client_win
         );
-        // Do NOT disable steamclient/steam_api for the Steam process — Proton needs its
-        // own client DLLs and adds lsteamclient=d for games on its own.
     } else {
+        // Plain wine-tkg: the original working hack. The fake_env trap (dummy
+        // steam/steam.sh) plus steamclient/steam_api=n keeps Wine-Steam from hijacking
+        // the Linux Steam client. Known to work for wine-tkg.
         let fake_env = crate::utils::setup_fake_steam_trap(&base_dir)?;
         cmd.env("STEAM_COMPAT_CLIENT_INSTALL_PATH", &fake_env);
         cmd.env("WINEDLLOVERRIDES", "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=");
