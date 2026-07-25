@@ -48,17 +48,17 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     //    Steam believe its client binaries are missing -> "reinstall steam". So for Proton
     //    we omit the trap and point the client path at C:\\Program Files (x86)\\Steam.
     let mut cmd = if is_proton {
-        // Launch Windows Steam through Proton's OWN steam bootstrap. Proton's `run()`
-        // engages the bootstrap (C:\windows\system32\steam.exe stub) ONLY when invoked as
-        // `proton run` with NO explicit exe argument. The stub then bootstraps the real
-        // Steam client from STEAM_COMPAT_CLIENT_INSTALL_PATH. Passing the real
-        // Program Files (x86)\Steam\steam.exe directly bypasses the stub and makes Steam
-        // validate steam.cfg itself -> "reinstall steam" (BootStrapParent missing).
-        // So: if the client is already installed, run `proton run` (no exe); otherwise run
-        // the installer (SteamSetup.exe) via `proton run <setup>`.
+        // Launch Windows Steam through Proton. Proton's `run()` engages its steam
+        // bootstrap only when the target is its OWN stub at
+        // C:\windows\system32\steam.exe (the branch that bootstraps the real client from
+        // STEAM_COMPAT_CLIENT_INSTALL_PATH). Passing the real
+        // Program Files (x86)\Steam\steam.exe directly makes Steam validate steam.cfg
+        // itself -> "reinstall steam"; and passing NO exe at all makes Proton build an
+        // empty wine argv (no-op, no log). So we always target the system32 stub.
         let mut c = crate::utils::build_runner_command(&resolved_runner)?; // -> `proton run`
         if steam_cfg.steam_exe.is_some() {
-            tracing::info!("  - Steam client already installed: launching via `proton run` (no exe) to engage Proton steam bootstrap");
+            tracing::info!("  - Steam client installed: launching Proton steam stub (C:\\windows\\system32\\steam.exe)");
+            c.arg("c:\\windows\\system32\\steam.exe");
         } else {
             tracing::info!("  - Steam client NOT found: running installer via `proton run`");
             c.arg(&setup_exe);
