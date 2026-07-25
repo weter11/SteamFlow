@@ -88,6 +88,22 @@ pub fn validate_steam_runtime_runner_path(runner_path: &Path) -> Option<String> 
 
 #[cfg(unix)]
 pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
+    detect_active_wineserver_runtime_filtered(wineprefix, false)
+}
+
+/// Scans `/proc` for a wine/wineserver process whose environment references
+/// `wineprefix`, and returns the path to its `exe`.
+///
+/// When `exclude_steam` is true, processes whose cmdline contains `steam.exe`
+/// are ignored. In the split-runtime architecture the background Windows
+/// Steam client runs under `steam_runtime_runner` while the game uses a
+/// different runner — both in the same `WINEPREFIX` in Shared mode.
+/// The Steam client is expected and not a conflict.
+#[cfg(unix)]
+pub fn detect_active_wineserver_runtime_filtered(
+    wineprefix: &Path,
+    exclude_steam: bool,
+) -> Option<PathBuf> {
     let prefix_str = wineprefix.to_string_lossy().to_string();
     let proc_dir = std::fs::read_dir("/proc").ok()?;
     for entry in proc_dir.flatten() {
@@ -95,15 +111,17 @@ pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
         if !pid_path.file_name()
             .and_then(|n| n.to_str())
             .map(|n| n.chars().all(|c| c.is_ascii_digit()))
-            .unwrap_or(false) { continue; }
-        let environ = std::fs::read(pid_path.join("environ")).ok()?;
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(pid_path.join("environ")) else { continue; };
         let environ_str = String::from_utf8_lossy(&environ);
         if !environ_str.contains(&prefix_str) { continue; }
-        // Check if this is a wine process
-        let cmdline = std::fs::read(pid_path.join("cmdline")).ok()?;
-        let cmdline_str = String::from_utf8_lossy(&cmdline);
-        if !cmdline_str.to_lowercase().contains("wine") { continue; }
-        // Read the actual binary
+        let Ok(cmdline) = std::fs::read(pid_path.join("cmdline")) else { continue; };
+        let cmdline_str = String::from_utf8_lossy(&cmdline).to_lowercase();
+        if !cmdline_str.contains("wine") { continue; }
+        if exclude_steam && cmdline_str.contains("steam.exe") { continue; }
         if let Ok(exe) = std::fs::read_link(pid_path.join("exe")) {
             return Some(exe);
         }
@@ -113,6 +131,11 @@ pub fn detect_active_wineserver_runtime(wineprefix: &Path) -> Option<PathBuf> {
 
 #[cfg(not(unix))]
 pub fn detect_active_wineserver_runtime(_wineprefix: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(unix))]
+pub fn detect_active_wineserver_runtime_filtered(_wineprefix: &Path, _exclude_steam: bool) -> Option<PathBuf> {
     None
 }
 
@@ -279,6 +302,37 @@ pub fn build_bare_wine_command(runner_path: &Path) -> Result<Command> {
                 bail!("Could not resolve bare Wine binary from {}", runner_path.display())
             }
         }
+    }
+}
+
+/// Resolves the effective Proton/Wine runner *name* (not yet an absolute path)
+/// that will be used to launch `app_id`, using the same precedence as
+/// `WineTkgRunner::effective_game_proton`:
+///   1. the per-game override (`LauncherConfig.game_configs[app_id].forced_proton_version`)
+///   2. an explicit `proton_path` passed into this launch (`PipelineContext::proton_path`)
+///   3. the global default (`LauncherConfig.proton_version`)
+///
+/// IMPORTANT: this must stay in sync with the resolution logic inside
+/// `WineTkgRunner::effective_game_proton`. Any pipeline stage that needs
+/// to know "which runner is this game actually using" (e.g. DLL/component
+/// detection in ResolveDllProvidersStage) should call this instead of
+/// re-deriving it, or it can silently disagree with the runner that
+/// actually launches the process.
+pub fn resolve_effective_proton_name<'a>(
+    app_id: u32,
+    launcher_config: &'a crate::config::LauncherConfig,
+    ctx_proton_path: Option<&'a str>,
+) -> &'a str {
+    if let Some(forced) = launcher_config
+        .game_configs
+        .get(&app_id)
+        .and_then(|c| c.forced_proton_version.as_ref())
+    {
+        forced.as_str()
+    } else {
+        ctx_proton_path
+            .filter(|p| !p.is_empty())
+            .unwrap_or(launcher_config.proton_version.as_str())
     }
 }
 

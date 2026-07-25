@@ -31,20 +31,16 @@ fn runtime_active(ctx: &LaunchContext) -> bool {
 /// the runtime runner so both share a single wineserver — which is exactly why the
 /// "both wine-tkg" combination worked but "runtime=wine-tkg, game=proton" crashed.
 fn effective_game_proton(ctx: &LaunchContext) -> String {
-    if runtime_active(ctx) && !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
-        return ctx.launcher_config.steam_runtime_runner.to_string_lossy().to_string();
-    }
-    if let Some(forced) = ctx.launcher_config
-        .game_configs
-        .get(&ctx.app.app_id)
-        .and_then(|c| c.forced_proton_version.as_ref())
-    {
-        return forced.clone();
-    }
-    ctx.proton_path
-        .clone()
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| ctx.launcher_config.proton_version.clone())
+    // For Steam Runtime launches the "runner" is a Proton, so the proton
+    // name is the effective runner name. When Steam Runtime is inactive
+    // we fall back to the game runner or default — both are plain wine
+    // runners whose names resolve identically through resolve_runner().
+    let name = crate::utils::resolve_effective_proton_name(
+        ctx.app.app_id,
+        &ctx.launcher_config,
+        ctx.proton_path.as_deref(),
+    );
+    name.to_string()
 }
 
 #[async_trait::async_trait]
