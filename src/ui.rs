@@ -2856,8 +2856,10 @@ impl eframe::App for SteamLauncher {
 
                         if self.show_repair_confirmation {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.colored_label(egui::Color32::YELLOW, "⚠ Repair will move your current Steam prefix to a backup.");
-                                ui.label("You will need to log in to Windows Steam again.");
+                                ui.colored_label(egui::Color32::YELLOW, "⚠ Repair will reinstall Windows Steam in the existing Steam prefix.");
+                                ui.label("Game library, saves, and settings are preserved — you will need to log in only once.");
+                                ui.label("SteamFlow kills stale wine/steam processes first, then runs the Windows Steam installer.");
+                                ui.label("If Steam already exists in the prefix, SteamFlow just relaunches it (Steam self-repairs).");
                                 ui.horizontal(|ui| {
                                     if ui.button("Confirm Repair").clicked() {
                                         self.show_repair_confirmation = false;

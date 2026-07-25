@@ -276,13 +276,19 @@ pub async fn restore_master_steam() -> Result<()> {
 
 pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
     let steam_cfg = crate::utils::get_master_steam_config();
-    tracing::info!("Starting repair for Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
+    tracing::info!("Repairing Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 
-    // 1. Backup existing (handles killing processes and rotation)
-    if steam_cfg.root_dir.exists() {
-        backup_master_steam().await?;
-    }
+    // Kill any wine/steam processes still active in the prefix so the
+    // reinstall can proceed cleanly.
+    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
 
-    // 2. Re-install (handles directory creation)
+    // Re-install the Windows Steam client in-place. SteamSetup.exe will
+    // either overwrite the existing client (self-repair) or do a fresh
+    // install if the client is missing — both preserve the Wine prefix
+    // userdata (saves, configs, game library). A full backup is NOT
+    // needed here because user data lives in userdata/, not the client dir.
+    // The separate "Backup Runtime" button is available for users who
+    // want an explicit prefix snapshot before any operation.
     install_master_steam(config).await
 }
