@@ -2204,9 +2204,10 @@ impl SteamClient {
                     Ok(b) => String::from_utf8_lossy(&b).replace('\0', " "),
                     Err(_) => continue,
                 };
-                // Kill steam.exe and steamwebhelper.exe processes in this prefix
+                // Kill Steam client processes in this prefix.
                 if !cmdline.to_lowercase().contains("steam.exe")
                     && !cmdline.to_lowercase().contains("steamwebhelper.exe")
+                    && !cmdline.to_lowercase().contains("steamservice.exe")
                 {
                     continue;
                 }
@@ -2230,6 +2231,79 @@ impl SteamClient {
         {
             let _ = wineprefix;
         }
+    }
+
+    /// Terminates Steam helper processes disabled by the user in the given prefix.
+    ///
+    /// Matching is performed against each process command line and environment,
+    /// then only that process is terminated. This avoids changing permissions on
+    /// shared Wine binaries, which would affect unrelated applications.
+    #[cfg(unix)]
+    pub fn kill_disabled_steam_processes_in_prefix(
+        wineprefix: &Path,
+        no_browser: bool,
+        no_friends_ui: bool,
+        no_overlay: bool,
+        no_chat_ui: bool,
+        no_vr: bool,
+    ) {
+        let prefix_str = wineprefix.to_string_lossy().to_string();
+        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+            return;
+        };
+
+        for entry in proc_dir.flatten() {
+            let pid_path = entry.path();
+            let Some(pid_str) = pid_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+
+            let cmdline = match std::fs::read(pid_path.join("cmdline")) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
+                Err(_) => continue,
+            };
+            let environ = match std::fs::read(pid_path.join("environ")) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            if !String::from_utf8_lossy(&environ).contains(&prefix_str) {
+                continue;
+            }
+
+            let lower = cmdline.to_lowercase();
+            let is_webhelper = lower.contains("steamwebhelper.exe");
+            let is_overlay = lower.contains("gameoverlayui.exe") || lower.contains("overlay");
+            let is_vr = lower.contains("vrserver.exe")
+                || lower.contains("vrmonitor.exe")
+                || lower.contains("openvr");
+            let disabled = (no_browser && is_webhelper)
+                || (no_friends_ui && is_webhelper && lower.contains("friend"))
+                || (no_chat_ui && is_webhelper && lower.contains("chat"))
+                || (no_overlay && is_overlay)
+                || (no_vr && is_vr);
+
+            if disabled {
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn kill_disabled_steam_processes_in_prefix(
+        _wineprefix: &Path,
+        _no_browser: bool,
+        _no_friends_ui: bool,
+        _no_overlay: bool,
+        _no_chat_ui: bool,
+        _no_vr: bool,
+    ) {
     }
 
     /// Scans /proc to find a wine process running steam.exe inside the given WINEPREFIX.
