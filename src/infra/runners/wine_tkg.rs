@@ -908,6 +908,35 @@ impl Runner for WineTkgRunner {
             }
         }
 
+        // For Proton games, lsteamclient.dll MUST be loaded so it can communicate
+        // with the Windows Steam process via Steam's own IPC protocol.
+        // build_dll_overrides defaults lsteamclient=n (builtin only), which
+        // prevents Proton's lsteamclient from being found. We remove that override
+        // so the game's Proton lsteamclient loads normally.
+        // Under PlainWine (wine-tkg for background Steam) the override stays:
+        // wine-tkg handles Steam IPC itself and the game must not use its own lsteamclient.
+        let game_runner_for_dll = if let Some(game_runner) = ctx.user_config.as_ref()
+            .and_then(|c| c.game_runner.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            game_runner.to_string()
+        } else {
+            effective_game_proton(ctx)
+        };
+        let is_proton_game = matches!(
+            crate::utils::classify_runner(
+                &crate::utils::resolve_runner(&game_runner_for_dll, &library_root)
+            ),
+            crate::utils::RunnerKind::Proton { .. }
+        );
+        if is_proton_game {
+            dll_overrides = dll_overrides
+                .split(';')
+                .filter(|seg| !seg.trim().starts_with("lsteamclient="))
+                .collect::<Vec<_>>()
+                .join(";");
+        }
+
         // Enhance overrides with resolved DLL providers
         for res in &ctx.dll_resolutions {
             if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal ||
