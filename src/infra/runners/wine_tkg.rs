@@ -207,9 +207,6 @@ impl Runner for WineTkgRunner {
                     if slc.no_chat_ui {
                         steam_args.push("-nochatui".to_string());
                     }
-                    if slc.no_browser {
-                        steam_args.push("-no-browser".to_string());
-                    }
                     if slc.no_overlay {
                         steam_args.push("-disable-overlay".to_string());
                     }
@@ -270,8 +267,6 @@ impl Runner for WineTkgRunner {
                                  GameOverlayRenderer=n;GameOverlayRenderer64=n",
                             )
                             .env("WINEPATH", "C:\\Program Files (x86)\\Steam")
-                            .env("STEAM_DISABLE_BROWSER", "1")
-                            .env("STEAM_NO_BROWSER", "1")
                             .env("STEAMCMD", "1") // tells Steam it's running as a cmd tool
                             .stdout(std::process::Stdio::null()) // silence CEF log spam
                             .stderr(std::process::Stdio::null());
@@ -456,6 +451,10 @@ impl Runner for WineTkgRunner {
                 slc.no_overlay,
                 slc.no_chat_ui,
             );
+            // Do not launch the game while Steam is reacting to the helper
+            // termination. Give it time to settle and respawn its normal
+            // helper set before the game starts.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
 
         // Write steam_appid.txt to the game working directory
