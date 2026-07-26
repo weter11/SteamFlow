@@ -36,10 +36,6 @@ pub struct SteamLaunchConfig {
     pub no_overlay: bool, // no in-game overlay
     #[serde(default = "default_true")]
     pub no_chat_ui: bool, // no chat popups
-    #[serde(default)]
-    pub no_vr: bool, // no OpenVR/SteamVR
-    #[serde(default)]
-    pub big_picture: bool, // force Big Picture (lighter than desktop UI)
 }
 
 pub fn default_true() -> bool {
@@ -53,8 +49,6 @@ impl Default for SteamLaunchConfig {
             no_friends_ui: true,
             no_overlay: true,
             no_chat_ui: true,
-            no_vr: false,
-            big_picture: false,
         }
     }
 }

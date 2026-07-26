@@ -1370,15 +1370,7 @@ impl SteamLauncher {
             if ui.checkbox(&mut slc.no_chat_ui, "Disable Chat UI").changed() {
                 steam_cfg_changed = true;
             }
-            if ui.checkbox(&mut slc.no_vr, "Disable SteamVR/OpenVR").changed() {
-                steam_cfg_changed = true;
-            }
-            if ui
-                .checkbox(&mut slc.big_picture, "Force Big Picture mode (lighter UI)")
-                .changed()
-            {
-                steam_cfg_changed = true;
-            }
+
 
             ui.add_space(8.0);
             ui.heading("Steam Process");

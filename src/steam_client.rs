@@ -2204,9 +2204,13 @@ impl SteamClient {
                     Ok(b) => String::from_utf8_lossy(&b).replace('\0', " "),
                     Err(_) => continue,
                 };
-                // Kill steam.exe and steamwebhelper.exe processes in this prefix
+                // Kill steam.exe, steamwebhelper.exe, and steamservice.exe processes
+                // in this prefix. steamservice.exe is the Steam Windows Service
+                // helper that runs alongside the main Steam client and must be
+                // terminated together for clean state.
                 if !cmdline.to_lowercase().contains("steam.exe")
                     && !cmdline.to_lowercase().contains("steamwebhelper.exe")
+                    && !cmdline.to_lowercase().contains("steamservice.exe")
                 {
                     continue;
                 }
@@ -2230,6 +2234,54 @@ impl SteamClient {
         {
             let _ = wineprefix;
         }
+    }
+
+    /// Scans /proc to find wine processes that are part of Steam's CEF
+    /// browser subsystem (steamwebhelper.exe) inside the given WINEPREFIX.
+    /// Returns the set of executable paths for all matching processes.
+    /// This is used by the post-launch CEF enforcement to detect newly
+    /// spawned helper processes and disable them via chmod 000.
+    #[cfg(unix)]
+    pub fn cef_processes_in_prefix(wineprefix: &Path) -> std::collections::HashSet<PathBuf> {
+        let prefix_str = wineprefix.to_string_lossy().to_string();
+        let mut result = std::collections::HashSet::new();
+        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+            return result;
+        };
+        for entry in proc_dir.flatten() {
+            let pid_path = entry.path();
+            let Some(pid_str) = pid_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let cmdline = match std::fs::read(pid_path.join("cmdline")) {
+                Ok(b) => String::from_utf8_lossy(&b).replace(' ', " "),
+                Err(_) => continue,
+            };
+            if !cmdline.to_lowercase().contains("steamwebhelper.exe") {
+                continue;
+            }
+            let environ = match std::fs::read(pid_path.join("environ")) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if !String::from_utf8_lossy(&environ).contains(&prefix_str) {
+                continue;
+            }
+            // Resolve the executable path from /proc/<pid>/exe symlink
+            let exe_link = pid_path.join("exe");
+            if let Ok(exe_target) = std::fs::read_link(&exe_link) {
+                result.insert(exe_target);
+            }
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    pub fn cef_processes_in_prefix(_wineprefix: &Path) -> std::collections::HashSet<PathBuf> {
+        std::collections::HashSet::new()
     }
 
     /// Scans /proc to find a wine process running steam.exe inside the given WINEPREFIX.
