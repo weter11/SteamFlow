@@ -234,12 +234,9 @@ impl Runner for WineTkgRunner {
                     if slc.no_overlay {
                         steam_args.push("-disable-overlay".to_string());
                     }
-                    if slc.no_vr {
-                        steam_args.push("-noopenvr".to_string());
-                    }
-                    if slc.big_picture {
-                        steam_args.push("-bigpicture".to_string());
-                    }
+                    // Note: -noopenvr and -bigpicture are removed to avoid
+                    // interfering with Steam's normal service operation and
+                    // user preferences (VR and Big Picture mode are user-facing).
 
                     let steam_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix);
 
@@ -258,8 +255,14 @@ impl Runner for WineTkgRunner {
                     }
 
                     if steam_running {
-                        println!("✅ Steam already running in prefix — skipping spawn");
-                    } else {
+                        // Steam is already running in the prefix (from a prior session
+                        // or manual launch). Kill it so we can restart it with the
+                        // user's current Steam Features settings applied.
+                        SteamClient::kill_steam_in_prefix(&steam_wineprefix);
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        tracing::info!("Killed existing Steam process to apply current Steam Features settings");
+                    }
+                    {
                         let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {

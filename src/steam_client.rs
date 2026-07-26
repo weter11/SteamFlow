@@ -2204,9 +2204,13 @@ impl SteamClient {
                     Ok(b) => String::from_utf8_lossy(&b).replace('\0', " "),
                     Err(_) => continue,
                 };
-                // Kill steam.exe and steamwebhelper.exe processes in this prefix
+                // Kill steam.exe, steamwebhelper.exe, and steamservice.exe processes
+                // in this prefix. steamservice.exe is the Steam Windows Service
+                // helper that runs alongside the main Steam client and must be
+                // terminated together for clean state.
                 if !cmdline.to_lowercase().contains("steam.exe")
                     && !cmdline.to_lowercase().contains("steamwebhelper.exe")
+                    && !cmdline.to_lowercase().contains("steamservice.exe")
                 {
                     continue;
                 }
