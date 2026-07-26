@@ -445,20 +445,17 @@ impl Runner for WineTkgRunner {
             let slc = ctx.user_config.as_ref()
                 .map(|c| c.steam_launch_config.clone())
                 .unwrap_or_default();
-            // Steam can respawn web helpers after they are terminated, so a
-            // single enforcement pass is not sufficient. Keep checking during
-            // startup while Steam finishes creating its helper processes.
-            const ENFORCEMENT_WINDOW_SECS: u64 = 30;
-            for _ in 0..ENFORCEMENT_WINDOW_SECS {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                SteamClient::kill_disabled_steam_processes_in_prefix(
-                    &enforcement_prefix,
-                    slc.no_browser,
-                    slc.no_friends_ui,
-                    slc.no_overlay,
-                    slc.no_chat_ui,
-                );
-            }
+            // Let Steam finish creating its helper processes before enforcing
+            // the disabled-helper settings. Killing them during startup makes
+            // Steam immediately respawn the full helper set.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            SteamClient::kill_disabled_steam_processes_in_prefix(
+                &enforcement_prefix,
+                slc.no_browser,
+                slc.no_friends_ui,
+                slc.no_overlay,
+                slc.no_chat_ui,
+            );
         }
 
         // Write steam_appid.txt to the game working directory
