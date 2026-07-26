@@ -255,14 +255,12 @@ impl Runner for WineTkgRunner {
                     }
 
                     if steam_running {
-                        // Steam is already running in the prefix (from a prior session
-                        // or manual launch). Kill it so we can restart it with the
-                        // user's current Steam Features settings applied.
-                        SteamClient::kill_steam_in_prefix(&steam_wineprefix);
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                        tracing::info!("Killed existing Steam process to apply current Steam Features settings");
-                    }
-                    {
+                        // Steam is already running in the prefix (from a prior game
+                        // launch or manual launch). Don't kill and respawn — that
+                        // disrupts the user's existing session. The CEF enforcement
+                        // pass (after readiness gate) will handle newly spawned
+                        // helpers to ensure user-disabled features are enforced.
+                    } else {
                         let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {
@@ -418,7 +416,7 @@ impl Runner for WineTkgRunner {
                                 println!("✅ Steam ready signal: {}", msg);
 
                                 // Grace period check: ensure it didn't crash immediately after signaling ready
-                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                                 if let Ok(Some(status)) = steam_process.try_wait() {
                                     println!("❌ FATAL: Background Steam exited during grace period with: {}", status);
                                     unsafe {
