@@ -25,8 +25,7 @@ fn effective_game_proton(ctx: &LaunchContext) -> String {
         ctx.app.app_id,
         &ctx.launcher_config,
         ctx.proton_path.as_deref(),
-    )
-    .to_string()
+    ).to_string()
 }
 
 #[async_trait::async_trait]
@@ -214,12 +213,9 @@ impl Runner for WineTkgRunner {
                     if slc.no_overlay {
                         steam_args.push("-disable-overlay".to_string());
                     }
-                    if slc.no_vr {
-                        steam_args.push("-noopenvr".to_string());
-                    }
-                    if slc.big_picture {
-                        steam_args.push("-bigpicture".to_string());
-                    }
+                    // Note: -noopenvr and -bigpicture are removed to avoid
+                    // interfering with Steam's normal service operation and
+                    // user preferences (VR and Big Picture mode are user-facing).
 
                     let steam_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix);
 
@@ -238,7 +234,11 @@ impl Runner for WineTkgRunner {
                     }
 
                     if steam_running {
-                        println!("✅ Steam already running in prefix — skipping spawn");
+                        // Steam is already running in the prefix (from a prior game
+                        // launch or manual launch). Don't kill and respawn — that
+                        // disrupts the user's existing session. The CEF enforcement
+                        // pass (after readiness gate) will handle newly spawned
+                        // helpers to ensure user-disabled features are enforced.
                     } else {
                         let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
@@ -395,7 +395,7 @@ impl Runner for WineTkgRunner {
                                 println!("✅ Steam ready signal: {}", msg);
 
                                 // Grace period check: ensure it didn't crash immediately after signaling ready
-                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                                 if let Ok(Some(status)) = steam_process.try_wait() {
                                     println!("❌ FATAL: Background Steam exited during grace period with: {}", status);
                                     unsafe {
@@ -908,6 +908,35 @@ impl Runner for WineTkgRunner {
             for action in &fixup.actions_log {
                 tracing::info!("rhai fixup action: {}", action);
             }
+        }
+
+        // For Proton games, lsteamclient.dll MUST be loaded so it can communicate
+        // with the Windows Steam process via Steam's own IPC protocol.
+        // build_dll_overrides defaults lsteamclient=n (builtin only), which
+        // prevents Proton's lsteamclient from being found. We remove that override
+        // so the game's Proton lsteamclient loads normally.
+        // Under PlainWine (wine-tkg for background Steam) the override stays:
+        // wine-tkg handles Steam IPC itself and the game must not use its own lsteamclient.
+        let game_runner_for_dll = if let Some(game_runner) = ctx.user_config.as_ref()
+            .and_then(|c| c.game_runner.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            game_runner.to_string()
+        } else {
+            effective_game_proton(ctx)
+        };
+        let is_proton_game = matches!(
+            crate::utils::classify_runner(
+                &crate::utils::resolve_runner(&game_runner_for_dll, &library_root)
+            ),
+            crate::utils::RunnerKind::Proton { .. }
+        );
+        if is_proton_game {
+            dll_overrides = dll_overrides
+                .split(';')
+                .filter(|seg| !seg.trim().starts_with("lsteamclient="))
+                .collect::<Vec<_>>()
+                .join(";");
         }
 
         // Enhance overrides with resolved DLL providers
