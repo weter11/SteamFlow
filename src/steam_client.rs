@@ -2245,9 +2245,8 @@ impl SteamClient {
         no_friends_ui: bool,
         no_overlay: bool,
         no_chat_ui: bool,
-        no_vr: bool,
     ) {
-        let prefix_str = wineprefix.to_string_lossy().to_string();
+        let canonical_prefix = std::fs::canonicalize(wineprefix).ok();
         let Ok(proc_dir) = std::fs::read_dir("/proc") else {
             return;
         };
@@ -2269,21 +2268,36 @@ impl SteamClient {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };
-            if !String::from_utf8_lossy(&environ).contains(&prefix_str) {
+            let process_prefix = environ
+                .split(|byte| *byte == 0)
+                .find_map(|entry| entry.strip_prefix(b"WINEPREFIX="))
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .map(Path::new);
+            let Some(process_prefix) = process_prefix else {
+                continue;
+            };
+            let process_matches_prefix = match (&canonical_prefix, std::fs::canonicalize(process_prefix).ok()) {
+                (Some(expected), Some(actual)) => expected == &actual,
+                _ => process_prefix == wineprefix,
+            };
+            if !process_matches_prefix {
                 continue;
             }
 
             let lower = cmdline.to_lowercase();
             let is_webhelper = lower.contains("steamwebhelper.exe");
-            let is_overlay = lower.contains("gameoverlayui.exe") || lower.contains("overlay");
-            let is_vr = lower.contains("vrserver.exe")
-                || lower.contains("vrmonitor.exe")
-                || lower.contains("openvr");
+            let is_overlay = lower.split_whitespace().any(|argument| {
+                argument
+                    .trim_matches('"')
+                    .replace('\\', "/")
+                    .rsplit('/')
+                    .next()
+                    == Some("gameoverlayui.exe")
+            });
             let disabled = (no_browser && is_webhelper)
                 || (no_friends_ui && is_webhelper && lower.contains("friend"))
                 || (no_chat_ui && is_webhelper && lower.contains("chat"))
-                || (no_overlay && is_overlay)
-                || (no_vr && is_vr);
+                || (no_overlay && is_overlay);
 
             if disabled {
                 if let Ok(pid) = pid_str.parse::<i32>() {
@@ -2302,7 +2316,6 @@ impl SteamClient {
         _no_friends_ui: bool,
         _no_overlay: bool,
         _no_chat_ui: bool,
-        _no_vr: bool,
     ) {
     }
 

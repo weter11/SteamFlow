@@ -452,7 +452,6 @@ impl Runner for WineTkgRunner {
                 slc.no_friends_ui,
                 slc.no_overlay,
                 slc.no_chat_ui,
-                slc.no_vr,
             );
         }
 
