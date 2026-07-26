@@ -457,6 +457,61 @@ impl Runner for WineTkgRunner {
                     }
         }
 
+        // Post-launch CEF enforcement: after Steam has started,
+        // apply permission-based restrictions to prevent Steam from spawning
+        // processes the user explicitly disabled. This is robust because
+        // Wine respects Unix file permissions — Steam cannot work around
+        // a chmod 000 even if it ignores the -no-browser flag internally.
+        let steam_wineprefix_for_enforcement = crate::utils::get_master_steam_config().wine_prefix.clone();
+        let slc = ctx.user_config.as_ref()
+            .map(|c| c.steam_launch_config.clone())
+            .unwrap_or_default();
+        let webhelper_before = SteamClient::cef_processes_in_prefix(&steam_wineprefix_for_enforcement);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let webhelper_after = SteamClient::cef_processes_in_prefix(&steam_wineprefix_for_enforcement);
+        let new_helpers: Vec<_> = webhelper_after
+            .difference(&webhelper_before)
+            .cloned()
+            .collect();
+        for path in new_helpers {
+            let exe_name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let disabled = (slc.no_browser && exe_name.contains("webhelper"))
+                || (slc.no_overlay && exe_name.contains("overlay"))
+                || (slc.no_friends_ui && exe_name.contains("friends"))
+                || (slc.no_chat_ui && exe_name.contains("chat"));
+            if disabled {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = match std::fs::metadata(&path) {
+                        Ok(m) => m.permissions(),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to get metadata for {} ({}): {}",
+                                path.display(), exe_name, e
+                            );
+                            continue;
+                        }
+                    };
+                    perms.set_mode(0o000);
+                    if let Err(e) = std::fs::set_permissions(&path, perms) {
+                        tracing::warn!(
+                            "Failed to disable {} ({}): {}",
+                            path.display(), exe_name, e
+                        );
+                    } else {
+                        tracing::info!(
+                            "Disabled {} by permission (user disabled this feature)",
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+
         // Write steam_appid.txt to the game working directory
         let install_dir = PathBuf::from(
             ctx.app.install_path
