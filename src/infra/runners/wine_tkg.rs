@@ -437,7 +437,17 @@ impl Runner for WineTkgRunner {
             // Deliberately NOT done at t+2s: steamwebhelper's CEF subsystem
             // spawns multiple child processes while it boots, and killing it
             // mid-spawn just triggers Steam's own crash-recovery, which
-            // respawns it repeatedly.
+            // respawns it — repeatedly, on every single launch, competing with
+            // the game for CPU/RAM/disk I/O the whole time. That's what caused
+            // the ~20s regression after PR63 replaced PR62's persistent
+            // chmod-000 lockout with a one-shot SIGTERM that doesn't stop the
+            // process from coming back.
+            //
+            // Waiting 30s lets the helper subsystem finish whatever it's going
+            // to spawn before we act at all, and
+            // enforce_disabled_steam_features_in_prefix now also locks the
+            // underlying file (resolved safely from the process's own argv,
+            // never via /proc/<pid>/exe).
             let enforcement_prefix = crate::utils::steam_wineprefix_for_game(
                 &ctx.launcher_config,
                 ctx.app.app_id,
