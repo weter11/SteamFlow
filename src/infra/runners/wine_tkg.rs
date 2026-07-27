@@ -430,8 +430,14 @@ impl Runner for WineTkgRunner {
         }
 
         if use_steam_runtime {
-            // Enforce the settings after startup as well as through Steam flags.
-            // Steam may spawn helpers after the initial command-line processing.
+            // Enforce the user's disabled Steam features (webhelper/CEF, friends
+            // UI, chat UI, overlay) as a background task, fully decoupled from
+            // the game launch critical path — this does NOT block the game.
+            //
+            // Deliberately NOT done at t+2s: steamwebhelper's CEF subsystem
+            // spawns multiple child processes while it boots, and killing it
+            // mid-spawn just triggers Steam's own crash-recovery, which
+            // respawns it repeatedly.
             let enforcement_prefix = crate::utils::steam_wineprefix_for_game(
                 &ctx.launcher_config,
                 ctx.app.app_id,
@@ -440,21 +446,16 @@ impl Runner for WineTkgRunner {
             let slc = ctx.user_config.as_ref()
                 .map(|c| c.steam_launch_config.clone())
                 .unwrap_or_default();
-            // Let Steam finish creating its helper processes before enforcing
-            // the disabled-helper settings. Killing them during startup makes
-            // Steam immediately respawn the full helper set.
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            SteamClient::kill_disabled_steam_processes_in_prefix(
-                &enforcement_prefix,
-                slc.no_browser,
-                slc.no_friends_ui,
-                slc.no_overlay,
-                slc.no_chat_ui,
-            );
-            // Do not launch the game while Steam is reacting to the helper
-            // termination. Give it time to settle and respawn its normal
-            // helper set before the game starts.
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                SteamClient::enforce_disabled_steam_features_in_prefix(
+                    &enforcement_prefix,
+                    slc.no_browser,
+                    slc.no_friends_ui,
+                    slc.no_overlay,
+                    slc.no_chat_ui,
+                );
+            });
         }
 
         // Write steam_appid.txt to the game working directory
