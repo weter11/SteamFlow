@@ -8,18 +8,6 @@ use crate::launch::pipeline::{LaunchError, LaunchErrorKind};
 
 pub struct WineTkgRunner;
 
-/// True when the Windows Steam Runtime is Active for this launch (Enabled policy, or
-/// Auto policy with the legacy use_steam_runtime toggle on).
-fn runtime_active(ctx: &LaunchContext) -> bool {
-    match ctx.user_config.as_ref().map(|c| &c.steam_runtime_policy) {
-        Some(crate::models::SteamRuntimePolicy::Enabled) => true,
-        Some(crate::models::SteamRuntimePolicy::Disabled) => false,
-        Some(crate::models::SteamRuntimePolicy::Auto) | None => {
-            ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false)
-        }
-    }
-}
-
 /// Resolve the runner (Compatibility Layer) the game should launch under.
 ///
 /// When the Windows Steam Runtime is Active, the background Steam process owns the
@@ -31,17 +19,8 @@ fn runtime_active(ctx: &LaunchContext) -> bool {
 /// the runtime runner so both share a single wineserver — which is exactly why the
 /// "both wine-tkg" combination worked but "runtime=wine-tkg, game=proton" crashed.
 fn effective_game_proton(ctx: &LaunchContext) -> String {
-    // Resolve the effective proton name using the same precedence as build_command():
-    //   1. per-game forced_proton_version override
-    //   2. explicit proton_path from launch context
-    //   3. global proton_version default
-    //
-    // The Steam Runtime (active/inactive) determines whether background Steam is
-    // running and whether the WINEPREFIX is shared — but it does NOT dictate which
-    // Compatibility Layer the GAME itself uses. The user's per-game "Force specific
-    // Proton/Wine version" setting (or global default) is what decides the game's
-    // runner. The runtime runner only matters for spawning the background Steam
-    // process and for wineserver conflict detection.
+    // The runtime runner launches background Steam only. The game runner is
+    // selected by the user's per-game or global compatibility-layer settings.
     crate::utils::resolve_effective_proton_name(
         ctx.app.app_id,
         &ctx.launcher_config,
@@ -228,9 +207,6 @@ impl Runner for WineTkgRunner {
                     if slc.no_chat_ui {
                         steam_args.push("-nochatui".to_string());
                     }
-                    if slc.no_browser {
-                        steam_args.push("-no-browser".to_string());
-                    }
                     if slc.no_overlay {
                         steam_args.push("-disable-overlay".to_string());
                     }
@@ -291,8 +267,6 @@ impl Runner for WineTkgRunner {
                                  GameOverlayRenderer=n;GameOverlayRenderer64=n",
                             )
                             .env("WINEPATH", "C:\\Program Files (x86)\\Steam")
-                            .env("STEAM_DISABLE_BROWSER", "1")
-                            .env("STEAM_NO_BROWSER", "1")
                             .env("STEAMCMD", "1") // tells Steam it's running as a cmd tool
                             .stdout(std::process::Stdio::null()) // silence CEF log spam
                             .stderr(std::process::Stdio::null());
@@ -455,59 +429,33 @@ impl Runner for WineTkgRunner {
                     }
         }
 
-        // Post-launch CEF enforcement: after Steam has started,
-        // apply permission-based restrictions to prevent Steam from spawning
-        // processes the user explicitly disabled. This is robust because
-        // Wine respects Unix file permissions — Steam cannot work around
-        // a chmod 000 even if it ignores the -no-browser flag internally.
-        let steam_wineprefix_for_enforcement = crate::utils::get_master_steam_config().wine_prefix.clone();
-        let slc = ctx.user_config.as_ref()
-            .map(|c| c.steam_launch_config.clone())
-            .unwrap_or_default();
-        let webhelper_before = SteamClient::cef_processes_in_prefix(&steam_wineprefix_for_enforcement);
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let webhelper_after = SteamClient::cef_processes_in_prefix(&steam_wineprefix_for_enforcement);
-        let new_helpers: Vec<_> = webhelper_after
-            .difference(&webhelper_before)
-            .cloned()
-            .collect();
-        for path in new_helpers {
-            let exe_name = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            let disabled = (slc.no_browser && exe_name.contains("webhelper"))
-                || (slc.no_overlay && exe_name.contains("overlay"))
-                || (slc.no_friends_ui && exe_name.contains("friends"))
-                || (slc.no_chat_ui && exe_name.contains("chat"));
-            if disabled {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = match std::fs::metadata(&path) {
-                        Ok(m) => m.permissions(),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to get metadata for {} ({}): {}",
-                                path.display(), exe_name, e
-                            );
-                            continue;
-                        }
-                    };
-                    perms.set_mode(0o000);
-                    if let Err(e) = std::fs::set_permissions(&path, perms) {
-                        tracing::warn!(
-                            "Failed to disable {} ({}): {}",
-                            path.display(), exe_name, e
-                        );
-                    } else {
-                        tracing::info!(
-                            "Disabled {} by permission (user disabled this feature)",
-                            path.display()
-                        );
-                    }
-                }
-            }
+        if use_steam_runtime {
+            // Enforce the user's disabled Steam features (webhelper/CEF, friends
+            // UI, chat UI, overlay) as a background task, fully decoupled from
+            // the game launch critical path — this does NOT block the game.
+            //
+            // Deliberately NOT done at t+2s: steamwebhelper's CEF subsystem
+            // spawns multiple child processes while it boots, and killing it
+            // mid-spawn just triggers Steam's own crash-recovery, which
+            // respawns it repeatedly.
+            let enforcement_prefix = crate::utils::steam_wineprefix_for_game(
+                &ctx.launcher_config,
+                ctx.app.app_id,
+                &user_config_store,
+            );
+            let slc = ctx.user_config.as_ref()
+                .map(|c| c.steam_launch_config.clone())
+                .unwrap_or_default();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                SteamClient::enforce_disabled_steam_features_in_prefix(
+                    &enforcement_prefix,
+                    slc.no_browser,
+                    slc.no_friends_ui,
+                    slc.no_overlay,
+                    slc.no_chat_ui,
+                );
+            });
         }
 
         // Write steam_appid.txt to the game working directory
@@ -1314,18 +1262,7 @@ impl Runner for WineTkgRunner {
     async fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
-        // Resolve the effective Compatibility Layer for this game using
-        // the same precedence as effective_game_proton():
-        //   1. per-user game_runner override (set in the game tab)
-        //   2. per-game forced_proton_version override
-        //   3. explicit proton_path from launch context
-        //   4. global proton_version default
-        //
-        // The Steam Runtime (active/inactive) determines whether background
-        // Steam is running and whether the WINEPREFIX is shared — but it
-        // does NOT dictate which Compatibility Layer the game itself uses.
-        // The user's per-game "Force specific Proton/Wine version" setting
-        // (or global default) is what decides the game's runner.
+        // The per-game runner override takes precedence over the global runner.
         let effective_proton = if let Some(game_runner) = ctx.user_config.as_ref()
             .and_then(|c| c.game_runner.as_deref())
             .filter(|s| !s.is_empty())

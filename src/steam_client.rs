@@ -2204,10 +2204,7 @@ impl SteamClient {
                     Ok(b) => String::from_utf8_lossy(&b).replace('\0', " "),
                     Err(_) => continue,
                 };
-                // Kill steam.exe, steamwebhelper.exe, and steamservice.exe processes
-                // in this prefix. steamservice.exe is the Steam Windows Service
-                // helper that runs alongside the main Steam client and must be
-                // terminated together for clean state.
+                // Kill Steam client processes in this prefix.
                 if !cmdline.to_lowercase().contains("steam.exe")
                     && !cmdline.to_lowercase().contains("steamwebhelper.exe")
                     && !cmdline.to_lowercase().contains("steamservice.exe")
@@ -2236,18 +2233,24 @@ impl SteamClient {
         }
     }
 
-    /// Scans /proc to find wine processes that are part of Steam's CEF
-    /// browser subsystem (steamwebhelper.exe) inside the given WINEPREFIX.
-    /// Returns the set of executable paths for all matching processes.
-    /// This is used by the post-launch CEF enforcement to detect newly
-    /// spawned helper processes and disable them via chmod 000.
+    /// Terminates Steam helper processes disabled by the user in the given prefix.
+    ///
+    /// Matching is performed against each process command line and environment,
+    /// then only that process is terminated. This avoids changing permissions on
+    /// shared Wine binaries, which would affect unrelated applications.
     #[cfg(unix)]
-    pub fn cef_processes_in_prefix(wineprefix: &Path) -> std::collections::HashSet<PathBuf> {
-        let prefix_str = wineprefix.to_string_lossy().to_string();
-        let mut result = std::collections::HashSet::new();
+    pub fn kill_disabled_steam_processes_in_prefix(
+        wineprefix: &Path,
+        no_browser: bool,
+        no_friends_ui: bool,
+        no_overlay: bool,
+        no_chat_ui: bool,
+    ) {
+        let canonical_prefix = std::fs::canonicalize(wineprefix).ok();
         let Ok(proc_dir) = std::fs::read_dir("/proc") else {
-            return result;
+            return;
         };
+
         for entry in proc_dir.flatten() {
             let pid_path = entry.path();
             let Some(pid_str) = pid_path.file_name().and_then(|n| n.to_str()) else {
@@ -2256,32 +2259,191 @@ impl SteamClient {
             if !pid_str.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
+
             let cmdline = match std::fs::read(pid_path.join("cmdline")) {
-                Ok(b) => String::from_utf8_lossy(&b).replace(' ', " "),
+                Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
                 Err(_) => continue,
             };
-            if !cmdline.to_lowercase().contains("steamwebhelper.exe") {
-                continue;
-            }
             let environ = match std::fs::read(pid_path.join("environ")) {
-                Ok(b) => b,
+                Ok(bytes) => bytes,
                 Err(_) => continue,
             };
-            if !String::from_utf8_lossy(&environ).contains(&prefix_str) {
+            let process_prefix = environ
+                .split(|byte| *byte == 0)
+                .find_map(|entry| entry.strip_prefix(b"WINEPREFIX="))
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .map(Path::new);
+            let Some(process_prefix) = process_prefix else {
+                continue;
+            };
+            let process_matches_prefix = match (&canonical_prefix, std::fs::canonicalize(process_prefix).ok()) {
+                (Some(expected), Some(actual)) => expected == &actual,
+                _ => process_prefix == wineprefix,
+            };
+            if !process_matches_prefix {
                 continue;
             }
-            // Resolve the executable path from /proc/<pid>/exe symlink
-            let exe_link = pid_path.join("exe");
-            if let Ok(exe_target) = std::fs::read_link(&exe_link) {
-                result.insert(exe_target);
+
+            let lower = cmdline.to_lowercase();
+            let is_webhelper = lower.contains("steamwebhelper.exe");
+            let is_overlay = lower.split_whitespace().any(|argument| {
+                argument
+                    .trim_matches('"')
+                    .replace('\\', "/")
+                    .rsplit('/')
+                    .next()
+                    == Some("gameoverlayui.exe")
+            });
+            let disabled = (no_browser && is_webhelper)
+                || (no_friends_ui && is_webhelper && lower.contains("friend"))
+                || (no_chat_ui && is_webhelper && lower.contains("chat"))
+                || (no_overlay && is_overlay);
+
+            if disabled {
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                }
             }
         }
-        result
+    }
+
+    /// Disables configured Steam helpers without delaying game startup.
+    ///
+    /// The executable is resolved from the process command line rather than
+    /// `/proc/<pid>/exe`: Wine's host executable is not the Windows helper.
+    /// Locking the actual helper prevents Steam from immediately respawning it
+    /// after the process is terminated.
+    #[cfg(unix)]
+    pub fn enforce_disabled_steam_features_in_prefix(
+        wineprefix: &Path,
+        no_browser: bool,
+        no_friends_ui: bool,
+        no_overlay: bool,
+        no_chat_ui: bool,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let canonical_prefix = std::fs::canonicalize(wineprefix).ok();
+        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+            return;
+        };
+
+        for entry in proc_dir.flatten() {
+            let pid_path = entry.path();
+            let Some(pid_str) = pid_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+
+            let argv = match std::fs::read(pid_path.join("cmdline")) {
+                Ok(bytes) => bytes
+                    .split(|byte| *byte == 0)
+                    .filter(|argument| !argument.is_empty())
+                    .filter_map(|argument| std::str::from_utf8(argument).ok())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+                Err(_) => continue,
+            };
+            let lower = argv.join(" ").to_lowercase();
+            let is_webhelper = lower.contains("steamwebhelper.exe");
+            let is_overlay = argv.iter().any(|argument| {
+                argument
+                    .trim_matches('"')
+                    .replace('\\', "/")
+                    .rsplit('/')
+                    .next()
+                    == Some("gameoverlayui.exe")
+            });
+            let disabled = (no_browser && is_webhelper)
+                || (no_friends_ui && is_webhelper && lower.contains("friend"))
+                || (no_chat_ui && is_webhelper && lower.contains("chat"))
+                || (no_overlay && is_overlay);
+            if !disabled {
+                continue;
+            }
+
+            let environ = match std::fs::read(pid_path.join("environ")) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let process_prefix = environ
+                .split(|byte| *byte == 0)
+                .find_map(|entry| entry.strip_prefix(b"WINEPREFIX="))
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .map(Path::new);
+            let Some(process_prefix) = process_prefix else {
+                continue;
+            };
+            let process_matches_prefix =
+                match (&canonical_prefix, std::fs::canonicalize(process_prefix).ok()) {
+                    (Some(expected), Some(actual)) => expected == &actual,
+                    _ => process_prefix == wineprefix,
+                };
+            if !process_matches_prefix {
+                continue;
+            }
+
+            if let Some(executable) = argv.iter().find(|argument| {
+                argument.to_lowercase().contains("steamwebhelper.exe")
+                    || argument.to_lowercase().contains("gameoverlayui.exe")
+            }) {
+                let candidate = executable.trim_matches('"').replace('\\', "/");
+                let candidate = if candidate.len() > 2
+                    && candidate.as_bytes()[1] == b':'
+                    && candidate.as_bytes()[2] == b'/'
+                {
+                    let drive = candidate.as_bytes()[0].to_ascii_lowercase();
+                    if drive == b'c' {
+                        wineprefix.join("drive_c").join(&candidate[3..])
+                    } else {
+                        PathBuf::from(&candidate[2..])
+                    }
+                } else {
+                    PathBuf::from(&candidate)
+                };
+                if let (Some(expected), Ok(actual)) =
+                    (&canonical_prefix, std::fs::canonicalize(&candidate))
+                {
+                    if actual.starts_with(expected) {
+                        if let Ok(metadata) = std::fs::metadata(&actual) {
+                            let mut permissions = metadata.permissions();
+                            permissions.set_mode(0);
+                            let _ = std::fs::set_permissions(&actual, permissions);
+                        }
+                    }
+                }
+            }
+
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        }
     }
 
     #[cfg(not(unix))]
-    pub fn cef_processes_in_prefix(_wineprefix: &Path) -> std::collections::HashSet<PathBuf> {
-        std::collections::HashSet::new()
+    pub fn kill_disabled_steam_processes_in_prefix(
+        _wineprefix: &Path,
+        _no_browser: bool,
+        _no_friends_ui: bool,
+        _no_overlay: bool,
+        _no_chat_ui: bool,
+    ) {
+    }
+
+    #[cfg(not(unix))]
+    pub fn enforce_disabled_steam_features_in_prefix(
+        _wineprefix: &Path,
+        _no_browser: bool,
+        _no_friends_ui: bool,
+        _no_overlay: bool,
+        _no_chat_ui: bool,
+    ) {
     }
 
     /// Scans /proc to find a wine process running steam.exe inside the given WINEPREFIX.
