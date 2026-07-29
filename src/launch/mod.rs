@@ -132,6 +132,16 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     let _ = diagnostics::apply_install_diagnostics(&mut cmd)?;
 
+    // SteamSetup.exe refuses to install into a non-empty destination ("destination
+    // folder should be empty"). A previous failed/partial install can leave a Steam
+    // dir with package/ + steamapps/ but no valid steam.exe, which trips that error.
+    // When we are launching the INSTALLER (no steam.exe), clear the target dir first,
+    // preserving the game library (steamapps/) and saves (userdata/) by moving them
+    // aside and restoring them into the fresh install.
+    if steam_cfg.steam_exe.is_none() {
+        prepare_clean_install_target(&steam_cfg.wine_prefix)?;
+    }
+
     let _child = cmd.spawn().context("Failed to spawn master steam process")?;
 
     Ok(())
@@ -173,6 +183,51 @@ pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
     );
 
     cmd.spawn().context("Failed to spawn Wine Control Panel")?;
+    Ok(())
+}
+
+/// Clears the Steam client install directory so SteamSetup.exe sees an empty
+/// destination (it errors with "destination folder should be empty" otherwise),
+/// while preserving the user's game library and saves.
+///
+/// Strategy: move the existing Steam dir aside, run the installer into a clean
+/// target, then move steamapps/ and userdata/ back. The staged dir is removed
+/// afterwards; on a fresh install (no existing dir) this is a no-op.
+fn prepare_clean_install_target(wine_prefix: &Path) -> Result<()> {
+    let client_dir = wine_prefix.join("drive_c/Program Files (x86)/Steam");
+    if !client_dir.exists() {
+        return Ok(());
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let stage = wine_prefix
+        .parent()
+        .unwrap_or(wine_prefix)
+        .join(format!("steam_client.broken.{}", ts));
+
+    tracing::info!(
+        "Clearing Steam install target {} for fresh installer (preserving library/saves)",
+        client_dir.display()
+    );
+    std::fs::create_dir_all(stage.parent().unwrap_or(&stage))
+        .context("failed creating install stage dir")?;
+    std::fs::rename(&client_dir, &stage)
+        .with_context(|| format!("failed moving client dir to {}", stage.display()))?;
+
+    for name in ["steamapps", "userdata"] {
+        let src = stage.join(name);
+        let dst = client_dir.join(name);
+        if src.exists() {
+            std::fs::create_dir_all(&client_dir).ok();
+            std::fs::rename(&src, &dst)
+                .with_context(|| format!("failed restoring {} into install target", name))?;
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&stage);
     Ok(())
 }
 
