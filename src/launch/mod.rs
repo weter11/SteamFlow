@@ -23,7 +23,11 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     // update and works. Disabling the self-update keeps the known-good client in place.
     if let Some(ref steam_exe) = steam_cfg.steam_exe {
         if let Some(steam_dir) = steam_exe.parent() {
-            crate::steam_client::SteamClient::ensure_no_self_update(steam_dir);
+            if config.skip_steam_self_update {
+                crate::steam_client::SteamClient::ensure_no_self_update(steam_dir);
+            } else {
+                crate::steam_client::SteamClient::clear_no_self_update(steam_dir);
+            }
         }
     }
 
@@ -278,17 +282,97 @@ pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
     let steam_cfg = crate::utils::get_master_steam_config();
     tracing::info!("Repairing Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 
-    // Kill any wine/steam processes still active in the prefix so the
-    // reinstall can proceed cleanly.
     crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
     crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
 
-    // Re-install the Windows Steam client in-place. SteamSetup.exe will
-    // either overwrite the existing client (self-repair) or do a fresh
-    // install if the client is missing — both preserve the Wine prefix
-    // userdata (saves, configs, game library). A full backup is NOT
-    // needed here because user data lives in userdata/, not the client dir.
-    // The separate "Backup Runtime" button is available for users who
-    // want an explicit prefix snapshot before any operation.
-    install_master_steam(config).await
+    // A damaged client (e.g. a half-applied in-place self-update that fails to
+    // rename steamwebhelper.exe under Proton) cannot be fixed by relaunching it --
+    // launch just re-runs the failing updater. Instead we REINSTALL the client over
+    // the prefix: move the broken Steam install directory aside, run SteamSetup, then
+    // restore the user data that lives *inside* the client dir.
+    //
+    // PRESERVED (relocated out and back): steamapps/ (game library, NEVER deleted)
+    // and userdata/ (saves, login, config). The Wine prefix (pfx/drive_c) is left
+    // intact. The broken client dir is removed only after a successful reinstall +
+    // restore, so no user data is lost.
+
+    let client_dir: Option<PathBuf> = steam_cfg
+        .steam_exe
+        .as_ref()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .or_else(|| {
+            let cand = steam_cfg
+                .wine_prefix
+                .join("drive_c/Program Files (x86)/Steam");
+            if cand.exists() { Some(cand) } else { None }
+        });
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let backup_stage = steam_cfg
+        .wine_prefix
+        .parent()
+        .unwrap_or(&steam_cfg.wine_prefix)
+        .join(format!("steam_client.broken.{}", ts));
+
+    if let Some(ref client_dir) = client_dir {
+        if client_dir.exists() {
+            tracing::info!("Moving broken Steam client aside to {}", backup_stage.display());
+            std::fs::create_dir_all(
+                backup_stage.parent().unwrap_or(&backup_stage),
+            )
+            .context("failed creating repair stage dir")?;
+            std::fs::rename(client_dir, &backup_stage)
+                .with_context(|| format!("failed moving client dir to {}", backup_stage.display()))?;
+        }
+
+        let restore = || -> Result<()> {
+            if backup_stage.exists() {
+                std::fs::create_dir_all(client_dir).ok();
+                for name in ["steamapps", "userdata"] {
+                    let src = backup_stage.join(name);
+                    let dst = client_dir.join(name);
+                    if src.exists() && !dst.exists() {
+                        tracing::info!("Restoring preserved {} into new client", name);
+                        std::fs::rename(&src, &dst).with_context(|| {
+                            format!("failed restoring {} from repair stage", name)
+                        })?;
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        let res = install_master_steam(config).await;
+        if let Err(e) = restore() {
+            tracing::warn!("repair: failed to restore preserved data: {e}");
+        }
+        res?;
+
+        if config.skip_steam_self_update {
+            crate::steam_client::SteamClient::ensure_no_self_update(client_dir);
+        } else {
+            crate::steam_client::SteamClient::clear_no_self_update(client_dir);
+        }
+
+        if backup_stage.exists() {
+            let _ = std::fs::remove_dir_all(&backup_stage);
+            tracing::info!("Removed broken client stage {}", backup_stage.display());
+        }
+    } else {
+        install_master_steam(config).await?;
+        if let Some(ref exe) = steam_cfg.steam_exe {
+            if let Some(dir) = exe.parent() {
+                if config.skip_steam_self_update {
+                    crate::steam_client::SteamClient::ensure_no_self_update(dir);
+                } else {
+                    crate::steam_client::SteamClient::clear_no_self_update(dir);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

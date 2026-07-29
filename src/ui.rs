@@ -2774,6 +2774,22 @@ impl eframe::App for SteamLauncher {
                         let prefix_exists = steam_cfg.root_dir.exists();
                         let latest_backup = crate::launch::get_latest_backup();
 
+                        ui.add_space(4.0);
+                        let mut skip_update = self.launcher_config.skip_steam_self_update;
+                        if ui
+                            .checkbox(&mut skip_update, "Skip Steam self-update (Proton-safe)")
+                            .on_hover_text(
+                                "Pin the Windows Steam client to skip its in-client updater.                                  Under Proton the updater fails to apply a new client (rename of                                  steamwebhelper.exe is denied) and the launch aborts before                                  connecting. Leave on unless you specifically need auto-updates.",
+                            )
+                            .changed()
+                        {
+                            self.launcher_config.skip_steam_self_update = skip_update;
+                            let config_to_save = self.launcher_config.clone();
+                            self.runtime.spawn(async move {
+                                let _ = config_to_save.save().await;
+                            });
+                        }
+
                         ui.horizontal(|ui| {
                             if !prefix_exists {
                                 if ui.button("Install Windows Steam Runtime").clicked() {
@@ -2848,10 +2864,10 @@ impl eframe::App for SteamLauncher {
 
                         if self.show_repair_confirmation {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.colored_label(egui::Color32::YELLOW, "⚠ Repair will reinstall Windows Steam in the existing Steam prefix.");
-                                ui.label("Game library, saves, and settings are preserved — you will need to log in only once.");
-                                ui.label("SteamFlow kills stale wine/steam processes first, then runs the Windows Steam installer.");
-                                ui.label("If Steam already exists in the prefix, SteamFlow just relaunches it (Steam self-repairs).");
+                                ui.colored_label(egui::Color32::YELLOW, "⚠ Repair will REINSTALL the Windows Steam client over the existing prefix.");
+                                ui.label("Your game library (steamapps/) and saves (userdata/) are preserved — only the client is replaced.");
+                                ui.label("SteamFlow removes the broken client, runs the Windows Steam installer, then restores your library and saves.");
+                                ui.label("If 'Skip Steam self-update' is enabled, the fresh client is pinned to avoid the Proton rename failure.");
                                 ui.horizontal(|ui| {
                                     if ui.button("Confirm Repair").clicked() {
                                         self.show_repair_confirmation = false;

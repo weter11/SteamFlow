@@ -26,6 +26,14 @@ pub struct LauncherConfig {
     pub use_shared_compat_data: bool,
     #[serde(default = "crate::models::default_true")]
     pub windows_steam_discovery_enabled: bool,
+    /// When enabled (default), the Windows Steam client is pinned to skip its in-client
+    /// self-updater. Under Proton-based runners Steam's updater downloads a fresh client
+    /// that then fails the in-place rename (rename ...steamwebhelper.exe -> .old returns
+    /// ERROR_ACCESS_DENIED) and the launch aborts before connecting. Disabling the
+    /// self-update keeps the known-good client in place. wine-tkg does not trigger the
+    /// update and works either way, but leaving this on is safe for it too.
+    #[serde(default = "crate::models::default_true")]
+    pub skip_steam_self_update: bool,
     #[serde(default)]
     pub preferred_launch_options: HashMap<u32, String>,
     #[serde(default)]
@@ -60,6 +68,7 @@ impl Default for LauncherConfig {
             enable_cloud_sync: true,
             use_shared_compat_data: false,
             windows_steam_discovery_enabled: true,
+            skip_steam_self_update: true,
             preferred_launch_options: HashMap::new(),
             game_configs: HashMap::new(),
         }
