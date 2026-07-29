@@ -186,13 +186,28 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
         prepare_clean_install_target(&steam_cfg.wine_prefix)?;
     }
 
-    let _child = cmd.spawn().context("Failed to spawn master steam process")?;
-
-    // Only on the installer path do we wait for SteamSetup and then restore the
-    // staged library/saves into the freshly installed client. On the launcher path
-    // (steam.exe present) the existing client is used as-is.
+    // Spawn SteamSetup and BLOCK on it. The user's library/saves were staged into a
+    // sibling folder (steam_client.staged.<ts>) by prepare_clean_install_target; they
+    // must stay OUT of the install target for the ENTIRE install, otherwise SteamSetup
+    // aborts with "destination folder should be empty". We only restore them after the
+    // installer process exits. On the launcher path (steam.exe present) there is nothing
+    // to stage, so we spawn without blocking.
+    let install_path = steam_cfg.wine_prefix.parent().map(|p| p.to_path_buf());
     if steam_cfg.steam_exe.is_none() {
-        restore_staged_install_data(&steam_cfg.wine_prefix);
+        let mut child = cmd.spawn().context("Failed to spawn master steam process")?;
+        if let Some(parent) = install_path {
+            let staged = find_staged_install_data(&parent);
+            // Wait for SteamSetup; copy (not move) staged data back as it finishes so a
+            // crash during restore does not lose the original staged copy.
+            let res = child.wait();
+            if let Some(stage) = staged {
+                restore_staged_install_data(&stage, &steam_cfg.wine_prefix);
+                let _ = std::fs::remove_dir_all(&stage);
+            }
+            res.context("SteamSetup exited abnormally")?;
+        }
+    } else {
+        let _child = cmd.spawn().context("Failed to spawn master steam process")?;
     }
 
     Ok(())
@@ -258,7 +273,7 @@ fn prepare_clean_install_target(wine_prefix: &Path) -> Result<()> {
     let stage = wine_prefix
         .parent()
         .unwrap_or(wine_prefix)
-        .join(format!("steam_client.broken.{}", ts));
+        .join(format!("steam_client.staged.{}", ts));
 
     tracing::info!(
         "Clearing Steam install target {} for fresh installer (staging library/saves)",
@@ -272,45 +287,51 @@ fn prepare_clean_install_target(wine_prefix: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Restores the game library (steamapps/) and saves (userdata/) that
-/// `prepare_clean_install_target` staged aside, into the freshly installed client
-/// dir. Called AFTER SteamSetup starts so the installer always sees an empty target.
-/// Any failure is logged but non-fatal (the install itself is what matters).
-///
-/// We MERGE directories (move the staged contents into the destination, not the
-/// whole folder) because SteamSetup may have already created an empty `steamapps/`.
-/// A naive rename that skips an existing destination would silently drop the user's
-/// installed games, so we descend and move individual entries.
-fn restore_staged_install_data(wine_prefix: &Path) {
-    let client_dir = wine_prefix.join("drive_c/Program Files (x86)/Steam");
-    let Some(parent) = wine_prefix.parent() else { return };
+/// Locates the staged install data directory created by
+/// `prepare_clean_install_target` (named `steam_client.staged.<ts>`), if any.
+fn find_staged_install_data(parent: &Path) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
     if let Ok(entries) = std::fs::read_dir(parent) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("steam_client.broken.") {
-                let stage = entry.path();
-                tracing::info!("Restoring staged library/saves from {}", stage.display());
-                for sub in ["steamapps", "userdata"] {
-                    let src = stage.join(sub);
-                    let dst = client_dir.join(sub);
-                    if !src.exists() {
-                        continue;
-                    }
-                    let _ = std::fs::create_dir_all(&dst);
-                    if let Ok(children) = std::fs::read_dir(&src) {
-                        for child in children.flatten() {
-                            let cname = child.file_name();
-                            let from = child.path();
-                            let to = dst.join(&cname);
-                            if !to.exists() {
-                                if let Err(e) = std::fs::rename(&from, &to) {
-                                    tracing::warn!("failed restoring {}/{}: {}", sub, cname.to_string_lossy(), e);
-                                }
-                            }
-                        }
+            if name.starts_with("steam_client.staged.") {
+                found = Some(entry.path());
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Restores the game library (steamapps/) and saves (userdata/) from a specific
+/// staged dir into the freshly installed client dir. Called AFTER SteamSetup exits,
+/// so the installer always saw an empty target. Any failure is logged but non-fatal
+/// (the install itself is what matters).
+///
+/// We COPY entries (not move/rename the whole folder) and MERGE, because SteamSetup
+/// may have already created an empty `steamapps/`. A naive move that skips an
+/// existing destination would silently drop the user's installed games, so we descend
+/// and copy individual entries, never overwriting what the installer created.
+fn restore_staged_install_data(stage: &Path, wine_prefix: &Path) {
+    let client_dir = wine_prefix.join("drive_c/Program Files (x86)/Steam");
+    tracing::info!("Restoring staged library/saves from {}", stage.display());
+    for sub in ["steamapps", "userdata"] {
+        let src = stage.join(sub);
+        let dst = client_dir.join(sub);
+        if !src.exists() {
+            continue;
+        }
+        let _ = std::fs::create_dir_all(&dst);
+        if let Ok(children) = std::fs::read_dir(&src) {
+            for child in children.flatten() {
+                let cname = child.file_name();
+                let from = child.path();
+                let to = dst.join(&cname);
+                if !to.exists() {
+                    if let Err(e) = std::fs::rename(&from, &to) {
+                        tracing::warn!("failed restoring {}/{}: {}", sub, cname.to_string_lossy(), e);
                     }
                 }
-                let _ = std::fs::remove_dir_all(&stage);
             }
         }
     }
@@ -451,11 +472,13 @@ pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // Repair stages its data under a DISTINCT prefix (steam_client.repair.*) so it is
+    // never picked up by install_master_steam's steam_client.staged.* scanning/restore.
     let backup_stage = steam_cfg
         .wine_prefix
         .parent()
         .unwrap_or(&steam_cfg.wine_prefix)
-        .join(format!("steam_client.broken.{}", ts));
+        .join(format!("steam_client.repair.{}", ts));
 
     if let Some(ref client_dir) = client_dir {
         if client_dir.exists() {
@@ -470,7 +493,7 @@ pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
 
         // Merge staged library/saves into the freshly installed client. We descend and
         // move individual entries (not the whole folder) because install_master_steam /
-        // SteamSetup may have already created an empty steamapps/ — a naive rename that
+        // SteamSetup may have already created an empty steamapps/ — a naive move that
         // skips an existing destination would silently drop the user's installed games.
         let restore = || -> Result<()> {
             if backup_stage.exists() {
