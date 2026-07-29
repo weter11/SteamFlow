@@ -49,14 +49,10 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
         let library_root = PathBuf::from(&config.steam_library_path);
     let resolved_runner = crate::utils::resolve_runner(&runner_name, &library_root);
-    let runner_kind = crate::utils::classify_runner(&resolved_runner);
-    let (is_proton, proton_root): (bool, Option<PathBuf>) = match &runner_kind {
-        crate::utils::RunnerKind::Proton { proton_script, .. } => (
-            true,
-            proton_script.parent().map(|p| p.to_path_buf()),
-        ),
-        _ => (false, None),
-    };
+    let is_proton = matches!(
+        crate::utils::classify_runner(&resolved_runner),
+        crate::utils::RunnerKind::Proton { .. }
+    );
 
     // Launch Windows Steam with the BARE Wine binary of the selected runner — exactly how
     // a plain wine-tkg launch works. We deliberately do NOT use the `proton run` script:
@@ -93,40 +89,15 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     cmd.arg("-cef-disable-gpu");
     cmd.arg("-no-cef-sandbox");
 
-    // Replicate the environment that Proton's `proton` script exports for its
-    // BUNDLED wine. Bare-wine launches skip the script, but Proton's wine64 needs
-    // LD_LIBRARY_PATH pointing at Proton's lib dirs (X11/GL drivers) and WINEDLLPATH
-    // at its wine build, otherwise winex11 fails to load ("no driver could be loaded")
-    // and the explorer/installer process can't create a window.
-    if is_proton {
-        if let Some(ref root) = proton_root {
-            let mut ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-            for lib in ["files/lib64", "dist/lib64", "files/lib", "dist/lib", "lib64", "lib"] {
-                let d = root.join(lib);
-                if d.is_dir() {
-                    if !ld.is_empty() { ld.push(':'); }
-                    ld.push_str(&d.to_string_lossy());
-                }
-            }
-            if !ld.is_empty() {
-                cmd.env("LD_LIBRARY_PATH", ld);
-            }
-            for dll in ["files/lib/wine", "dist/lib/wine", "lib/wine", "files/lib64/wine", "dist/lib64/wine"] {
-                let d = root.join(dll);
-                if d.is_dir() {
-                    let parent = d.parent().unwrap_or(root).to_path_buf();
-                    let existing = std::env::var("WINEDLLPATH").unwrap_or_default();
-                    let mut combined = parent.to_string_lossy().to_string();
-                    if !existing.is_empty() {
-                        combined.push(':');
-                        combined.push_str(&existing);
-                    }
-                    cmd.env("WINEDLLPATH", combined);
-                    break;
-                }
-            }
-        }
-    }
+    // NOTE: On the bare-wine path we deliberately do NOT replicate Proton's
+    // LD_LIBRARY_PATH / WINEDLLPATH / GST_PLUGIN_SYSTEM_PATH_1_0 / PATH exports from
+    // the `proton` script. Proton's bundled wine binary self-locates its own libs
+    // (libwine, ntdll) via its baked-in RPATH, and the system X11/GL libraries live
+    // in /lib/x86_64-linux-gnu. Overriding LD_LIBRARY_PATH with ONLY Proton's lib
+    // dirs (which contain no libX11/libGL) makes winex11 fail to load ->
+    // 'err:winediag:nodrv_CreateWindow / explorer process failed to start'. This is
+    // exactly why the PlainWine (wine-tkg) path works: it sets no such override and
+    // inherits the system X/GL libs. Launch Proton's bare wine the same way.
 
     // Environment Variables
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
