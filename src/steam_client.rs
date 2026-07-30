@@ -2550,6 +2550,32 @@ impl SteamClient {
         }
     }
 
+    /// Removes the `BootStrapperForceSelfUpdate=disable` pin from the client's
+    /// steam.cfg, re-enabling Steam's in-client self-updater. Used when the user
+    /// turns OFF the "Skip Steam self-update" option, so the preference is honoured
+    /// rather than permanently pinned on by an earlier run.
+    pub fn clear_no_self_update(steam_dir: &Path) {
+        let cfg_path = steam_dir.join("steam.cfg");
+        if !cfg_path.exists() {
+            return;
+        }
+        let content = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        let filtered: Vec<&str> = content
+            .lines()
+            .map(|l| l.trim_end())
+            .filter(|l| !l.eq_ignore_ascii_case("BootStrapperForceSelfUpdate=disable"))
+            .filter(|l| !l.is_empty())
+            .collect();
+        let new_content = format!("{}
+", filtered.join("
+"));
+        if let Err(e) = std::fs::write(&cfg_path, new_content) {
+            tracing::warn!("failed to clear steam.cfg self-update disable: {}", e);
+        } else {
+            tracing::info!("steam.cfg unpinned: self-update re-enabled ({})", cfg_path.display());
+        }
+    }
+
     /// The single canonical entry point for launching a game process.
     /// This function orchestrates the launch via a staged pipeline and the appropriate runner.
     /// Bypassing this for production launches is strictly forbidden.

@@ -23,7 +23,11 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     // update and works. Disabling the self-update keeps the known-good client in place.
     if let Some(ref steam_exe) = steam_cfg.steam_exe {
         if let Some(steam_dir) = steam_exe.parent() {
-            crate::steam_client::SteamClient::ensure_no_self_update(steam_dir);
+            if config.skip_steam_self_update {
+                crate::steam_client::SteamClient::ensure_no_self_update(steam_dir);
+            } else {
+                crate::steam_client::SteamClient::clear_no_self_update(steam_dir);
+            }
         }
     }
 
@@ -45,8 +49,10 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
         let library_root = PathBuf::from(&config.steam_library_path);
     let resolved_runner = crate::utils::resolve_runner(&runner_name, &library_root);
-    let runner_kind = crate::utils::classify_runner(&resolved_runner);
-    let is_proton = matches!(runner_kind, crate::utils::RunnerKind::Proton { .. });
+    let is_proton = matches!(
+        crate::utils::classify_runner(&resolved_runner),
+        crate::utils::RunnerKind::Proton { .. }
+    );
 
     // Launch Windows Steam with the BARE Wine binary of the selected runner — exactly how
     // a plain wine-tkg launch works. We deliberately do NOT use the `proton run` script:
@@ -82,6 +88,16 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     // (visible in bootstrap_log.txt).
     cmd.arg("-cef-disable-gpu");
     cmd.arg("-no-cef-sandbox");
+
+    // NOTE: On the bare-wine path we deliberately do NOT replicate Proton's
+    // LD_LIBRARY_PATH / WINEDLLPATH / GST_PLUGIN_SYSTEM_PATH_1_0 / PATH exports from
+    // the `proton` script. Proton's bundled wine binary self-locates its own libs
+    // (libwine, ntdll) via its baked-in RPATH, and the system X11/GL libraries live
+    // in /lib/x86_64-linux-gnu. Overriding LD_LIBRARY_PATH with ONLY Proton's lib
+    // dirs (which contain no libX11/libGL) makes winex11 fail to load ->
+    // 'err:winediag:nodrv_CreateWindow / explorer process failed to start'. This is
+    // exactly why the PlainWine (wine-tkg) path works: it sets no such override and
+    // inherits the system X/GL libs. Launch Proton's bare wine the same way.
 
     // Environment Variables
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
@@ -128,8 +144,82 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
 
     let _ = diagnostics::apply_install_diagnostics(&mut cmd)?;
 
-    let _child = cmd.spawn().context("Failed to spawn master steam process")?;
+    // SteamSetup.exe refuses to install into a non-empty destination ("destination
+    // folder should be empty"). A previous failed/partial install can leave a Steam
+    // dir with package/ + steamapps/ but no valid steam.exe, which trips that error.
+    //
+    // When we are launching the INSTALLER (no steam.exe), delete the broken client
+    // dir but first move the user's game library (steamapps/) and saves (userdata/)
+    // aside so they survive the reinstall. The staged data is restored into the fresh
+    // client AFTER the installer finishes (see below), so the destination stays empty
+    // for the installer itself.
+    if steam_cfg.steam_exe.is_none() {
+        prepare_clean_install_target(&steam_cfg.wine_prefix)?;
+    }
 
+    // Spawn SteamSetup and BLOCK on it. The user's library/saves were staged into a
+    // sibling folder (steam_client.staged.<ts>) by prepare_clean_install_target; they
+    // must stay OUT of the install target for the ENTIRE install, otherwise SteamSetup
+    // aborts with "destination folder should be empty". We only restore them after the
+    // installer process exits. On the launcher path (steam.exe present) there is nothing
+    // to stage, so we spawn without blocking.
+    let install_path = steam_cfg.wine_prefix.parent().map(|p| p.to_path_buf());
+    if steam_cfg.steam_exe.is_none() {
+        let mut child = cmd.spawn().context("Failed to spawn master steam process")?;
+        if let Some(parent) = install_path {
+            let staged = find_staged_install_data(&parent);
+            // Wait for SteamSetup; copy (not move) staged data back as it finishes so a
+            // crash during restore does not lose the original staged copy.
+            let res = child.wait();
+            if let Some(stage) = staged {
+                restore_staged_install_data(&stage, &steam_cfg.wine_prefix);
+                let _ = std::fs::remove_dir_all(&stage);
+            }
+            res.context("SteamSetup exited abnormally")?;
+        }
+    } else {
+        let _child = cmd.spawn().context("Failed to spawn master steam process")?;
+    }
+
+    Ok(())
+}
+
+/// Launch Wine Configuration (winecfg.exe) using the configured runner and
+/// master Wine prefix. winecfg lets you configure Wine's Wine DLL overrides,
+/// Windows version, audio drivers, display settings, and more — useful
+/// for tuning the Wine environment for specific Windows applications.
+pub fn launch_winecfg(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    cmd.arg("winecfg.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine Configuration"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine Configuration")?;
     Ok(())
 }
 
@@ -170,6 +260,214 @@ pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
 
     cmd.spawn().context("Failed to spawn Wine Control Panel")?;
     Ok(())
+}
+
+/// Launch Wine File Manager (winefile.exe) using the configured runner and
+/// master Wine prefix. winefile provides a graphical GUI for browsing the
+/// Wine prefix filesystem — useful for manually finding and editing Wine
+/// registry files, ini files, and other configuration outside the Wine
+/// registry editor.
+pub fn launch_wine_file_manager(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    cmd.arg("winefile.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine File Manager"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine File Manager")?;
+    Ok(())
+}
+
+/// Launch Wine Registry Editor (regedit.exe) using the configured runner and
+/// master Wine prefix. regedit lets you view and edit the Wine registry
+/// (HKLM, HKCU, etc.) — useful for manually fixing registry entries that
+/// the Wine uninstaller or SteamSetup didn't clean up.
+pub fn launch_wine_regedit(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    cmd.arg("regedit.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine Registry Editor"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine Registry Editor")?;
+
+/// Launch Wine Task Manager (taskmgr.exe) using the configured runner and
+/// master Wine prefix. taskmgr lets you view and kill processes running
+/// inside the Wine prefix — useful for stopping stuck wine processes
+/// before repair/reinstall.
+    Ok(())
+}
+
+/// Launch Wine Task Manager (taskmgr.exe) using the configured runner and
+/// master Wine prefix. taskmgr lets you view and kill processes
+/// running inside the Wine prefix — useful for stopping stuck wine
+/// processes before repair/reinstall.
+pub fn launch_wine_taskmgr(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    cmd.arg("taskmgr.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine Task Manager"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine Task Manager")?;
+    Ok(())
+}
+
+/// Prepares an EMPTY Steam install target so SteamSetup.exe does not error with
+/// "destination folder should be empty".
+///
+/// The broken client dir is deleted, but the user's game library (steamapps/) and
+/// saves (userdata/) are moved aside first (into a sibling `steam_client.broken.<ts>`
+/// stage) so they survive the reinstall. The destination is left empty for the
+/// installer; `restore_staged_install_data` moves them back afterwards.
+/// On a fresh install (no existing client dir) this is a no-op.
+fn prepare_clean_install_target(wine_prefix: &Path) -> Result<()> {
+    let client_dir = wine_prefix.join("drive_c/Program Files (x86)/Steam");
+    if !client_dir.exists() {
+        return Ok(());
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let stage = wine_prefix
+        .parent()
+        .unwrap_or(wine_prefix)
+        .join(format!("steam_client.staged.{}", ts));
+
+    tracing::info!(
+        "Clearing Steam install target {} for fresh installer (staging library/saves)",
+        client_dir.display()
+    );
+    std::fs::create_dir_all(stage.parent().unwrap_or(&stage))
+        .context("failed creating install stage dir")?;
+    std::fs::rename(&client_dir, &stage)
+        .with_context(|| format!("failed moving client dir to {}", stage.display()))?;
+
+    Ok(())
+}
+
+/// Locates the staged install data directory created by
+/// `prepare_clean_install_target` (named `steam_client.staged.<ts>`), if any.
+fn find_staged_install_data(parent: &Path) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("steam_client.staged.") {
+                found = Some(entry.path());
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Restores the game library (steamapps/) and saves (userdata/) from a specific
+/// staged dir into the freshly installed client dir. Called AFTER SteamSetup exits,
+/// so the installer always saw an empty target. Any failure is logged but non-fatal
+/// (the install itself is what matters).
+///
+/// We COPY entries (not move/rename the whole folder) and MERGE, because SteamSetup
+/// may have already created an empty `steamapps/`. A naive move that skips an
+/// existing destination would silently drop the user's installed games, so we descend
+/// and copy individual entries, never overwriting what the installer created.
+fn restore_staged_install_data(stage: &Path, wine_prefix: &Path) {
+    let client_dir = wine_prefix.join("drive_c/Program Files (x86)/Steam");
+    tracing::info!("Restoring staged library/saves from {}", stage.display());
+    for sub in ["steamapps", "userdata"] {
+        let src = stage.join(sub);
+        let dst = client_dir.join(sub);
+        if !src.exists() {
+            continue;
+        }
+        let _ = std::fs::create_dir_all(&dst);
+        if let Ok(children) = std::fs::read_dir(&src) {
+            for child in children.flatten() {
+                let cname = child.file_name();
+                let from = child.path();
+                let to = dst.join(&cname);
+                if !to.exists() {
+                    if let Err(e) = std::fs::rename(&from, &to) {
+                        tracing::warn!("failed restoring {}/{}: {}", sub, cname.to_string_lossy(), e);
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn download_steam_setup(path: &Path) -> Result<()> {
@@ -278,17 +576,91 @@ pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
     let steam_cfg = crate::utils::get_master_steam_config();
     tracing::info!("Repairing Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 
-    // Kill any wine/steam processes still active in the prefix so the
-    // reinstall can proceed cleanly.
     crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
     crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
 
-    // Re-install the Windows Steam client in-place. SteamSetup.exe will
-    // either overwrite the existing client (self-repair) or do a fresh
-    // install if the client is missing — both preserve the Wine prefix
-    // userdata (saves, configs, game library). A full backup is NOT
-    // needed here because user data lives in userdata/, not the client dir.
-    // The separate "Backup Runtime" button is available for users who
-    // want an explicit prefix snapshot before any operation.
-    install_master_steam(config).await
+    // A damaged client (e.g. a half-applied in-place self-update that fails to
+    // rename steamwebhelper.exe under Proton) cannot be fixed by relaunching it --
+    // launch just re-runs the failing updater. We use Wine\'s built-in uninstaller
+    // to cleanly remove Steam from the prefix (registry + uninstall.exe), then run
+    // SteamSetup fresh. The uninstaller removes only Steam components; user data
+    // (steamapps/, userdata/) is left intact in the prefix.
+    //
+    // PRESERVED: steamapps/ (game library, NEVER deleted) and userdata/ (saves,
+    // login, config). The Wine prefix (pfx/drive_c) stays intact throughout.
+
+    let client_dir: Option<PathBuf> = steam_cfg
+        .steam_exe
+        .as_ref()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .or_else(|| {
+            let cand = steam_cfg
+                .wine_prefix
+                .join("drive_c/Program Files (x86)/Steam");
+            if cand.exists() { Some(cand) } else { None }
+        });
+
+    // Try Wine\'s uninstaller first (clean registry + file removal) if Steam is registered
+    if let Some(ref client_dir) = client_dir {
+        if client_dir.exists() {
+            let system_reg = steam_cfg.wine_prefix.join("pfx/system.reg");
+            let has_uninstall_entry = system_reg.exists()
+                && std::fs::read_to_string(&system_reg)
+                    .map(|c| c.contains("Uninstall\\Steam") && c.contains("UninstallString"))
+                    .unwrap_or(false);
+
+            if has_uninstall_entry {
+                tracing::info!("Steam found in Wine registry — attempting clean uninstall via wine uninstaller");
+                let uninstall_output = std::process::Command::new("wine")
+                    .arg("uninstaller")
+                    .arg("--remove")
+                    .arg("Steam")
+                    .env("WINEPREFIX", &steam_cfg.wine_prefix)
+                    .env("WINEDLLOVERRIDES", "mshtml=")
+                    .output();
+
+                match uninstall_output {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!("Wine uninstaller removed Steam successfully");
+                        // Wait for wineserver to settle after registry removal
+                        let _ = std::process::Command::new("wineserver")
+                            .arg("-w")
+                            .env("WINEPREFIX", &steam_cfg.wine_prefix)
+                            .status();
+                    }
+                    Ok(output) => {
+                        tracing::warn!(
+                            "Wine uninstaller exited with status {:?}: stderr={}",
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to run wine uninstaller: {}", e);
+                    }
+                }
+            } else {
+                tracing::info!("Steam not found in Wine registry — uninstaller skip, proceeding to fresh install");
+            }
+        }
+    }
+
+    let res = install_master_steam(config).await;
+    if let Err(e) = res {
+        tracing::warn!("repair: install_master_steam failed: {e}");
+        return Err(e);
+    }
+
+    if config.skip_steam_self_update {
+        if let Some(ref dir) = client_dir {
+            crate::steam_client::SteamClient::ensure_no_self_update(dir);
+        }
+    } else {
+        if let Some(ref dir) = client_dir {
+            crate::steam_client::SteamClient::clear_no_self_update(dir);
+        }
+    }
+
+    Ok(())
 }
+

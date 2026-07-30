@@ -123,6 +123,10 @@ pub enum AsyncOp {
     UserProfileFetched(crate::models::UserProfile),
     SettingsSaved(bool),
     WineControlPanelLaunched,
+    WineCfgLaunched,
+    WineFileManagerLaunched,
+    WineRegeditLaunched,
+    WineTaskManagerLaunched,
     ScanCompleted(u32, HashMap<u32, String>),
     MasterSteamRepaired,
     MasterSteamBackedUp,
@@ -609,6 +613,18 @@ impl SteamLauncher {
                 }
                 AsyncOp::WineControlPanelLaunched => {
                     self.status = "Wine Control Panel launched".to_string();
+                }
+                AsyncOp::WineCfgLaunched => {
+                    self.status = "Wine Configuration launched".to_string();
+                }
+                AsyncOp::WineFileManagerLaunched => {
+                    self.status = "Wine File Manager launched".to_string();
+                }
+                AsyncOp::WineRegeditLaunched => {
+                    self.status = "Wine Registry Editor launched".to_string();
+                }
+                AsyncOp::WineTaskManagerLaunched => {
+                    self.status = "Wine Task Manager launched".to_string();
                 }
                 AsyncOp::ScanCompleted(appid, installed_paths) => {
                     for g in &mut self.library {
@@ -2774,6 +2790,22 @@ impl eframe::App for SteamLauncher {
                         let prefix_exists = steam_cfg.root_dir.exists();
                         let latest_backup = crate::launch::get_latest_backup();
 
+                        ui.add_space(4.0);
+                        let mut skip_update = self.launcher_config.skip_steam_self_update;
+                        if ui
+                            .checkbox(&mut skip_update, "Skip Steam self-update (Proton-safe)")
+                            .on_hover_text(
+                                "Pin the Windows Steam client to skip its in-client updater.                                  Under Proton the updater fails to apply a new client (rename of                                  steamwebhelper.exe is denied) and the launch aborts before                                  connecting. Leave on unless you specifically need auto-updates.",
+                            )
+                            .changed()
+                        {
+                            self.launcher_config.skip_steam_self_update = skip_update;
+                            let config_to_save = self.launcher_config.clone();
+                            self.runtime.spawn(async move {
+                                let _ = config_to_save.save().await;
+                            });
+                        }
+
                         ui.horizontal(|ui| {
                             if !prefix_exists {
                                 if ui.button("Install Windows Steam Runtime").clicked() {
@@ -2848,10 +2880,10 @@ impl eframe::App for SteamLauncher {
 
                         if self.show_repair_confirmation {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.colored_label(egui::Color32::YELLOW, "⚠ Repair will reinstall Windows Steam in the existing Steam prefix.");
-                                ui.label("Game library, saves, and settings are preserved — you will need to log in only once.");
-                                ui.label("SteamFlow kills stale wine/steam processes first, then runs the Windows Steam installer.");
-                                ui.label("If Steam already exists in the prefix, SteamFlow just relaunches it (Steam self-repairs).");
+                                ui.colored_label(egui::Color32::YELLOW, "⚠ Repair will REINSTALL the Windows Steam client over the existing prefix.");
+                                ui.label("Your game library (steamapps/) and saves (userdata/) are preserved — only the client is replaced.");
+                                ui.label("SteamFlow removes the broken client, runs the Windows Steam installer, then restores your library and saves.");
+                                ui.label("If 'Skip Steam self-update' is enabled, the fresh client is pinned to avoid the Proton rename failure.");
                                 ui.horizontal(|ui| {
                                     if ui.button("Confirm Repair").clicked() {
                                         self.show_repair_confirmation = false;
@@ -2988,6 +3020,70 @@ impl eframe::App for SteamLauncher {
                             });
                         }
                         ui.label("Launches Wine's control.exe using the default Proton version and SteamFlow's master Wine prefix.");
+
+                        if ui.button("Wine Configuration (winecfg)").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_winecfg(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineCfgLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine Configuration failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's winecfg.exe — configure Wine DLL overrides, Windows version, and drivers.");
+
+                        if ui.button("Open Wine File Manager").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_wine_file_manager(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineFileManagerLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine File Manager failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's winefile.exe — browse the Wine prefix filesystem graphically.");
+
+                        if ui.button("Open Wine Registry Editor").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_wine_regedit(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineRegeditLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine Registry Editor failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's regedit.exe — view and edit the Wine registry.");
+
+                        if ui.button("Open Wine Task Manager").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_wine_taskmgr(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineTaskManagerLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine Task Manager failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's taskmgr.exe — manage processes running inside the Wine prefix.");
 
                         ui.add_space(8.0);
                         ui.separator();
