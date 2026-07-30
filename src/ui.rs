@@ -123,6 +123,7 @@ pub enum AsyncOp {
     UserProfileFetched(crate::models::UserProfile),
     SettingsSaved(bool),
     WineControlPanelLaunched,
+    WineCfgLaunched,
     WineFileManagerLaunched,
     WineRegeditLaunched,
     WineTaskManagerLaunched,
@@ -612,6 +613,9 @@ impl SteamLauncher {
                 }
                 AsyncOp::WineControlPanelLaunched => {
                     self.status = "Wine Control Panel launched".to_string();
+                }
+                AsyncOp::WineCfgLaunched => {
+                    self.status = "Wine Configuration launched".to_string();
                 }
                 AsyncOp::WineFileManagerLaunched => {
                     self.status = "Wine File Manager launched".to_string();
@@ -3016,6 +3020,22 @@ impl eframe::App for SteamLauncher {
                             });
                         }
                         ui.label("Launches Wine's control.exe using the default Proton version and SteamFlow's master Wine prefix.");
+
+                        if ui.button("Wine Configuration (winecfg)").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_winecfg(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineCfgLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine Configuration failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's winecfg.exe — configure Wine DLL overrides, Windows version, and drivers.");
 
                         if ui.button("Open Wine File Manager").clicked() {
                             let config = self.launcher_config.clone();

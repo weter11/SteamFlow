@@ -184,6 +184,45 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     Ok(())
 }
 
+/// Launch Wine Configuration (winecfg.exe) using the configured runner and
+/// master Wine prefix. winecfg lets you configure Wine's Wine DLL overrides,
+/// Windows version, audio drivers, display settings, and more — useful
+/// for tuning the Wine environment for specific Windows applications.
+pub fn launch_winecfg(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    cmd.arg("winecfg.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine Configuration"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine Configuration")?;
+    Ok(())
+}
+
 pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
     let library_root = PathBuf::from(&config.steam_library_path);
     let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
