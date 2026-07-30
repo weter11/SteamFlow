@@ -123,6 +123,9 @@ pub enum AsyncOp {
     UserProfileFetched(crate::models::UserProfile),
     SettingsSaved(bool),
     WineControlPanelLaunched,
+    WineFileManagerLaunched,
+    WineRegeditLaunched,
+    WineTaskManagerLaunched,
     ScanCompleted(u32, HashMap<u32, String>),
     MasterSteamRepaired,
     MasterSteamBackedUp,
@@ -609,6 +612,15 @@ impl SteamLauncher {
                 }
                 AsyncOp::WineControlPanelLaunched => {
                     self.status = "Wine Control Panel launched".to_string();
+                }
+                AsyncOp::WineFileManagerLaunched => {
+                    self.status = "Wine File Manager launched".to_string();
+                }
+                AsyncOp::WineRegeditLaunched => {
+                    self.status = "Wine Registry Editor launched".to_string();
+                }
+                AsyncOp::WineTaskManagerLaunched => {
+                    self.status = "Wine Task Manager launched".to_string();
                 }
                 AsyncOp::ScanCompleted(appid, installed_paths) => {
                     for g in &mut self.library {
@@ -3004,6 +3016,54 @@ impl eframe::App for SteamLauncher {
                             });
                         }
                         ui.label("Launches Wine's control.exe using the default Proton version and SteamFlow's master Wine prefix.");
+
+                        if ui.button("Open Wine File Manager").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_wine_file_manager(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineFileManagerLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine File Manager failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's winefile.exe — browse the Wine prefix filesystem graphically.");
+
+                        if ui.button("Open Wine Registry Editor").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_wine_regedit(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineRegeditLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine Registry Editor failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's regedit.exe — view and edit the Wine registry.");
+
+                        if ui.button("Open Wine Task Manager").clicked() {
+                            let config = self.launcher_config.clone();
+                            let tx = self.operation_tx.clone();
+                            self.runtime.spawn(async move {
+                                match crate::launch::launch_wine_taskmgr(&config) {
+                                    Ok(()) => {
+                                        let _ = tx.send(AsyncOp::WineTaskManagerLaunched);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AsyncOp::Error(format!("Wine Task Manager failed: {e}")));
+                                    }
+                                }
+                            });
+                        }
+                        ui.label("Launches Wine's taskmgr.exe — manage processes running inside the Wine prefix.");
 
                         ui.add_space(8.0);
                         ui.separator();

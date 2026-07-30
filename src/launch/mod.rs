@@ -223,6 +223,129 @@ pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
     Ok(())
 }
 
+/// Launch Wine File Manager (winefile.exe) using the configured runner and
+/// master Wine prefix. winefile provides a graphical GUI for browsing the
+/// Wine prefix filesystem — useful for manually finding and editing Wine
+/// registry files, ini files, and other configuration outside the Wine
+/// registry editor.
+pub fn launch_wine_file_manager(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    cmd.arg("winefile.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine File Manager"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine File Manager")?;
+    Ok(())
+}
+
+/// Launch Wine Registry Editor (regedit.exe) using the configured runner and
+/// master Wine prefix. regedit lets you view and edit the Wine registry
+/// (HKLM, HKCU, etc.) — useful for manually fixing registry entries that
+/// the Wine uninstaller or SteamSetup didn't clean up.
+pub fn launch_wine_regedit(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    cmd.arg("regedit.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine Registry Editor"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine Registry Editor")?;
+
+/// Launch Wine Task Manager (taskmgr.exe) using the configured runner and
+/// master Wine prefix. taskmgr lets you view and kill processes running
+/// inside the Wine prefix — useful for stopping stuck wine processes
+/// before repair/reinstall.
+    Ok(())
+}
+
+/// Launch Wine Task Manager (taskmgr.exe) using the configured runner and
+/// master Wine prefix. taskmgr lets you view and kill processes
+/// running inside the Wine prefix — useful for stopping stuck wine
+/// processes before repair/reinstall.
+pub fn launch_wine_taskmgr(config: &LauncherConfig) -> Result<()> {
+    let library_root = PathBuf::from(&config.steam_library_path);
+    let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+    let mut cmd = crate::utils::build_bare_wine_command(&resolved_runner)?;
+    let steam_cfg = crate::utils::get_master_steam_config();
+
+    std::fs::create_dir_all(&steam_cfg.wine_prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
+
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+
+    cmd.arg("taskmgr.exe");
+    cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &steam_cfg.root_dir);
+
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        runner = %resolved_runner.display(),
+        wineprefix = %steam_cfg.wine_prefix.display(),
+        "Launching Wine Task Manager"
+    );
+
+    cmd.spawn().context("Failed to spawn Wine Task Manager")?;
+    Ok(())
+}
+
 /// Prepares an EMPTY Steam install target so SteamSetup.exe does not error with
 /// "destination folder should be empty".
 ///
