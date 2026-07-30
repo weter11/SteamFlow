@@ -419,9 +419,9 @@ pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
 
     // A damaged client (e.g. a half-applied in-place self-update that fails to
     // rename steamwebhelper.exe under Proton) cannot be fixed by relaunching it --
-    // launch just re-runs the failing updater. Instead we REINSTALL the client over
-    // the prefix: move the broken Steam install directory aside, run SteamSetup, then
-    // restore the user data that lives *inside* the client dir.
+    // launch just re-runs the failing updater. We attempt a clean reinstall using
+    // Wine's built-in uninstaller first (proper registry cleanup), then fall back
+    // to manual staging if the uninstaller isn't available or fails.
     //
     // PRESERVED (relocated out and back): steamapps/ (game library, NEVER deleted)
     // and userdata/ (saves, login, config). The Wine prefix (pfx/drive_c) is left
@@ -451,76 +451,186 @@ pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
         .unwrap_or(&steam_cfg.wine_prefix)
         .join(format!("steam_client.repair.{}", ts));
 
+    // Try Wine's uninstaller first (clean registry removal) if Steam is registered
+    let mut used_uninstaller = false;
+    let mut staged_steamapps = None;
+    let mut staged_userdata = None;
+
     if let Some(ref client_dir) = client_dir {
         if client_dir.exists() {
-            tracing::info!("Moving broken Steam client aside to {}", backup_stage.display());
-            std::fs::create_dir_all(
-                backup_stage.parent().unwrap_or(&backup_stage),
-            )
-            .context("failed creating repair stage dir")?;
-            std::fs::rename(client_dir, &backup_stage)
-                .with_context(|| format!("failed moving client dir to {}", backup_stage.display()))?;
-        }
+            // Check if Steam has a valid uninstall entry in the Wine registry
+            let system_reg = steam_cfg.wine_prefix.join("pfx/system.reg");
+            let has_uninstall_entry = system_reg.exists()
+                && std::fs::read_to_string(&system_reg)
+                    .map(|c| c.contains("Uninstall\\Steam") && c.contains("UninstallString"))
+                    .unwrap_or(false);
 
-        // Merge staged library/saves into the freshly installed client. We descend and
-        // move individual entries (not the whole folder) because install_master_steam /
-        // SteamSetup may have already created an empty steamapps/ — a naive move that
-        // skips an existing destination would silently drop the user's installed games.
-        let restore = || -> Result<()> {
-            if backup_stage.exists() {
-                for name in ["steamapps", "userdata"] {
-                    let src = backup_stage.join(name);
-                    let dst = client_dir.join(name);
-                    if !src.exists() {
-                        continue;
+            if has_uninstall_entry {
+                tracing::info!("Steam found in Wine registry — attempting clean uninstall via wine uninstaller");
+                let uninstall_output = std::process::Command::new("wine")
+                    .arg("uninstaller")
+                    .arg("--remove")
+                    .arg("Steam")
+                    .env("WINEPREFIX", &steam_cfg.wine_prefix)
+                    .env("WINEDLLOVERRIDES", "mshtml=") // avoid GUI popup blockers
+                    .output();
+
+                match uninstall_output {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!("Wine uninstaller removed Steam successfully");
+                        used_uninstaller = true;
+                        // Wait for wineserver to settle
+                        let _ = std::process::Command::new("wineserver")
+                            .arg("-w")
+                            .env("WINEPREFIX", &steam_cfg.wine_prefix)
+                            .status();
                     }
-                    std::fs::create_dir_all(&dst).ok();
-                    if let Ok(children) = std::fs::read_dir(&src) {
-                        for child in children.flatten() {
-                            let cname = child.file_name();
-                            let from = child.path();
-                            let to = dst.join(&cname);
-                            if !to.exists() {
-                                tracing::info!("Restoring preserved {} into new client", cname.to_string_lossy());
-                                std::fs::rename(&from, &to).with_context(|| {
-                                    format!("failed restoring {} from repair stage", cname.to_string_lossy())
-                                })?;
-                            }
-                        }
+                    Ok(output) => {
+                        tracing::warn!(
+                            "Wine uninstaller exited with status {:?}: stderr={}",
+                            output.status.code(),
+                            String::from_utf8_lossy(&output.stderr)
+                        );
                     }
-                }
-            }
-            Ok(())
-        };
-
-        let res = install_master_steam(config).await;
-        if let Err(e) = restore() {
-            tracing::warn!("repair: failed to restore preserved data: {e}");
-        }
-        res?;
-
-        if config.skip_steam_self_update {
-            crate::steam_client::SteamClient::ensure_no_self_update(client_dir);
-        } else {
-            crate::steam_client::SteamClient::clear_no_self_update(client_dir);
-        }
-
-        if backup_stage.exists() {
-            let _ = std::fs::remove_dir_all(&backup_stage);
-            tracing::info!("Removed broken client stage {}", backup_stage.display());
-        }
-    } else {
-        install_master_steam(config).await?;
-        if let Some(ref exe) = steam_cfg.steam_exe {
-            if let Some(dir) = exe.parent() {
-                if config.skip_steam_self_update {
-                    crate::steam_client::SteamClient::ensure_no_self_update(dir);
-                } else {
-                    crate::steam_client::SteamClient::clear_no_self_update(dir);
+                    Err(e) => {
+                        tracing::warn!("Failed to run wine uninstaller: {}", e);
+                    }
                 }
             }
         }
     }
 
+    // If uninstaller didn't work or Steam wasn't registered, stage the old client manually
+    if let Some(ref client_dir) = client_dir {
+        if client_dir.exists() && !used_uninstaller {
+            tracing::info!("Moving broken Steam client aside to {}", backup_stage.display());
+            std::fs::create_dir_all(backup_stage.parent().unwrap_or(&backup_stage))
+                .context("failed creating repair stage dir")?;
+            std::fs::rename(client_dir, &backup_stage)
+                .with_context(|| format!("failed moving client dir to {}", backup_stage.display()))?;
+
+            // Pre-stage steamapps and userdata for restore after reinstall
+            let steamapps_src = backup_stage.join("steamapps");
+            let userdata_src = backup_stage.join("userdata");
+            if steamapps_src.exists() {
+                staged_steamapps = Some(steamapps_src);
+            }
+            if userdata_src.exists() {
+                staged_userdata = Some(userdata_src);
+            }
+        }
+    }
+
+    // Merge staged library/saves into the freshly installed client. We descend and
+    // move individual entries (not the whole folder) because install_master_steam /
+    // SteamSetup may have already created an empty steamapps/ — a naive move that
+    // skips an existing destination would silently drop the user's installed games.
+    let client_dir_ref = client_dir.as_ref().expect("client_dir should exist");
+    let restore = || -> Result<()> {
+        if backup_stage.exists() {
+            for name in ["steamapps", "userdata"] {
+                // Skip if we already staged these from the uninstaller path
+                if name == "steamapps" && staged_steamapps.is_some() {
+                    continue;
+                }
+                if name == "userdata" && staged_userdata.is_some() {
+                    continue;
+                }
+                let src = backup_stage.join(name);
+                let dst = client_dir_ref.join(name);
+                if !src.exists() {
+                    continue;
+                }
+                std::fs::create_dir_all(&dst).ok();
+                if let Ok(children) = std::fs::read_dir(&src) {
+                    for child in children.flatten() {
+                        let cname = child.file_name();
+                        let from = child.path();
+                        let to = dst.join(&cname);
+                        if !to.exists() {
+                            tracing::info!("Restoring preserved {} into new client", cname.to_string_lossy());
+                            std::fs::rename(&from, &to).with_context(|| {
+                                format!("failed restoring {} from repair stage", cname.to_string_lossy())
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // Restore pre-staged data from uninstaller path
+    let client_dir_ref = client_dir.as_ref().expect("client_dir should exist");
+    let restore_staged = || -> Result<()> {
+        if let Some(ref steamapps_src) = staged_steamapps {
+            if steamapps_src.exists() {
+                let dst = client_dir_ref.join("steamapps");
+                std::fs::create_dir_all(&dst).ok();
+                if let Ok(children) = std::fs::read_dir(steamapps_src) {
+                    for child in children.flatten() {
+                        let cname = child.file_name();
+                        let from = child.path();
+                        let to = dst.join(&cname);
+                        if !to.exists() {
+                            tracing::info!("Restoring preserved {} into new client", cname.to_string_lossy());
+                            std::fs::rename(&from, &to).with_context(|| {
+                                format!("failed restoring {} from uninstaller stage", cname.to_string_lossy())
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ref userdata_src) = staged_userdata {
+            if userdata_src.exists() {
+                let dst = client_dir_ref.join("userdata");
+                std::fs::create_dir_all(&dst).ok();
+                if let Ok(children) = std::fs::read_dir(userdata_src) {
+                    for child in children.flatten() {
+                        let cname = child.file_name();
+                        let from = child.path();
+                        let to = dst.join(&cname);
+                        if !to.exists() {
+                            tracing::info!("Restoring preserved {} into new client", cname.to_string_lossy());
+                            std::fs::rename(&from, &to).with_context(|| {
+                                format!("failed restoring {} from uninstaller stage", cname.to_string_lossy())
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    let res = install_master_steam(config).await;
+    if let Err(e) = restore() {
+        tracing::warn!("repair: failed to restore preserved data: {e}");
+    }
+    if let Err(e) = restore_staged() {
+        tracing::warn!("repair: failed to restore uninstaller-staged data: {e}");
+    }
+    res?;
+
+    if config.skip_steam_self_update {
+        if let Some(ref dir) = client_dir { crate::steam_client::SteamClient::ensure_no_self_update(dir); }
+    } else {
+        if let Some(ref dir) = client_dir { crate::steam_client::SteamClient::clear_no_self_update(dir); }
+    }
+
+    if backup_stage.exists() {
+        let _ = std::fs::remove_dir_all(&backup_stage);
+        tracing::info!("Removed broken client stage {}", backup_stage.display());
+    }
+    // Clean up uninstaller staging dirs if used
+    if let Some(s) = staged_steamapps {
+        let _ = std::fs::remove_dir_all(s.parent().unwrap_or(&s));
+    }
+    if let Some(s) = staged_userdata {
+        let _ = std::fs::remove_dir_all(s.parent().unwrap_or(&s));
+    }
+
     Ok(())
 }
+
