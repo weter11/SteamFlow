@@ -1611,8 +1611,10 @@ impl SteamLauncher {
                                 };
                             let c = components.clone();
                             row("DXVK:", &c.dxvk);
+                            row("D7VK:", &c.d7vk);
                             row("VKD3D-Proton:", &c.vkd3d_proton);
                             row("VKD3D:", &c.vkd3d);
+                            row("DXVK-NVAPI:", &c.dxvk_nvapi);
                             row("NVAPI:", &c.nvapi);
                         });
                 });
@@ -2995,8 +2997,10 @@ impl eframe::App for SteamLauncher {
                                             };
                                         let c = components.clone();
                                         row("DXVK:", &c.dxvk);
+                                        row("D7VK:", &c.d7vk);
                                         row("VKD3D-Proton:", &c.vkd3d_proton);
                                         row("VKD3D:", &c.vkd3d);
+                                        row("DXVK-NVAPI:", &c.dxvk_nvapi);
                                         row("NVAPI:", &c.nvapi);
                                     });
                             });

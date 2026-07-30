@@ -50,6 +50,7 @@ pub const COMPONENT_FAMILIES: &[&str] = &[
     "vkd3d-proton",
     "vkd3d",
     "nvapi",
+    "dxvk-nvapi",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
