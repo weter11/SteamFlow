@@ -1589,6 +1589,14 @@ pub fn build_dll_overrides(
     if vkd3d_proton_active || vkd3d_active {
         overrides.push("d3d12=n,b".into());
         overrides.push("d3d12core=n,b".into());
+        if vkd3d_proton_active {
+            // VKD3D-Proton creates a Vulkan device and requires DXVK's native
+            // dxgi.dll to present swapchains. Without dxgi=n,b, Wine loads its
+            // builtin wined3d-based dxgi, producing a Vulkan-device + wined3d/
+            // llvmpipe swapchain mismatch that crashes in wined3d.dll on
+            // D3D12 games (e.g. Little Nightmares EE / Atlas engine).
+            overrides.push("dxgi=n,b".into());
+        }
         if vkd3d_active {
             overrides.push("libvkd3d-1=n,b".into());
             overrides.push("libvkd3d-shader-1=n,b".into());
