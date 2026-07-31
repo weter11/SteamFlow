@@ -672,15 +672,6 @@ impl Runner for WineTkgRunner {
             }
         }
 
-        // force_wined3d check: when set, DXVK is completely disabled.
-        let force_wined3d = glc.force_wined3d;
-        if force_wined3d {
-            tracing::info!(
-                "force_wined3d is enabled for game {} - DXVK will be disabled for this launch.",
-                ctx.app.app_id
-            );
-        }
-
         let game_working_dir: PathBuf = {
             let install_dir = PathBuf::from(
                 ctx.app.install_path
@@ -844,10 +835,7 @@ impl Runner for WineTkgRunner {
         let effective_dxvk = glc.dxvk_enabled || policy_dxvk;
 
         // If user explicitly selected WineD3D and didn't force DXVK, we use builtins.
-        // force_wined3d (per-game "Force WineD3D") forces built-in D3D regardless of
-        // policy so DXVK/VKD3D are fully bypassed — needed for games like Amnesia that
-        // crash with DXVK or that only ship 32-bit binaries.
-        let force_builtin_d3d = (force_builtin || force_wined3d) && !effective_dxvk;
+        let force_builtin_d3d = force_builtin && !effective_dxvk;
 
         // 2. Resolve DX12 policy (D3D12ProviderPolicy) - CONSERVATIVE
         let (policy_vkd3dp, policy_vkd3dw) = match glc.d3d12_policy {
@@ -857,8 +845,8 @@ impl Runner for WineTkgRunner {
             crate::models::D3D12ProviderPolicy::Vkd3dWine => (false, true),
         };
         // Manual overrides take precedence
-        let effective_vkd3d_proton = (glc.vkd3d_proton_enabled || policy_vkd3dp) && !force_wined3d;
-        let effective_vkd3d = (glc.vkd3d_enabled || policy_vkd3dw) && !force_wined3d;
+        let effective_vkd3d_proton = glc.vkd3d_proton_enabled || policy_vkd3dp;
+        let effective_vkd3d = glc.vkd3d_enabled || policy_vkd3dw;
 
         // Strict D3D12 provider selection: when VKD3D-Proton is explicitly requested,
         // do NOT fall back to upstream Wine VKD3D — the two are incompatible providers.
@@ -882,6 +870,16 @@ impl Runner for WineTkgRunner {
             false
         } else {
             effective_vkd3d
+        };
+
+        // 3. Resolve DX3-7 policy (D3D7BackendPolicy).
+        // Auto: use D7VK if detected in runner, otherwise fall back to WineD3D.
+        // WineD3D: force Wine's built-in D3D (no D7VK).
+        // D7VK: force D7VK if present in runner.
+        let effective_ddraw_d7vk = match glc.d3d7_policy {
+            crate::models::D3D7BackendPolicy::Auto => _components.d7vk.is_some(),
+            crate::models::D3D7BackendPolicy::WineD3D => false,
+            crate::models::D3D7BackendPolicy::D7VK => _components.d7vk.is_some(),
         };
 
         // NVAPI Support
@@ -964,7 +962,7 @@ impl Runner for WineTkgRunner {
                      dll_overrides.push_str(&format!(";{}=n", res.name));
                 }
                 // D7VK ships ddraw.dll and requires ddraw=n,b in WINEDLLOVERRIDES
-                if res.name == "ddraw" && !dll_overrides.contains("ddraw=n,b") {
+                if effective_ddraw_d7vk && res.name == "ddraw" && !dll_overrides.contains("ddraw=n,b") {
                      tracing::info!("Adding D7VK WINEDLLOVERRIDES: ddraw=n,b");
                      dll_overrides.push_str(";ddraw=n,b");
                 }
@@ -1017,7 +1015,8 @@ impl Runner for WineTkgRunner {
                 let is_d3d12_dll = matches!(name.as_str(), "d3d12" | "d3d12core" | "libvkd3d-1" | "libvkd3d-shader-1");
 
                 let is_nvapi_dll = matches!(name.as_str(), "nvapi" | "nvapi64" | "nvofapi64");
-                let selected = (is_dxvk_dll && effective_dxvk) || (is_d3d12_dll && (effective_vkd3d_proton || effective_vkd3d)) || is_nvapi_dll;
+                let is_ddraw_dll = matches!(name.as_str(), "ddraw");
+                let selected = (is_dxvk_dll && effective_dxvk) || (is_d3d12_dll && (effective_vkd3d_proton || effective_vkd3d)) || is_nvapi_dll || (is_ddraw_dll && effective_ddraw_d7vk);
 
                 if !selected {
                     continue;
