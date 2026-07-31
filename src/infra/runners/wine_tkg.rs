@@ -860,30 +860,25 @@ impl Runner for WineTkgRunner {
         let effective_vkd3d_proton = (glc.vkd3d_proton_enabled || policy_vkd3dp) && !force_wined3d;
         let effective_vkd3d = (glc.vkd3d_enabled || policy_vkd3dw) && !force_wined3d;
 
-        // vkd3d-proton fallback: if VKD3D-Proton is requested but not
-        // available in the runner, fall back to upstream VKD3D (Wine).
-        // This happens when user selected VKD3D-Proton policy or forced it,
-        // but the runner doesn't bundle VKD3D-Proton DLLs.
+        // Strict D3D12 provider selection: when VKD3D-Proton is explicitly requested,
+        // do NOT fall back to upstream Wine VKD3D — the two are incompatible providers.
         let effective_vkd3d_proton = if effective_vkd3d_proton && _components.vkd3d_proton.is_none() {
-            if _components.vkd3d.is_some() {
-                tracing::info!(
-                    "VKD3D-Proton not found in runner '{}', falling back to VKD3D (Wine).",
-                    active_runner_path.display()
-                );
-            }
+            tracing::warn!(
+                "VKD3D-Proton selected but not found in runner '{}'; keeping selection active (DLL not resolved).",
+                active_runner_path.display()
+            );
             false
         } else {
             effective_vkd3d_proton
         };
 
-        // Similarly, if VKD3D-Wine is forced but not available, fall back to VKD3D-Proton if present.
+        // Strict D3D12 provider selection: when VKD3D (Wine) is explicitly requested,
+        // do NOT fall back to VKD3D-Proton.
         let effective_vkd3d = if effective_vkd3d && _components.vkd3d.is_none() {
-            if _components.vkd3d_proton.is_some() {
-                tracing::info!(
-                    "VKD3D (Wine) not found in runner '{}', falling back to VKD3D-Proton.",
-                    active_runner_path.display()
-                );
-            }
+            tracing::warn!(
+                "VKD3D (Wine) selected but not found in runner '{}'; keeping selection active (DLL not resolved).",
+                active_runner_path.display()
+            );
             false
         } else {
             effective_vkd3d

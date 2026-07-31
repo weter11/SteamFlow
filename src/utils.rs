@@ -1293,7 +1293,6 @@ pub fn read_versions_txt(root: &Path) -> RunnerVersions {
                 "WINE_COMMIT" => versions.wine_commit = Some(val.to_string()),
                 "DXVK_VERSION" => versions.dxvk = Some(val.to_string()),
                 "D7VK_VERSION" => versions.d7vk = Some(val.to_string()),
-                "VKD3D_VERSION" => versions.vkd3d = Some(val.to_string()),
                 "VKD3D_PROTON_VERSION" => versions.vkd3d_proton = Some(val.to_string()),
                 "DXVK_NVAPI_VERSION" => versions.dxvk_nvapi = Some(val.to_string()),
                 "WINE_MONO_VERSION" => versions.wine_mono = Some(val.to_string()),
