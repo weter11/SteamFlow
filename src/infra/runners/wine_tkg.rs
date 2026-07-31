@@ -837,10 +837,12 @@ impl Runner for WineTkgRunner {
         // If user explicitly selected WineD3D and didn't force DXVK, we use builtins.
         let force_builtin_d3d = force_builtin && !effective_dxvk;
 
-        // 2. Resolve DX12 policy (D3D12ProviderPolicy) - CONSERVATIVE
+        // 2. Resolve DX12 policy (D3D12ProviderPolicy).
+        // Auto: prefer VKD3D-Proton when the runner bundles it, falling back to
+        // Wine VKD3D only when VKD3D-Proton is absent. Explicit selections are
+        // honored strictly (no fallback) per the fallback-only-in-Auto rule.
         let (policy_vkd3dp, policy_vkd3dw) = match glc.d3d12_policy {
-            // Auto is now conservative: no forced D3D12 provider unless explicitly requested.
-            crate::models::D3D12ProviderPolicy::Auto => (false, false),
+            crate::models::D3D12ProviderPolicy::Auto => (_components.vkd3d_proton.is_some(), !_components.vkd3d_proton.is_some() && _components.vkd3d.is_some()),
             crate::models::D3D12ProviderPolicy::Vkd3dProton => (true, false),
             crate::models::D3D12ProviderPolicy::Vkd3dWine => (false, true),
         };
