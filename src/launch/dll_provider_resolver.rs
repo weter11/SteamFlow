@@ -54,6 +54,7 @@ impl DllProviderResolver {
         Self {
             target_dlls: vec![
                 "d3d7".into(),
+                "ddraw".into(),
                 "d3d8".into(),
                 "d3d9".into(),
                 "dxgi".into(),
@@ -197,7 +198,7 @@ impl DllProviderResolver {
                          if path.to_string_lossy().contains("vkd3d-proton") { "vkd3d-proton" } else { "vkd3d" }
                      } else if res.name.contains("nvapi") {
                          "nvapi"
-                     } else if res.name == "d3d7" {
+                     } else if res.name == "d3d7" || res.name == "ddraw" {
                          "d7vk"
                      } else {
                          "dxvk"
@@ -379,7 +380,7 @@ impl DllProviderResolver {
         let dll_filename = format!("{}.dll", dll_name);
 
         // Match DLL to component and look for it in runner root
-        let is_d7vk = dll_name == "d3d7";
+        let is_d7vk = dll_name == "d3d7" || dll_name == "ddraw";
         if is_d7vk && components.d7vk.is_some() {
             let mut relative_paths = Vec::new();
             for lib_subdir in crate::proton::UNIFIED_LIB_SUBDIRS {

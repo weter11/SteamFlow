@@ -968,6 +968,11 @@ impl Runner for WineTkgRunner {
                      tracing::info!("Adding native override for resolved DLL: {} (provider: {:?})", res.name, res.chosen_provider);
                      dll_overrides.push_str(&format!(";{}=n", res.name));
                 }
+                // D7VK ships ddraw.dll and requires ddraw=n,b in WINEDLLOVERRIDES
+                if res.name == "ddraw" && !dll_overrides.contains("ddraw=n,b") {
+                     tracing::info!("Adding D7VK WINEDLLOVERRIDES: ddraw=n,b");
+                     dll_overrides.push_str(";ddraw=n,b");
+                }
             } else if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Internal {
                  tracing::info!("Resolved DLL {} is handled internally (alias), skipping explicit override", res.name);
             }

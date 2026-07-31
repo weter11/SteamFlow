@@ -444,6 +444,7 @@ pub struct RunnerComponents {
     pub vkd3d_proton: Option<ComponentInfo>,
     pub vkd3d: Option<ComponentInfo>,
     pub nvapi: Option<ComponentInfo>,
+    pub dxvk_nvapi: Option<ComponentInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,14 +505,22 @@ pub fn detect_runner_components(
 ) -> RunnerComponents {
     let root = derive_runner_root(runner_path);
 
-    let (dxvk, d7vk, vkd3d_proton, vkd3d, nvapi) = (
+    let (mut dxvk, mut d7vk, mut vkd3d_proton, mut vkd3d, mut nvapi) = (
         detect_dxvk(&root, wineprefix),
         detect_d7vk(&root, wineprefix),
         detect_vkd3d_proton(&root, wineprefix),
         detect_vkd3d(&root, wineprefix),
         detect_nvapi(&root, wineprefix),
     );
+    let mut dxvk_nvapi = detect_dxvk_nvapi(&root, wineprefix);
 
+    let versions = read_versions_txt(&root);
+    apply_versions_override(&mut dxvk, &versions, "dxvk");
+    apply_versions_override(&mut d7vk, &versions, "d7vk");
+    apply_versions_override(&mut vkd3d_proton, &versions, "vkd3d_proton");
+    apply_versions_override(&mut vkd3d, &versions, "vkd3d");
+    apply_versions_override(&mut nvapi, &versions, "nvapi");
+    apply_versions_override(&mut dxvk_nvapi, &versions, "dxvk_nvapi");
 
     RunnerComponents {
         dxvk,
@@ -519,6 +528,7 @@ pub fn detect_runner_components(
         vkd3d_proton,
         vkd3d,
         nvapi,
+        dxvk_nvapi,
     }
 }
 
@@ -559,7 +569,7 @@ pub fn detect_prime_env() -> std::collections::HashMap<String, String> {
 fn detect_d7vk(root: &Path, _prefix: Option<&Path>) -> Option<ComponentInfo> {
     // 1. Bundled inside runner (Modern Wine-TKG layout)
     let comp_subdirs = ["lib/wine/d7vk", "files/lib/wine/d7vk", "dist/lib/wine/d7vk"];
-    let required = ["d3d7.dll"];
+    let required = ["ddraw.dll"];
 
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
@@ -609,6 +619,58 @@ fn detect_d7vk(root: &Path, _prefix: Option<&Path>) -> Option<ComponentInfo> {
                     path: Some(arch_path),
                 });
             }
+        }
+    }
+
+    None
+}
+
+fn detect_dxvk_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 1. Bundled inside runner (Modern Wine-TKG layout)
+    let comp_subdirs = [
+        "lib/wine/dxvk-nvapi",
+        "files/lib/wine/dxvk-nvapi",
+        "dist/lib/wine/dxvk-nvapi",
+    ];
+    let required = vec!["nvapi64.dll", "nvofapi64.dll"];
+    let alt_required = vec!["nvapi.dll"];
+
+    for subdir in comp_subdirs {
+        let comp_path = root.join(subdir);
+        if comp_path.is_dir() {
+            for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                let arch_path = comp_path.join(arch_dir);
+                let req = if *arch_dir == "i386-windows" {
+                    &alt_required
+                } else {
+                    &required
+                };
+                if req.iter().all(|dll| arch_path.join(dll).exists()) {
+                    let version = ["version", "../version"]
+                        .iter()
+                        .filter_map(|v| {
+                            let p = arch_path.join(v);
+                            std::fs::read_to_string(p).ok()
+                        })
+                        .map(|s| parse_short_version(&s))
+                        .find(|s| s != "unknown")
+                        .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Installed into WINEPREFIX (dxvk-nvapi often deployed to system32)
+    if let Some(pfx) = prefix {
+        let prefix_dlls = vec!["drive_c/windows/system32/nvapi64.dll"];
+        if let Some(info) = check_prefix(pfx, &prefix_dlls, "DXVK-NVAPI") {
+            return Some(info);
         }
     }
 
@@ -1197,6 +1259,86 @@ pub fn parse_short_version(s: &str) -> String {
     v.to_string()
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RunnerVersions {
+    pub wine_commit: Option<String>,
+    pub dxvk: Option<String>,
+    pub d7vk: Option<String>,
+    pub vkd3d_proton: Option<String>,
+    pub vkd3d: Option<String>,
+    pub nvapi: Option<String>,
+    pub dxvk_nvapi: Option<String>,
+    pub wine_mono: Option<String>,
+    pub wine_gecko: Option<String>,
+    pub build_date: Option<String>,
+}
+
+/// Parse VERSIONS.txt from the runner root. Each line is KEY=VALUE.
+pub fn read_versions_txt(root: &Path) -> RunnerVersions {
+    let path = root.join("VERSIONS.txt");
+    let mut versions = RunnerVersions::default();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') || !line.contains('=') {
+                continue;
+            }
+            let mut parts = line.splitn(2, '=');
+            let key = parts.next().map(|s| s.trim()).unwrap_or("");
+            let val = parts.next().map(|s| s.trim()).unwrap_or("");
+            if val.is_empty() {
+                continue;
+            }
+            match key {
+                "WINE_COMMIT" => versions.wine_commit = Some(val.to_string()),
+                "DXVK_VERSION" => versions.dxvk = Some(val.to_string()),
+                "D7VK_VERSION" => versions.d7vk = Some(val.to_string()),
+                "VKD3D_VERSION" => versions.vkd3d = Some(val.to_string()),
+                "VKD3D_PROTON_VERSION" => versions.vkd3d_proton = Some(val.to_string()),
+                "DXVK_NVAPI_VERSION" => versions.dxvk_nvapi = Some(val.to_string()),
+                "WINE_MONO_VERSION" => versions.wine_mono = Some(val.to_string()),
+                "WINE_GECKO_VERSION" => versions.wine_gecko = Some(val.to_string()),
+                "BUILD_DATE" => versions.build_date = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    }
+    versions
+}
+
+fn apply_versions_override(
+    component: &mut Option<ComponentInfo>,
+    versions: &RunnerVersions,
+    key: &str,
+) {
+    if component
+        .as_ref()
+        .map(|c| !c.version.is_empty() && c.version != "unknown")
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let ver = match key {
+        "dxvk" => versions.dxvk.as_deref(),
+        "d7vk" => versions.d7vk.as_deref(),
+        "vkd3d_proton" => versions.vkd3d_proton.as_deref(),
+        "vkd3d" => versions.vkd3d.as_deref(),
+        "nvapi" => versions.nvapi.as_deref(),
+        "dxvk_nvapi" => versions.dxvk_nvapi.as_deref(),
+        _ => None,
+    };
+    if let Some(v) = ver {
+        let path = component
+            .as_ref()
+            .and_then(|c| c.path.clone());
+        *component = Some(ComponentInfo {
+            version: v.to_string(),
+            source: ComponentSource::BundledWithRunner,
+            path,
+        });
+    }
+}
+
 fn dll_contains_string(path: &Path, needle: &str) -> bool {
     let needle_lower = needle.to_ascii_lowercase();
     std::fs::read(path)
@@ -1529,12 +1671,14 @@ pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
         detect_nvapi(path, None),
     );
 
+    let dxvk_nvapi = detect_dxvk_nvapi(path, None);
     crate::utils::RunnerComponents {
         dxvk,
         d7vk,
         vkd3d_proton,
         vkd3d,
         nvapi,
+        dxvk_nvapi,
     }
 }
 
