@@ -193,6 +193,9 @@ pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
     #[cfg(unix)]
     {
         let prefix_str = wineprefix.to_string_lossy().to_string();
+
+        // Phase 1: collect PIDs, then SIGTERM all prefix wine processes.
+        let mut killed_pids: Vec<i32> = Vec::new();
         if let Ok(proc_dir) = std::fs::read_dir("/proc") {
             for entry in proc_dir.flatten() {
                 let pid_path = entry.path();
@@ -205,8 +208,48 @@ pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
                     Err(_) => continue,
                 };
                 if !String::from_utf8_lossy(&environ).contains(&prefix_str) { continue }
+                let cmdline = std::fs::read(pid_path.join("cmdline"))
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+                if !cmdline.to_lowercase().contains("wine") { continue }
                 if let Ok(pid) = pid_str.parse::<i32>() {
                     unsafe { libc::kill(pid, libc::SIGTERM); }
+                    killed_pids.push(pid);
+                }
+            }
+        }
+
+        // Phase 2: wait for all SIGTERM'd processes to die (up to 3 seconds).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let alive: Vec<i32> = killed_pids.iter().copied().filter(|pid| {
+                unsafe { libc::kill(*pid, 0) == 0 }
+            }).collect();
+            if alive.is_empty() { break; }
+            if std::time::Instant::now() > deadline { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Phase 3: SIGKILL any stragglers (winedevice.exe commonly survives SIGTERM
+        // because it defers shutdown until pending device I/O completes).
+        if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+            for entry in proc_dir.flatten() {
+                let pid_path = entry.path();
+                let Some(pid_str) = pid_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+                else { continue };
+                let environ = match std::fs::read(pid_path.join("environ")) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if !String::from_utf8_lossy(&environ).contains(&prefix_str) { continue }
+                let cmdline = std::fs::read(pid_path.join("cmdline"))
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+                if !cmdline.to_lowercase().contains("wine") { continue }
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
                 }
             }
         }
