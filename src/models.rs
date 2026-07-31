@@ -54,6 +54,14 @@ impl Default for SteamLaunchConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum D3D7BackendPolicy {
+    #[default]
+    Auto,
+    WineD3D,
+    D7VK,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum GraphicsBackendPolicy {
     #[default]
     Auto,
@@ -82,6 +90,8 @@ pub struct GraphicsLayerConfig {
     #[serde(default)]
     pub graphics_backend_policy: GraphicsBackendPolicy,
     #[serde(default)]
+    pub d3d7_policy: D3D7BackendPolicy,
+    #[serde(default)]
     pub d3d12_policy: D3D12ProviderPolicy,
     #[serde(default)]
     pub use_symlinks_in_prefix: bool,
@@ -103,6 +113,7 @@ impl Default for GraphicsLayerConfig {
             vkd3d_enabled: false,
             nvapi_enabled: true,
             graphics_backend_policy: GraphicsBackendPolicy::Auto,
+            d3d7_policy: D3D7BackendPolicy::Auto,
             d3d12_policy: D3D12ProviderPolicy::Auto,
             use_symlinks_in_prefix: false,
             custom_dxvk_path: None,

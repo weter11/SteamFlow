@@ -1449,6 +1449,26 @@ impl SteamLauncher {
 
             {
                 ui.horizontal(|ui| {
+                    ui.label("Graphics Backend Policy (DX3-7):");
+                    egui::ComboBox::from_id_salt("d3d7_backend_policy_selector")
+                        .selected_text(format!("{:?}", glc.d3d7_policy))
+                        .show_ui(ui, |ui| {
+                            use crate::models::D3D7BackendPolicy;
+                            if ui.selectable_value(&mut glc.d3d7_policy, D3D7BackendPolicy::Auto, "Auto (Recommended)").clicked() {
+                                gl_changed = true;
+                            }
+                            if ui.selectable_value(&mut glc.d3d7_policy, D3D7BackendPolicy::WineD3D, "WineD3D (OpenGL)").clicked() {
+                                gl_changed = true;
+                            }
+                            if ui.selectable_value(&mut glc.d3d7_policy, D3D7BackendPolicy::D7VK, "D7VK (Vulkan)").clicked() {
+                                gl_changed = true;
+                            }
+                        });
+                });
+            }
+
+            {
+                ui.horizontal(|ui| {
                     ui.label("D3D12 Provider Policy (DX12):");
                     egui::ComboBox::from_id_salt("d3d12_provider_policy_selector")
                         .selected_text(format!("{:?}", glc.d3d12_policy))
