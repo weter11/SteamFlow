@@ -130,6 +130,7 @@ mod tests {
             vkd3d_enabled: false,
             nvapi_enabled: true,
             graphics_backend_policy: crate::models::GraphicsBackendPolicy::WineD3D,
+            d3d7_policy: crate::models::D3D7BackendPolicy::Auto,
             d3d12_policy: crate::models::D3D12ProviderPolicy::Auto,
             use_symlinks_in_prefix: false,
             custom_dxvk_path: None,

@@ -488,6 +488,9 @@ pub struct RunnerComponents {
     pub vkd3d: Option<ComponentInfo>,
     pub nvapi: Option<ComponentInfo>,
     pub dxvk_nvapi: Option<ComponentInfo>,
+    /// True when lib64/wine/i386-windows/ contains valid 32-bit PE DLLs
+    /// (dxgi.dll, d3d11.dll, d3d12.dll, ddraw.dll) — confirms 32-bit game compatibility.
+    pub has_wow64_32bit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,6 +568,15 @@ pub fn detect_runner_components(
     apply_versions_override(&mut nvapi, &versions, "nvapi");
     apply_versions_override(&mut dxvk_nvapi, &versions, "dxvk_nvapi");
 
+    let has_wow64_32bit = ["lib64/wine/i386-windows", "files/lib64/wine/i386-windows", "dist/lib64/wine/i386-windows"]
+        .iter()
+        .any(|d| {
+            let dir = root.join(d);
+            ["dxgi.dll", "d3d11.dll", "d3d12.dll", "ddraw.dll"]
+                .iter()
+                .any(|dll| dir.join(dll).exists())
+        });
+
     RunnerComponents {
         dxvk,
         d7vk,
@@ -572,6 +584,7 @@ pub fn detect_runner_components(
         vkd3d,
         nvapi,
         dxvk_nvapi,
+        has_wow64_32bit,
     }
 }
 
@@ -821,6 +834,31 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 // ── VKD3D-Proton ─────────────────────────────────────────────────────────────
 
 fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 0. Content-based rule for flat WoW64 layouts (steamflow-runner):
+    //    both d3d12.dll AND d3d12core.dll in the same dir => VKD3D-Proton.
+    //    (Wine's built-in VKD3D ships only d3d12.dll.)
+    for subdir in ["lib64/wine", "files/lib64/wine", "dist/lib64/wine", "lib/wine", "files/lib/wine", "dist/lib/wine"] {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            if arch_path.join("d3d12.dll").exists() && arch_path.join("d3d12core.dll").exists() {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
+            }
+        }
+    }
+
     // 1. Modern Wine-TKG layout
     let comp_subdirs = ["lib/wine/vkd3d-proton", "files/lib/wine/vkd3d-proton", "dist/lib/wine/vkd3d-proton"];
     let required = ["d3d12.dll", "d3d12core.dll"];
@@ -1037,6 +1075,30 @@ fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 }
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 0. Content-based rule for flat WoW64 layouts (steamflow-runner):
+    //    d3d12.dll WITHOUT d3d12core.dll in the same dir => Wine's built-in VKD3D.
+    for subdir in ["lib64/wine", "files/lib64/wine", "dist/lib64/wine", "lib/wine", "files/lib/wine", "dist/lib/wine"] {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            if arch_path.join("d3d12.dll").exists() && !arch_path.join("d3d12core.dll").exists() {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
+            }
+        }
+    }
+
     // 1. Modern Wine-TKG layout
     let comp_subdirs = ["lib/wine/vkd3d", "files/lib/wine/vkd3d", "dist/lib/wine/vkd3d"];
     let required = ["libvkd3d-1.dll", "libvkd3d-shader-1.dll"];
@@ -1714,6 +1776,14 @@ pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
     );
 
     let dxvk_nvapi = detect_dxvk_nvapi(path, None);
+    let has_wow64_32bit = ["lib64/wine/i386-windows", "files/lib64/wine/i386-windows", "dist/lib64/wine/i386-windows"]
+        .iter()
+        .any(|d| {
+            let dir = path.join(d);
+            ["dxgi.dll", "d3d11.dll", "d3d12.dll", "ddraw.dll"]
+                .iter()
+                .any(|dll| dir.join(dll).exists())
+        });
     crate::utils::RunnerComponents {
         dxvk,
         d7vk,
@@ -1721,6 +1791,7 @@ pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
         vkd3d,
         nvapi,
         dxvk_nvapi,
+        has_wow64_32bit,
     }
 }
 
