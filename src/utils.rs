@@ -655,7 +655,7 @@ fn detect_d7vk(root: &Path, _prefix: Option<&Path>) -> Option<ComponentInfo> {
     }
 
     // Unified layout (Proton 11+ / CachyOS)
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             if required.iter().all(|dll| arch_path.join(dll).exists()) {
@@ -766,7 +766,7 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     }
 
     // Unified layout (Proton 11+ / CachyOS)
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             if required.iter().all(|dll| arch_path.join(dll).exists()) {
@@ -918,7 +918,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
     }
 
     // Legacy Unified layout
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             if required.iter().all(|dll| arch_path.join(dll).exists()) {
@@ -1031,7 +1031,7 @@ fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     }
 
     // Unified layout
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (arch_name, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             let dlls = if *arch_name == "x86_64" {
@@ -1154,7 +1154,7 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     }
 
     // Legacy Unified layout
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             if required.iter().all(|dll| arch_path.join(dll).exists()) {
@@ -1417,7 +1417,14 @@ fn apply_versions_override(
 ) {
     if component
         .as_ref()
-        .map(|c| !c.version.is_empty() && c.version != "unknown")
+        .map(|c| {
+            !c.version.is_empty()
+                && c.version != "unknown"
+                // "found" is a placeholder emitted by detection when no version
+                // file sits next to the DLL (flat WoW64 layout). It is not a
+                // real version — allow the VERSIONS.txt override to fill it in.
+                && c.version != "found"
+        })
         .unwrap_or(false)
     {
         return;
