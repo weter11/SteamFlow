@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use crate::launch::pipeline::{PipelineStage, PipelineContext, LaunchError, LaunchErrorKind};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct ResolveGameFixupsStage;
 
@@ -36,6 +36,14 @@ impl PipelineStage for ResolveGameFixupsStage {
                 let fctx = crate::launch::fixups::FixupContext::new(ctx.app_id, app.name.clone(), install_dir, wineprefix.to_string_lossy().to_string(), arch.into());
                 match crate::launch::fixups::load_and_run_fixup(ctx.app_id, fctx) {
                     Ok(Some((name, result))) => {
+                        if !result.registry.is_empty() {
+                            if let Err(e) = apply_registry_ops(&runner, &wineprefix, &result.registry, name.as_str(), ctx) {
+                                if let Some(logger) = &ctx.logger {
+                                    let mut m = HashMap::new(); m.insert("app_id".into(), ctx.app_id.to_string()); m.insert("error".into(), e.to_string());
+                                    let _ = logger.error("fixup_registry_warning", "Registry fixup failed; continuing launch".into(), Some(self.name().into()), m);
+                                }
+                            }
+                        }
                         ctx.verification.rhai_fixup_applied = Some(name.clone());
                         ctx.fixup_script_name = Some(name);
                         ctx.fixup_result = Some(result);
@@ -53,4 +61,55 @@ impl PipelineStage for ResolveGameFixupsStage {
         }
         Ok(())
     }
+}
+
+
+/// Apply fixup registry operations inline (Q1 decision): run `wine reg.exe add`
+/// against the prefix right after the Rhai script executes, before the game spawns.
+/// Non-zero `reg.exe` exits log a warning but do NOT halt the launch.
+fn apply_registry_ops(
+    runner: &Path,
+    wineprefix: &Path,
+    ops: &[crate::launch::fixups::RegOp],
+    script_name: &str,
+    ctx: &PipelineContext,
+) -> std::result::Result<(), LaunchError> {
+    use crate::launch::fixups::RegKind;
+    let wine_bin = crate::utils::build_bare_wine_command(runner)
+        .map_err(|e| LaunchError::new(LaunchErrorKind::Runner, format!("registry fixup: cannot resolve wine for runner {}", runner.display())).with_source(e))?
+        .get_program()
+        .to_owned();
+    for op in ops {
+        let (reg_type, value) = match op.kind {
+            RegKind::Dword => ("REG_DWORD", op.value.clone()),
+            RegKind::String => ("REG_SZ", op.value.clone()),
+        };
+        let mut reg = std::process::Command::new(&wine_bin);
+        reg.env("WINEPREFIX", wineprefix);
+        reg.arg("reg.exe").arg("add").arg(&op.path)
+            .arg("/v").arg(&op.key)
+            .arg("/t").arg(reg_type)
+            .arg("/d").arg(&value)
+            .arg("/f");
+        let out = reg.output()
+            .map_err(|e| LaunchError::new(LaunchErrorKind::Process, format!("registry fixup: failed to run reg.exe for {}\\{}", op.path, op.key)).with_source(anyhow::Error::from(e)))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if let Some(logger) = &ctx.logger {
+                let mut m = HashMap::new();
+                m.insert("app_id".into(), ctx.app_id.to_string());
+                m.insert("script".into(), script_name.to_string());
+                m.insert("reg_path".into(), format!("{}\\{}", op.path, op.key));
+                m.insert("stderr".into(), stderr);
+                let _ = logger.error("fixup_registry_warning", "reg.exe exited non-zero; continuing launch".into(), Some("ResolveGameFixups".into()), m);
+            }
+        } else if let Some(logger) = &ctx.logger {
+            let mut m = HashMap::new();
+            m.insert("app_id".into(), ctx.app_id.to_string());
+            m.insert("reg_path".into(), format!("{}\\{}", op.path, op.key));
+            m.insert("value".into(), value);
+            let _ = logger.info("fixup_registry_applied", "Applied registry fixup".into(), Some("ResolveGameFixups".into()), m);
+        }
+    }
+    Ok(())
 }
