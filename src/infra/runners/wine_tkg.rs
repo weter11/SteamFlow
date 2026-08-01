@@ -1349,6 +1349,16 @@ impl Runner for WineTkgRunner {
         let args = ctx.launch_info.arguments.split_whitespace().map(ToString::to_string);
         spec.args.extend(args);
 
+        // Rhai fixup launch args (protonfixes append_argument equivalent) — applied
+        // BEFORE user Launch Options so the user's custom args take final precedence.
+        if let Some(fixup) = &ctx.fixup_result {
+            for arg in &fixup.extra_launch_args {
+                if !arg.trim().is_empty() {
+                    spec.args.push(arg.trim().to_string());
+                }
+            }
+        }
+
         // Split user launch args
         let user_launch_args = ctx.user_config.as_ref()
             .map(|c| c.launch_options.split_whitespace().map(ToString::to_string).collect::<Vec<_>>())

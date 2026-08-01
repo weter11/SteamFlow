@@ -59,9 +59,11 @@ fn test_d7vk_discovery() {
     let tmp = tempdir().unwrap();
     let runner_root = tmp.path().to_path_buf();
 
+    // D7VK ships ddraw.dll (Direct3D 7/6/5/3 -> Vulkan via DXVK's D3D9 backend),
+    // NOT d3d7.dll — corrected in PR #66. The detection scans for ddraw.dll.
     let d7vk_dir = runner_root.join("files/lib/wine/d7vk/x86_64-windows");
     fs::create_dir_all(&d7vk_dir).unwrap();
-    fs::write(d7vk_dir.join("d3d7.dll"), "fake dll").unwrap();
+    fs::write(d7vk_dir.join("ddraw.dll"), "fake dll").unwrap();
     fs::write(d7vk_dir.join("version"), "d7vk (v1.0-g1234567)").unwrap();
 
     let components = detect_runner_components(&runner_root, None);
