@@ -109,6 +109,12 @@ pub fn seed_default_fixups() -> Result<()> {
 
 type SharedCtx = Arc<Mutex<FixupContext>>;
 
+/// Poison-safe lock: a Rhai script can't realistically panic the Rust side, but a
+/// poisoned mutex must never abort the launch thread.
+fn lock_ctx(shared: &SharedCtx) -> std::sync::MutexGuard<'_, FixupContext> {
+    shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn engine_for(shared: &SharedCtx) -> Engine {
     let mut engine = Engine::new();
     engine.register_type::<SharedCtx>();
@@ -116,18 +122,18 @@ fn engine_for(shared: &SharedCtx) -> Engine {
 
     // Context getters — callable both as ctx.app_id (method) and app_id() (free).
     // Rhai passes the registered type (SharedCtx) as the getter receiver, so no capture is needed.
-    engine.register_get("app_id", |ctx: &mut SharedCtx| ctx.lock().unwrap().app_id as i64);
-    engine.register_get("app_name", |ctx: &mut SharedCtx| ctx.lock().unwrap().app_name.clone());
-    engine.register_get("install_dir", |ctx: &mut SharedCtx| ctx.lock().unwrap().install_dir.clone());
-    engine.register_get("wineprefix", |ctx: &mut SharedCtx| ctx.lock().unwrap().wineprefix.clone());
-    engine.register_get("target_architecture", |ctx: &mut SharedCtx| ctx.lock().unwrap().target_architecture.clone());
+    engine.register_get("app_id", |ctx: &mut SharedCtx| lock_ctx(ctx).app_id as i64);
+    engine.register_get("app_name", |ctx: &mut SharedCtx| lock_ctx(ctx).app_name.clone());
+    engine.register_get("install_dir", |ctx: &mut SharedCtx| lock_ctx(ctx).install_dir.clone());
+    engine.register_get("wineprefix", |ctx: &mut SharedCtx| lock_ctx(ctx).wineprefix.clone());
+    engine.register_get("target_architecture", |ctx: &mut SharedCtx| lock_ctx(ctx).target_architecture.clone());
 
     // Free-function style (protonfixes translation standard): set_env("K","v")
     macro_rules! free_fn {
         ($name:literal, $method:ident, $($arg:ident : $ty:ty),*) => {
             let shared = Arc::clone(&shared_getters);
             engine.register_fn($name, move |$($arg: $ty),*| {
-                let mut ctx = shared.lock().unwrap();
+                let mut ctx = lock_ctx(&shared);
                 ctx.$method($($arg),*);
             });
         };
@@ -139,7 +145,7 @@ fn engine_for(shared: &SharedCtx) -> Engine {
     free_fn!("disable_dll", disable_dll, dll_name: &str);
     engine.register_fn("disable_nvapi", {
         let shared = Arc::clone(&shared_getters);
-        move || shared.lock().unwrap().disable_nvapi()
+        move || lock_ctx(&shared).disable_nvapi()
     });
     free_fn!("add_launch_arg", add_launch_arg, arg: &str);
     free_fn!("set_reg_dword", set_reg_dword, path: &str, key: &str, val: i64);
@@ -147,16 +153,16 @@ fn engine_for(shared: &SharedCtx) -> Engine {
     free_fn!("log", log, message: &str);
 
     // Method-style (backward compat with existing fixups): ctx.set_env("K","v")
-    engine.register_fn("set_env", |ctx: &mut SharedCtx, key: &str, val: &str| ctx.lock().unwrap().set_env(key, val));
-    engine.register_fn("remove_env", |ctx: &mut SharedCtx, key: &str| ctx.lock().unwrap().remove_env(key));
-    engine.register_fn("add_dll_override", |ctx: &mut SharedCtx, fragment: &str| ctx.lock().unwrap().add_dll_override(fragment));
-    engine.register_fn("override_dll", |ctx: &mut SharedCtx, dll_name: &str, override_type: &str| ctx.lock().unwrap().override_dll(dll_name, override_type));
-    engine.register_fn("disable_dll", |ctx: &mut SharedCtx, dll_name: &str| ctx.lock().unwrap().disable_dll(dll_name));
-    engine.register_fn("disable_nvapi", |ctx: &mut SharedCtx| ctx.lock().unwrap().disable_nvapi());
-    engine.register_fn("add_launch_arg", |ctx: &mut SharedCtx, arg: &str| ctx.lock().unwrap().add_launch_arg(arg));
-    engine.register_fn("set_reg_dword", |ctx: &mut SharedCtx, path: &str, key: &str, val: i64| ctx.lock().unwrap().set_reg_dword(path, key, val));
-    engine.register_fn("set_reg_string", |ctx: &mut SharedCtx, path: &str, key: &str, val: &str| ctx.lock().unwrap().set_reg_string(path, key, val));
-    engine.register_fn("log", |ctx: &mut SharedCtx, message: &str| ctx.lock().unwrap().log(message));
+    engine.register_fn("set_env", |ctx: &mut SharedCtx, key: &str, val: &str| lock_ctx(ctx).set_env(key, val));
+    engine.register_fn("remove_env", |ctx: &mut SharedCtx, key: &str| lock_ctx(ctx).remove_env(key));
+    engine.register_fn("add_dll_override", |ctx: &mut SharedCtx, fragment: &str| lock_ctx(ctx).add_dll_override(fragment));
+    engine.register_fn("override_dll", |ctx: &mut SharedCtx, dll_name: &str, override_type: &str| lock_ctx(ctx).override_dll(dll_name, override_type));
+    engine.register_fn("disable_dll", |ctx: &mut SharedCtx, dll_name: &str| lock_ctx(ctx).disable_dll(dll_name));
+    engine.register_fn("disable_nvapi", |ctx: &mut SharedCtx| lock_ctx(ctx).disable_nvapi());
+    engine.register_fn("add_launch_arg", |ctx: &mut SharedCtx, arg: &str| lock_ctx(ctx).add_launch_arg(arg));
+    engine.register_fn("set_reg_dword", |ctx: &mut SharedCtx, path: &str, key: &str, val: i64| lock_ctx(ctx).set_reg_dword(path, key, val));
+    engine.register_fn("set_reg_string", |ctx: &mut SharedCtx, path: &str, key: &str, val: &str| lock_ctx(ctx).set_reg_string(path, key, val));
+    engine.register_fn("log", |ctx: &mut SharedCtx, message: &str| lock_ctx(ctx).log(message));
 
     engine
 }
