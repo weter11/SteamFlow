@@ -897,6 +897,7 @@ impl Runner for WineTkgRunner {
         }
 
         let use_symlinks = glc.use_symlinks_in_prefix;
+        let runner_root = crate::utils::derive_runner_root(&active_runner_path);
         let mut dll_overrides = crate::utils::build_dll_overrides(
             effective_dxvk,
             effective_vkd3d_proton,
@@ -905,6 +906,7 @@ impl Runner for WineTkgRunner {
             force_builtin_d3d,
             Some(&game_working_dir),
             strict_dxvk,
+            Some(&runner_root),
         );
         if let Some(fixup) = &ctx.fixup_result {
             for fragment in &fixup.extra_dll_overrides {

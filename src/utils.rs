@@ -1519,6 +1519,7 @@ pub fn build_dll_overrides(
     force_builtin_d3d: bool, // NEW — for WineD3D policy
     game_dir: Option<&std::path::Path>, // check for game-local DLLs
     strict_dxvk: bool,
+    runner_root: Option<&std::path::Path>, // runner root, to test which builtins ship
 ) -> String {
     let mut overrides: Vec<String> = vec![
         "vstdlib_s=n".into(),
@@ -1528,14 +1529,30 @@ pub fn build_dll_overrides(
         "steam_api=n".into(),
         "steam_api64=n".into(),
         "lsteamclient=".into(),
-        // AMD AGS (amd_ags_x64/x86.dll) frequently fails to load under Wine
-        // ("Could not map ... section .text, file probably truncated" -> the game's
-        // EXE import fails with STATUS_DLL_NOT_FOUND). Wine ships a working builtin
-        // stub, so force the builtin for these. This fixes Resident Evil 2 / RE:2
-        // and other Capcom/AMD-AGS titles without affecting real GPU behaviour.
-        "amd_ags_x64=b".into(),
-        "amd_ags_x86=b".into(),
     ];
+
+    // AMD AGS (amd_ags_x64/x86.dll) frequently fails to load under Wine
+    // ("Could not map ... section .text, file probably truncated" -> the game's
+    // EXE import fails with STATUS_DLL_NOT_FOUND). Wine ships a working builtin
+    // stub, so force the builtin for these. This fixes Resident Evil 2 / RE:2
+    // and other Capcom/AMD-AGS titles without affecting real GPU behaviour.
+    //
+    // Only force the builtin when the runner actually ships one: minimal WoW64
+    // runners (steamflow-runner-wine11-wow64) omit the amd_ags builtin, and
+    // forcing "=b" then makes the game's own amd_ags_x64.dll unresolvable
+    // (exit 53, missing_required_module) — e.g. RE2. In that case drop the
+    // override so the game's shipped DLL loads normally.
+    let amd_ags_builtin_ships = runner_root.map(|root| {
+        ["lib64/wine/x86_64-windows/amd_ags_x64.dll",
+         "lib/wine/x86_64-windows/amd_ags_x64.dll",
+         "files/lib64/wine/x86_64-windows/amd_ags_x64.dll",
+         "files/lib/wine/x86_64-windows/amd_ags_x64.dll"]
+            .iter().any(|rel| root.join(rel).exists())
+    }).unwrap_or(false);
+    if amd_ags_builtin_ships {
+        overrides.push("amd_ags_x64=b".into());
+        overrides.push("amd_ags_x86=b".into());
+    }
 
     if no_overlay {
         overrides.push("GameOverlayRenderer=n".into());
@@ -1596,6 +1613,18 @@ pub fn build_dll_overrides(
             // llvmpipe swapchain mismatch that crashes in wined3d.dll on
             // D3D12 games (e.g. Little Nightmares EE / Atlas engine).
             overrides.push("dxgi=n,b".into());
+            // Pair every D3D10/11 DLL with native dxgi: Wine's builtin d3d11 /
+            // d3d10core import Wine-internal symbols (DXGID3D10CreateDevice,
+            // DXGID3D10RegisterLayers) from dxgi.dll that DXVK's native dxgi
+            // does not export. Loading builtin d3d11 against native dxgi yields
+            // null imports -> broken D3D11 device -> crash (Portal 2, RE2).
+            // Only push when the DXVK branch (above) hasn't already done so.
+            for stem in &["d3d8", "d3d9", "d3d10core", "d3d11"] {
+                let entry = format!("{stem}=n,b");
+                if !overrides.iter().any(|o| o.starts_with(&format!("{stem}="))) {
+                    overrides.push(entry);
+                }
+            }
         }
         if vkd3d_active {
             overrides.push("libvkd3d-1=n,b".into());
