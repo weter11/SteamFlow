@@ -1519,6 +1519,7 @@ pub fn build_dll_overrides(
     force_builtin_d3d: bool, // NEW — for WineD3D policy
     game_dir: Option<&std::path::Path>, // check for game-local DLLs
     strict_dxvk: bool,
+    runner_root: Option<&std::path::Path>, // runner root, to test which builtins ship
 ) -> String {
     let mut overrides: Vec<String> = vec![
         "vstdlib_s=n".into(),
@@ -1528,14 +1529,15 @@ pub fn build_dll_overrides(
         "steam_api=n".into(),
         "steam_api64=n".into(),
         "lsteamclient=".into(),
-        // AMD AGS (amd_ags_x64/x86.dll) frequently fails to load under Wine
-        // ("Could not map ... section .text, file probably truncated" -> the game's
-        // EXE import fails with STATUS_DLL_NOT_FOUND). Wine ships a working builtin
-        // stub, so force the builtin for these. This fixes Resident Evil 2 / RE:2
-        // and other Capcom/AMD-AGS titles without affecting real GPU behaviour.
-        "amd_ags_x64=b".into(),
-        "amd_ags_x86=b".into(),
     ];
+
+    // NOTE: no blanket amd_ags_x64/amd_ags_x86 overrides. Games that need AMD
+    // AGS ship their own amd_ags_x64.dll / amd_ags_x86.dll in their install
+    // dir (e.g. RE2), and per the game-local-priority rule that DLL must win.
+    // Forcing "=b" made the game's own copy unresolvable (exit 53,
+    // missing_required_module) when the runner doesn't bundle the builtin.
+    // If a game genuinely needs AGS and doesn't ship it, the user can add a
+    // per-game WINEDLLOVERRIDES via Launch Options.
 
     if no_overlay {
         overrides.push("GameOverlayRenderer=n".into());
@@ -1560,14 +1562,25 @@ pub fn build_dll_overrides(
         return overrides.join(";");
     }
 
+    // Game-local priority: check the game dir AND common subdirs the game
+    // loads from (bin/, .trex/ etc). If the game ships its own copy, do NOT
+    // override it — the game's DLL must win (e.g. Portal 2 RTX Remix ships
+    // bin/d3d9.dll + dxvk_d3d9.dll + .trex/d3d9.dll).
+    let game_has = |dll: &str| -> bool {
+        game_dir.map(|d| {
+            d.join(dll).exists()
+                || d.join("bin").join(dll).exists()
+                || d.join("bin").join(".trex").join(dll).exists()
+                || d.join(".trex").join(dll).exists()
+        }).unwrap_or(false)
+    };
+
     if dxvk_active {
         // If the game ships its own d3d DLLs, don't fight them — just
         // ensure native wins without specifying which native.
         // Wine searches exe-dir before system32, so "n,b" is fine UNLESS
         // a foreign dll landed in system32. We skip the override entirely
         // for DLLs the game already provides locally.
-        let game_has = |dll: &str| -> bool { game_dir.map(|d| d.join(dll).exists()).unwrap_or(false) };
-
         for dll in &[
             "d3d8.dll",
             "d3d9.dll",
@@ -1578,7 +1591,10 @@ pub fn build_dll_overrides(
             let stem = dll.trim_end_matches(".dll");
             let mode = if strict_dxvk { "n" } else { "n,b" };
 
-            if strict_dxvk || !game_has(dll) {
+            // Game-local priority is absolute: if the game ships its own copy,
+            // never override it, even in strict DXVK mode (the game's build may
+            // be a modified fork — e.g. Portal 2 RTX Remix's dxvk_d3d9.dll).
+            if !game_has(dll) {
                 overrides.push(format!("{stem}={mode}"));
             }
             // If the game ships it locally and we are not in strict mode,
@@ -1596,6 +1612,22 @@ pub fn build_dll_overrides(
             // llvmpipe swapchain mismatch that crashes in wined3d.dll on
             // D3D12 games (e.g. Little Nightmares EE / Atlas engine).
             overrides.push("dxgi=n,b".into());
+            // Pair every D3D10/11 DLL with native dxgi: Wine's builtin d3d11 /
+            // d3d10core import Wine-internal symbols (DXGID3D10CreateDevice,
+            // DXGID3D10RegisterLayers) from dxgi.dll that DXVK's native dxgi
+            // does not export. Loading builtin d3d11 against native dxgi yields
+            // null imports -> broken D3D11 device -> crash (Portal 2, RE2).
+            // Only push when the DXVK branch (above) hasn't already done so.
+            for stem in &["d3d8", "d3d9", "d3d10core", "d3d11"] {
+                if game_has(&format!("{stem}.dll")) {
+                    // Game ships its own copy — keep game-local priority.
+                    continue;
+                }
+                let entry = format!("{stem}=n,b");
+                if !overrides.iter().any(|o| o.starts_with(&format!("{stem}="))) {
+                    overrides.push(entry);
+                }
+            }
         }
         if vkd3d_active {
             overrides.push("libvkd3d-1=n,b".into());

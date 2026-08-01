@@ -674,8 +674,13 @@ impl LaunchPipeline {
     fn populate_effective_graphics_stack(&self, ctx: &mut PipelineContext) {
         if let Some(spec) = &ctx.command_spec {
              if let Some(overrides) = spec.env.get("WINEDLLOVERRIDES") {
-                 let has_dxvk = overrides.contains("d3d11=n") || overrides.contains("dxgi=n") || overrides.contains("d3d9=n") || overrides.contains("d3d8=n");
-                 let has_vkd3dp = overrides.contains("d3d12=n");
+                 // Classify by the *distinctive* DLLs per provider. dxgi=n,b alone
+                 // no longer proves DXVK: vkd3d-proton also forces native dxgi
+                 // (required for its swapchain). DXVK is only truly active when a
+                 // d3d8/d3d9/d3d11 override is present; d3d12=n,b implies
+                 // vkd3d-proton; libvkd3d-1=n,b implies Wine vkd3d.
+                 let has_dxvk = overrides.contains("d3d11=n") || overrides.contains("d3d9=n") || overrides.contains("d3d8=n") || overrides.contains("d3d10core=n");
+                 let has_vkd3dp = overrides.contains("d3d12=n") || overrides.contains("d3d12core=n");
                  let has_vkd3dw = overrides.contains("libvkd3d-1=n");
 
                  ctx.graphics_stack.effective_backend = if has_dxvk { "DXVK" } else { "WineD3D (Baseline)" }.to_string();
