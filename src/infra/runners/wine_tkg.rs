@@ -953,8 +953,21 @@ impl Runner for WineTkgRunner {
 
         // Enhance overrides with resolved DLL providers
         for res in &ctx.dll_resolutions {
-            if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal ||
-               (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Custom && !use_symlinks) ||
+            if res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::GameLocal {
+                // GAME-LOCAL PRIORITY: the game ships its own copy of this DLL
+                // (e.g. Portal 2 RTX Remix ships bin/d3d9.dll + dxvk_d3d9.dll,
+                // .trex/d3d9.dll). Do NOT add a native override: Wine's native
+                // search consults WINEDLLPATH (runner dirs) before the game's
+                // dir, so "=n" would hand the game the runner's DXVK instead of
+                // its own Remix build and break the launch. Leave the override
+                // absent so the game's own DLL loads.
+                tracing::info!(
+                    "DLL {} provided by the game itself; no override added (game-local priority)",
+                    res.name
+                );
+                continue;
+            }
+            if (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Custom && !use_symlinks) ||
                (res.chosen_provider == crate::launch::dll_provider_resolver::DllProvider::Runner && res.name.contains("nvapi")) {
 
                 // Do not emit overrides for DLLs that are handled via internal capabilities
@@ -963,7 +976,7 @@ impl Runner for WineTkgRunner {
                      continue;
                 }
 
-                // Ensure native wins for game-local or non-symlinked custom DLLs
+                // Ensure native wins for non-symlinked custom DLLs
                 if !dll_overrides.contains(&format!("{}=n", res.name)) {
                      tracing::info!("Adding native override for resolved DLL: {} (provider: {:?})", res.name, res.chosen_provider);
                      dll_overrides.push_str(&format!(";{}=n", res.name));
