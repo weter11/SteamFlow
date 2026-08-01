@@ -1,2 +1,2 @@
-ctx.set_env("PBA_DISABLE_CRASHHANDLER", "1");
-ctx.log("Disabled process crash handler for Wine compatibility");
+set_env("PBA_DISABLE_CRASHHANDLER", "1");
+log("Disabled process crash handler for Wine compatibility");
