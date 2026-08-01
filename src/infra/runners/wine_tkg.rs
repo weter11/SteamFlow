@@ -1248,6 +1248,13 @@ impl Runner for WineTkgRunner {
             }
         }
 
+        // Dev-only overlay: ~/.config/SteamFlow/debug.json is applied last so its
+        // keys win over per-game env variables and built-in debug defaults.
+        // (Not exposed in the UI; see crate::config::load_debug_config.)
+        for (key, val) in crate::config::load_debug_config().env {
+            env.insert(key, val);
+        }
+
         let wants_mangohud = ctx.user_config.as_ref()
             .map(|c| {
                 c.env_variables.contains_key("MANGOHUD")
