@@ -88,7 +88,10 @@ fn test_build_dll_overrides_strict_dxvk_ignores_local() {
 
     let overrides = build_dll_overrides(true, false, false, true, false, Some(tmp.path()), true, None);
 
-    // In strict mode, even if d3d11.dll exists locally, we should still add the override
-    // and it should be 'n' (native only)
-    assert!(overrides.contains("d3d11=n"));
+    // PR #67 (3529d0a): game-local DLL priority is ABSOLUTE — a game's own
+    // d3d11.dll (e.g. RTX Remix fork) must win even in strict DXVK mode, so
+    // NO override may be emitted for it. Other DXVK keys stay native-only.
+    assert!(!overrides.contains("d3d11=n,b"), "game-local d3d11 must not be overridden: {overrides}");
+    assert!(!overrides.contains("d3d11=n"), "game-local d3d11 must not be overridden: {overrides}");
+    assert!(overrides.contains("d3d9=n"), "non-local DXVK keys should still be native-only: {overrides}");
 }

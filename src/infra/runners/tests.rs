@@ -122,9 +122,12 @@ mod tests {
         let runner = WineTkgRunner;
         let env = runner.build_env(&ctx).await.unwrap();
 
-        // Auto is now CONSERVATIVE: it should NOT have enabled DXVK even if simulated on disk
+        // Auto = best available (user rule: fallbacks only in Auto, explicit selection is
+        // strict). When the runner bundles DXVK, Auto must activate it; if the runner has
+        // no DXVK, Auto falls back to WineD3D. The test runner simulates DXVK on disk, so
+        // Auto is expected to produce native d3d11/dxgi overrides here.
         let overrides = env.get("WINEDLLOVERRIDES").unwrap();
-        assert!(!overrides.contains("d3d11=n,b"));
+        assert!(overrides.contains("d3d11=n,b"), "Auto should enable DXVK when bundled, got: {overrides}");
 
         // Explicitly requesting DXVK should still enable it
         let mut user_config_dxvk = user_config.clone();
