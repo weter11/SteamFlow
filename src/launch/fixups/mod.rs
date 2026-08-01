@@ -93,6 +93,8 @@ pub const SEED_SCRIPTS: &[(&str, &str)] = &[
     ("359550.rhai", include_str!("seed_scripts/359550.rhai")),
     ("271590.rhai", include_str!("seed_scripts/271590.rhai")),
     ("1151640.rhai", include_str!("seed_scripts/1151640.rhai")),
+    ("883710.rhai", include_str!("seed_scripts/883710.rhai")),
+    ("489830.rhai", include_str!("seed_scripts/489830.rhai")),
 ];
 
 pub fn fixups_dir() -> Result<PathBuf> { Ok(crate::config::config_dir()?.join("fixups")) }
@@ -291,6 +293,34 @@ mod tests {
         assert_eq!(res.registry[0].value, "1");
         assert_eq!(res.registry[1].kind, RegKind::String);
         assert_eq!(res.registry[1].value, "Test");
+    }
+
+    #[test]
+    fn ported_883710_re2_fixup() {
+        // Verify the reference port from protonfixes/gamefixes/883710.py executes
+        // and produces the expected DLL overrides + NVAPI disable.
+        let body = SEED_SCRIPTS.iter().find(|(n, _)| *n == "883710.rhai").unwrap().1;
+        let mut p = std::env::temp_dir();
+        p.push("steamflow_883710.rhai");
+        std::fs::write(&p, body).unwrap();
+        let res = run_fixup_script(&p, ctx()).unwrap();
+        assert!(res.extra_dll_overrides.contains(&"amd_ags_x64=b".to_string()), "got {:?}", res.extra_dll_overrides);
+        assert!(res.extra_dll_overrides.contains(&"nvapi=".to_string()));
+        assert!(res.extra_dll_overrides.contains(&"nvapi64=".to_string()));
+        assert_eq!(res.extra_env.get("DXVK_ENABLE_NVAPI").map(|s| s.as_str()), Some("0"));
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn ported_489830_skyrim_fixup() {
+        let body = SEED_SCRIPTS.iter().find(|(n, _)| *n == "489830.rhai").unwrap().1;
+        let mut p = std::env::temp_dir();
+        p.push("steamflow_489830.rhai");
+        std::fs::write(&p, body).unwrap();
+        let res = run_fixup_script(&p, ctx()).unwrap();
+        assert!(res.extra_dll_overrides.contains(&"x3daudio1_7=n,b".to_string()), "got {:?}", res.extra_dll_overrides);
+        assert!(res.extra_dll_overrides.contains(&"d3dcompiler_46=n,b".to_string()));
+        let _ = std::fs::remove_file(p);
     }
 
     #[test]
