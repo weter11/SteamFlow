@@ -193,6 +193,9 @@ pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
     #[cfg(unix)]
     {
         let prefix_str = wineprefix.to_string_lossy().to_string();
+
+        // Phase 1: collect PIDs, then SIGTERM all prefix wine processes.
+        let mut killed_pids: Vec<i32> = Vec::new();
         if let Ok(proc_dir) = std::fs::read_dir("/proc") {
             for entry in proc_dir.flatten() {
                 let pid_path = entry.path();
@@ -205,8 +208,48 @@ pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
                     Err(_) => continue,
                 };
                 if !String::from_utf8_lossy(&environ).contains(&prefix_str) { continue }
+                let cmdline = std::fs::read(pid_path.join("cmdline"))
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+                if !cmdline.to_lowercase().contains("wine") { continue }
                 if let Ok(pid) = pid_str.parse::<i32>() {
                     unsafe { libc::kill(pid, libc::SIGTERM); }
+                    killed_pids.push(pid);
+                }
+            }
+        }
+
+        // Phase 2: wait for all SIGTERM'd processes to die (up to 3 seconds).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let alive: Vec<i32> = killed_pids.iter().copied().filter(|pid| {
+                unsafe { libc::kill(*pid, 0) == 0 }
+            }).collect();
+            if alive.is_empty() { break; }
+            if std::time::Instant::now() > deadline { break; }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Phase 3: SIGKILL any stragglers (winedevice.exe commonly survives SIGTERM
+        // because it defers shutdown until pending device I/O completes).
+        if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+            for entry in proc_dir.flatten() {
+                let pid_path = entry.path();
+                let Some(pid_str) = pid_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| n.chars().all(|c| c.is_ascii_digit()))
+                else { continue };
+                let environ = match std::fs::read(pid_path.join("environ")) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if !String::from_utf8_lossy(&environ).contains(&prefix_str) { continue }
+                let cmdline = std::fs::read(pid_path.join("cmdline"))
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+                if !cmdline.to_lowercase().contains("wine") { continue }
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    unsafe { libc::kill(pid, libc::SIGKILL); }
                 }
             }
         }
@@ -444,6 +487,10 @@ pub struct RunnerComponents {
     pub vkd3d_proton: Option<ComponentInfo>,
     pub vkd3d: Option<ComponentInfo>,
     pub nvapi: Option<ComponentInfo>,
+    pub dxvk_nvapi: Option<ComponentInfo>,
+    /// True when lib64/wine/i386-windows/ contains valid 32-bit PE DLLs
+    /// (dxgi.dll, d3d11.dll, d3d12.dll, ddraw.dll) — confirms 32-bit game compatibility.
+    pub has_wow64_32bit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,14 +551,31 @@ pub fn detect_runner_components(
 ) -> RunnerComponents {
     let root = derive_runner_root(runner_path);
 
-    let (dxvk, d7vk, vkd3d_proton, vkd3d, nvapi) = (
+    let (mut dxvk, mut d7vk, mut vkd3d_proton, mut vkd3d, mut nvapi) = (
         detect_dxvk(&root, wineprefix),
         detect_d7vk(&root, wineprefix),
         detect_vkd3d_proton(&root, wineprefix),
         detect_vkd3d(&root, wineprefix),
         detect_nvapi(&root, wineprefix),
     );
+    let mut dxvk_nvapi = detect_dxvk_nvapi(&root, wineprefix);
 
+    let versions = read_versions_txt(&root);
+    apply_versions_override(&mut dxvk, &versions, "dxvk");
+    apply_versions_override(&mut d7vk, &versions, "d7vk");
+    apply_versions_override(&mut vkd3d_proton, &versions, "vkd3d_proton");
+    apply_versions_override(&mut vkd3d, &versions, "vkd3d");
+    apply_versions_override(&mut nvapi, &versions, "nvapi");
+    apply_versions_override(&mut dxvk_nvapi, &versions, "dxvk_nvapi");
+
+    let has_wow64_32bit = ["lib64/wine/i386-windows", "files/lib64/wine/i386-windows", "dist/lib64/wine/i386-windows"]
+        .iter()
+        .any(|d| {
+            let dir = root.join(d);
+            ["dxgi.dll", "d3d11.dll", "d3d12.dll", "ddraw.dll"]
+                .iter()
+                .any(|dll| dir.join(dll).exists())
+        });
 
     RunnerComponents {
         dxvk,
@@ -519,6 +583,8 @@ pub fn detect_runner_components(
         vkd3d_proton,
         vkd3d,
         nvapi,
+        dxvk_nvapi,
+        has_wow64_32bit,
     }
 }
 
@@ -559,7 +625,7 @@ pub fn detect_prime_env() -> std::collections::HashMap<String, String> {
 fn detect_d7vk(root: &Path, _prefix: Option<&Path>) -> Option<ComponentInfo> {
     // 1. Bundled inside runner (Modern Wine-TKG layout)
     let comp_subdirs = ["lib/wine/d7vk", "files/lib/wine/d7vk", "dist/lib/wine/d7vk"];
-    let required = ["d3d7.dll"];
+    let required = ["ddraw.dll"];
 
     for subdir in comp_subdirs {
         let comp_path = root.join(subdir);
@@ -589,7 +655,7 @@ fn detect_d7vk(root: &Path, _prefix: Option<&Path>) -> Option<ComponentInfo> {
     }
 
     // Unified layout (Proton 11+ / CachyOS)
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             if required.iter().all(|dll| arch_path.join(dll).exists()) {
@@ -609,6 +675,58 @@ fn detect_d7vk(root: &Path, _prefix: Option<&Path>) -> Option<ComponentInfo> {
                     path: Some(arch_path),
                 });
             }
+        }
+    }
+
+    None
+}
+
+fn detect_dxvk_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 1. Bundled inside runner (Modern Wine-TKG layout)
+    let comp_subdirs = [
+        "lib/wine/dxvk-nvapi",
+        "files/lib/wine/dxvk-nvapi",
+        "dist/lib/wine/dxvk-nvapi",
+    ];
+    let required = vec!["nvapi64.dll", "nvofapi64.dll"];
+    let alt_required = vec!["nvapi.dll"];
+
+    for subdir in comp_subdirs {
+        let comp_path = root.join(subdir);
+        if comp_path.is_dir() {
+            for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+                let arch_path = comp_path.join(arch_dir);
+                let req = if *arch_dir == "i386-windows" {
+                    &alt_required
+                } else {
+                    &required
+                };
+                if req.iter().all(|dll| arch_path.join(dll).exists()) {
+                    let version = ["version", "../version"]
+                        .iter()
+                        .filter_map(|v| {
+                            let p = arch_path.join(v);
+                            std::fs::read_to_string(p).ok()
+                        })
+                        .map(|s| parse_short_version(&s))
+                        .find(|s| s != "unknown")
+                        .unwrap_or_else(|| "found".to_string());
+
+                    return Some(ComponentInfo {
+                        version,
+                        source: ComponentSource::BundledWithRunner,
+                        path: Some(arch_path),
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Installed into WINEPREFIX (dxvk-nvapi often deployed to system32)
+    if let Some(pfx) = prefix {
+        let prefix_dlls = vec!["drive_c/windows/system32/nvapi64.dll"];
+        if let Some(info) = check_prefix(pfx, &prefix_dlls, "DXVK-NVAPI") {
+            return Some(info);
         }
     }
 
@@ -648,7 +766,7 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     }
 
     // Unified layout (Proton 11+ / CachyOS)
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             if required.iter().all(|dll| arch_path.join(dll).exists()) {
@@ -716,6 +834,31 @@ fn detect_dxvk(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 // ── VKD3D-Proton ─────────────────────────────────────────────────────────────
 
 fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 0. Content-based rule for flat WoW64 layouts (steamflow-runner):
+    //    both d3d12.dll AND d3d12core.dll in the same dir => VKD3D-Proton.
+    //    (Wine's built-in VKD3D ships only d3d12.dll.)
+    for subdir in ["lib64/wine", "files/lib64/wine", "dist/lib64/wine", "lib/wine", "files/lib/wine", "dist/lib/wine"] {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            if arch_path.join("d3d12.dll").exists() && arch_path.join("d3d12core.dll").exists() {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
+            }
+        }
+    }
+
     // 1. Modern Wine-TKG layout
     let comp_subdirs = ["lib/wine/vkd3d-proton", "files/lib/wine/vkd3d-proton", "dist/lib/wine/vkd3d-proton"];
     let required = ["d3d12.dll", "d3d12core.dll"];
@@ -775,7 +918,7 @@ fn detect_vkd3d_proton(root: &Path, prefix: Option<&Path>) -> Option<ComponentIn
     }
 
     // Legacy Unified layout
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             if required.iter().all(|dll| arch_path.join(dll).exists()) {
@@ -888,7 +1031,7 @@ fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     }
 
     // Unified layout
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (arch_name, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             let dlls = if *arch_name == "x86_64" {
@@ -932,6 +1075,30 @@ fn detect_nvapi(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
 }
 
 fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
+    // 0. Content-based rule for flat WoW64 layouts (steamflow-runner):
+    //    d3d12.dll WITHOUT d3d12core.dll in the same dir => Wine's built-in VKD3D.
+    for subdir in ["lib64/wine", "files/lib64/wine", "dist/lib64/wine", "lib/wine", "files/lib/wine", "dist/lib/wine"] {
+        for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
+            let arch_path = root.join(subdir).join(arch_dir);
+            if arch_path.join("d3d12.dll").exists() && !arch_path.join("d3d12core.dll").exists() {
+                let version = ["version", "../version", "../../version"]
+                    .iter()
+                    .filter_map(|v| {
+                        let p = arch_path.join(v);
+                        std::fs::read_to_string(p).ok()
+                    })
+                    .map(|s| parse_short_version(&s))
+                    .find(|s| s != "unknown")
+                    .unwrap_or_else(|| "found".to_string());
+                return Some(ComponentInfo {
+                    version,
+                    source: ComponentSource::BundledWithRunner,
+                    path: Some(arch_path),
+                });
+            }
+        }
+    }
+
     // 1. Modern Wine-TKG layout
     let comp_subdirs = ["lib/wine/vkd3d", "files/lib/wine/vkd3d", "dist/lib/wine/vkd3d"];
     let required = ["libvkd3d-1.dll", "libvkd3d-shader-1.dll"];
@@ -987,7 +1154,7 @@ fn detect_vkd3d(root: &Path, prefix: Option<&Path>) -> Option<ComponentInfo> {
     }
 
     // Legacy Unified layout
-    for subdir in crate::proton::UNIFIED_LIB_SUBDIRS {
+    for subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
         for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
             let arch_path = root.join(subdir).join(arch_dir);
             if required.iter().all(|dll| arch_path.join(dll).exists()) {
@@ -1197,6 +1364,92 @@ pub fn parse_short_version(s: &str) -> String {
     v.to_string()
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RunnerVersions {
+    pub wine_commit: Option<String>,
+    pub dxvk: Option<String>,
+    pub d7vk: Option<String>,
+    pub vkd3d_proton: Option<String>,
+    pub vkd3d: Option<String>,
+    pub nvapi: Option<String>,
+    pub dxvk_nvapi: Option<String>,
+    pub wine_mono: Option<String>,
+    pub wine_gecko: Option<String>,
+    pub build_date: Option<String>,
+}
+
+/// Parse VERSIONS.txt from the runner root. Each line is KEY=VALUE.
+pub fn read_versions_txt(root: &Path) -> RunnerVersions {
+    let path = root.join("VERSIONS.txt");
+    let mut versions = RunnerVersions::default();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') || !line.contains('=') {
+                continue;
+            }
+            let mut parts = line.splitn(2, '=');
+            let key = parts.next().map(|s| s.trim()).unwrap_or("");
+            let val = parts.next().map(|s| s.trim()).unwrap_or("");
+            if val.is_empty() {
+                continue;
+            }
+            match key {
+                "WINE_COMMIT" => versions.wine_commit = Some(val.to_string()),
+                "DXVK_VERSION" => versions.dxvk = Some(val.to_string()),
+                "D7VK_VERSION" => versions.d7vk = Some(val.to_string()),
+                "VKD3D_PROTON_VERSION" => versions.vkd3d_proton = Some(val.to_string()),
+                "DXVK_NVAPI_VERSION" => versions.dxvk_nvapi = Some(val.to_string()),
+                "WINE_MONO_VERSION" => versions.wine_mono = Some(val.to_string()),
+                "WINE_GECKO_VERSION" => versions.wine_gecko = Some(val.to_string()),
+                "BUILD_DATE" => versions.build_date = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    }
+    versions
+}
+
+fn apply_versions_override(
+    component: &mut Option<ComponentInfo>,
+    versions: &RunnerVersions,
+    key: &str,
+) {
+    if component
+        .as_ref()
+        .map(|c| {
+            !c.version.is_empty()
+                && c.version != "unknown"
+                // "found" is a placeholder emitted by detection when no version
+                // file sits next to the DLL (flat WoW64 layout). It is not a
+                // real version — allow the VERSIONS.txt override to fill it in.
+                && c.version != "found"
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let ver = match key {
+        "dxvk" => versions.dxvk.as_deref(),
+        "d7vk" => versions.d7vk.as_deref(),
+        "vkd3d_proton" => versions.vkd3d_proton.as_deref(),
+        "vkd3d" => versions.vkd3d.as_deref(),
+        "nvapi" => versions.nvapi.as_deref(),
+        "dxvk_nvapi" => versions.dxvk_nvapi.as_deref(),
+        _ => None,
+    };
+    if let Some(v) = ver {
+        let path = component
+            .as_ref()
+            .and_then(|c| c.path.clone());
+        *component = Some(ComponentInfo {
+            version: v.to_string(),
+            source: ComponentSource::BundledWithRunner,
+            path,
+        });
+    }
+}
+
 fn dll_contains_string(path: &Path, needle: &str) -> bool {
     let needle_lower = needle.to_ascii_lowercase();
     std::fs::read(path)
@@ -1336,6 +1589,14 @@ pub fn build_dll_overrides(
     if vkd3d_proton_active || vkd3d_active {
         overrides.push("d3d12=n,b".into());
         overrides.push("d3d12core=n,b".into());
+        if vkd3d_proton_active {
+            // VKD3D-Proton creates a Vulkan device and requires DXVK's native
+            // dxgi.dll to present swapchains. Without dxgi=n,b, Wine loads its
+            // builtin wined3d-based dxgi, producing a Vulkan-device + wined3d/
+            // llvmpipe swapchain mismatch that crashes in wined3d.dll on
+            // D3D12 games (e.g. Little Nightmares EE / Atlas engine).
+            overrides.push("dxgi=n,b".into());
+        }
         if vkd3d_active {
             overrides.push("libvkd3d-1=n,b".into());
             overrides.push("libvkd3d-shader-1=n,b".into());
@@ -1529,12 +1790,23 @@ pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
         detect_nvapi(path, None),
     );
 
+    let dxvk_nvapi = detect_dxvk_nvapi(path, None);
+    let has_wow64_32bit = ["lib64/wine/i386-windows", "files/lib64/wine/i386-windows", "dist/lib64/wine/i386-windows"]
+        .iter()
+        .any(|d| {
+            let dir = path.join(d);
+            ["dxgi.dll", "d3d11.dll", "d3d12.dll", "ddraw.dll"]
+                .iter()
+                .any(|dll| dir.join(dll).exists())
+        });
     crate::utils::RunnerComponents {
         dxvk,
         d7vk,
         vkd3d_proton,
         vkd3d,
         nvapi,
+        dxvk_nvapi,
+        has_wow64_32bit,
     }
 }
 

@@ -30,6 +30,25 @@ pub const UNIFIED_LIB_SUBDIRS: &[&str] = &[
     "dist/lib64/wine",
 ];
 
+/// lib64-first search order for bundled graphics components (DXVK, D7VK,
+/// VKD3D-Proton, DXVK-NVAPI) in flat WoW64 runner layouts.
+///
+/// In the steamflow-runner layout, `lib64/wine/x86_64-windows` holds the
+/// *real* bundled component DLLs (e.g. vkd3d-proton's multi-MB d3d12core.dll,
+/// DXVK's multi-MB dxgi.dll), while `lib/wine/x86_64-windows` holds Wine's
+/// own small builtin shims. `UNIFIED_LIB_SUBDIRS` lists `lib/wine` first, so
+/// scanning it would hand the game Wine's builtin vkd3d/DXVK instead of the
+/// bundled components. Detection, DLL resolution and WINEDLLPATH construction
+/// must all use this lib64-first order for component lookups.
+pub const COMPONENT_LIB_SUBDIRS: &[&str] = &[
+    "lib64/wine",
+    "files/lib64/wine",
+    "dist/lib64/wine",
+    "lib/wine",
+    "files/lib/wine",
+    "dist/lib/wine",
+];
+
 pub const UNIFIED_BASE_LIB_SUBDIRS: &[&str] = &[
     "files/lib",
     "files/lib64",
@@ -50,6 +69,7 @@ pub const COMPONENT_FAMILIES: &[&str] = &[
     "vkd3d-proton",
     "vkd3d",
     "nvapi",
+    "dxvk-nvapi",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

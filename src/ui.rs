@@ -1449,6 +1449,26 @@ impl SteamLauncher {
 
             {
                 ui.horizontal(|ui| {
+                    ui.label("Graphics Backend Policy (DX3-7):");
+                    egui::ComboBox::from_id_salt("d3d7_backend_policy_selector")
+                        .selected_text(format!("{:?}", glc.d3d7_policy))
+                        .show_ui(ui, |ui| {
+                            use crate::models::D3D7BackendPolicy;
+                            if ui.selectable_value(&mut glc.d3d7_policy, D3D7BackendPolicy::Auto, "Auto (Recommended)").clicked() {
+                                gl_changed = true;
+                            }
+                            if ui.selectable_value(&mut glc.d3d7_policy, D3D7BackendPolicy::WineD3D, "WineD3D (OpenGL)").clicked() {
+                                gl_changed = true;
+                            }
+                            if ui.selectable_value(&mut glc.d3d7_policy, D3D7BackendPolicy::D7VK, "D7VK (Vulkan)").clicked() {
+                                gl_changed = true;
+                            }
+                        });
+                });
+            }
+
+            {
+                ui.horizontal(|ui| {
                     ui.label("D3D12 Provider Policy (DX12):");
                     egui::ComboBox::from_id_salt("d3d12_provider_policy_selector")
                         .selected_text(format!("{:?}", glc.d3d12_policy))
@@ -1508,72 +1528,12 @@ impl SteamLauncher {
             });
 
             ui.add_space(8.0);
-            ui.heading("Manual Overrides (advanced)");
-
-            // Smart Override button: resets D3D12 policy + manual overrides
-            // to values that match what the runner actually has available.
-            // If runner has vkd3d-proton but not vkd3d wine (or vice versa),
-            // auto-selects the available one as fallback.
-            if ui.button("⚡ Smart Override — match runner capabilities").on_hover_text(
-                "Resets D3D12 policy and manual overrides to match what this runner actually provides.                  Falls back from VKD3D-Proton to VKD3D-Wine (or vice versa) if the preferred one is not available."
-            ).clicked() {
-                let available = &self.runner_components;
-                let has_vkd3d_proton = available.as_ref().map(|c| c.vkd3d_proton.is_some()).unwrap_or(false);
-                let has_vkd3d = available.as_ref().map(|c| c.vkd3d.is_some()).unwrap_or(false);
-
-                // Reset D3D12 policy to Auto first
-                glc.d3d12_policy = crate::models::D3D12ProviderPolicy::Auto;
-
-                if has_vkd3d_proton {
-                    // Runner has VKD3D-Proton: enable that provider
-                    glc.vkd3d_proton_enabled = true;
-                    glc.vkd3d_enabled = false;
-                } else if has_vkd3d {
-                    // Runner has VKD3D (Wine) but not VKD3D-Proton: use Wine's
-                    glc.vkd3d_proton_enabled = false;
-                    glc.vkd3d_enabled = true;
-                } else {
-                    // Neither vkd3d-proton nor vkd3d available — disable both overrides
-                    glc.vkd3d_proton_enabled = false;
-                    glc.vkd3d_enabled = false;
-                }
-
-                // Reset other manual overrides to not forced
-                glc.dxvk_enabled = false;
-                glc.nvapi_enabled = true; // NVAPI enabled by default
-
-                gl_changed = true;
-            }
 
             ui.horizontal(|ui| {
-                if ui.checkbox(&mut glc.dxvk_enabled, "Force DXVK").on_hover_text("Always use DXVK for DX8-11, ignoring policy.").changed() {
-                    gl_changed = true;
-                }
-                if ui.checkbox(&mut glc.vkd3d_proton_enabled, "Force VKD3D-Proton").on_hover_text("Always use VKD3D-Proton for DX12, ignoring policy.").changed() {
-                    gl_changed = true;
-                }
-                if ui.checkbox(&mut glc.vkd3d_enabled, "Force VKD3D (Wine)").on_hover_text("Always use upstream Wine VKD3D for DX12, ignoring policy.").changed() {
-                    gl_changed = true;
-                }
                 if ui.checkbox(&mut glc.nvapi_enabled, "Enable NVAPI").on_hover_text("Expose NVIDIA API to the game (requires runner support).").changed() {
                     gl_changed = true;
                 }
-                if ui.checkbox(&mut glc.force_wined3d, "Force WineD3D (disable DXVK/VKD3D)").on_hover_text("Use Wine's built-in OpenGL/D3D translation instead of DXVK/VKD3D. Useful for older games (e.g. Amnesia) that crash with DXVK, or for 32-bit-only titles that lack 64-bit driver support.").changed() {
-                    gl_changed = true;
-                }
             });
-
-            if gl_changed {
-                self.user_configs.insert(game.app_id, user_cfg_gl);
-                let store = self.user_configs.clone();
-                self.runtime.spawn(async move {
-                    let _ = crate::config::save_user_configs(&store).await;
-                });
-                // Invalidate component cache so display refreshes
-                self.last_scanned_runner = PathBuf::new();
-            }
-
-            ui.add_space(8.0);
 
             if let Some(components) = &self.runner_components {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1611,13 +1571,24 @@ impl SteamLauncher {
                                 };
                             let c = components.clone();
                             row("DXVK:", &c.dxvk);
+                            row("D7VK:", &c.d7vk);
                             row("VKD3D-Proton:", &c.vkd3d_proton);
                             row("VKD3D:", &c.vkd3d);
+                            row("DXVK-NVAPI:", &c.dxvk_nvapi);
                             row("NVAPI:", &c.nvapi);
                         });
                 });
             }
 
+            if gl_changed {
+                self.user_configs.insert(game.app_id, user_cfg_gl);
+                let store = self.user_configs.clone();
+                self.runtime.spawn(async move {
+                    let _ = crate::config::save_user_configs(&store).await;
+                });
+                // Invalidate component cache so display refreshes
+                self.last_scanned_runner = PathBuf::new();
+            }
             if steam_cfg_changed {
                 self.user_configs.insert(game_app_id, user_cfg);
                 let store = self.user_configs.clone();
@@ -2995,8 +2966,10 @@ impl eframe::App for SteamLauncher {
                                             };
                                         let c = components.clone();
                                         row("DXVK:", &c.dxvk);
+                                        row("D7VK:", &c.d7vk);
                                         row("VKD3D-Proton:", &c.vkd3d_proton);
                                         row("VKD3D:", &c.vkd3d);
+                                        row("DXVK-NVAPI:", &c.dxvk_nvapi);
                                         row("NVAPI:", &c.nvapi);
                                     });
                             });
