@@ -2233,6 +2233,102 @@ impl SteamClient {
         }
     }
 
+    /// Returns true if the Windows Steam client in the given prefix has a
+    /// persisted login session (an `ssfn*` sentry file exists next to steam.exe).
+    ///
+    /// Without the sentry file the client starts anonymous (SteamID U:1:0) and
+    /// cannot answer Steamworks ownership queries, so Steamworks games abort
+    /// early (RE2 exits 53). This is the Stage-1 gate that must pass before
+    /// library registration can matter.
+    pub fn windows_client_has_session(prefix: &Path) -> bool {
+        let Some(steam_dir) = crate::utils::find_steam_exe_in_prefix(prefix)
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        else {
+            return false;
+        };
+        let Ok(entries) = std::fs::read_dir(&steam_dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("ssfn")
+        })
+    }
+
+    /// One-time login bridge: launches `steam.exe -login <account> <password>`
+    /// inside the master prefix using the configured runner's bare wine binary,
+    /// then waits (polling) for the client to write its `ssfn*` sentry file.
+    ///
+    /// This is the ONLY way the Windows client itself learns the account; the
+    /// steam-vent session SteamFlow uses for library browsing is separate and
+    /// does not produce the client's sentry file.
+    ///
+    /// `password` is passed on the command line (Steam's only supported
+    /// non-interactive login), so callers should clear it from the UI after use.
+    pub async fn windows_client_login(
+        runner_path: &std::path::Path,
+        username: &str,
+        password: &str,
+    ) -> Result<std::path::PathBuf> {
+        use std::time::{Duration, Instant};
+
+        let steam_exe = Self::master_steam_exe()
+            .ok_or_else(|| anyhow!("Windows Steam client not installed (no steam.exe found)"))?;
+        let prefix = crate::utils::resolve_master_wineprefix();
+
+        if Self::windows_client_has_session(&prefix) {
+            return Ok(steam_exe); // already logged in
+        }
+
+        let mut cmd = crate::utils::build_bare_wine_command(runner_path)?;
+        cmd.arg(&steam_exe);
+        cmd.arg("-login");
+        cmd.arg(username);
+        cmd.arg(password);
+        cmd.arg("-tcp");
+        cmd.arg("-noverifyfiles");
+        cmd.arg("-noreactlogin");
+        cmd.arg("-cef-disable-gpu");
+        cmd.arg("-no-cef-sandbox");
+        cmd.env("WINEPREFIX", &prefix);
+        cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
+        if let Ok(display) = std::env::var("DISPLAY") {
+            cmd.env("DISPLAY", display);
+        }
+        if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+            cmd.env("WAYLAND_DISPLAY", wayland);
+        }
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            cmd.env("XDG_RUNTIME_DIR", xdg);
+        }
+
+        tracing::info!("Launching Windows Steam client login: {:?}", cmd);
+        let mut child = cmd.spawn().context("failed to spawn steam.exe -login")?;
+
+        // Poll for the sentry file (client must complete its web/login flow,
+        // possibly including Steam Guard confirmation on the user's phone).
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if Self::windows_client_has_session(&prefix) {
+                let _ = child.kill();
+                return Ok(steam_exe);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                bail!(
+                    "timed out waiting for the Windows Steam client to log in (120s).                      Check for a Steam Guard prompt on your phone or email, then retry."
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+    }
+
+    /// Resolves the path to the master prefix's Windows Steam client executable.
+    fn master_steam_exe() -> Option<std::path::PathBuf> {
+        crate::utils::get_master_steam_config().steam_exe
+    }
+
     /// Terminates Steam helper processes disabled by the user in the given prefix.
     ///
     /// Matching is performed against each process command line and environment,
@@ -3488,5 +3584,37 @@ impl SteamClient {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod windows_client_login_tests {
+    use super::SteamClient;
+    use std::path::PathBuf;
+
+    #[test]
+    fn has_session_detects_ssfn_in_prefix() {
+        // Create a fake prefix with steam.exe + ssfn sentry file
+        let tmp = std::env::temp_dir().join(format!("steamflow_ssfn_test_{}", std::process::id()));
+        let steam_dir = tmp.join("drive_c/Program Files (x86)/Steam");
+        std::fs::create_dir_all(&steam_dir).unwrap();
+        std::fs::write(steam_dir.join("steam.exe"), b"MZ fake").unwrap();
+        std::fs::write(steam_dir.join("ssfn1234567890123456789"), b"sentry").unwrap();
+
+        assert!(SteamClient::windows_client_has_session(&tmp));
+
+        // Remove the sentry -> no session
+        std::fs::remove_file(steam_dir.join("ssfn1234567890123456789")).unwrap();
+        assert!(!SteamClient::windows_client_has_session(&tmp));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn has_session_false_when_steam_missing() {
+        let tmp = std::env::temp_dir().join(format!("steamflow_nosteam_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(!SteamClient::windows_client_has_session(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
