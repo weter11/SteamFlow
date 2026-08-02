@@ -184,7 +184,7 @@ pub fn detect_wineserver_for_runner(
     None
 }
 
-pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
+pub fn kill_all_wine_in_prefix(wineprefix: &Path, preserve_webhelper: bool) {
     // Same /proc scan pattern as is_steam_running_in_prefix and kill_steam_in_prefix
     // but match on any process whose cmdline contains "wine" (case-insensitive)
     // and whose environ contains the prefix path
@@ -211,7 +211,14 @@ pub fn kill_all_wine_in_prefix(wineprefix: &Path) {
                 let cmdline = std::fs::read(pid_path.join("cmdline"))
                     .map(|b| String::from_utf8_lossy(&b).to_string())
                     .unwrap_or_default();
-                if !cmdline.to_lowercase().contains("wine") { continue }
+                let lower = cmdline.to_lowercase();
+                if !lower.contains("wine") { continue }
+                // Preserve steamwebhelper when the caller asked for it (Manage /
+                // Repair with "Disable CEF browser" unchecked): the web helper is
+                // needed for the client's login flow and UI.
+                if preserve_webhelper && lower.contains("steamwebhelper.exe") {
+                    continue;
+                }
                 if let Ok(pid) = pid_str.parse::<i32>() {
                     unsafe { libc::kill(pid, libc::SIGTERM); }
                     killed_pids.push(pid);

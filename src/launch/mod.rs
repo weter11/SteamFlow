@@ -35,7 +35,16 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     // steam.exe / SteamService from a previous (failed) launch makes SteamSetup report
     // "steam already running, close it and continue installation" and blocks the install.
     // Killing first ensures a clean bootstrap.
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    //
+    // steamwebhelper is preserved unless the user explicitly disabled CEF ("Disable
+    // CEF browser" in Settings): the web helper is required for the client's login
+    // flow and UI, so Manage/Repair must leave it alive. kill_steam_in_prefix only
+    // targets steam.exe / steamservice / (optionally) steamwebhelper.
+    let kill_webhelper = config.steam_launch_config.no_browser;
+    crate::steam_client::SteamClient::kill_steam_in_prefix(
+        &steam_cfg.wine_prefix,
+        kill_webhelper,
+    );
 
     let setup_exe = runtimes_dir.join("SteamSetup.exe");
     if !setup_exe.exists() {
@@ -197,7 +206,7 @@ pub fn launch_winecfg(config: &LauncherConfig) -> Result<()> {
     std::fs::create_dir_all(&steam_cfg.wine_prefix)
         .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
 
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, !config.steam_launch_config.no_browser);
 
     cmd.arg("winecfg.exe");
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
@@ -236,7 +245,7 @@ pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {
     // Mixing runners in one WINEPREFIX produces the classic
     // "wine client error: version mismatch ... your wine binary was not upgraded correctly"
     // because the new wine64 and the old wineserver disagree on the pipe protocol.
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, !config.steam_launch_config.no_browser);
 
     cmd.arg("control.exe");
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
@@ -276,7 +285,7 @@ pub fn launch_wine_file_manager(config: &LauncherConfig) -> Result<()> {
     std::fs::create_dir_all(&steam_cfg.wine_prefix)
         .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
 
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, !config.steam_launch_config.no_browser);
 
     cmd.arg("winefile.exe");
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
@@ -315,7 +324,7 @@ pub fn launch_wine_regedit(config: &LauncherConfig) -> Result<()> {
     std::fs::create_dir_all(&steam_cfg.wine_prefix)
         .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
 
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, !config.steam_launch_config.no_browser);
 
     cmd.arg("regedit.exe");
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
@@ -359,7 +368,7 @@ pub fn launch_wine_taskmgr(config: &LauncherConfig) -> Result<()> {
     std::fs::create_dir_all(&steam_cfg.wine_prefix)
         .with_context(|| format!("failed creating Wine prefix {}", steam_cfg.wine_prefix.display()))?;
 
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, !config.steam_launch_config.no_browser);
 
     cmd.arg("taskmgr.exe");
     cmd.env("WINEPREFIX", &steam_cfg.wine_prefix);
@@ -487,8 +496,8 @@ pub async fn backup_master_steam() -> Result<()> {
     tracing::info!("Backing up Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 
     // 1. Kill all processes
-    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix, false);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, true);
 
     // 2. Manage backups
     let parent = steam_cfg.root_dir.parent().context("master steam root has no parent")?;
@@ -553,8 +562,8 @@ pub async fn restore_master_steam() -> Result<()> {
 
     // 1. Kill all processes in current prefix if it exists
     if steam_cfg.wine_prefix.exists() {
-        crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
-        crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+        crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix, false);
+        crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, true);
     }
 
     // 2. Move current aside if it exists
@@ -576,8 +585,9 @@ pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
     let steam_cfg = crate::utils::get_master_steam_config();
     tracing::info!("Repairing Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 
-    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix);
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix);
+    let kill_webhelper = config.steam_launch_config.no_browser;
+    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix, kill_webhelper);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, !kill_webhelper);
 
     // A damaged client (e.g. a half-applied in-place self-update that fails to
     // rename steamwebhelper.exe under Proton) cannot be fixed by relaunching it --

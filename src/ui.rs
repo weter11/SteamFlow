@@ -1431,7 +1431,7 @@ impl SteamLauncher {
                     game_app_id,
                     &self.user_configs,
                 );
-                SteamClient::kill_steam_in_prefix(&prefix);
+                SteamClient::kill_steam_in_prefix(&prefix, true);
                 self.status = "Steam stopped".to_string();
             }
 
@@ -1443,7 +1443,7 @@ impl SteamLauncher {
                     game_app_id,
                     &self.user_configs,
                 );
-                crate::utils::kill_all_wine_in_prefix(&prefix);
+                crate::utils::kill_all_wine_in_prefix(&prefix, false);
                 self.status = "All Wine processes in prefix terminated".to_string();
             }
 
@@ -2735,6 +2735,52 @@ impl eframe::App for SteamLauncher {
                             crate::models::SteamPrefixMode::PerGame,
                             "Per-game — copy/symlink Steam into each compatdata",
                         );
+
+                        ui.add_space(8.0);
+                        ui.label("Steam Client Features (global — applies to Manage / Repair / Reinstall):");
+                        let mut global_cfg_changed = false;
+                        if ui
+                            .checkbox(
+                                &mut self.launcher_config.steam_launch_config.no_browser,
+                                "Disable CEF browser (kills steamwebhelper)",
+                            )
+                            .changed()
+                        {
+                            global_cfg_changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.launcher_config.steam_launch_config.no_friends_ui,
+                                "Disable Friends UI",
+                            )
+                            .changed()
+                        {
+                            global_cfg_changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.launcher_config.steam_launch_config.no_overlay,
+                                "Disable In-Game Overlay",
+                            )
+                            .changed()
+                        {
+                            global_cfg_changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.launcher_config.steam_launch_config.no_chat_ui,
+                                "Disable Chat UI",
+                            )
+                            .changed()
+                        {
+                            global_cfg_changed = true;
+                        }
+                        if global_cfg_changed {
+                            let config_to_save = self.launcher_config.clone();
+                            self.runtime.spawn(async move {
+                                let _ = crate::config::save_launcher_config(&config_to_save).await;
+                            });
+                        }
 
                         ui.add_space(8.0);
                         ui.label("Steam Runtime Runner:");

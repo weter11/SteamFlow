@@ -93,6 +93,13 @@ pub struct LauncherConfig {
     /// update and works either way, but leaving this on is safe for it too.
     #[serde(default = "crate::models::default_true")]
     pub skip_steam_self_update: bool,
+    /// Global Steam-launch feature toggles used by client-management operations
+    /// (Manage / Repair / Reinstall / Backup / Restore). Defaults to
+    /// `all_alive()` — steamwebhelper must survive these operations so the
+    /// client can log in and render its UI. The per-game `SteamLaunchConfig`
+    /// still controls game launches.
+    #[serde(default = "crate::models::default_steam_launch_config_alive")]
+    pub steam_launch_config: crate::models::SteamLaunchConfig,
     #[serde(default)]
     pub preferred_launch_options: HashMap<u32, String>,
     #[serde(default)]
@@ -128,6 +135,7 @@ impl Default for LauncherConfig {
             use_shared_compat_data: false,
             windows_steam_discovery_enabled: true,
             skip_steam_self_update: true,
+            steam_launch_config: crate::models::SteamLaunchConfig::all_alive(),
             preferred_launch_options: HashMap::new(),
             game_configs: HashMap::new(),
         }

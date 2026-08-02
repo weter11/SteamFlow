@@ -2183,7 +2183,7 @@ impl SteamClient {
         Ok(())
     }
 
-    pub fn kill_steam_in_prefix(wineprefix: &Path) {
+    pub fn kill_steam_in_prefix(wineprefix: &Path, kill_webhelper: bool) {
         #[cfg(unix)]
         {
             let prefix_str = wineprefix.to_string_lossy().to_string();
@@ -2204,10 +2204,18 @@ impl SteamClient {
                     Ok(b) => String::from_utf8_lossy(&b).replace('\0', " "),
                     Err(_) => continue,
                 };
-                // Kill Steam client processes in this prefix.
-                if !cmdline.to_lowercase().contains("steam.exe")
-                    && !cmdline.to_lowercase().contains("steamwebhelper.exe")
-                    && !cmdline.to_lowercase().contains("steamservice.exe")
+                // Kill Steam client processes in this prefix. steamwebhelper is only
+                // killed when the user opted into it ("Disable CEF browser"): the
+                // web helper is required for the client's login flow and UI, so
+                // Manage/Repair must leave it alive unless explicitly disabled.
+                let lower = cmdline.to_lowercase();
+                let is_webhelper = lower.contains("steamwebhelper.exe");
+                if is_webhelper && !kill_webhelper {
+                    continue;
+                }
+                if !lower.contains("steam.exe")
+                    && !lower.contains("steamwebhelper.exe")
+                    && !lower.contains("steamservice.exe")
                 {
                     continue;
                 }
@@ -3590,7 +3598,6 @@ impl SteamClient {
 #[cfg(test)]
 mod windows_client_login_tests {
     use super::SteamClient;
-    use std::path::PathBuf;
 
     #[test]
     fn has_session_detects_ssfn_in_prefix() {
