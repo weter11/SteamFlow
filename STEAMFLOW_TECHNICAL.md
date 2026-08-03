@@ -7,7 +7,8 @@ Rust prototype of a Steam launcher that uses `steam-vent` for protocol/auth tran
 - `steam-vent-proto` (`0.5.2`) for protobuf request/response types.
 - `egui` / `eframe` for desktop GUI.
 - `tokio` for async tasks and background downloads.
-- `steam-vdf-parser` for text and binary VDF parsing.
+- `steam-vdf-parser` for Steam text and binary VDF parsing.
+- `keyvalues-serde` for serde-based PICS response models.
 
 ## Authentication flow (steam-vent 0.4.2)
 SteamFlow now follows the full auth sequence used by steam-vent's login pipeline:
