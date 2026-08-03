@@ -1350,7 +1350,33 @@ impl Runner for WineTkgRunner {
             .unwrap_or_else(|| install_dir.clone());
 
         spec.cwd = Some(game_working_dir);
-        spec.args.push(executable.to_string_lossy().to_string());
+
+        let launch_mode = ctx.user_config
+            .as_ref()
+            .map(|c| c.launch_mode)
+            .unwrap_or(ctx.launcher_config.launch_mode);
+        if !matches!(launch_mode, crate::models::LaunchMode::DirectWine) {
+            let steam_exe = crate::utils::get_master_steam_config().steam_exe
+                .ok_or_else(|| LaunchError::new(
+                    LaunchErrorKind::Environment,
+                    "Steam-mediated launch requires an installed Windows Steam client",
+                ))?;
+            spec.program = spec.program.clone();
+            spec.args.clear();
+            spec.args.push(steam_exe.to_string_lossy().to_string());
+            match launch_mode {
+                crate::models::LaunchMode::SteamAppLaunch => {
+                    spec.args.push("-applaunch".to_string());
+                    spec.args.push(ctx.app.app_id.to_string());
+                }
+                crate::models::LaunchMode::SteamProtocol => {
+                    spec.args.push(format!("steam://rungameid/{}", ctx.app.app_id));
+                }
+                crate::models::LaunchMode::DirectWine => unreachable!(),
+            }
+        } else {
+            spec.args.push(executable.to_string_lossy().to_string());
+        }
 
         // Split args from launch_info
         let args = ctx.launch_info.arguments.split_whitespace().map(ToString::to_string);

@@ -1,4 +1,4 @@
-use crate::models::{OwnedGame, RunnerSource, SessionState, SteamPrefixMode, UserConfigStore};
+use crate::models::{LaunchMode, OwnedGame, RunnerSource, SessionState, SteamPrefixMode, UserConfigStore};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -80,6 +80,8 @@ pub struct LauncherConfig {
     pub steam_runtime_runner_source: RunnerSource,
     #[serde(default)]
     pub steam_prefix_mode: SteamPrefixMode,
+    #[serde(default)]
+    pub launch_mode: LaunchMode,
     pub enable_cloud_sync: bool,
     #[serde(default)]
     pub use_shared_compat_data: bool,
@@ -131,6 +133,7 @@ impl Default for LauncherConfig {
             steam_runtime_runner: PathBuf::new(),
             steam_runtime_runner_source: RunnerSource::default(),
             steam_prefix_mode: SteamPrefixMode::default(),
+            launch_mode: LaunchMode::default(),
             enable_cloud_sync: true,
             use_shared_compat_data: false,
             windows_steam_discovery_enabled: true,

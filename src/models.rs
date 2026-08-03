@@ -26,6 +26,14 @@ pub enum SteamRuntimePolicy {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LaunchMode {
+    #[default]
+    DirectWine,
+    SteamAppLaunch,
+    SteamProtocol,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteamLaunchConfig {
     #[serde(default)]
@@ -152,6 +160,8 @@ pub struct UserAppConfig {
     #[serde(default)]
     pub steam_prefix_mode: SteamPrefixMode,
     #[serde(default)]
+    pub launch_mode: LaunchMode,
+    #[serde(default)]
     pub steam_launch_config: SteamLaunchConfig,
     #[serde(default)]
     pub graphics_layers: GraphicsLayerConfig,
@@ -186,6 +196,7 @@ impl Default for UserAppConfig {
             use_steam_runtime: false,
             steam_runtime_policy: SteamRuntimePolicy::Auto,
             steam_prefix_mode: SteamPrefixMode::Shared,
+            launch_mode: LaunchMode::DirectWine,
             steam_launch_config: SteamLaunchConfig::default(),
             graphics_layers: GraphicsLayerConfig::default(),
             gpu_preference: None,

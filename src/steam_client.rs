@@ -2310,7 +2310,7 @@ impl SteamClient {
         std::fs::create_dir_all(&steamapps_dir).ok();
         let lf_path = steamapps_dir.join("libraryfolders.vdf");
 
-        let existing_raw = std::fs::read_to_string(&lf_path).unwrap_or_default();
+        let mut existing_raw = std::fs::read_to_string(&lf_path).unwrap_or_default();
 
         // 2) Existing registered library paths (Windows-form), so we never add
         //    the same native library twice.
@@ -2352,9 +2352,6 @@ impl SteamClient {
         let mut new_entries: Vec<(String, Vec<(u32, u64)>)> = Vec::new();
         for lib in &native_libs {
             let win_path = format!("Z:\\{}", lib.to_string_lossy().replace('/', "\\"));
-            if existing_win_paths.iter().any(|p| p == &win_path) {
-                continue;
-            }
             let apps_dir = lib.join("steamapps");
             if !apps_dir.exists() {
                 continue;
@@ -2380,17 +2377,27 @@ impl SteamClient {
                 apps.push((appid, size));
             }
             if !apps.is_empty() {
-                new_entries.push((win_path, apps));
+                if existing_win_paths.iter().any(|p| p == &win_path) {
+                    existing_raw = merge_library_apps(&existing_raw, &win_path, &apps);
+                } else {
+                    new_entries.push((win_path, apps));
+                }
             }
         }
 
-        if new_entries.is_empty() {
+        let original_raw = std::fs::read_to_string(&lf_path).unwrap_or_default();
+        if new_entries.is_empty() && existing_raw == original_raw {
             return Ok(0);
         }
 
         // 5) Merge: keep the existing file byte-identical, insert new blocks
         //    before the final closing brace, backup first.
         std::fs::copy(&lf_path, lf_path.with_extension("vdf.bak")).ok();
+        if new_entries.is_empty() {
+            std::fs::write(&lf_path, &existing_raw)
+                .with_context(|| format!("failed writing {}", lf_path.display()))?;
+            return Ok(1);
+        }
         let insert_pos = existing_raw.rfind('}').unwrap_or(existing_raw.len());
         let mut out = existing_raw[..insert_pos].to_string();
         if !out.ends_with('\n') {
@@ -3761,14 +3768,40 @@ fn read_acf_size_on_disk(path: &std::path::Path) -> Option<u64> {
             return extract_vdf_quoted(rest).and_then(|v| v.parse().ok());
         }
     }
-    None
+    // Orphaned manifests can omit SizeOnDisk while retaining per-depot sizes.
+    let mut in_installed_depots = false;
+    let mut in_depot = false;
+    let mut total = 0u64;
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.starts_with("\"InstalledDepots\"") {
+            in_installed_depots = true;
+            continue;
+        }
+        if !in_installed_depots {
+            continue;
+        }
+        if t == "}" {
+            if in_depot { in_depot = false; } else { break; }
+            continue;
+        }
+        let values = extract_quoted_values(t);
+        if values.len() == 1 && values[0].parse::<u64>().is_ok() {
+            in_depot = true;
+        } else if in_depot && values.len() >= 2 && values[0] == "size" {
+            if let Ok(size) = values[1].parse::<u64>() {
+                total = total.saturating_add(size);
+            }
+        }
+    }
+    (total > 0).then_some(total)
 }
 
 /// Renders one `"N"` library-folder block in Steam's exact VDF format
 /// (tabs, quoted keys, `apps` map of appid -> SizeOnDisk).
 fn format_library_entry(idx: u32, win_path: &str, apps: &[(u32, u64)]) -> String {
     let mut s = format!(
-        "\t\"{}\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t\t\"label\"\t\t\"\"\n",
+        "\t\"{}\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t\t\"label\"\t\t\"\"\n",
         idx, win_path
     );
     s.push_str("\t\t\"totalsize\"\t\t\"0\"\n");
@@ -3780,6 +3813,55 @@ fn format_library_entry(idx: u32, win_path: &str, apps: &[(u32, u64)]) -> String
     }
     s.push_str("\t\t}\n\t}\n");
     s
+}
+
+fn merge_library_apps(raw: &str, win_path: &str, apps: &[(u32, u64)]) -> String {
+    let mut lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+    let path_marker = format!("\"{}\"", win_path);
+    let Some(path_line) = lines.iter().position(|line| line.contains(&path_marker)) else {
+        return raw.to_string();
+    };
+    let Some(apps_line) = lines[path_line..]
+        .iter()
+        .position(|line| line.trim() == "\"apps\"")
+        .map(|offset| path_line + offset)
+    else {
+        return raw.to_string();
+    };
+    let Some(open_line) = (apps_line + 1..lines.len())
+        .find(|&idx| lines[idx].trim() == "{")
+        .map(|idx| idx)
+    else {
+        return raw.to_string();
+    };
+    let mut known = std::collections::HashSet::new();
+    for line in &lines[open_line + 1..] {
+        let values = extract_quoted_values(line.trim());
+        if values.len() >= 2 {
+            if let Ok(appid) = values[0].parse::<u32>() {
+                known.insert(appid);
+            }
+        }
+        if line.trim() == "}" {
+            break;
+        }
+    }
+    let Some(close_line) = (open_line + 1..lines.len())
+        .find(|&idx| lines[idx].trim() == "}")
+    else {
+        return raw.to_string();
+    };
+    let additions: Vec<String> = apps.iter()
+        .filter(|(appid, _)| !known.contains(appid))
+        .map(|(appid, size)| format!("\t\t\t\"{}\"\t\t\"{}\"", appid, size))
+        .collect();
+    if additions.is_empty() {
+        return raw.to_string();
+    }
+    lines.splice(close_line..close_line, additions);
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
 }
 
 #[cfg(test)]

@@ -1175,6 +1175,23 @@ impl SteamLauncher {
             ui.add_space(8.0);
             ui.heading("Runtime Settings");
             ui.horizontal(|ui| {
+                ui.label("Launch Mode:");
+                egui::ComboBox::from_id_salt("launch_mode_selector")
+                    .selected_text(format!("{:?}", config.launch_mode))
+                    .show_ui(ui, |ui| {
+                        use crate::models::LaunchMode;
+                        for (mode, label) in [
+                            (LaunchMode::DirectWine, "Direct Wine"),
+                            (LaunchMode::SteamAppLaunch, "Steam App Launch"),
+                            (LaunchMode::SteamProtocol, "Steam Protocol"),
+                        ] {
+                            if ui.selectable_value(&mut config.launch_mode, mode, label).clicked() {
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
                 ui.label("Use Windows Steam Runtime:");
                 egui::ComboBox::from_id_salt("steam_runtime_policy_selector")
                     .selected_text(format!("{:?}", config.steam_runtime_policy))
@@ -1272,7 +1289,7 @@ impl SteamLauncher {
             changed = true;
         }
         if config.requires_steam_api {
-            ui.label("Steam API will be needed — ensure Windows Steam Runtime is enabled in Settings.");
+            ui.label("Steam API will be needed — use Steam App Launch or Steam Protocol.");
         }
 
         // Per-game: DX12 overlay suppression
