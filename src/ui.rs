@@ -1646,13 +1646,14 @@ impl SteamLauncher {
                 self.last_scanned_runner = PathBuf::new();
             }
             if steam_cfg_changed {
+                let kill_webhelper = user_cfg.steam_launch_config.no_browser;
                 self.user_configs.insert(game_app_id, user_cfg);
                 let prefix = crate::utils::steam_wineprefix_for_game(
                     &self.launcher_config,
                     game_app_id,
                     &self.user_configs,
                 );
-                SteamClient::kill_steam_in_prefix(&prefix);
+                SteamClient::kill_steam_in_prefix(&prefix, kill_webhelper);
                 self.status = "Steam feature settings changed; Steam will restart on next launch".to_string();
                 let store = self.user_configs.clone();
                 self.runtime.spawn(async move {
