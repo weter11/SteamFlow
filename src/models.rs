@@ -53,6 +53,24 @@ impl Default for SteamLaunchConfig {
     }
 }
 
+impl SteamLaunchConfig {
+    /// Global default for client-management operations (Manage / Repair /
+    /// Reinstall / Backup / Restore): everything alive — the web helper must
+    /// survive so the client can log in and show its UI.
+    pub fn all_alive() -> Self {
+        Self {
+            no_browser: false,
+            no_friends_ui: false,
+            no_overlay: false,
+            no_chat_ui: false,
+        }
+    }
+}
+
+pub fn default_steam_launch_config_alive() -> SteamLaunchConfig {
+    SteamLaunchConfig::all_alive()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum D3D7BackendPolicy {
     #[default]

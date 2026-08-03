@@ -70,13 +70,25 @@ def main():
     util.winedll_override('amd_ags_x64', 'b')
 ```
 
-`fixups/883710.rhai`:
+`fixups/883710.rhai` — **with a critical caveat for SteamFlow runners**:
 
 ```rhai
 // Resident Evil 2 Biohazard
-override_dll("amd_ags_x64", "builtin");
+// NOTE: amd_ags_x64 override intentionally NOT set. The minimal
+// steamflow-runner-wine11-wow64 does NOT bundle the AGS builtin stub, so
+// `override_dll("amd_ags_x64", "builtin")` makes the game's own working
+// amd_ags_x64.dll unresolvable -> exit 53 (Library ... not found).
+// Game-local DLL priority wins (PR #67 rule). Full Proton builds that
+// bundle the stub don't need the override either.
 disable_nvapi();
 ```
+
+**Why the port differs from upstream:** protonfixes' `util.winedll_override('amd_ags_x64', 'b')`
+assumes a full Proton build ships the `amd_ags_x64.dll` builtin stub. SteamFlow's minimal WoW64
+runner does not. Per the game-local priority principle, the game's own `amd_ags_x64.dll` (RE2
+ships a working 42 KB copy) must win. Porting the override verbatim re-breaks RE2 with exit 53.
+Rule: **only set `=b` for a DLL when the runner actually bundles the builtin** — otherwise leave
+the game's own copy alone.
 
 ### Example B — GTA V / Rockstar Launcher (memory & window fix)
 `protonfixes/gamefixes/271590.py`:

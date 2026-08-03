@@ -182,6 +182,54 @@ fn is_app_manifest(path: &Path) -> bool {
     name.starts_with("appmanifest_") && name.ends_with(".acf")
 }
 
+/// Synchronous variant of [`parse_library_folders`] for call sites that are
+/// not inside an async context (e.g. client-side VDF registration while Steam
+/// is stopped).
+/// Extracts a quoted string token from a VDF line fragment (first `"..."`).
+fn extract_vdf_path_token(line: &str) -> Option<String> {
+    let first = line.find('"')?;
+    let rest = &line[first + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Resilient `libraryfolders.vdf` parser.
+///
+/// Steam rewrites this file on client exit, and a half-written / malformed
+/// entry (e.g. a library index line like `"1` with a missing closing quote)
+/// makes keyvalues-serde hard-fail ("Failed parsing VDF text") — which
+/// previously produced spurious warnings and, worse, silently dropped ALL
+/// extra library folders. This line-scanner extracts every `"path"` value
+/// directly (same approach as the ACF parser) and tolerates malformed lines.
+pub fn parse_library_folders_sync(path: PathBuf) -> Result<Vec<PathBuf>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed reading {}", path.display()))?;
+
+    let mut libraries = Vec::new();
+
+    // `"path"` only ever appears inside a library-folder block, so no block
+    // tracking is needed — scan every line for the key directly. This also
+    // tolerates a malformed block header (`"1` missing its closing quote).
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"path\"") {
+            if let Some(value) = extract_vdf_path_token(rest.trim_start()) {
+                if !value.is_empty() {
+                    libraries.push(PathBuf::from(value));
+                }
+            }
+        }
+    }
+
+    libraries.sort();
+    libraries.dedup();
+    Ok(libraries)
+}
+
 pub async fn parse_library_folders(path: PathBuf) -> Result<Vec<PathBuf>> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -191,21 +239,19 @@ pub async fn parse_library_folders(path: PathBuf) -> Result<Vec<PathBuf>> {
         .await
         .with_context(|| format!("failed reading {}", path.display()))?;
 
-    let parsed = keyvalues_serde::from_str::<LibraryFoldersFile>(&raw)
-        .context("failed to parse libraryfolders.vdf with keyvalues-serde")?;
-
+    // See parse_library_folders_sync: use the resilient line-scanner instead
+    // of keyvalues-serde so a malformed entry (Steam rewrites this file on
+    // exit and can leave a half-written line) never drops every library.
     let mut libraries = Vec::new();
-    for (key, value) in parsed.libraryfolders {
-        if !key.chars().all(|ch| ch.is_ascii_digit()) {
-            continue;
-        }
 
-        match value {
-            LibraryFolderRecord::LegacyPath(p) if !p.is_empty() => libraries.push(PathBuf::from(p)),
-            LibraryFolderRecord::Detailed { path: Some(p), .. } if !p.is_empty() => {
-                libraries.push(PathBuf::from(p))
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"path\"") {
+            if let Some(value) = extract_vdf_path_token(rest.trim_start()) {
+                if !value.is_empty() {
+                    libraries.push(PathBuf::from(value));
+                }
             }
-            _ => {}
         }
     }
 
@@ -389,4 +435,58 @@ pub fn merge_games(owned: Vec<OwnedGame>, installed: Vec<LocalGame>) -> Vec<Game
     let mut games: Vec<GameModel> = merged.into_values().collect();
     games.sort_by(|a, b| a.name.cmp(&b.name));
     games
+}
+
+#[cfg(test)]
+mod library_folders_parser_tests {
+    use super::*;
+
+    fn write_tmp(content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "steamflow_lf_test_{}_{}.vdf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn parses_valid_vdf() {
+        let p = write_tmp(
+            "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"/home/user/.local/share/Steam\"\n\t\t\"label\"\t\t\"\"\n\t\t\"apps\"\n\t\t{\n\t\t}\n\t}\n}\n",
+        );
+        let libs = parse_library_folders_sync(p.clone()).unwrap();
+        assert_eq!(libs, vec![std::path::PathBuf::from("/home/user/.local/share/Steam")]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn tolerates_malformed_library_index() {
+        // Real-world case: Steam rewrites this file on exit and can leave a
+        // library index like `"1` with a missing closing quote. keyvalues-serde
+        // hard-fails on that ("Failed parsing VDF text"); the scanner must not.
+        let p = write_tmp(
+            "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"C:\\Program Files (x86)\\Steam\"\n\t\t\"apps\"\n\t\t{\n\t\t}\n\t}\n\t\"1\n\t{\n\t\t\"path\"\t\t\"Z:\\home\\wer\\.local\\share\\Steam\"\n\t\t\"apps\"\n\t\t{\n\t\t\t\"883710\"\t\t\"0\"\n\t\t}\n\t}\n}\n",
+        );
+        let libs = parse_library_folders_sync(p.clone()).unwrap();
+        assert_eq!(
+            libs,
+            vec![
+                std::path::PathBuf::from("C:\\Program Files (x86)\\Steam"),
+                std::path::PathBuf::from("Z:\\home\\wer\\.local\\share\\Steam"),
+            ]
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn missing_file_returns_empty() {
+        let p = std::env::temp_dir().join("steamflow_lf_nonexistent_does_not_exist.vdf");
+        let libs = parse_library_folders_sync(p).unwrap();
+        assert!(libs.is_empty());
+    }
 }
