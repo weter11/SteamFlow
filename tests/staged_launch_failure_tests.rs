@@ -37,6 +37,7 @@ async fn test_stage_validation_failure_launch_info() {
         update_available: false,
         update_queued: false,
         local_manifest_ids: HashMap::new(),
+        manifest_missing: false,
     });
     // ctx.launch_info is None, so ResolveProfileStage should fail
 
@@ -63,6 +64,7 @@ async fn test_stage_execution_failure_adhoc() {
         update_available: false,
         update_queued: false,
         local_manifest_ids: HashMap::new(),
+        manifest_missing: false,
     });
     ctx.launch_info = Some(steamflow::steam_client::LaunchInfo {
         app_id: 123,

@@ -42,6 +42,7 @@ async fn test_batman_path_resolution() {
         update_available: false,
         update_queued: false,
         local_manifest_ids: HashMap::new(),
+        manifest_missing: false,
     };
 
     let launch_info = LaunchInfo {
