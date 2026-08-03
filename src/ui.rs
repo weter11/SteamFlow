@@ -127,6 +127,7 @@ pub enum AsyncOp {
     WineFileManagerLaunched,
     WineRegeditLaunched,
     WineTaskManagerLaunched,
+    WindowsClientLoginResult(Result<std::path::PathBuf, String>),
     ScanCompleted(u32, HashMap<u32, String>),
     MasterSteamRepaired,
     MasterSteamBackedUp,
@@ -578,6 +579,19 @@ impl SteamLauncher {
                     };
                     self.refresh_library();
                 }
+                AsyncOp::WindowsClientLoginResult(result) => {
+                    match result {
+                        Ok(path) => {
+                            self.status = format!(
+                                "Windows Steam client logged in (sentry file present at {})",
+                                path.display()
+                            );
+                        }
+                        Err(err) => {
+                            self.status = format!("Windows Steam client login failed: {err}");
+                        }
+                    }
+                }
                 AsyncOp::AuthFailed(err) => {
                     if self.client.is_offline() {
                         self.needs_reauth = false;
@@ -876,6 +890,26 @@ impl SteamLauncher {
                     let _ = tx.send(AsyncOp::AuthFailed(err.to_string()));
                 }
             }
+        });
+    }
+
+    fn handle_windows_client_login(&mut self) {
+        if self.auth_username.trim().is_empty() || self.auth_password.is_empty() {
+            self.status = "Enter username and password first".to_string();
+            return;
+        }
+        let runner = self.launcher_config.steam_runtime_runner.clone();
+        let username = self.auth_username.trim().to_string();
+        let password = self.auth_password.clone();
+        let tx = self.operation_tx.clone();
+        self.status = "Logging into Windows Steam client (check for Steam Guard prompt)…".to_string();
+        self.runtime.spawn(async move {
+            let result = crate::steam_client::SteamClient::windows_client_login(
+                &runner, &username, &password,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            let _ = tx.send(AsyncOp::WindowsClientLoginResult(result));
         });
     }
 
@@ -1419,7 +1453,7 @@ impl SteamLauncher {
                     game_app_id,
                     &self.user_configs,
                 );
-                SteamClient::kill_steam_in_prefix(&prefix);
+                SteamClient::kill_steam_in_prefix(&prefix, true);
                 self.status = "Steam stopped".to_string();
             }
 
@@ -1431,7 +1465,7 @@ impl SteamLauncher {
                     game_app_id,
                     &self.user_configs,
                 );
-                crate::utils::kill_all_wine_in_prefix(&prefix);
+                crate::utils::kill_all_wine_in_prefix(&prefix, false);
                 self.status = "All Wine processes in prefix terminated".to_string();
             }
 
@@ -2455,6 +2489,22 @@ impl SteamLauncher {
         if ui.button("Login / Re-authenticate").clicked() {
             self.handle_auth_submit();
         }
+
+        ui.add_space(4.0);
+        let master_prefix = crate::utils::resolve_master_wineprefix();
+        let client_logged_in =
+            crate::steam_client::SteamClient::windows_client_has_session(&master_prefix);
+        if client_logged_in {
+            ui.label("✅ Windows Steam client: logged in (sentry file present)");
+        } else {
+            ui.label("❌ Windows Steam client: not logged in — Steamworks games (e.g. RE2) will exit immediately");
+        }
+        if ui
+            .button("Login Windows Steam client (one-time, creates sentry file)")
+            .clicked()
+        {
+            self.handle_windows_client_login();
+        }
     }
 }
 
@@ -2714,6 +2764,52 @@ impl eframe::App for SteamLauncher {
                             crate::models::SteamPrefixMode::PerGame,
                             "Per-game — copy/symlink Steam into each compatdata",
                         );
+
+                        ui.add_space(8.0);
+                        ui.label("Steam Client Features (global — applies to Manage / Repair / Reinstall):");
+                        let mut global_cfg_changed = false;
+                        if ui
+                            .checkbox(
+                                &mut self.launcher_config.steam_launch_config.no_browser,
+                                "Disable CEF browser (kills steamwebhelper)",
+                            )
+                            .changed()
+                        {
+                            global_cfg_changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.launcher_config.steam_launch_config.no_friends_ui,
+                                "Disable Friends UI",
+                            )
+                            .changed()
+                        {
+                            global_cfg_changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.launcher_config.steam_launch_config.no_overlay,
+                                "Disable In-Game Overlay",
+                            )
+                            .changed()
+                        {
+                            global_cfg_changed = true;
+                        }
+                        if ui
+                            .checkbox(
+                                &mut self.launcher_config.steam_launch_config.no_chat_ui,
+                                "Disable Chat UI",
+                            )
+                            .changed()
+                        {
+                            global_cfg_changed = true;
+                        }
+                        if global_cfg_changed {
+                            let config_to_save = self.launcher_config.clone();
+                            self.runtime.spawn(async move {
+                                let _ = crate::config::save_launcher_config(&config_to_save).await;
+                            });
+                        }
 
                         ui.add_space(8.0);
                         ui.label("Steam Runtime Runner:");

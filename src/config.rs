@@ -11,6 +11,65 @@ pub struct GameConfig {
     pub platform_preference: Option<String>,
 }
 
+/// Dev-only configuration loaded from `~/.config/SteamFlow/debug.json`.
+///
+/// Not exposed in the UI — this is a debugging facility for developers.
+/// The `env` map is applied as the final (highest-priority) overlay onto
+/// every game launch environment, so keys here win over per-game env
+/// variables and built-in debug defaults.
+///
+/// Example file:
+/// ```json
+/// {
+///   "env": {
+///     "VKD3D_DEBUG": "info",
+///     "DXVK_LOG_LEVEL": "info",
+///     "WINEDEBUG": "+mfplat,+wg_transform,+gstreamer",
+///     "GST_DEBUG": "2",
+///     "GST_DEBUG_NO_COLOR": "1"
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DebugConfig {
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+/// Loads `debug.json` from the SteamFlow config dir.
+///
+/// - Missing file -> empty [`DebugConfig`] (no-op).
+/// - Malformed JSON -> logs a warning to stderr and returns empty config;
+///   a broken debug file must never break a game launch.
+pub fn load_debug_config() -> DebugConfig {
+    let Ok(dir) = config_dir() else {
+        return DebugConfig::default();
+    };
+    let path = dir.join("debug.json");
+    if !path.exists() {
+        return DebugConfig::default();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(content) => match serde_json::from_str::<DebugConfig>(&content) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!(
+                    "[debug.json] failed to parse {}: {e}; ignoring debug config",
+                    path.display()
+                );
+                DebugConfig::default()
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "[debug.json] failed to read {}: {e}; ignoring debug config",
+                path.display()
+            );
+            DebugConfig::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
     pub steam_library_path: String,
@@ -34,6 +93,13 @@ pub struct LauncherConfig {
     /// update and works either way, but leaving this on is safe for it too.
     #[serde(default = "crate::models::default_true")]
     pub skip_steam_self_update: bool,
+    /// Global Steam-launch feature toggles used by client-management operations
+    /// (Manage / Repair / Reinstall / Backup / Restore). Defaults to
+    /// `all_alive()` — steamwebhelper must survive these operations so the
+    /// client can log in and render its UI. The per-game `SteamLaunchConfig`
+    /// still controls game launches.
+    #[serde(default = "crate::models::default_steam_launch_config_alive")]
+    pub steam_launch_config: crate::models::SteamLaunchConfig,
     #[serde(default)]
     pub preferred_launch_options: HashMap<u32, String>,
     #[serde(default)]
@@ -69,6 +135,7 @@ impl Default for LauncherConfig {
             use_shared_compat_data: false,
             windows_steam_discovery_enabled: true,
             skip_steam_self_update: true,
+            steam_launch_config: crate::models::SteamLaunchConfig::all_alive(),
             preferred_launch_options: HashMap::new(),
             game_configs: HashMap::new(),
         }

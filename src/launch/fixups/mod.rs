@@ -297,14 +297,16 @@ mod tests {
 
     #[test]
     fn ported_883710_re2_fixup() {
-        // Verify the reference port from protonfixes/gamefixes/883710.py executes
-        // and produces the expected DLL overrides + NVAPI disable.
+        // RE2 fixup must NOT override amd_ags_x64: the minimal steamflow-runner
+        // does not bundle the AGS builtin stub, so =b would make the game's own
+        // amd_ags_x64.dll unresolvable (exit 53). Game-local DLL priority wins
+        // (PR #67). NVAPI disable stays.
         let body = SEED_SCRIPTS.iter().find(|(n, _)| *n == "883710.rhai").unwrap().1;
         let mut p = std::env::temp_dir();
         p.push("steamflow_883710.rhai");
         std::fs::write(&p, body).unwrap();
         let res = run_fixup_script(&p, ctx()).unwrap();
-        assert!(res.extra_dll_overrides.contains(&"amd_ags_x64=b".to_string()), "got {:?}", res.extra_dll_overrides);
+        assert!(!res.extra_dll_overrides.iter().any(|o| o.starts_with("amd_ags_x64")), "amd_ags_x64 must stay game-local, got {:?}", res.extra_dll_overrides);
         assert!(res.extra_dll_overrides.contains(&"nvapi=".to_string()));
         assert!(res.extra_dll_overrides.contains(&"nvapi64=".to_string()));
         assert_eq!(res.extra_env.get("DXVK_ENABLE_NVAPI").map(|s| s.as_str()), Some("0"));
