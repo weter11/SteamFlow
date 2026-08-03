@@ -46,6 +46,28 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
         kill_webhelper,
     );
 
+    // Stage 2: register native Linux Steam library folders in the Windows
+    // client's libraryfolders.vdf. Must happen while the client is STOPPED
+    // (Steam rewrites this file on exit). This makes the client report games
+    // installed by native Steam as installed, so strict Steamworks games
+    // (RE2 etc.) pass the "is it installed?" API gate after login.
+    match crate::steam_client::SteamClient::register_native_libraries_in_windows_client(
+        &steam_cfg.wine_prefix,
+    ) {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                "Registered {n} native Steam library folder(s) in Windows client libraryfolders.vdf"
+            );
+        }
+        Ok(_) => {
+            tracing::debug!("Native library registration: nothing new to register");
+        }
+        Err(e) => {
+            // Non-fatal: a broken VDF must not block install/repair.
+            tracing::warn!("Native library registration skipped: {e}");
+        }
+    }
+
     let setup_exe = runtimes_dir.join("SteamSetup.exe");
     if !setup_exe.exists() {
         download_steam_setup(&setup_exe).await?;

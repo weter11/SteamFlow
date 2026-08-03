@@ -182,6 +182,40 @@ fn is_app_manifest(path: &Path) -> bool {
     name.starts_with("appmanifest_") && name.ends_with(".acf")
 }
 
+/// Synchronous variant of [`parse_library_folders`] for call sites that are
+/// not inside an async context (e.g. client-side VDF registration while Steam
+/// is stopped).
+pub fn parse_library_folders_sync(path: PathBuf) -> Result<Vec<PathBuf>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed reading {}", path.display()))?;
+
+    let parsed = keyvalues_serde::from_str::<LibraryFoldersFile>(&raw)
+        .context("failed to parse libraryfolders.vdf with keyvalues-serde")?;
+
+    let mut libraries = Vec::new();
+    for (key, value) in parsed.libraryfolders {
+        if !key.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+
+        match value {
+            LibraryFolderRecord::LegacyPath(p) if !p.is_empty() => libraries.push(PathBuf::from(p)),
+            LibraryFolderRecord::Detailed { path: Some(p), .. } if !p.is_empty() => {
+                libraries.push(PathBuf::from(p))
+            }
+            _ => {}
+        }
+    }
+
+    libraries.sort();
+    libraries.dedup();
+    Ok(libraries)
+}
+
 pub async fn parse_library_folders(path: PathBuf) -> Result<Vec<PathBuf>> {
     if !path.exists() {
         return Ok(Vec::new());
