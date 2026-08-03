@@ -28,7 +28,7 @@ pub enum SteamRuntimePolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteamLaunchConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub no_browser: bool, // legacy storage: true disables CEF/steamwebhelper
     #[serde(default)]
     pub no_friends_ui: bool, // legacy storage: true disables the friends list
