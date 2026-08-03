@@ -1368,22 +1368,44 @@ impl SteamLauncher {
             ui.label("Only applies when 'Use Steam Runtime' is enabled.");
             ui.add_space(4.0);
 
+            let mut cef_enabled = !slc.no_browser;
+            if ui.checkbox(&mut cef_enabled, "CEF browser (steamwebhelper)").changed() {
+                slc.no_browser = !cef_enabled;
+                steam_cfg_changed = true;
+            }
+
+            if !cef_enabled {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Friends, chat, and overlay require CEF browser (steamwebhelper).",
+                );
+            }
+
+            let mut friends_enabled = !slc.no_friends_ui;
             if ui
-                .checkbox(
-                    &mut slc.no_browser,
-                    "Disable CEF browser (kills steamwebhelper, saves ~2GB RAM)",
+                .add_enabled(cef_enabled, egui::Checkbox::new(&mut friends_enabled, "Friends UI"))
+                .changed()
+            {
+                slc.no_friends_ui = !friends_enabled;
+                steam_cfg_changed = true;
+            }
+            let mut overlay_enabled = !slc.no_overlay;
+            if ui
+                .add_enabled(
+                    cef_enabled,
+                    egui::Checkbox::new(&mut overlay_enabled, "In-Game Overlay"),
                 )
                 .changed()
             {
+                slc.no_overlay = !overlay_enabled;
                 steam_cfg_changed = true;
             }
-            if ui.checkbox(&mut slc.no_friends_ui, "Disable Friends UI").changed() {
-                steam_cfg_changed = true;
-            }
-            if ui.checkbox(&mut slc.no_overlay, "Disable In-Game Overlay").changed() {
-                steam_cfg_changed = true;
-            }
-            if ui.checkbox(&mut slc.no_chat_ui, "Disable Chat UI").changed() {
+            let mut chat_enabled = !slc.no_chat_ui;
+            if ui
+                .add_enabled(cef_enabled, egui::Checkbox::new(&mut chat_enabled, "Chat UI"))
+                .changed()
+            {
+                slc.no_chat_ui = !chat_enabled;
                 steam_cfg_changed = true;
             }
 
@@ -1591,6 +1613,13 @@ impl SteamLauncher {
             }
             if steam_cfg_changed {
                 self.user_configs.insert(game_app_id, user_cfg);
+                let prefix = crate::utils::steam_wineprefix_for_game(
+                    &self.launcher_config,
+                    game_app_id,
+                    &self.user_configs,
+                );
+                SteamClient::kill_steam_in_prefix(&prefix);
+                self.status = "Steam feature settings changed; Steam will restart on next launch".to_string();
                 let store = self.user_configs.clone();
                 self.runtime.spawn(async move {
                     let _ = crate::config::save_user_configs(&store).await;
