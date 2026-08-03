@@ -1,29 +1,10 @@
 use crate::config::{detect_steam_path, load_launcher_config};
 use crate::models::{GameLibrary, GameModel, LibraryGame, LocalGame, OwnedGame};
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use steam_vdf_parser::parse_text;
 use tokio::fs;
-
-#[derive(Debug, Deserialize)]
-struct LibraryFoldersFile {
-    #[serde(default)]
-    libraryfolders: HashMap<String, LibraryFolderRecord>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum LibraryFolderRecord {
-    LegacyPath(String),
-    Detailed {
-        path: Option<String>,
-        #[serde(flatten)]
-        _other: HashMap<String, serde_json::Value>,
-    },
-    Ignore(#[allow(dead_code)] HashMap<String, serde_json::Value>),
-}
-
 
 #[derive(Debug, Clone)]
 pub struct InstalledAppInfo {
@@ -235,23 +216,28 @@ pub async fn parse_library_folders(path: PathBuf) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
 
-    let raw = fs::read_to_string(&path)
+    let raw = fs::read(&path)
         .await
         .with_context(|| format!("failed reading {}", path.display()))?;
 
-    // See parse_library_folders_sync: use the resilient line-scanner instead
-    // of keyvalues-serde so a malformed entry (Steam rewrites this file on
-    // exit and can leave a half-written line) never drops every library.
-    let mut libraries = Vec::new();
+    let raw = std::str::from_utf8(&raw)
+        .context("libraryfolders.vdf is not UTF-8 text VDF")?;
+    let parsed = parse_text(raw).context("failed to parse libraryfolders.vdf")?;
 
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("\"path\"") {
-            if let Some(value) = extract_vdf_path_token(rest.trim_start()) {
-                if !value.is_empty() {
-                    libraries.push(PathBuf::from(value));
-                }
-            }
+    let mut libraries = Vec::new();
+    let Some(libraryfolders) = parsed.get_obj(&[]) else {
+        return Ok(libraries);
+    };
+    for (key, value) in libraryfolders.iter() {
+        if !key.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+
+        let path = value
+            .as_str()
+            .or_else(|| value.get_str(&["path"]));
+        if let Some(path) = path.filter(|path| !path.is_empty()) {
+            libraries.push(PathBuf::from(path));
         }
     }
 
@@ -261,52 +247,22 @@ pub async fn parse_library_folders(path: PathBuf) -> Result<Vec<PathBuf>> {
 }
 
 async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAppInfo)>> {
-    let raw = fs::read_to_string(path)
+    let raw = fs::read(path)
         .await
         .with_context(|| format!("failed reading {}", path.display()))?;
+    let raw = std::str::from_utf8(&raw)
+        .with_context(|| format!("{} is not UTF-8 text VDF", path.display()))?;
+    let parsed = parse_text(raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
 
-    let mut app_id = None;
-    let mut install_dir_name = None;
-    let mut name = None;
-    let mut active_branch = "public".to_string();
-
-    let mut in_user_config = false;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        let parts = extract_quoted_values(trimmed);
-
-        if parts.len() == 1 && parts[0].eq_ignore_ascii_case("userconfig") {
-            in_user_config = true;
-            continue;
-        }
-
-        if trimmed == "{" || trimmed == "}" {
-            if trimmed == "}" && in_user_config {
-                in_user_config = false;
-            }
-            continue;
-        }
-
-        if parts.len() >= 2 {
-            let key = parts[0].to_lowercase();
-            let value = &parts[1];
-
-            if !in_user_config {
-                if key == "appid" {
-                    app_id = value.parse::<u32>().ok();
-                } else if key == "installdir" {
-                    install_dir_name = Some(value.to_string());
-                } else if key == "name" {
-                    name = Some(value.to_string());
-                }
-            } else if key == "betakey" {
-                if !value.trim().is_empty() {
-                    active_branch = value.to_string();
-                }
-            }
-        }
-    }
+    let app_id = parsed.get_str(&["appid"]).and_then(|value| value.parse().ok());
+    let install_dir_name = parsed.get_str(&["installdir"]);
+    let name = parsed.get_str(&["name"]).map(str::to_owned);
+    let active_branch = parsed
+        .get_str(&["UserConfig", "betakey"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("public")
+        .to_owned();
 
     match (app_id, install_dir_name) {
         (Some(id), Some(dir)) => {
@@ -325,26 +281,6 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
         }
         _ => Ok(None),
     }
-}
-
-fn extract_quoted_values(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_quote = false;
-    let mut current = String::new();
-    for ch in line.chars() {
-        if ch == '"' {
-            if in_quote {
-                out.push(current.clone());
-                current.clear();
-            }
-            in_quote = !in_quote;
-            continue;
-        }
-        if in_quote {
-            current.push(ch);
-        }
-    }
-    out
 }
 
 pub fn build_game_library(

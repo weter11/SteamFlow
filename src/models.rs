@@ -28,14 +28,14 @@ pub enum SteamRuntimePolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteamLaunchConfig {
-    #[serde(default = "default_true")]
-    pub no_browser: bool, // kill CEF/steamwebhelper entirely
-    #[serde(default = "default_true")]
-    pub no_friends_ui: bool, // no friends list window
-    #[serde(default = "default_true")]
-    pub no_overlay: bool, // no in-game overlay
-    #[serde(default = "default_true")]
-    pub no_chat_ui: bool, // no chat popups
+    #[serde(default)]
+    pub no_browser: bool, // legacy storage: true disables CEF/steamwebhelper
+    #[serde(default)]
+    pub no_friends_ui: bool, // legacy storage: true disables the friends list
+    #[serde(default)]
+    pub no_overlay: bool, // legacy storage: true disables the in-game overlay
+    #[serde(default)]
+    pub no_chat_ui: bool, // legacy storage: true disables chat popups
 }
 
 pub fn default_true() -> bool {
@@ -45,10 +45,10 @@ pub fn default_true() -> bool {
 impl Default for SteamLaunchConfig {
     fn default() -> Self {
         Self {
-            no_browser: true,
-            no_friends_ui: true,
-            no_overlay: true,
-            no_chat_ui: true,
+            no_browser: false,
+            no_friends_ui: false,
+            no_overlay: false,
+            no_chat_ui: false,
         }
     }
 }

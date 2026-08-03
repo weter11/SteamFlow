@@ -7,7 +7,8 @@ Rust prototype of a Steam launcher that uses `steam-vent` for protocol/auth tran
 - `steam-vent-proto` (`0.5.2`) for protobuf request/response types.
 - `egui` / `eframe` for desktop GUI.
 - `tokio` for async tasks and background downloads.
-- `keyvalues-serde` for VDF parsing.
+- `steam-vdf-parser` for Steam text and binary VDF parsing.
+- `keyvalues-serde` for serde-based PICS response models.
 
 ## Authentication flow (steam-vent 0.4.2)
 SteamFlow now follows the full auth sequence used by steam-vent's login pipeline:
@@ -25,7 +26,8 @@ Guard data is persisted through `FileGuardDataStore::user_cache()` so repeated S
 ## Library
 - `fetch_owned_games()` via `Player.GetOwnedGames` service method.
 - Local install scan from `steamapps/libraryfolders.vdf` and `appmanifest_*.acf`.
-- VDF parsing now uses `keyvalues-serde` models (no line-based fallback parsing).
+- Steam text VDF files (`libraryfolders.vdf` and `appmanifest_*.acf`) use
+  `steam-vdf-parser`; binary PICS VDF payloads use its binary parser.
 - Unified `GameLibrary` with per-game install status.
 - **Steam Cloud Sync**: Automatic sync-down before launch and sync-up after game exit (if enabled in settings).
 
