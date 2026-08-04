@@ -59,7 +59,7 @@ mod tests {
     #[tokio::test]
     async fn test_wine_tkg_runner_graphics_policy_autodetect() {
         use crate::infra::runners::wine_tkg::WineTkgRunner;
-        use crate::models::GraphicsBackendPolicy;
+        use crate::models::{GraphicsBackendPolicy, SteamPrefixMode, SteamRuntimePolicy};
         use crate::config::LauncherConfig;
         use crate::steam_client::{LaunchInfo, LaunchTarget};
         use crate::models::{LibraryGame, UserAppConfig};
@@ -73,7 +73,8 @@ mod tests {
         fs::create_dir_all(&lib).unwrap();
         fs::create_dir_all(&pfx).unwrap();
 
-        // Simulate DXVK existence in runner path
+        // Simulate DXVK existence in runner path (no vkd3d-proton / vkd3d and no
+        // d3d12.dll in the prefix) so component detection is fully hermetic.
         let runner_path = tmp.path().join("proton_8");
         let dxvk_dll = runner_path.join("files/lib/wine/dxvk/d3d11.dll");
         fs::create_dir_all(dxvk_dll.parent().unwrap()).unwrap();
@@ -98,6 +99,13 @@ mod tests {
 
         let mut user_config = UserAppConfig::default();
         user_config.graphics_layers.graphics_backend_policy = GraphicsBackendPolicy::Auto;
+        // Pin the game to its own per-game compatdata prefix under `tmp`. Without this,
+        // steam_wineprefix_for_game() resolves to the real host master prefix, whose
+        // system32 carries vkd3d-proton's d3d12.dll — that would make the Auto policy
+        // flip to vkd3d-proton and add the d3d11=n,b pairing, breaking the test's
+        // hermeticity and asserting against host state.
+        user_config.steam_prefix_mode = SteamPrefixMode::PerGame;
+        user_config.steam_runtime_policy = SteamRuntimePolicy::Enabled;
 
         let ctx = LaunchContext {
             app,
