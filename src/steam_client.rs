@@ -2241,6 +2241,70 @@ impl SteamClient {
         }
     }
 
+    /// Undoes the chmod-000 lock that per-game "Disable CEF browser" enforcement
+    /// places on steamwebhelper.exe. Client-management operations (Manage / Repair /
+    /// Reinstall) require the web helper alive to render the client UI and login flow,
+    /// so the lock must be lifted before those operations start — otherwise Steam
+    /// cannot spawn steamwebhelper.exe at all (CreateFile fails on mode-000 files).
+    ///
+    /// Returns true when steamwebhelper.exe exists in the prefix and is executable
+    /// afterwards (either it already was, or the lock was lifted).
+    pub fn restore_steamwebhelper_in_prefix(wineprefix: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let Some(steam_dir) = crate::utils::find_steam_exe_in_prefix(wineprefix)
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            else {
+                tracing::warn!(
+                    "restore_steamwebhelper: no steam.exe found in {}",
+                    wineprefix.display()
+                );
+                return false;
+            };
+            let helper = steam_dir.join("steamwebhelper.exe");
+            let Ok(metadata) = std::fs::metadata(&helper) else {
+                tracing::info!(
+                    "restore_steamwebhelper: steamwebhelper.exe not present in {}",
+                    steam_dir.display()
+                );
+                return false;
+            };
+            let mode = metadata.permissions().mode();
+            if mode & 0o111 != 0 {
+                tracing::info!(
+                    "restore_steamwebhelper: {} already executable (mode {:03o})",
+                    helper.display(),
+                    mode
+                );
+                return true;
+            }
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o755);
+            match std::fs::set_permissions(&helper, perms) {
+                Ok(()) => {
+                    tracing::info!(
+                        "restore_steamwebhelper: lifted mode-000 lock on {}",
+                        helper.display()
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "restore_steamwebhelper: failed to lift lock on {}: {e}",
+                        helper.display()
+                    );
+                    false
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = wineprefix;
+            false
+        }
+    }
+
     /// Returns true if the Windows Steam client in the given prefix has a
     /// persisted login session.
     ///
@@ -4007,5 +4071,213 @@ mod windows_client_login_tests {
         assert!(after.contains("Program Files (x86)"));
         assert!(after.contains("\\Steam\""));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod steamwebhelper_management_tests {
+    use super::SteamClient;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn fake_prefix(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let tmp = std::env::temp_dir().join(format!("steamflow_{tag}_{}", std::process::id()));
+        let steam_dir = tmp.join("drive_c/Program Files (x86)/Steam");
+        std::fs::create_dir_all(&steam_dir).unwrap();
+        std::fs::write(steam_dir.join("steam.exe"), b"MZ fake").unwrap();
+        (tmp, steam_dir)
+    }
+
+    #[test]
+    fn restore_lifts_mode000_lock_on_webhelper() {
+        let (prefix, steam_dir) = fake_prefix("webhelper_restore");
+        let helper = steam_dir.join("steamwebhelper.exe");
+        std::fs::write(&helper, b"MZ fake webhelper").unwrap();
+        // Simulate the per-game "Disable CEF" enforcement lock (chmod 000).
+        let mut perms = std::fs::metadata(&helper).unwrap().permissions();
+        perms.set_mode(0);
+        std::fs::set_permissions(&helper, perms).unwrap();
+        assert_eq!(std::fs::metadata(&helper).unwrap().permissions().mode() & 0o111, 0);
+
+        assert!(SteamClient::restore_steamwebhelper_in_prefix(&prefix));
+        let mode = std::fs::metadata(&helper).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "steamwebhelper.exe must be executable after restore");
+        assert_eq!(mode & 0o777, 0o755);
+
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn restore_is_noop_when_webhelper_already_executable() {
+        let (prefix, steam_dir) = fake_prefix("webhelper_alive");
+        let helper = steam_dir.join("steamwebhelper.exe");
+        std::fs::write(&helper, b"MZ fake webhelper").unwrap();
+        let mut perms = std::fs::metadata(&helper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&helper, perms).unwrap();
+
+        assert!(SteamClient::restore_steamwebhelper_in_prefix(&prefix));
+        assert_eq!(std::fs::metadata(&helper).unwrap().permissions().mode() & 0o777, 0o755);
+
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn restore_returns_false_when_webhelper_missing() {
+        let (prefix, _) = fake_prefix("webhelper_missing");
+        // steam.exe exists but steamwebhelper.exe does not (client install broken).
+        assert!(!SteamClient::restore_steamwebhelper_in_prefix(&prefix));
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// Spawns a fake steamwebhelper process whose cmdline contains the real
+    /// path .../steamwebhelper.exe (copied /bin/sleep, argv[0] = that path) and
+    /// whose environ carries WINEPREFIX=<prefix>, so the /proc-scanning kill and
+    /// enforcement logic treats it as a real web helper inside the prefix.
+    fn spawn_fake_webhelper(prefix: &Path, steam_dir: &Path) -> std::process::Child {
+        let helper = steam_dir.join("steamwebhelper.exe");
+        // A real executable at that path (not a symlink): enforcement resolves the
+        // file from argv and canonicalizes it, and canonicalize() on a symlink
+        // would resolve away from the prefix, skipping the chmod.
+        if !helper.exists() {
+            std::fs::copy("/bin/sleep", &helper).expect("copy sleep as fake webhelper");
+        }
+        // Retry on ETXTBSY: a previous child may still hold the freshly copied
+        // executable mapped while being reaped. exec fails with "Text file busy"
+        // until the old mapping is gone — transient in parallel test runs.
+        let mut attempt = 0;
+        loop {
+            match std::process::Command::new(&helper)
+                .arg("60")
+                .env("WINEPREFIX", prefix)
+                .spawn()
+            {
+                Ok(child) => return child,
+                Err(e) if attempt < 20 && e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("spawn fake steamwebhelper: {e}"),
+            }
+        }
+    }
+
+    fn process_alive(child: &mut std::process::Child) -> bool {
+        match child.try_wait() {
+            Ok(Some(_)) => false,
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn kill_with_preserve_flag_leaves_webhelper_running() {
+        let (prefix, steam_dir) = fake_prefix("webhelper_kill_preserve");
+        let mut child = spawn_fake_webhelper(&prefix, &steam_dir);
+        // Give /proc time to see the process.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(process_alive(&mut child), "webhelper should be running before kill");
+
+        // kill_webhelper=false (the Manage/Repair/Reinstall force-alive path):
+        // the web helper must survive.
+        SteamClient::kill_steam_in_prefix(&prefix, false);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(process_alive(&mut child), "webhelper must NOT be killed with kill_webhelper=false");
+
+        // kill_webhelper=true (user explicitly disabled CEF): it is killed.
+        SteamClient::kill_steam_in_prefix(&prefix, true);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!process_alive(&mut child), "webhelper must be killed with kill_webhelper=true");
+
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn enforce_reapplies_lock_after_operation() {
+        // After Manage/Repair with a global CEF-off config, enforcement must
+        // re-lock the web helper (chmod 000) so we don't leave it force-enabled.
+        let (prefix, steam_dir) = fake_prefix("webhelper_reenforce");
+        let helper = steam_dir.join("steamwebhelper.exe");
+        let mut child = spawn_fake_webhelper(&prefix, &steam_dir);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        SteamClient::enforce_disabled_steam_features_in_prefix(&prefix, true, false, false, false);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !process_alive(&mut child),
+            "enforcement must terminate the web helper"
+        );
+        assert_eq!(
+            std::fs::metadata(&helper).unwrap().permissions().mode() & 0o111,
+            0,
+            "enforcement must re-lock the executable (mode 000)"
+        );
+
+        // And a subsequent operation restores it — the exact fix cycle.
+        assert!(SteamClient::restore_steamwebhelper_in_prefix(&prefix));
+        let mode = std::fs::metadata(&helper).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0);
+
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// Live demonstration of the full Manage/Repair force-alive cycle with real
+    /// processes and captured log lines:
+    ///   1. per-game enforcement locks steamwebhelper.exe (chmod 000) + kills it
+    ///   2. a client-management op calls restore_steamwebhelper_in_prefix (log line)
+    ///   3. the op's kill_steam_in_prefix(prefix, false) leaves webhelper alive
+    ///   4. post-op enforcement re-applies the user's CEF-off state (log line)
+    #[test]
+    fn management_cycle_logs_and_preserves_webhelper() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let _guard = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_test_writer()
+            .with_span_events(FmtSpan::NONE)
+            .set_default();
+
+        let (prefix, steam_dir) = fake_prefix("webhelper_cycle");
+        let helper = steam_dir.join("steamwebhelper.exe");
+
+        // --- Step 1: per-game "Disable CEF" enforcement locks + kills ---
+        let mut child = spawn_fake_webhelper(&prefix, &steam_dir);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        SteamClient::enforce_disabled_steam_features_in_prefix(&prefix, true, false, false, false);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!process_alive(&mut child), "pre-op state: webhelper killed by per-game enforcement");
+        assert_eq!(
+            std::fs::metadata(&helper).unwrap().permissions().mode() & 0o111,
+            0,
+            "pre-op state: steamwebhelper.exe locked (mode 000)"
+        );
+
+        // --- Step 2: Manage/Repair starts → restore the lock (log line emitted) ---
+        tracing::info!("[demo] Manage/Repair starts with per-game CEF off + global CEF off");
+        assert!(SteamClient::restore_steamwebhelper_in_prefix(&prefix));
+        let mode_after_restore = std::fs::metadata(&helper).unwrap().permissions().mode();
+        assert_ne!(mode_after_restore & 0o111, 0);
+
+        // --- Step 3: the op relaunches the client; webhelper must survive the kill ---
+        let mut child2 = spawn_fake_webhelper(&prefix, &steam_dir);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        SteamClient::kill_steam_in_prefix(&prefix, false);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            process_alive(&mut child2),
+            "during op: webhelper must survive kill_steam_in_prefix(prefix, false)"
+        );
+
+        // --- Step 4: post-op restore of the user's configured state ---
+        tracing::info!("[demo] Manage/Repair completed; restoring user's CEF-off state");
+        SteamClient::enforce_disabled_steam_features_in_prefix(&prefix, true, false, false, false);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!process_alive(&mut child2));
+        assert_eq!(
+            std::fs::metadata(&helper).unwrap().permissions().mode() & 0o111,
+            0,
+            "post-op: webhelper re-locked per user config"
+        );
+
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 }
