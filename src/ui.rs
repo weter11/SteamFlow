@@ -496,7 +496,9 @@ impl SteamLauncher {
         if let Some(rx) = &self.play_result_rx {
             match rx.try_recv() {
                 Ok(message) => {
+                    let mut finished = true;
                     if let Some(value) = message.strip_prefix("__RUNNING__") {
+                        finished = false;
                         if let Some((appid, pid)) = value.split_once(':') {
                             if let (Ok(appid), Ok(pid)) = (appid.parse(), pid.parse()) {
                                 self.game_processes.insert(appid, GameProcessState::Running(pid));
@@ -507,7 +509,9 @@ impl SteamLauncher {
                     } else {
                         self.status = message;
                     }
-                    self.play_result_rx = None;
+                    if finished {
+                        self.play_result_rx = None;
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.status = "Play task disconnected".to_string();
@@ -795,12 +799,12 @@ impl SteamLauncher {
                         self.status = err;
                     }
                 }
-                AsyncOp::GameRunning(appid, pid) => {
-                    self.game_processes.insert(appid, GameProcessState::Running(pid));
-                }
-                AsyncOp::GameIdle(appid) => {
-                    self.game_processes.remove(&appid);
-                }
+            AsyncOp::GameRunning(appid, pid) => {
+                self.game_processes.insert(appid, GameProcessState::Running(pid));
+            }
+            AsyncOp::GameIdle(appid) => {
+                self.game_processes.remove(&appid);
+            }
             }
         }
     }
@@ -948,30 +952,6 @@ impl SteamLauncher {
                 prefer_proton = pref == "windows";
             }
 
-            fn stop_game(&mut self, appid: u32) {
-                let Some(GameProcessState::Running(pid)) = self.game_processes.get(&appid).copied() else {
-                    return;
-                };
-                self.status = format!("Stopping game {appid}…");
-                self.game_processes.insert(appid, GameProcessState::Launching);
-                let tx = self.operation_tx.clone();
-                self.runtime.spawn(async move {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    #[cfg(not(unix))]
-                    let _ = pid;
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    #[cfg(unix)]
-                    unsafe {
-                        if libc::kill(pid as libc::pid_t, 0) == 0 {
-                            libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                        }
-                    }
-                    let _ = tx.send(AsyncOp::GameIdle(appid));
-                });
-            }
         }
 
         let mut client = self.client.clone();
@@ -987,6 +967,31 @@ impl SteamLauncher {
                     let _ = tx.send(AsyncOp::Error(format!("Failed to get launch options: {err}")));
                 }
             }
+        });
+    }
+
+    fn stop_game(&mut self, appid: u32) {
+        let Some(GameProcessState::Running(pid)) = self.game_processes.get(&appid).copied() else {
+            return;
+        };
+        self.status = format!("Stopping game {appid}…");
+        self.game_processes.insert(appid, GameProcessState::Launching);
+        let tx = self.operation_tx.clone();
+        self.runtime.spawn(async move {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            #[cfg(not(unix))]
+            let _ = pid;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            #[cfg(unix)]
+            unsafe {
+                if libc::kill(pid as libc::pid_t, 0) == 0 {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            let _ = tx.send(AsyncOp::GameIdle(appid));
         });
     }
 

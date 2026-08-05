@@ -349,7 +349,7 @@ pub struct DownloadState {
     pub downloaded_bytes: u64,
     pub status_text: String,
     pub abort_signal: Arc<AtomicBool>,
-    pub operation_controller: steam_cdn::cdn::OperationController,
+    pub operation_controller: steam_cdn::OperationController,
 }
 
 impl Default for DownloadState {
@@ -363,7 +363,7 @@ impl Default for DownloadState {
             downloaded_bytes: 0,
             status_text: String::new(),
             abort_signal: Arc::new(AtomicBool::new(false)),
-            operation_controller: steam_cdn::cdn::OperationController::new(),
+            operation_controller: steam_cdn::OperationController::new(),
         }
     }
 }

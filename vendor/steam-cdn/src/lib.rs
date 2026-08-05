@@ -9,5 +9,5 @@ mod error;
 mod utils;
 pub mod web_api;
 
-pub use cdn::CDNClient;
+pub use cdn::{CDNClient, OperationController};
 pub use error::Error;

@@ -909,7 +909,7 @@ impl SteamClient {
                     .read()
                     .ok()
                     .map(|s| s.abort_signal.clone());
-                    let operation_controller = shared_state_clone
+                let operation_controller = shared_state_clone
                     .read()
                     .ok()
                     .map(|s| s.operation_controller.clone());
@@ -1855,6 +1855,10 @@ impl SteamClient {
                         .read()
                         .ok()
                         .map(|s| s.abort_signal.clone());
+                    let operation_controller = shared_state_clone
+                        .read()
+                        .ok()
+                        .map(|s| s.operation_controller.clone());
 
                     match cdn_client
                         .download_depot(
@@ -1866,6 +1870,7 @@ impl SteamClient {
                             manifest_code,
                             verify_mode,
                             abort_signal,
+                            operation_controller,
                             Some(on_progress),
                             Some(on_manifest),
                         )
