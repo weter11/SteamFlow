@@ -3370,17 +3370,29 @@ impl eframe::App for SteamLauncher {
                                         progress.total_bytes as f32
                                     };
                                     let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
+                                    // Human-readable sizes + percentage. total == 0
+                                    // (e.g. before the manifest resolves) -> 0%, no
+                                    // divide-by-zero.
+                                    let pct = if progress.total_bytes == 0 {
+                                        0.0
+                                    } else {
+                                        (progress.bytes_downloaded as f64 * 100.0
+                                            / progress.total_bytes as f64)
+                                            .clamp(0.0, 100.0)
+                                    };
+                                    let cur_str = Self::format_bytes(progress.bytes_downloaded);
+                                    let tot_str = Self::format_bytes(progress.total_bytes);
 
                                     ui.horizontal(|ui| {
                                         ui.add(
                                             egui::ProgressBar::new(fraction)
                                                 .show_percentage()
                                                 .text(format!(
-                                                    "Live operation: {:?} - {} ({} / {} bytes)",
-                                                    progress.state,
+                                                    "{}: {} / {} ({:.0}%)",
                                                     progress.current_file,
-                                                    progress.bytes_downloaded,
-                                                    progress.total_bytes
+                                                    cur_str,
+                                                    tot_str,
+                                                    pct
                                                 )),
                                         );
 
