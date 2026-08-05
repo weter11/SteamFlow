@@ -168,8 +168,6 @@ impl ManifestFile {
                 let verify_mode = verify_mode;
                 let abort_signal = abort_signal.clone();
                 let target_path = target_path.to_path_buf();
-                let file_exists_before = file_exists_before;
-                let current_len_before = current_len_before;
                 let on_progress = on_progress.clone();
                 async move {
                     // Cancellation check
@@ -181,47 +179,45 @@ impl ManifestFile {
 
                     let permit = semaphore_owned.acquire_owned().await?;
 
-                    // Task 1: Partial Resume / Smart Skip
-                    if !verify_mode && file_exists_before {
-                        if current_len_before >= (chunk_data.offset + chunk_data.original_size as u64) {
-                            if let Some(ref cb) = on_progress {
-                                cb(chunk_data.original_size as u64);
-                            }
-                            drop(permit);
-                            return Ok((chunk_data.offset, None));
-                        }
-                    }
-
                     let metadata = tokio::fs::metadata(&target_path).await;
                     let file_exists = metadata.is_ok();
                     let current_len = metadata.map(|m| m.len()).unwrap_or(0);
 
-                    // Task 1: Deep Check
-                    if verify_mode && file_exists {
+                    // Deep Check (runs in BOTH verify and install/resume mode):
+                    // a chunk whose byte range is already present on disk is
+                    // accepted ONLY if its content hashes to the manifest SHA.
+                    // Length alone is never trusted — a same-size corrupt file
+                    // (e.g. a zeroed region from a failed write) would otherwise
+                    // be silently skipped during install/update/repair and never
+                    // repaired. Verified chunks are skipped (no HTTP fetch);
+                    // corrupt or missing chunks fall through to the CDN fetch.
+                    if file_exists && current_len >= chunk_data.offset + chunk_data.original_size as u64 {
                         let mut file = tokio::fs::File::open(&target_path)
                             .await
                             .map_err(|e| Error::Unexpected(e.to_string()))?;
-                        if current_len >= chunk_data.offset + chunk_data.original_size as u64 {
-                            file.seek(tokio::io::SeekFrom::Start(chunk_data.offset))
-                                .await
-                                .map_err(|e| Error::Unexpected(e.to_string()))?;
+                        file.seek(tokio::io::SeekFrom::Start(chunk_data.offset))
+                            .await
+                            .map_err(|e| Error::Unexpected(e.to_string()))?;
 
-                            let mut buffer = vec![0u8; chunk_data.original_size as usize];
-                            if file.read_exact(&mut buffer).await.is_ok() {
-                                let mut hasher = sha1::Sha1::new();
-                                hasher.update(&buffer);
-                                let hash = hasher.finalize().to_vec();
+                        let mut buffer = vec![0u8; chunk_data.original_size as usize];
+                        if file.read_exact(&mut buffer).await.is_ok() {
+                            let mut hasher = sha1::Sha1::new();
+                            hasher.update(&buffer);
+                            let hash = hasher.finalize().to_vec();
 
-                                if hash == chunk_data.sha {
-                                    tracing::info!("Verified chunk {}", chunk_data.id());
-                                    if let Some(ref cb) = on_progress {
-                                        cb(chunk_data.original_size as u64);
-                                    }
-                                    drop(permit);
-                                    return Ok((chunk_data.offset, None));
-                                } else {
-                                    tracing::warn!("Corruption detected in chunk {}", chunk_data.id());
+                            if hash == chunk_data.sha {
+                                tracing::info!("Verified chunk {}", chunk_data.id());
+                                if let Some(ref cb) = on_progress {
+                                    cb(chunk_data.original_size as u64);
                                 }
+                                drop(permit);
+                                return Ok((chunk_data.offset, None));
+                            } else {
+                                tracing::warn!(
+                                    "Corruption detected in chunk {} (verify_mode={})",
+                                    chunk_data.id(),
+                                    verify_mode
+                                );
                             }
                         }
                     }
