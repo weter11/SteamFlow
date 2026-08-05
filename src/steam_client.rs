@@ -889,9 +889,12 @@ impl SteamClient {
                     );
 
                 let state_for_closure = shared_state_clone.clone();
-                let on_progress = Arc::new(move |bytes: u64| {
+                let on_progress = Arc::new(move |completed: u64, total: u64| {
                     if let Ok(mut state) = state_for_closure.write() {
-                        state.downloaded_bytes += bytes;
+                        // completed/total are depot-wide aggregates (all files),
+                        // so store them directly — no per-chunk += accumulation.
+                        state.downloaded_bytes = completed;
+                        state.total_bytes = total;
                     }
                 });
 
@@ -1832,15 +1835,15 @@ impl SteamClient {
 
                     let tx_clone = tx.clone();
                     let selection_depot_id = selection.depot_id;
-                    let on_progress = Arc::new(move |bytes: u64| {
+                    let on_progress = Arc::new(move |completed: u64, total: u64| {
                         let _ = tx_clone.try_send(DownloadProgress {
                             state: if verify_mode {
                                 DownloadProgressState::Verifying
                             } else {
                                 DownloadProgressState::Downloading
                             },
-                            bytes_downloaded: bytes,
-                            total_bytes: 0, // We don't have total file size here easily
+                            bytes_downloaded: completed,
+                            total_bytes: total,
                             current_file: format!("Depot {}", selection_depot_id),
                         });
                     });

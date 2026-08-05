@@ -1207,6 +1207,115 @@ impl SteamLauncher {
         let mut changed = false;
 
         ui.vertical(|ui| {
+            // Maintenance + live operation controls on top so Verify/Repair is
+            // reachable from the game's Properties and the Pause/Cancel buttons
+            // are visible during any download/verify/repair operation.
+            ui.heading("Maintenance");
+            ui.horizontal(|ui| {
+                if ui.button("Verify Integrity").clicked() {
+                    let app_id = game.app_id;
+                    let client = self.client.clone();
+                    let tx = self.operation_tx.clone();
+                    let download_state = self.download_state.clone();
+                    self.runtime.spawn(async move {
+                        match client.verify_game(app_id, download_state).await {
+                            Ok(rx) => {
+                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
+                            }
+                            Err(err) => {
+                                let _ = tx.send(AsyncOp::Error(format!(
+                                    "Failed to verify {app_id}: {err}"
+                                )));
+                            }
+                        }
+                    });
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Uninstall").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(200, 45, 45)),
+                    )
+                    .clicked()
+                {
+                    self.open_uninstall_modal(game);
+                }
+            });
+
+            // Live operation progress bar + Pause/Cancel — shown whenever a
+            // download/verify is active for THIS game, independent of where the
+            // operation was triggered from.
+            let active_for_this_game = self.active_download_appid == Some(game.app_id);
+            if active_for_this_game {
+                if let Some(progress) = self.live_download_progress.clone() {
+                    let denom = if progress.total_bytes == 0 {
+                        1.0
+                    } else {
+                        progress.total_bytes as f32
+                    };
+                    let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
+                    let pct = if progress.total_bytes == 0 {
+                        0.0
+                    } else {
+                        (progress.bytes_downloaded as f64 * 100.0
+                            / progress.total_bytes as f64)
+                            .clamp(0.0, 100.0)
+                    };
+                    let cur_str = Self::format_bytes(progress.bytes_downloaded);
+                    let tot_str = Self::format_bytes(progress.total_bytes);
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .show_percentage()
+                                .text(format!(
+                                    "{}: {} / {} ({:.0}%)",
+                                    progress.current_file,
+                                    cur_str,
+                                    tot_str,
+                                    pct
+                                )),
+                        );
+                    });
+                }
+
+                let (is_downloading, is_paused, controller) = {
+                    let state = self.download_state.read().unwrap();
+                    (state.is_downloading, state.is_paused, state.operation_controller.clone())
+                };
+                if is_downloading || is_paused {
+                    ui.horizontal(|ui| {
+                        if ui.button(if is_paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
+                            if let Ok(mut state) = self.download_state.write() {
+                                state.is_paused = !is_paused;
+                                if is_paused {
+                                    state.operation_controller.resume();
+                                } else {
+                                    state.operation_controller.pause();
+                                }
+                            }
+                        }
+                        if ui.button("✖ Cancel").clicked() {
+                            controller.cancel();
+                            if let Ok(mut state) = self.download_state.write() {
+                                state.is_downloading = false;
+                                state.is_paused = false;
+                                state.abort_signal.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                            self.live_download_progress = None;
+                            self.download_receiver = None;
+                            self.active_download_appid = None;
+                            self.status = "Operation cancelled".to_string();
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+            }
+
+            ui.add_space(4.0);
             ui.heading("Launch Options");
             if ui.add(egui::TextEdit::singleline(&mut config.launch_options).desired_width(f32::INFINITY)).changed() {
                 changed = true;
@@ -1775,39 +1884,6 @@ impl SteamLauncher {
             }
 
             ui.add_space(16.0);
-            ui.heading("Maintenance");
-            ui.horizontal(|ui| {
-                if ui.button("Verify Integrity").clicked() {
-                    let app_id = game.app_id;
-                    let client = self.client.clone();
-                    let tx = self.operation_tx.clone();
-                    let download_state = self.download_state.clone();
-                    self.runtime.spawn(async move {
-                        match client.verify_game(app_id, download_state).await {
-                            Ok(rx) => {
-                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
-                            }
-                            Err(err) => {
-                                let _ = tx.send(AsyncOp::Error(format!(
-                                    "Failed to verify {app_id}: {err}"
-                                )));
-                            }
-                        }
-                    });
-                }
-
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("Uninstall").color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::from_rgb(200, 45, 45)),
-                    )
-                    .clicked()
-                {
-                    self.open_uninstall_modal(game);
-                }
-            });
         });
     }
 
@@ -3437,17 +3513,29 @@ impl eframe::App for SteamLauncher {
                                         progress.total_bytes as f32
                                     };
                                     let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
+                                    // Human-readable sizes + percentage. total == 0
+                                    // (e.g. before the manifest resolves) -> 0%, no
+                                    // divide-by-zero.
+                                    let pct = if progress.total_bytes == 0 {
+                                        0.0
+                                    } else {
+                                        (progress.bytes_downloaded as f64 * 100.0
+                                            / progress.total_bytes as f64)
+                                            .clamp(0.0, 100.0)
+                                    };
+                                    let cur_str = Self::format_bytes(progress.bytes_downloaded);
+                                    let tot_str = Self::format_bytes(progress.total_bytes);
 
                                     ui.horizontal(|ui| {
                                         ui.add(
                                             egui::ProgressBar::new(fraction)
                                                 .show_percentage()
                                                 .text(format!(
-                                                    "Live operation: {:?} - {} ({} / {} bytes)",
-                                                    progress.state,
+                                                    "{}: {} / {} ({:.0}%)",
                                                     progress.current_file,
-                                                    progress.bytes_downloaded,
-                                                    progress.total_bytes
+                                                    cur_str,
+                                                    tot_str,
+                                                    pct
                                                 )),
                                         );
 
