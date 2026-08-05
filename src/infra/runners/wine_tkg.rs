@@ -1350,31 +1350,88 @@ impl Runner for WineTkgRunner {
             .unwrap_or_else(|| install_dir.clone());
 
         spec.cwd = Some(game_working_dir);
-        spec.args.push(executable.to_string_lossy().to_string());
 
-        // Split args from launch_info
-        let args = ctx.launch_info.arguments.split_whitespace().map(ToString::to_string);
-        spec.args.extend(args);
+        let launch_mode = ctx.user_config
+            .as_ref()
+            .map(|c| c.launch_mode)
+            .unwrap_or(ctx.launcher_config.launch_mode);
 
-        // Rhai fixup launch args (protonfixes append_argument equivalent) — applied
-        // BEFORE user Launch Options so the user's custom args take final precedence.
+        // Collect the arguments that must be forwarded to the game. These come from
+        // three sources, applied in precedence order: the manifest launch_info, any
+        // Rhai fixup `append_argument` results (before user options so the user's
+        // explicit Launch Options take final precedence), and the user's Launch
+        // Options (minus the mangohud shims, which are handled as a wrapper).
+        let mut forwarded_args: Vec<String> = Vec::new();
+        forwarded_args.extend(
+            ctx.launch_info.arguments
+                .split_whitespace()
+                .map(ToString::to_string),
+        );
         if let Some(fixup) = &ctx.fixup_result {
             for arg in &fixup.extra_launch_args {
                 if !arg.trim().is_empty() {
-                    spec.args.push(arg.trim().to_string());
+                    forwarded_args.push(arg.trim().to_string());
                 }
             }
         }
+        forwarded_args.extend(
+            ctx.user_config.as_ref()
+                .map(|c| c.launch_options.split_whitespace().map(ToString::to_string).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| a != "-mangohud" && a != "--mangohud"),
+        );
 
-        // Split user launch args
-        let user_launch_args = ctx.user_config.as_ref()
-            .map(|c| c.launch_options.split_whitespace().map(ToString::to_string).collect::<Vec<_>>())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|a| a != "-mangohud" && a != "--mangohud");
-        spec.args.extend(user_launch_args);
+        let steam_mediated = !matches!(launch_mode, crate::models::LaunchMode::DirectWine);
+        let mut steam_mode_args: Option<Vec<String>> = None;
+        if steam_mediated {
+            let steam_exe = crate::utils::get_master_steam_config().steam_exe
+                .ok_or_else(|| LaunchError::new(
+                    LaunchErrorKind::Environment,
+                    "Steam-mediated launch requires an installed Windows Steam client",
+                ))?;
+            let mut args = vec![steam_exe.to_string_lossy().to_string()];
+            match launch_mode {
+                crate::models::LaunchMode::SteamAppLaunch => {
+                    // `-applaunch <id>` forwards every trailing argument to the game,
+                    // so the forwarded args may be appended after the app id.
+                    args.push("-applaunch".to_string());
+                    args.push(ctx.app.app_id.to_string());
+                    args.extend(forwarded_args.iter().cloned());
+                }
+                crate::models::LaunchMode::SteamProtocol => {
+                    // `steam://rungameid/<id>` ignores trailing argv. To forward launch
+                    // options the args must be embedded in the URI as `//<args>` with
+                    // spaces percent-encoded (%20) — Steam parses them as launch options.
+                    let mut uri = format!("steam://rungameid/{}", ctx.app.app_id);
+                    if !forwarded_args.is_empty() {
+                        uri.push_str("//");
+                        uri.push_str(&forwarded_args.join("%20"));
+                    }
+                    args.push(uri);
+                }
+                crate::models::LaunchMode::DirectWine => unreachable!(),
+            }
+            steam_mode_args = Some(args);
+        }
+
+        if let Some(args) = steam_mode_args {
+            spec.args = args;
+        } else {
+            spec.args.push(executable.to_string_lossy().to_string());
+            spec.args.extend(forwarded_args.iter().cloned());
+        }
 
         spec.env = self.build_env(ctx).await?;
+
+        // Steam-mediated launches invoke steam.exe, which lives in the master prefix.
+        // build_env() sets WINEPREFIX to the game's effective prefix — for per-game
+        // compatdata that is the game's own prefix, where steam.exe does not exist.
+        // Force the master prefix so steam.exe runs under the right environment.
+        if steam_mediated {
+            let master_prefix = crate::utils::get_master_steam_config().wine_prefix;
+            spec.env.insert("WINEPREFIX".to_string(), master_prefix.to_string_lossy().to_string());
+        }
 
         Ok(spec)
     }

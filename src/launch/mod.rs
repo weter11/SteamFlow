@@ -36,14 +36,17 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
     // "steam already running, close it and continue installation" and blocks the install.
     // Killing first ensures a clean bootstrap.
     //
-    // steamwebhelper is preserved unless the user explicitly disabled CEF ("Disable
-    // CEF browser" in Settings): the web helper is required for the client's login
-    // flow and UI, so Manage/Repair must leave it alive. kill_steam_in_prefix only
-    // targets steam.exe / steamservice / (optionally) steamwebhelper.
-    let kill_webhelper = config.steam_launch_config.no_browser;
+    // steamwebhelper is FORCED alive during client-management operations regardless of
+    // the user's global or per-game "Disable CEF browser" settings: the web helper is
+    // required for the client's login flow and UI, so Manage/Repair/Reinstall must
+    // leave it running. First lift any chmod-000 lock left by per-game CEF enforcement
+    // (in Shared prefix mode that enforcement targets this very prefix), then never
+    // kill the web helper during the op. The user's configured state is re-applied
+    // after the operation finishes (see the restore block at the end of this function).
+    crate::steam_client::SteamClient::restore_steamwebhelper_in_prefix(&steam_cfg.wine_prefix);
     crate::steam_client::SteamClient::kill_steam_in_prefix(
         &steam_cfg.wine_prefix,
-        kill_webhelper,
+        false,
     );
 
     // Stage 2: register native Linux Steam library folders in the Windows
@@ -210,6 +213,35 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
         }
     } else {
         let _child = cmd.spawn().context("Failed to spawn master steam process")?;
+    }
+
+    // Restore steamwebhelper to the state the user's settings actually specify.
+    // During the operation above it was force-enabled (the op's client relaunch
+    // spawns it, and we never killed it). If the user's GLOBAL config disables
+    // CEF, re-apply the enforcement after a short boot window so we do not leave
+    // the web helper force-enabled once the operation is done. The per-game
+    // setting is re-applied automatically on that game's next launch (its own
+    // enforcement task), so only the global default needs handling here.
+    let restore_slc = config.steam_launch_config.clone();
+    if restore_slc.no_browser
+        || restore_slc.no_friends_ui
+        || restore_slc.no_overlay
+        || restore_slc.no_chat_ui
+    {
+        let restore_prefix = steam_cfg.wine_prefix.clone();
+        tokio::spawn(async move {
+            // Match the per-game path's 30s boot window: the CEF subsystem spawns
+            // children while it boots, so acting immediately would race Steam's
+            // crash-recovery and cause respawn loops.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            crate::steam_client::SteamClient::enforce_disabled_steam_features_in_prefix(
+                &restore_prefix,
+                restore_slc.no_browser,
+                restore_slc.no_friends_ui,
+                restore_slc.no_overlay,
+                restore_slc.no_chat_ui,
+            );
+        });
     }
 
     Ok(())
@@ -607,9 +639,13 @@ pub async fn repair_master_steam(config: &LauncherConfig) -> Result<()> {
     let steam_cfg = crate::utils::get_master_steam_config();
     tracing::info!("Repairing Windows Steam Runtime in {}", steam_cfg.wine_prefix.display());
 
-    let kill_webhelper = config.steam_launch_config.no_browser;
-    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix, kill_webhelper);
-    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, !kill_webhelper);
+    // Force steamwebhelper alive for the duration of the repair regardless of the
+    // user's global/per-game CEF settings (see install_master_steam for the full
+    // rationale): lift any chmod-000 lock left by per-game enforcement and never
+    // kill the web helper during the operation.
+    crate::steam_client::SteamClient::restore_steamwebhelper_in_prefix(&steam_cfg.wine_prefix);
+    crate::steam_client::SteamClient::kill_steam_in_prefix(&steam_cfg.wine_prefix, false);
+    crate::utils::kill_all_wine_in_prefix(&steam_cfg.wine_prefix, true);
 
     // A damaged client (e.g. a half-applied in-place self-update that fails to
     // rename steamwebhelper.exe under Proton) cannot be fixed by relaunching it --

@@ -125,7 +125,26 @@ impl ManifestFile {
 
         let metadata_before = tokio::fs::metadata(target_path).await;
         let file_exists_before = metadata_before.is_ok();
-        let current_len_before = metadata_before.map(|m| m.len()).unwrap_or(0);
+        let current_len_before = metadata_before.as_ref().map(|m| m.len()).unwrap_or(0);
+
+        // Steam replaces files regardless of their on-disk permissions. A
+        // read-only target (e.g. chmod 0555 by the game, REFramework, or a
+        // previous tool) makes `write(true)` fail with EACCES. Mirror the
+        // official client: ensure the owner write bit before opening.
+        if file_exists_before {
+            if let Ok(meta) = &metadata_before {
+                let mut perms = meta.permissions();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = perms.mode();
+                    if mode & 0o200 == 0 {
+                        perms.set_mode(mode | 0o200);
+                        let _ = tokio::fs::set_permissions(target_path, perms).await;
+                    }
+                }
+            }
+        }
 
         let mut out = tokio::fs::OpenOptions::new()
             .write(true)

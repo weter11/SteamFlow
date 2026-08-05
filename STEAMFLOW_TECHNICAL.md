@@ -48,6 +48,34 @@ Guard data is persisted through `FileGuardDataStore::user_cache()` so repeated S
 - Product metadata lookup through PICS is integrated into `SteamClient::get_product_info`.
 - Linux-first launch target selection, then Windows fallback (Proton path required).
 
+## Configuration & migration notes
+
+### `SteamLaunchConfig` defaults (breaking change, PR #72)
+`no_browser` / `no_friends_ui` / `no_overlay` / `no_chat_ui` previously
+defaulted to `true` (`default_true`); they now default to `false` (serde
+default) — i.e. **CEF/steamwebhelper and the friends/overlay/chat features are
+ALIVE by default**.
+
+- **Why:** client-management operations (Manage / Repair / Reinstall / Backup /
+  Restore) require steamwebhelper alive for the login flow and UI. The global
+  `LauncherConfig.steam_launch_config` now defaults to
+  `SteamLaunchConfig::all_alive()`.
+- **Migration effect:** any existing `config.json` / `user_apps.json` that
+  *omits* these keys silently flips from "all disabled" to "all enabled" on
+  upgrade. Configs that store them explicitly (`"no_browser": true`, ...) are
+  unaffected.
+- **Per-game vs global:** `UserAppConfig.steam_launch_config` (per-game) and
+  `LauncherConfig.steam_launch_config` (global) now both default to alive, but
+  the old per-game default was dead — so per-game configs written before this
+  change that relied on the implicit default will also flip.
+- **To restore the old behavior after upgrading,** set the keys explicitly in
+  the config file (e.g. `"no_browser": true`).
+
+### `force_wined3d` (dead config field)
+`GraphicsLayerConfig.force_wined3d` is persisted but **not consumed anywhere
+in the launch pipeline** (verified PR #72 audit). Changing it has no effect on
+the effective graphics stack; use `graphics_backend_policy` instead.
+
 ## Run
 ```bash
 cargo run

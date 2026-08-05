@@ -32,6 +32,31 @@ impl PipelineStage for PreflightStage {
 
         let mut final_res: std::result::Result<(), LaunchError> = Ok(());
 
+        let launch_mode = ctx.user_config.as_ref()
+            .map(|c| c.launch_mode)
+            .or_else(|| ctx.launcher_config.as_ref().map(|c| c.launch_mode))
+            .unwrap_or_default();
+        if !matches!(launch_mode, crate::models::LaunchMode::DirectWine) {
+            let mut check = PreflightCheck {
+                name: "Windows Steam Session".into(),
+                status: true,
+                details: "OK".into(),
+            };
+            let prefix = crate::utils::get_master_steam_config().wine_prefix;
+            if !crate::steam_client::SteamClient::windows_client_has_session(&prefix) {
+                check.status = false;
+                check.details = format!(
+                    "Windows Steam has no persisted login session in {}",
+                    prefix.display()
+                );
+                final_res = Err(LaunchError::new(
+                    LaunchErrorKind::Environment,
+                    format!("[Preflight] {}", check.details),
+                ).with_context("launch_mode", format!("{:?}", launch_mode)));
+            }
+            checks.push(check);
+        }
+
         // 1. Verify runner binary
         let runner_file = &spec.program;
         let mut check = PreflightCheck { name: "Runner Existence".into(), status: true, details: "OK".into() };

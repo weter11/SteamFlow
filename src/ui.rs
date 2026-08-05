@@ -1175,6 +1175,23 @@ impl SteamLauncher {
             ui.add_space(8.0);
             ui.heading("Runtime Settings");
             ui.horizontal(|ui| {
+                ui.label("Launch Mode:");
+                egui::ComboBox::from_id_salt("launch_mode_selector")
+                    .selected_text(format!("{:?}", config.launch_mode))
+                    .show_ui(ui, |ui| {
+                        use crate::models::LaunchMode;
+                        for (mode, label) in [
+                            (LaunchMode::DirectWine, "Direct Wine"),
+                            (LaunchMode::SteamAppLaunch, "Steam App Launch"),
+                            (LaunchMode::SteamProtocol, "Steam Protocol"),
+                        ] {
+                            if ui.selectable_value(&mut config.launch_mode, mode, label).clicked() {
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
                 ui.label("Use Windows Steam Runtime:");
                 egui::ComboBox::from_id_salt("steam_runtime_policy_selector")
                     .selected_text(format!("{:?}", config.steam_runtime_policy))
@@ -1272,7 +1289,7 @@ impl SteamLauncher {
             changed = true;
         }
         if config.requires_steam_api {
-            ui.label("Steam API will be needed — ensure Windows Steam Runtime is enabled in Settings.");
+            ui.label("Steam API will be needed — use Steam App Launch or Steam Protocol.");
         }
 
         // Per-game: DX12 overlay suppression
@@ -1388,61 +1405,55 @@ impl SteamLauncher {
             }
 
             ui.add_space(16.0);
-            ui.heading("Steam Features");
 
+            // In Steam-mediated launch modes the game is launched through steam.exe
+            // itself, so SteamFlow must not inject client feature flags (steamwebhelper
+            // suppression, etc.) — Steam manages its own browser/session. Hide the
+            // section entirely in that case. Per-game launch mode wins, falling back
+            // to the global default (mirrors the launch pipeline's precedence).
             let game_app_id = game.app_id;
             let mut user_cfg = self
                 .user_configs
                 .get(&game_app_id)
                 .cloned()
                 .unwrap_or_default();
-            let slc = &mut user_cfg.steam_launch_config;
             let mut steam_cfg_changed = false;
-
-            ui.label("Only applies when 'Use Steam Runtime' is enabled.");
-            ui.add_space(4.0);
-
-            let mut cef_enabled = !slc.no_browser;
-            if ui.checkbox(&mut cef_enabled, "CEF browser (steamwebhelper)").changed() {
-                slc.no_browser = !cef_enabled;
-                steam_cfg_changed = true;
-            }
-
-            if !cef_enabled {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Friends, chat, and overlay require CEF browser (steamwebhelper).",
+            let effective_launch_mode = if self.user_configs.contains_key(&game_app_id) {
+                user_cfg.launch_mode
+            } else {
+                self.launcher_config.launch_mode
+            };
+            if !matches!(effective_launch_mode, crate::models::LaunchMode::DirectWine) {
+                ui.heading("Steam Features");
+                ui.label(
+                    egui::RichText::new(
+                        "Steam-mediated launch (via the installed Windows Steam client) — Steam owns its own browser, friends, and overlay. Client feature flags are managed inside Steam.",
+                    ).weak().small(),
                 );
-            }
+            } else {
+                let slc = &mut user_cfg.steam_launch_config;
 
-            let mut friends_enabled = !slc.no_friends_ui;
-            if ui
-                .add_enabled(cef_enabled, egui::Checkbox::new(&mut friends_enabled, "Friends UI"))
-                .changed()
-            {
-                slc.no_friends_ui = !friends_enabled;
-                steam_cfg_changed = true;
-            }
-            let mut overlay_enabled = !slc.no_overlay;
-            if ui
-                .add_enabled(
-                    cef_enabled,
-                    egui::Checkbox::new(&mut overlay_enabled, "In-Game Overlay"),
-                )
-                .changed()
-            {
-                slc.no_overlay = !overlay_enabled;
-                steam_cfg_changed = true;
-            }
-            let mut chat_enabled = !slc.no_chat_ui;
-            if ui
-                .add_enabled(cef_enabled, egui::Checkbox::new(&mut chat_enabled, "Chat UI"))
-                .changed()
-            {
-                slc.no_chat_ui = !chat_enabled;
-                steam_cfg_changed = true;
-            }
+                ui.heading("Steam Features");
+                ui.label("CEF browser (steamwebhelper) powers Friends, Chat, and In-Game Overlay.");
+                ui.add_space(4.0);
 
+                let mut cef_enabled = !slc.no_browser;
+                if ui
+                    .checkbox(&mut cef_enabled, "CEF browser (steamwebhelper)")
+                    .on_hover_text("Unchecking it disables Friends, Chat, and In-Game Overlay.")
+                    .changed()
+                {
+                    slc.no_browser = !cef_enabled;
+                    steam_cfg_changed = true;
+                }
+
+                if !cef_enabled {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Unchecking it disables Friends, Chat, and In-Game Overlay.",
+                    );
+                }
+            }
 
             ui.add_space(8.0);
             ui.heading("Steam Process");
@@ -2754,6 +2765,29 @@ impl eframe::App for SteamLauncher {
                         ui.separator();
                         ui.heading("Steam Runtime");
 
+                        let mut global_cfg_changed = false;
+                        ui.label("Launch Mode (global default — per-game overrides apply):");
+                        egui::ComboBox::from_id_salt("global_launch_mode_selector")
+                            .selected_text(format!("{:?}", self.launcher_config.launch_mode))
+                            .show_ui(ui, |ui| {
+                                use crate::models::LaunchMode;
+                                if ui.selectable_value(&mut self.launcher_config.launch_mode, LaunchMode::DirectWine, "Direct Wine").clicked() {
+                                    global_cfg_changed = true;
+                                }
+                                if ui.selectable_value(&mut self.launcher_config.launch_mode, LaunchMode::SteamAppLaunch, "Steam App Launch").clicked() {
+                                    global_cfg_changed = true;
+                                }
+                                if ui.selectable_value(&mut self.launcher_config.launch_mode, LaunchMode::SteamProtocol, "Steam Protocol").clicked() {
+                                    global_cfg_changed = true;
+                                }
+                            });
+                        ui.label(
+                            egui::RichText::new(
+                                "Direct Wine launches the game binary directly. Steam App Launch / Steam Protocol route the launch through the installed Windows Steam client (required for DRM/steamworks and mods that need Steam).",
+                            ).weak().small(),
+                        );
+
+                        ui.add_space(8.0);
                         ui.label("Prefix Mode:");
                         ui.radio_value(
                             &mut self.launcher_config.steam_prefix_mode,
@@ -2768,39 +2802,13 @@ impl eframe::App for SteamLauncher {
 
                         ui.add_space(8.0);
                         ui.label("Steam Client Features (global — applies to Manage / Repair / Reinstall):");
-                        let mut global_cfg_changed = false;
+                        ui.label("CEF browser (steamwebhelper) powers Friends, Chat, and In-Game Overlay.");
                         if ui
                             .checkbox(
                                 &mut self.launcher_config.steam_launch_config.no_browser,
                                 "Disable CEF browser (kills steamwebhelper)",
                             )
-                            .changed()
-                        {
-                            global_cfg_changed = true;
-                        }
-                        if ui
-                            .checkbox(
-                                &mut self.launcher_config.steam_launch_config.no_friends_ui,
-                                "Disable Friends UI",
-                            )
-                            .changed()
-                        {
-                            global_cfg_changed = true;
-                        }
-                        if ui
-                            .checkbox(
-                                &mut self.launcher_config.steam_launch_config.no_overlay,
-                                "Disable In-Game Overlay",
-                            )
-                            .changed()
-                        {
-                            global_cfg_changed = true;
-                        }
-                        if ui
-                            .checkbox(
-                                &mut self.launcher_config.steam_launch_config.no_chat_ui,
-                                "Disable Chat UI",
-                            )
+                            .on_hover_text("Unchecking it disables Friends, Chat, and In-Game Overlay.")
                             .changed()
                         {
                             global_cfg_changed = true;
