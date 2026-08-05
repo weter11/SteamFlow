@@ -2,7 +2,7 @@ use depot::AppDepots;
 use inner::InnerClient;
 use manifest::DepotManifest;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use steam_vent::{
     proto::{
         steammessages_clientserver_2::{
@@ -19,6 +19,39 @@ pub mod depot;
 pub mod depot_chunk;
 pub mod inner;
 pub mod manifest;
+
+#[derive(Clone, Debug)]
+pub struct OperationController {
+    state: Arc<AtomicU8>,
+}
+
+impl OperationController {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    pub fn pause(&self) {
+        self.state.store(1, Ordering::Release);
+    }
+
+    pub fn resume(&self) {
+        self.state.store(0, Ordering::Release);
+    }
+
+    pub fn cancel(&self) {
+        self.state.store(2, Ordering::Release);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 2
+    }
+}
 
 pub const MANIFEST_VERSION: usize = 5;
 
@@ -130,6 +163,7 @@ impl CDNClient {
         manifest_request_code: Option<u64>,
         verify_mode: bool,
         abort_signal: Option<Arc<AtomicBool>>,
+        operation_controller: Option<OperationController>,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
         on_manifest: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
@@ -169,6 +203,7 @@ impl CDNClient {
                     &full_path,
                     verify_mode,
                     abort_signal.clone(),
+                    operation_controller.clone(),
                     None,
                     on_progress.clone(),
                 )

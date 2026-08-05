@@ -9,7 +9,7 @@ use tokio::{
     sync::Semaphore,
 };
 
-use crate::{cdn::inner::InnerClient, Error};
+use crate::{cdn::{inner::InnerClient, OperationController}, Error};
 
 #[derive(Debug)]
 pub struct ChunkData {
@@ -117,6 +117,7 @@ impl ManifestFile {
         target_path: &std::path::Path,
         verify_mode: bool,
         abort_signal: Option<Arc<AtomicBool>>,
+        operation_controller: Option<OperationController>,
         max_tasks: Option<usize>,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
@@ -167,6 +168,7 @@ impl ManifestFile {
                 let semaphore_owned = semaphore.clone();
                 let verify_mode = verify_mode;
                 let abort_signal = abort_signal.clone();
+                let operation_controller = operation_controller.clone();
                 let target_path = target_path.to_path_buf();
                 let on_progress = on_progress.clone();
                 async move {
@@ -174,6 +176,17 @@ impl ManifestFile {
                     if let Some(signal) = &abort_signal {
                         if signal.load(Ordering::Relaxed) {
                             return Ok((chunk_data.offset, None));
+                        }
+                        if let Some(controller) = &operation_controller {
+                            if controller.is_cancelled() {
+                                return Ok((chunk_data.offset, None));
+                            }
+                            while controller.is_paused() {
+                                if controller.is_cancelled() {
+                                    return Ok((chunk_data.offset, None));
+                                }
+                                tokio::task::yield_now().await;
+                            }
                         }
                     }
 
@@ -236,6 +249,20 @@ impl ManifestFile {
             if let Some(signal) = &abort_signal {
                 if signal.load(Ordering::Relaxed) {
                     break;
+                }
+                if let Some(controller) = &operation_controller {
+                    if controller.is_cancelled() {
+                        break;
+                    }
+                    while controller.is_paused() {
+                        if controller.is_cancelled() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    if controller.is_cancelled() {
+                        break;
+                    }
                 }
             }
             let (offset, data) = result?;

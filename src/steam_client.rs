@@ -616,6 +616,13 @@ impl SteamClient {
         let shared_state_clone = shared_state.clone();
 
         tokio::task::spawn(async move {
+            if let Ok(mut state) = shared_state_clone.write() {
+                state.is_downloading = true;
+                state.is_paused = false;
+                state.app_id = appid;
+                state.abort_signal.store(false, std::sync::atomic::Ordering::Release);
+                state.operation_controller.resume();
+            }
             let _ = tx
                 .send(DownloadProgress {
                     state: DownloadProgressState::Queued,
@@ -902,6 +909,10 @@ impl SteamClient {
                     .read()
                     .ok()
                     .map(|s| s.abort_signal.clone());
+                    let operation_controller = shared_state_clone
+                    .read()
+                    .ok()
+                    .map(|s| s.operation_controller.clone());
 
                     match cdn_client
                         .download_depot(
@@ -913,6 +924,7 @@ impl SteamClient {
                             manifest_code,
                             false, // verify_mode: false
                             abort_signal,
+                            operation_controller,
                             Some(on_progress),
                             Some(on_manifest.clone()),
                         )
@@ -1702,6 +1714,8 @@ impl SteamClient {
                 state.app_name = game_name.clone();
                 state.downloaded_bytes = 0;
                 state.status_text = format!("Preparing operation for {}...", game_name);
+                state.abort_signal.store(false, std::sync::atomic::Ordering::Release);
+                state.operation_controller.resume();
             }
 
             let _ = tx
