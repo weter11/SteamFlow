@@ -9,7 +9,7 @@ use crate::steam_client::SteamClient;
 use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -171,6 +171,8 @@ pub struct SteamLauncher {
     download_receiver: Option<tokio::sync::mpsc::Receiver<DownloadProgress>>,
     active_download_appid: Option<u32>,
     live_download_progress: Option<DownloadProgress>,
+    /// (timestamp, depot bytes downloaded) samples for ETA estimation.
+    progress_samples: VecDeque<(std::time::Instant, u64)>,
     pub download_state: Arc<RwLock<DownloadState>>,
     play_result_rx: Option<Receiver<String>>,
     show_settings: bool,
@@ -259,6 +261,7 @@ impl SteamLauncher {
             download_receiver: None,
             active_download_appid: None,
             live_download_progress: None,
+            progress_samples: VecDeque::new(),
             download_state: Arc::new(RwLock::new(DownloadState::default())),
             play_result_rx: None,
             show_settings: false,
@@ -478,9 +481,16 @@ impl SteamLauncher {
                 self.live_download_progress = Some(progress.clone());
                 match progress.state {
                     DownloadProgressState::Queued => {
+                        // New operation: reset the rate estimator.
+                        self.progress_samples.clear();
                         self.status = "Install queued".to_string();
                     }
                     DownloadProgressState::Downloading => {
+                        // Record a (time, bytes) sample for ETA estimation.
+                        Self::record_progress_sample(
+                            &mut self.progress_samples,
+                            progress.bytes_downloaded,
+                        );
                         // Prefer file-level detail (active file + its byte
                         // offsets) over the depot aggregate in status text.
                         let (file_label, cur, tot) = if progress.file_total_bytes > 0 {
@@ -509,6 +519,10 @@ impl SteamLauncher {
                         self.status = format!("Downloading {file_label}: {cur} / {tot} bytes");
                     }
                     DownloadProgressState::Verifying => {
+                        Self::record_progress_sample(
+                            &mut self.progress_samples,
+                            progress.bytes_downloaded,
+                        );
                         let (file_label, cur, tot) = if progress.file_total_bytes > 0 {
                             (
                                 progress.file_path.clone(),
@@ -1384,6 +1398,24 @@ impl SteamLauncher {
                         )
                     };
                     let fraction = (cur as f32 / denom).clamp(0.0, 1.0);
+
+                    // ETA for the active file (falling back to the depot
+                    // aggregate until file-level info arrives).
+                    let eta_suffix = if progress.file_total_bytes > 0 {
+                        self.eta_seconds(
+                            progress
+                                .file_total_bytes
+                                .saturating_sub(progress.file_bytes_downloaded),
+                        )
+                    } else {
+                        self.eta_seconds(
+                            progress.total_bytes.saturating_sub(progress.bytes_downloaded),
+                        )
+                    }
+                    .map(Self::format_eta)
+                    .map(|e| format!(" · {e}"))
+                    .unwrap_or_default();
+                    let label = format!("{label}{eta_suffix}");
 
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
@@ -2537,6 +2569,65 @@ impl SteamLauncher {
             unit_idx += 1;
         }
         format!("{:.2} {}", size, units[unit_idx])
+    }
+
+    /// Record a (timestamp, depot-bytes-downloaded) sample used to estimate the
+    /// download rate for the ETA display. Samples older than ~15s are dropped.
+    /// Takes the sample deque directly (not `&mut self`) so it can be called
+    /// while `download_receiver` is still mutably borrowed in the poll loop.
+    fn record_progress_sample(
+        samples: &mut VecDeque<(std::time::Instant, u64)>,
+        bytes_downloaded: u64,
+    ) {
+        let now = std::time::Instant::now();
+        samples.push_back((now, bytes_downloaded));
+        while samples.len() > 30
+            || (samples.len() > 2
+                && now.duration_since(samples.front().unwrap().0).as_secs() > 15)
+        {
+            samples.pop_front();
+        }
+    }
+
+    /// Estimate the remaining time (seconds) needed to transfer `remaining_bytes`
+    /// based on the recent sample window. Returns None until a reliable rate is
+    /// available (or when the download is stalled).
+    fn eta_seconds(&self, remaining_bytes: u64) -> Option<u64> {
+        if remaining_bytes == 0 {
+            return Some(0);
+        }
+        let now = std::time::Instant::now();
+        let samples: Vec<(std::time::Instant, u64)> = self
+            .progress_samples
+            .iter()
+            .filter(|(t, _)| now.duration_since(*t).as_secs_f64() < 15.0)
+            .copied()
+            .collect();
+        if samples.len() < 2 {
+            return None;
+        }
+        let (t0, b0) = samples[0];
+        let (t1, b1) = *samples.last().unwrap();
+        let dt = t1.duration_since(t0).as_secs_f64();
+        let db = b1.saturating_sub(b0) as f64;
+        if dt <= 0.0 || db <= 0.0 {
+            return None;
+        }
+        let rate = db / dt;
+        if rate <= 0.0 {
+            return None;
+        }
+        Some((remaining_bytes as f64 / rate).ceil() as u64)
+    }
+
+    fn format_eta(secs: u64) -> String {
+        if secs < 60 {
+            format!("ETA {secs}s")
+        } else if secs < 3600 {
+            format!("ETA {}m {:02}s", secs / 60, secs % 60)
+        } else {
+            format!("ETA {}h {:02}m", secs / 3600, (secs % 3600) / 60)
+        }
     }
 
     fn draw_proton_manager(&mut self, ui: &mut egui::Ui) {
@@ -3779,12 +3870,24 @@ impl eframe::App for SteamLauncher {
                                         .collect::<String>()
                                         + if game_name.chars().count() > 40 { "…" } else { "" };
 
+                                    // ETA from the recent-rate window (None until
+                                    // a reliable rate is available).
+                                    let eta_suffix = self
+                                        .eta_seconds(
+                                            progress
+                                                .total_bytes
+                                                .saturating_sub(progress.bytes_downloaded),
+                                        )
+                                        .map(Self::format_eta)
+                                        .map(|e| format!(" · {e}"))
+                                        .unwrap_or_default();
+
                                     ui.horizontal(|ui| {
                                         ui.add(
                                             egui::ProgressBar::new(fraction)
                                                 .show_percentage()
                                                 .text(format!(
-                                                    "{} {game_name_capped} — {} / {} ({:.0}%)",
+                                                    "{} {game_name_capped} — {} / {} ({:.0}%){eta_suffix}",
                                                     progress.current_file,
                                                     cur_str,
                                                     tot_str,
