@@ -111,7 +111,11 @@ enum GameProcessState {
 }
 
 pub enum AsyncOp {
-    DownloadStarted(u32, tokio::sync::mpsc::Receiver<DownloadProgress>),
+    DownloadStarted(
+        u32,
+        tokio::sync::mpsc::Receiver<DownloadProgress>,
+        Arc<RwLock<DownloadState>>,
+    ),
     BranchUpdated(u32, String),
     AccountDataFetched(crate::steam_client::AccountData),
     Uninstalled(u32, String),
@@ -133,6 +137,9 @@ pub enum AsyncOp {
     WineFileManagerLaunched,
     WineRegeditLaunched,
     WineTaskManagerLaunched,
+    /// Result of the Mods-tab native file picker (zenity/kdialog/…).
+    CustomExecPicked(u32, Option<String>),
+    ModLauncherLaunched,
     WindowsClientLoginResult(Result<std::path::PathBuf, String>),
     ScanCompleted(u32, HashMap<u32, String>),
     MasterSteamRepaired,
@@ -148,6 +155,20 @@ pub enum AsyncOp {
     Error(String),
     GameRunning(u32, u32),
     GameIdle(u32),
+}
+
+/// One active background operation (install/update/verify) bound to a single
+/// AppID. Each task owns its own receiver, progress snapshot, ETA samples, and
+/// `DownloadState` (its own abort signal + operation controller) so multiple
+/// concurrent operations never clobber each other.
+struct ActiveDownloadTask {
+    app_id: u32,
+    game_name: String,
+    rx: tokio::sync::mpsc::Receiver<DownloadProgress>,
+    progress: Option<DownloadProgress>,
+    state: Arc<RwLock<DownloadState>>,
+    /// (timestamp, depot bytes downloaded) samples for ETA estimation.
+    samples: VecDeque<(std::time::Instant, u64)>,
 }
 
 pub struct SteamLauncher {
@@ -168,12 +189,9 @@ pub struct SteamLauncher {
     auth_guard_code: String,
     needs_reauth: bool,
     install_log: Vec<String>,
-    download_receiver: Option<tokio::sync::mpsc::Receiver<DownloadProgress>>,
-    active_download_appid: Option<u32>,
-    live_download_progress: Option<DownloadProgress>,
-    /// (timestamp, depot bytes downloaded) samples for ETA estimation.
-    progress_samples: VecDeque<(std::time::Instant, u64)>,
-    pub download_state: Arc<RwLock<DownloadState>>,
+    /// One active background operation per AppID (install/update/verify) —
+    /// progress bars are rendered per task, each bound to its own game title.
+    download_tasks: HashMap<u32, ActiveDownloadTask>,
     play_result_rx: Option<Receiver<String>>,
     show_settings: bool,
     launcher_config: LauncherConfig,
@@ -258,11 +276,7 @@ impl SteamLauncher {
             auth_guard_code: String::new(),
             needs_reauth: !authenticated,
             install_log: Vec::new(),
-            download_receiver: None,
-            active_download_appid: None,
-            live_download_progress: None,
-            progress_samples: VecDeque::new(),
-            download_state: Arc::new(RwLock::new(DownloadState::default())),
+            download_tasks: HashMap::new(),
             play_result_rx: None,
             show_settings: false,
             launcher_config,
@@ -415,21 +429,33 @@ impl SteamLauncher {
                 ];
 
                 for url in candidates {
-                    if let Ok(response) = reqwest::get(&url).await {
-                        if response.status().is_success() {
-                            if let Ok(bytes) = response.bytes().await {
-                                // Only persist a body that is non-empty and
-                                // actually decodes — never write a zero-byte or
-                                // garbage file that would poison the cache and
-                                // block future retries.
-                                if !bytes.is_empty() && image::load_from_memory(&bytes).is_ok() {
-                                    if tokio::fs::write(&target_path, bytes).await.is_ok() {
-                                        let _ = tx.send((
-                                            appid,
-                                            Some(target_path.to_string_lossy().to_string()),
-                                        ));
-                                        return;
-                                    }
+                    // Per-candidate 5s timeout: a stalled CDN (no internet,
+                    // weak signal, hung connection) must never leave the cover
+                    // stuck on "Loading cover art…" indefinitely — the fetch
+                    // resolves to the styled title-card fallback instead, and
+                    // the pending flag clears so it retries on next selection.
+                    let fetch = async { reqwest::get(&url).await };
+                    let timed = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        fetch,
+                    )
+                    .await;
+                    let Ok(Ok(response)) = timed else {
+                        continue;
+                    };
+                    if response.status().is_success() {
+                        if let Ok(bytes) = response.bytes().await {
+                            // Only persist a body that is non-empty and
+                            // actually decodes — never write a zero-byte or
+                            // garbage file that would poison the cache and
+                            // block future retries.
+                            if !bytes.is_empty() && image::load_from_memory(&bytes).is_ok() {
+                                if tokio::fs::write(&target_path, bytes).await.is_ok() {
+                                    let _ = tx.send((
+                                        appid,
+                                        Some(target_path.to_string_lossy().to_string()),
+                                    ));
+                                    return;
                                 }
                             }
                         }
@@ -474,23 +500,23 @@ impl SteamLauncher {
     }
 
     fn poll_download_progress(&mut self) {
-        let mut should_clear_receiver = false;
+        let mut finished: Vec<u32> = Vec::new();
 
-        if let Some(rx) = &mut self.download_receiver {
-            while let Ok(progress) = rx.try_recv() {
-                self.live_download_progress = Some(progress.clone());
+        // Drain every active task's channel independently — each task is
+        // strictly bound to its own AppID + game title.
+        for (appid, task) in self.download_tasks.iter_mut() {
+            while let Ok(progress) = task.rx.try_recv() {
+                task.progress = Some(progress.clone());
+                let game_name = task.game_name.clone();
                 match progress.state {
                     DownloadProgressState::Queued => {
                         // New operation: reset the rate estimator.
-                        self.progress_samples.clear();
-                        self.status = "Install queued".to_string();
+                        task.samples.clear();
+                        self.status = format!("{game_name}: queued");
                     }
                     DownloadProgressState::Downloading => {
                         // Record a (time, bytes) sample for ETA estimation.
-                        Self::record_progress_sample(
-                            &mut self.progress_samples,
-                            progress.bytes_downloaded,
-                        );
+                        Self::record_progress_sample(&mut task.samples, progress.bytes_downloaded);
                         // Prefer file-level detail (active file + its byte
                         // offsets) over the depot aggregate in status text.
                         let (file_label, cur, tot) = if progress.file_total_bytes > 0 {
@@ -508,7 +534,7 @@ impl SteamLauncher {
                         };
                         self.install_log.push(format!(
                             "App {} — downloading {}: {} / {} bytes",
-                            self.active_download_appid.unwrap_or(0),
+                            appid,
                             file_label,
                             cur,
                             tot
@@ -519,10 +545,7 @@ impl SteamLauncher {
                         self.status = format!("Downloading {file_label}: {cur} / {tot} bytes");
                     }
                     DownloadProgressState::Verifying => {
-                        Self::record_progress_sample(
-                            &mut self.progress_samples,
-                            progress.bytes_downloaded,
-                        );
+                        Self::record_progress_sample(&mut task.samples, progress.bytes_downloaded);
                         let (file_label, cur, tot) = if progress.file_total_bytes > 0 {
                             (
                                 progress.file_path.clone(),
@@ -539,36 +562,34 @@ impl SteamLauncher {
                         self.status = format!("Verifying {file_label}: {cur} / {tot} bytes");
                     }
                     DownloadProgressState::Completed => {
-                        self.status = "Install completed".to_string();
-                        if let Ok(mut state) = self.download_state.write() {
+                        self.status = format!("{game_name}: operation complete");
+                        if let Ok(mut state) = task.state.write() {
                             state.is_downloading = false;
                             state.is_paused = false;
                         }
-                        if let Some(appid) = self.active_download_appid {
-                            let tx = self.operation_tx.clone();
-                            self.runtime.spawn(async move {
-                                let installed_paths =
-                                    scan_installed_app_paths().await.unwrap_or_default();
-                                let _ = tx.send(AsyncOp::ScanCompleted(appid, installed_paths));
-                            });
-                        }
-                        should_clear_receiver = true;
+                        let app_id = *appid;
+                        let tx = self.operation_tx.clone();
+                        self.runtime.spawn(async move {
+                            let installed_paths =
+                                scan_installed_app_paths().await.unwrap_or_default();
+                            let _ = tx.send(AsyncOp::ScanCompleted(app_id, installed_paths));
+                        });
+                        finished.push(*appid);
                     }
                     DownloadProgressState::Failed => {
                         self.status = format!("Install failed: {}", progress.current_file);
-                        if let Ok(mut state) = self.download_state.write() {
+                        if let Ok(mut state) = task.state.write() {
                             state.is_downloading = false;
                             state.is_paused = false;
                         }
-                        should_clear_receiver = true;
+                        finished.push(*appid);
                     }
                 }
             }
         }
 
-        if should_clear_receiver {
-            self.download_receiver = None;
-            self.active_download_appid = None;
+        for appid in finished {
+            self.download_tasks.remove(&appid);
         }
     }
 
@@ -606,11 +627,13 @@ impl SteamLauncher {
     fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>, filter_depots: Option<Vec<u64>>) {
         let client = self.client.clone();
         let tx = self.operation_tx.clone();
-        let download_state = self.download_state.clone();
+        // Per-task DownloadState: its own abort signal + operation controller,
+        // so concurrent installs/verifies never cancel each other.
+        let download_state = Arc::new(RwLock::new(DownloadState::default()));
         self.runtime.spawn(async move {
-            match client.install_game(app_id, platform, cached_vdf, filter_depots, download_state).await {
+            match client.install_game(app_id, platform, cached_vdf, filter_depots, download_state.clone()).await {
                 Ok(rx) => {
-                    let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
+                    let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx, download_state));
                 }
                 Err(err) => {
                     let _ = tx.send(AsyncOp::Error(format!(
@@ -624,10 +647,27 @@ impl SteamLauncher {
     fn poll_async_ops(&mut self) {
         while let Ok(op) = self.operation_rx.try_recv() {
             match op {
-                AsyncOp::DownloadStarted(appid, rx) => {
-                    self.download_receiver = Some(rx);
-                    self.active_download_appid = Some(appid);
-                    self.status = format!("Operation started for app {appid}");
+                AsyncOp::DownloadStarted(appid, rx, state) => {
+                    // Register a new per-AppID task. If one already exists for
+                    // this app (e.g. a re-triggered verify), replace it.
+                    let game_name = self
+                        .library
+                        .iter()
+                        .find(|g| g.app_id == appid)
+                        .map(|g| g.name.clone())
+                        .unwrap_or_else(|| format!("App {appid}"));
+                    self.download_tasks.insert(
+                        appid,
+                        ActiveDownloadTask {
+                            app_id: appid,
+                            game_name: game_name.clone(),
+                            rx,
+                            progress: None,
+                            state,
+                            samples: VecDeque::new(),
+                        },
+                    );
+                    self.status = format!("Operation started for {game_name}");
                 }
                 AsyncOp::BranchUpdated(appid, branch) => {
                     if let Some(game) = self.library.iter_mut().find(|g| g.app_id == appid) {
@@ -744,6 +784,27 @@ impl SteamLauncher {
                 }
                 AsyncOp::WineTaskManagerLaunched => {
                     self.status = "Wine Task Manager launched".to_string();
+                }
+                AsyncOp::CustomExecPicked(appid, picked) => {
+                    match picked {
+                        Some(path) => {
+                            let mut cfg =
+                                self.user_configs.get(&appid).cloned().unwrap_or_default();
+                            cfg.custom_exec_path = Some(path.clone());
+                            self.user_configs.insert(appid, cfg);
+                            let store = self.user_configs.clone();
+                            self.runtime.spawn(async move {
+                                let _ = crate::config::save_user_configs(&store).await;
+                            });
+                            self.status = format!("Custom mod executable set: {path}");
+                        }
+                        None => {
+                            self.status = "File picker cancelled".to_string();
+                        }
+                    }
+                }
+                AsyncOp::ModLauncherLaunched => {
+                    self.status = "Custom mod executable launched".to_string();
                 }
                 AsyncOp::ScanCompleted(appid, installed_paths) => {
                     for g in &mut self.library {
@@ -1313,11 +1374,12 @@ impl SteamLauncher {
                     let app_id = game.app_id;
                     let client = self.client.clone();
                     let tx = self.operation_tx.clone();
-                    let download_state = self.download_state.clone();
+                    // Per-task DownloadState (own abort signal + controller).
+                    let download_state = Arc::new(RwLock::new(DownloadState::default()));
                     self.runtime.spawn(async move {
-                        match client.verify_game(app_id, download_state).await {
+                        match client.verify_game(app_id, download_state.clone()).await {
                             Ok(rx) => {
-                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx));
+                                let _ = tx.send(AsyncOp::DownloadStarted(app_id, rx, download_state));
                             }
                             Err(err) => {
                                 let _ = tx.send(AsyncOp::Error(format!(
@@ -1343,10 +1405,14 @@ impl SteamLauncher {
 
             // Live operation progress bar + Pause/Cancel — shown whenever a
             // download/verify is active for THIS game, independent of where the
-            // operation was triggered from.
-            let active_for_this_game = self.active_download_appid == Some(game.app_id);
-            if active_for_this_game {
-                if let Some(progress) = self.live_download_progress.clone() {
+            // operation was triggered from. Each task is bound to its own AppID
+            // and game title (no cross-talk between concurrent operations).
+            let mut cancel_this_task = false;
+            if let Some(task) = self.download_tasks.get(&game.app_id) {
+                let progress_opt = task.progress.clone();
+                let game_name = task.game_name.clone();
+                let samples = task.samples.clone();
+                if let Some(progress) = progress_opt {
                     let action_word = if progress.state == DownloadProgressState::Verifying {
                         "Verifying"
                     } else {
@@ -1402,13 +1468,15 @@ impl SteamLauncher {
                     // ETA for the active file (falling back to the depot
                     // aggregate until file-level info arrives).
                     let eta_suffix = if progress.file_total_bytes > 0 {
-                        self.eta_seconds(
+                        Self::eta_seconds(
+                            &samples,
                             progress
                                 .file_total_bytes
                                 .saturating_sub(progress.file_bytes_downloaded),
                         )
                     } else {
-                        self.eta_seconds(
+                        Self::eta_seconds(
+                            &samples,
                             progress.total_bytes.saturating_sub(progress.bytes_downloaded),
                         )
                     }
@@ -1428,13 +1496,13 @@ impl SteamLauncher {
                 }
 
                 let (is_downloading, is_paused, controller) = {
-                    let state = self.download_state.read().unwrap();
+                    let state = task.state.read().unwrap();
                     (state.is_downloading, state.is_paused, state.operation_controller.clone())
                 };
                 if is_downloading || is_paused {
                     ui.horizontal(|ui| {
                         if ui.button(if is_paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
-                            if let Ok(mut state) = self.download_state.write() {
+                            if let Ok(mut state) = task.state.write() {
                                 state.is_paused = !is_paused;
                                 if is_paused {
                                     state.operation_controller.resume();
@@ -1445,19 +1513,20 @@ impl SteamLauncher {
                         }
                         if ui.button("✖ Cancel").clicked() {
                             controller.cancel();
-                            if let Ok(mut state) = self.download_state.write() {
+                            if let Ok(mut state) = task.state.write() {
                                 state.is_downloading = false;
                                 state.is_paused = false;
                                 state.abort_signal.store(true, std::sync::atomic::Ordering::Release);
                             }
-                            self.live_download_progress = None;
-                            self.download_receiver = None;
-                            self.active_download_appid = None;
-                            self.status = "Operation cancelled".to_string();
+                            self.status = format!("Operation cancelled for {game_name}");
+                            cancel_this_task = true;
                         }
                     });
                 }
                 ui.add_space(8.0);
+            }
+            if cancel_this_task {
+                self.download_tasks.remove(&game.app_id);
             }
 
             ui.add_space(4.0);
@@ -1655,6 +1724,115 @@ impl SteamLauncher {
                 let _ = crate::config::save_user_configs(&store).await;
             });
         }
+    }
+
+    /// Mods tab: launch a custom mod wrapper/executable/script through the
+    /// game's runner environment. Path is persisted per-game in user_apps.json
+    /// (`custom_exec_path`); the native file picker defaults to the game's
+    /// install directory.
+    fn draw_mods_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
+        let mut config = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
+        let mut changed = false;
+
+        ui.vertical(|ui| {
+            ui.heading("Mod Launcher");
+            ui.label(
+                egui::RichText::new(
+                    "Run a custom wrapper, executable, or launch script (e.g. ./start_mod.sh, custom_launcher.exe) \
+                     through this game's runner environment.",
+                )
+                .weak(),
+            );
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let mut path = config.custom_exec_path.clone().unwrap_or_default();
+                let path_edit = ui.add(
+                    egui::TextEdit::singleline(&mut path)
+                        .hint_text("Path to custom mod executable/script…")
+                        .desired_width(f32::INFINITY),
+                );
+                if path_edit.changed() {
+                    config.custom_exec_path =
+                        if path.trim().is_empty() { None } else { Some(path.trim().to_string()) };
+                    changed = true;
+                }
+
+                if ui.button("Browse…").clicked() {
+                    let initial_dir = game
+                        .install_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::path::PathBuf::from(&self.launcher_config.steam_library_path)
+                        });
+                    let app_id = game.app_id;
+                    let tx = self.operation_tx.clone();
+                    self.runtime.spawn(async move {
+                        let picked = crate::utils::open_file_dialog(&initial_dir);
+                        let _ = tx.send(AsyncOp::CustomExecPicked(app_id, picked));
+                    });
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let has_exec = config
+                    .custom_exec_path
+                    .as_ref()
+                    .map(|p| !p.trim().is_empty())
+                    .unwrap_or(false);
+                let launch_btn = egui::Button::new(
+                    egui::RichText::new("▶ Play Mod").color(egui::Color32::WHITE).strong(),
+                )
+                .fill(egui::Color32::from_rgb(46, 125, 50))
+                .min_size(egui::vec2(120.0, 36.0));
+                if ui.add_enabled(has_exec, launch_btn).clicked() {
+                    let config_for_launch = self.launcher_config.clone();
+                    let user_config = config.clone();
+                    let app_id = game.app_id;
+                    let game_name = game.name.clone();
+                    let exec_path = user_config
+                        .custom_exec_path
+                        .clone()
+                        .unwrap_or_default();
+                    let tx = self.operation_tx.clone();
+                    self.runtime.spawn(async move {
+                        match crate::launch::launch_custom_exec(
+                            &config_for_launch,
+                            &user_config,
+                            app_id,
+                            &game_name,
+                            std::path::Path::new(&exec_path),
+                        ) {
+                            Ok(()) => {
+                                let _ = tx.send(AsyncOp::ModLauncherLaunched);
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AsyncOp::Error(format!("Mod launch failed: {e}")));
+                            }
+                        }
+                    });
+                }
+                ui.label(
+                    egui::RichText::new(match config.custom_exec_path.as_deref() {
+                        Some(p) if !p.trim().is_empty() => {
+                            format!("Will run: {p} (via the game's runner environment)")
+                        }
+                        _ => "Select a custom executable first.".to_string(),
+                    })
+                    .weak(),
+                );
+            });
+
+            if changed {
+                self.user_configs.insert(game.app_id, config);
+                let store = self.user_configs.clone();
+                self.runtime.spawn(async move {
+                    let _ = crate::config::save_user_configs(&store).await;
+                });
+            }
+        });
     }
 
     fn draw_options_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
@@ -2574,7 +2752,7 @@ impl SteamLauncher {
     /// Record a (timestamp, depot-bytes-downloaded) sample used to estimate the
     /// download rate for the ETA display. Samples older than ~15s are dropped.
     /// Takes the sample deque directly (not `&mut self`) so it can be called
-    /// while `download_receiver` is still mutably borrowed in the poll loop.
+    /// while draining a task receiver inside the poll loop.
     fn record_progress_sample(
         samples: &mut VecDeque<(std::time::Instant, u64)>,
         bytes_downloaded: u64,
@@ -2590,24 +2768,26 @@ impl SteamLauncher {
     }
 
     /// Estimate the remaining time (seconds) needed to transfer `remaining_bytes`
-    /// based on the recent sample window. Returns None until a reliable rate is
+    /// based on the given sample window. Returns None until a reliable rate is
     /// available (or when the download is stalled).
-    fn eta_seconds(&self, remaining_bytes: u64) -> Option<u64> {
+    fn eta_seconds(
+        samples: &VecDeque<(std::time::Instant, u64)>,
+        remaining_bytes: u64,
+    ) -> Option<u64> {
         if remaining_bytes == 0 {
             return Some(0);
         }
         let now = std::time::Instant::now();
-        let samples: Vec<(std::time::Instant, u64)> = self
-            .progress_samples
+        let window: Vec<(std::time::Instant, u64)> = samples
             .iter()
             .filter(|(t, _)| now.duration_since(*t).as_secs_f64() < 15.0)
             .copied()
             .collect();
-        if samples.len() < 2 {
+        if window.len() < 2 {
             return None;
         }
-        let (t0, b0) = samples[0];
-        let (t1, b1) = *samples.last().unwrap();
+        let (t0, b0) = window[0];
+        let (t1, b1) = *window.last().unwrap();
         let dt = t1.duration_since(t0).as_secs_f64();
         let db = b1.saturating_sub(b0) as f64;
         if dt <= 0.0 || db <= 0.0 {
@@ -3605,77 +3785,92 @@ impl eframe::App for SteamLauncher {
                             .id_salt("game_view_scroll")
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    if let Some(texture) = self.image_cache.get(&game.app_id) {
-                                        ui.add(egui::Image::new(texture).max_width(250.0));
-                                    } else {
-                                        // Styled fallback card: subtle vertical
-                                        // gradient + game title (or spinner while
-                                        // a cover download is in flight) — never
-                                        // a blank/broken texture.
-                                        let (rect, _response) = ui.allocate_exact_size(
-                                            egui::vec2(250.0, 375.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        // Spinner is put BEFORE taking the
-                                        // painter handle (ui.put needs &mut ui).
-                                        if self.pending_images.contains(&game.app_id) {
-                                            ui.put(
-                                                egui::Rect::from_center_size(
-                                                    rect.center() - egui::vec2(0.0, 14.0),
-                                                    egui::vec2(30.0, 30.0),
-                                                ),
-                                                egui::Spinner::new().size(30.0),
-                                            );
-                                        }
-                                        let painter = ui.painter();
-                                        let mut mesh = egui::epaint::Mesh::default();
-                                        let top_color = egui::Color32::from_rgb(32, 37, 46);
-                                        let bottom_color = egui::Color32::from_rgb(14, 16, 20);
-                                        mesh.colored_vertex(rect.left_top(), top_color);
-                                        mesh.colored_vertex(rect.right_top(), top_color);
-                                        mesh.colored_vertex(rect.right_bottom(), bottom_color);
-                                        mesh.colored_vertex(rect.left_bottom(), bottom_color);
-                                        mesh.add_triangle(0, 1, 2);
-                                        mesh.add_triangle(0, 2, 3);
-                                        painter.add(egui::epaint::Shape::mesh(mesh));
-                                        painter.rect_stroke(
-                                            rect,
-                                            4.0,
-                                            egui::Stroke::new(
-                                                1.0,
-                                                egui::Color32::from_gray(58),
-                                            ),
-                                            egui::StrokeKind::Inside,
-                                        );
-                                        if self.pending_images.contains(&game.app_id) {
-                                            painter.text(
-                                                egui::pos2(rect.center().x, rect.center().y + 24.0),
-                                                egui::Align2::CENTER_CENTER,
-                                                "Loading cover art…",
-                                                egui::FontId::proportional(14.0),
-                                                egui::Color32::from_gray(140),
-                                            );
+                                    // === LEFT: poster container — fixed 250x375
+                                    // and CLIPPED to its own rect, so the title,
+                                    // AppID, and PLAY button can never bleed over
+                                    // the cover art / fallback card ===
+                                    ui.allocate_ui(egui::vec2(250.0, 375.0), |ui| {
+                                        ui.set_clip_rect(ui.max_rect());
+                                        if let Some(texture) = self.image_cache.get(&game.app_id) {
+                                            ui.add(egui::Image::new(texture).max_width(250.0));
                                         } else {
-                                            // Title card: game name wrapped across
-                                            // the card.
-                                            let galley = painter.layout(
-                                                game.name.clone(),
-                                                egui::FontId::proportional(20.0),
-                                                egui::Color32::from_gray(180),
-                                                rect.width() - 24.0,
+                                            // Styled fallback card: subtle vertical
+                                            // gradient + game title (or spinner while
+                                            // a cover download is in flight) — never
+                                            // a blank/broken texture.
+                                            let (rect, _response) = ui.allocate_exact_size(
+                                                egui::vec2(250.0, 375.0),
+                                                egui::Sense::hover(),
                                             );
-                                            painter.galley(
-                                                rect.center() - egui::vec2(
-                                                    galley.size().x * 0.5,
-                                                    galley.size().y * 0.5,
+                                            // Spinner is put BEFORE taking the
+                                            // painter handle (ui.put needs &mut ui).
+                                            if self.pending_images.contains(&game.app_id) {
+                                                ui.put(
+                                                    egui::Rect::from_center_size(
+                                                        rect.center() - egui::vec2(0.0, 14.0),
+                                                        egui::vec2(30.0, 30.0),
+                                                    ),
+                                                    egui::Spinner::new().size(30.0),
+                                                );
+                                            }
+                                            let painter = ui.painter();
+                                            let mut mesh = egui::epaint::Mesh::default();
+                                            let top_color = egui::Color32::from_rgb(32, 37, 46);
+                                            let bottom_color = egui::Color32::from_rgb(14, 16, 20);
+                                            mesh.colored_vertex(rect.left_top(), top_color);
+                                            mesh.colored_vertex(rect.right_top(), top_color);
+                                            mesh.colored_vertex(rect.right_bottom(), bottom_color);
+                                            mesh.colored_vertex(rect.left_bottom(), bottom_color);
+                                            mesh.add_triangle(0, 1, 2);
+                                            mesh.add_triangle(0, 2, 3);
+                                            painter.add(egui::epaint::Shape::mesh(mesh));
+                                            painter.rect_stroke(
+                                                rect,
+                                                4.0,
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    egui::Color32::from_gray(58),
                                                 ),
-                                                galley,
-                                                egui::Color32::from_gray(180),
+                                                egui::StrokeKind::Inside,
                                             );
+                                            if self.pending_images.contains(&game.app_id) {
+                                                painter.text(
+                                                    egui::pos2(rect.center().x, rect.center().y + 24.0),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    "Loading cover art…",
+                                                    egui::FontId::proportional(14.0),
+                                                    egui::Color32::from_gray(140),
+                                                );
+                                            } else {
+                                                // Title card: game name wrapped across
+                                                // the card.
+                                                let galley = painter.layout(
+                                                    game.name.clone(),
+                                                    egui::FontId::proportional(20.0),
+                                                    egui::Color32::from_gray(180),
+                                                    rect.width() - 24.0,
+                                                );
+                                                painter.galley(
+                                                    rect.center() - egui::vec2(
+                                                        galley.size().x * 0.5,
+                                                        galley.size().y * 0.5,
+                                                    ),
+                                                    galley,
+                                                    egui::Color32::from_gray(180),
+                                                );
+                                            }
                                         }
-                                    }
+                                    });
 
+                                    ui.add_space(12.0);
+
+                                    // === RIGHT: info column — bounded to the
+                                    // remaining width so its children (title,
+                                    // AppID, buttons) never wrap around or cover
+                                    // the poster ===
                                     ui.vertical(|ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.set_max_width(ui.available_width());
                                         ui.horizontal(|ui| {
                                             // Title: wrap-enabled label constrained
                                             // to the row width MINUS a fixed right
@@ -3778,12 +3973,13 @@ impl eframe::App for SteamLauncher {
                                                         let app_id = game.app_id;
                                                         let client = self.client.clone();
                                                         let tx = self.operation_tx.clone();
-                                                        let download_state = self.download_state.clone();
+                                                        // Per-task DownloadState.
+                                                        let download_state = Arc::new(RwLock::new(DownloadState::default()));
                                                         self.runtime.spawn(async move {
-                                                            match client.update_game(app_id, download_state).await {
+                                                            match client.update_game(app_id, download_state.clone()).await {
                                                                 Ok(rx) => {
                                                                     let _ = tx.send(AsyncOp::DownloadStarted(
-                                                                        app_id, rx,
+                                                                        app_id, rx, download_state,
                                                                     ));
                                                                 }
                                                                 Err(err) => {
@@ -3831,49 +4027,60 @@ impl eframe::App for SteamLauncher {
 
                                 ui.add_space(10.0);
 
-                                if let Some(progress) = self.live_download_progress.clone() {
-                                    let denom = if progress.total_bytes == 0 {
-                                        1.0
-                                    } else {
-                                        progress.total_bytes as f32
-                                    };
-                                    let fraction = (progress.bytes_downloaded as f32 / denom).clamp(0.0, 1.0);
-                                    // Human-readable sizes + percentage. total == 0
-                                    // (e.g. before the manifest resolves) -> 0%, no
-                                    // divide-by-zero.
-                                    let pct = if progress.total_bytes == 0 {
-                                        0.0
-                                    } else {
-                                        (progress.bytes_downloaded as f64 * 100.0
-                                            / progress.total_bytes as f64)
-                                            .clamp(0.0, 100.0)
-                                    };
-                                    let cur_str = Self::format_bytes(progress.bytes_downloaded);
-                                    let tot_str = Self::format_bytes(progress.total_bytes);
-
-                                    // Top bar = DEPOT AGGREGATE progress. Label:
-                                    // "Depot <id> <game name> — <cur> / <tot> (<pct>%)".
-                                    // The game name is looked up from the active
-                                    // download (falling back to the selected game)
-                                    // and capped so very long titles don't push the
-                                    // byte counts off the bar.
-                                    let game_name = self
-                                        .library
-                                        .iter()
-                                        .find(|g| Some(g.app_id) == self.active_download_appid)
-                                        .map(|g| g.name.clone())
-                                        .filter(|n| !n.is_empty())
-                                        .unwrap_or_else(|| game.name.clone());
-                                    let game_name_capped: String = game_name
-                                        .chars()
-                                        .take(40)
-                                        .collect::<String>()
-                                        + if game_name.chars().count() > 40 { "…" } else { "" };
-
-                                    // ETA from the recent-rate window (None until
-                                    // a reliable rate is available).
-                                    let eta_suffix = self
-                                        .eta_seconds(
+                                // === Multi-task operation queue ===
+                                // One stacked progress bar per active task
+                                // (install/update/verify), each strictly bound
+                                // to its own AppID + game title, with its own
+                                // Pause/Cancel (per-task abort signal).
+                                let mut cancelled: Vec<u32> = Vec::new();
+                                let task_snapshots: Vec<(
+                                    u32,
+                                    String,
+                                    Option<DownloadProgress>,
+                                    VecDeque<(std::time::Instant, u64)>,
+                                    Arc<RwLock<DownloadState>>,
+                                )> = self
+                                    .download_tasks
+                                    .values()
+                                    .map(|t| {
+                                        (
+                                            t.app_id,
+                                            t.game_name.clone(),
+                                            t.progress.clone(),
+                                            t.samples.clone(),
+                                            t.state.clone(),
+                                        )
+                                    })
+                                    .collect();
+                                for (app_id, task_name, progress_opt, samples, state) in task_snapshots {
+                                    if let Some(progress) = progress_opt {
+                                        let action_word =
+                                            if progress.state == DownloadProgressState::Verifying {
+                                                "Verifying"
+                                            } else {
+                                                "Downloading"
+                                            };
+                                        let denom = if progress.total_bytes == 0 {
+                                            1.0
+                                        } else {
+                                            progress.total_bytes as f32
+                                        };
+                                        let fraction = (progress.bytes_downloaded as f32 / denom)
+                                            .clamp(0.0, 1.0);
+                                        // Human-readable sizes + percentage. total == 0
+                                        // (e.g. before the manifest resolves) -> 0%, no
+                                        // divide-by-zero.
+                                        let pct = if progress.total_bytes == 0 {
+                                            0.0
+                                        } else {
+                                            (progress.bytes_downloaded as f64 * 100.0
+                                                / progress.total_bytes as f64)
+                                                .clamp(0.0, 100.0)
+                                        };
+                                        let cur_str = Self::format_bytes(progress.bytes_downloaded);
+                                        let tot_str = Self::format_bytes(progress.total_bytes);
+                                        let eta_suffix = Self::eta_seconds(
+                                            &samples,
                                             progress
                                                 .total_bytes
                                                 .saturating_sub(progress.bytes_downloaded),
@@ -3882,48 +4089,52 @@ impl eframe::App for SteamLauncher {
                                         .map(|e| format!(" · {e}"))
                                         .unwrap_or_default();
 
-                                    ui.horizontal(|ui| {
-                                        ui.add(
-                                            egui::ProgressBar::new(fraction)
-                                                .show_percentage()
-                                                .text(format!(
-                                                    "{} {game_name_capped} — {} / {} ({:.0}%){eta_suffix}",
-                                                    progress.current_file,
-                                                    cur_str,
-                                                    tot_str,
-                                                    pct
-                                                )),
-                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::ProgressBar::new(fraction)
+                                                    .show_percentage()
+                                                    .text(format!(
+                                                        "{action_word} [{task_name}]: {cur_str} / {tot_str} ({pct:.0}%){eta_suffix}"
+                                                    )),
+                                            );
 
-                                        let (is_downloading, is_paused, controller) = {
-                                            let state = self.download_state.read().unwrap();
-                                            (state.is_downloading, state.is_paused, state.operation_controller.clone())
-                                        };
-                                        if is_downloading || is_paused {
-                                            if ui.button(if is_paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
-                                                if let Ok(mut state) = self.download_state.write() {
-                                                    state.is_paused = !is_paused;
-                                                    if is_paused {
-                                                        state.operation_controller.resume();
-                                                    } else {
-                                                        state.operation_controller.pause();
+                                            let (is_downloading, is_paused, controller) = {
+                                                let st = state.read().unwrap();
+                                                (
+                                                    st.is_downloading,
+                                                    st.is_paused,
+                                                    st.operation_controller.clone(),
+                                                )
+                                            };
+                                            if is_downloading || is_paused {
+                                                if ui.button(if is_paused { "▶ Resume" } else { "⏸ Pause" }).clicked() {
+                                                    if let Ok(mut st) = state.write() {
+                                                        st.is_paused = !is_paused;
+                                                        if is_paused {
+                                                            st.operation_controller.resume();
+                                                        } else {
+                                                            st.operation_controller.pause();
+                                                        }
                                                     }
                                                 }
-                                            }
-                                            if ui.button("✖ Cancel").clicked() {
-                                                controller.cancel();
-                                                if let Ok(mut state) = self.download_state.write() {
-                                                    state.is_downloading = false;
-                                                    state.is_paused = false;
-                                                    state.abort_signal.store(true, std::sync::atomic::Ordering::Release);
+                                                if ui.button("✖ Cancel").clicked() {
+                                                    controller.cancel();
+                                                    if let Ok(mut st) = state.write() {
+                                                        st.is_downloading = false;
+                                                        st.is_paused = false;
+                                                        st.abort_signal
+                                                            .store(true, std::sync::atomic::Ordering::Release);
+                                                    }
+                                                    self.status =
+                                                        format!("Operation cancelled for {task_name}");
+                                                    cancelled.push(app_id);
                                                 }
-                                                self.live_download_progress = None;
-                                                self.download_receiver = None;
-                                                self.active_download_appid = None;
-                                                self.status = "Operation cancelled".to_string();
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
+                                }
+                                for app_id in cancelled {
+                                    self.download_tasks.remove(&app_id);
                                 }
 
                                 ui.separator();
@@ -3941,9 +4152,7 @@ impl eframe::App for SteamLauncher {
                                 match self.current_tab {
                                     GameTab::Options => self.draw_options_tab(&game, ui),
                                     GameTab::Properties => self.draw_properties_tab(&game, ui),
-                                    GameTab::Mods => {
-                                        ui.label("Coming Soon");
-                                    }
+                                    GameTab::Mods => self.draw_mods_tab(&game, ui),
                                     GameTab::Info => self.draw_info_tab(&game, ui),
                                     GameTab::Misc => self.draw_misc_tab(&game, ui),
                                 }

@@ -6,7 +6,7 @@ pub mod fixups;
 pub mod diagnostics;
 
 use std::path::{Path, PathBuf};
-use anyhow::{Result, Context, anyhow};
+use anyhow::{Result, Context, anyhow, bail};
 use crate::config::{config_dir, LauncherConfig};
 
 pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
@@ -284,6 +284,125 @@ pub fn launch_winecfg(config: &LauncherConfig) -> Result<()> {
 
     cmd.spawn().context("Failed to spawn Wine Configuration")?;
     Ok(())
+}
+
+/// Launch a custom mod executable/script (Mods tab "Play Mod") through the
+/// game's runner environment:
+///  * Windows binaries (`.exe`/`.bat`/…) → the selected runner's bare wine
+///    binary, using the game's own Wine prefix + per-game env vars;
+///  * shell scripts (`.sh`/`.py`/…) → executed directly (bash fallback when
+///    the script lacks the executable bit), inheriting the same environment.
+/// The process is spawned detached (fire-and-forget), like the other wine
+/// tool launchers.
+pub fn launch_custom_exec(
+    config: &LauncherConfig,
+    user_config: &crate::models::UserAppConfig,
+    game_app_id: u32,
+    game_name: &str,
+    exec_path: &Path,
+) -> Result<()> {
+    if !exec_path.exists() {
+        bail!("Custom executable not found: {}", exec_path.display());
+    }
+
+    let mut user_config_store: crate::models::UserConfigStore =
+        crate::models::UserConfigStore::new();
+    user_config_store.insert(game_app_id, user_config.clone());
+
+    let prefix = crate::utils::steam_wineprefix_for_game(config, game_app_id, &user_config_store);
+    std::fs::create_dir_all(&prefix)
+        .with_context(|| format!("failed creating Wine prefix {}", prefix.display()))?;
+
+    let cwd = exec_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| prefix.clone());
+
+    // Scripts run directly; everything else goes through the runner's wine.
+    let is_script = matches!(
+        exec_path.extension().and_then(|e| e.to_str()),
+        Some("sh" | "bash" | "py" | "pl" | "rb" | "command")
+    );
+    let mut cmd = if is_script {
+        std::process::Command::new(exec_path)
+    } else {
+        let library_root = PathBuf::from(&config.steam_library_path);
+        let resolved_runner = crate::utils::resolve_runner(&config.proton_version, &library_root);
+        let mut c = crate::utils::build_bare_wine_command(&resolved_runner).with_context(|| {
+            format!(
+                "failed to resolve runner wine binary from {}",
+                resolved_runner.display()
+            )
+        })?;
+        c.arg(exec_path);
+        c
+    };
+
+    cmd.current_dir(&cwd);
+    cmd.env("WINEPREFIX", &prefix);
+    cmd.env("STEAM_COMPAT_DATA_PATH", &prefix);
+    cmd.env("SteamAppId", game_app_id.to_string());
+    cmd.env("SteamGameId", game_app_id.to_string());
+    cmd.env("SteamAppName", game_name);
+    cmd.env("WINEDEBUG", "-all");
+    // Per-game env vars (KEY=VALUE from Properties) reach the mod process.
+    for (k, v) in &user_config.env_variables {
+        cmd.env(k, v);
+    }
+    if let Ok(display) = std::env::var("DISPLAY") {
+        cmd.env("DISPLAY", display);
+    }
+    if let Ok(wayland) = std::env::var("WAYLAND_DISPLAY") {
+        cmd.env("WAYLAND_DISPLAY", wayland);
+    }
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        cmd.env("XDG_RUNTIME_DIR", xdg_runtime);
+    }
+
+    tracing::info!(
+        exec = %exec_path.display(),
+        wineprefix = %prefix.display(),
+        script = is_script,
+        "Launching custom mod executable"
+    );
+
+    // Non-executable scripts get a bash shim.
+    let spawn_result = if is_script && !is_executable(exec_path) {
+        let mut sh = std::process::Command::new("bash");
+        sh.arg(exec_path);
+        sh.current_dir(&cwd);
+        for (k, v) in cmd.get_envs() {
+            match v {
+                Some(v) => {
+                    sh.env(k, v);
+                }
+                None => {
+                    sh.env_remove(k);
+                }
+            }
+        }
+        sh.spawn().context("Failed to spawn custom mod script (bash)")
+    } else {
+        cmd.spawn().context("Failed to spawn custom mod executable")
+    };
+
+    spawn_result?;
+    Ok(())
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.exists()
+    }
 }
 
 pub fn launch_wine_control_panel(config: &LauncherConfig) -> Result<()> {

@@ -174,6 +174,12 @@ pub struct UserAppConfig {
     /// Shown as informational indicator — does not override the global `Use Windows Steam Runtime` setting.
     #[serde(default)]
     pub requires_steam_api: bool,
+
+    /// Custom mod launcher executable/script path (Mods tab "Play Mod").
+    /// Runs through the game's runner environment (bare wine for .exe,
+    /// direct exec for scripts) inside the game's Wine prefix.
+    #[serde(default)]
+    pub custom_exec_path: Option<String>,
 }
 
 pub type UserConfigStore = HashMap<u32, UserAppConfig>;
@@ -193,6 +199,7 @@ impl Default for UserAppConfig {
             hidden: false,
             favorite: false,
             requires_steam_api: false,
+            custom_exec_path: None,
         }
     }
 }

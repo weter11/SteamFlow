@@ -1400,6 +1400,14 @@ impl SteamClient {
             steamid: Some(u64::from(connection.steam_id())),
             include_appinfo: Some(true),
             include_played_free_games: Some(true),
+            // Standalone Steam mods (e.g. Portal: Revolution, AppID 601300)
+            // and free community mods are classified by Steam as "unvetted
+            // apps" and are dropped from GetOwnedGames unless explicitly
+            // requested. include_free_sub pulls in free subscriptions held on
+            // the account; skip_unvetted_apps=false keeps mod-type entries in
+            // the result so they appear in the library alongside native titles.
+            include_free_sub: Some(true),
+            skip_unvetted_apps: Some(false),
             ..Default::default()
         };
 
