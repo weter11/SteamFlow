@@ -616,6 +616,13 @@ impl SteamClient {
         let shared_state_clone = shared_state.clone();
 
         tokio::task::spawn(async move {
+            if let Ok(mut state) = shared_state_clone.write() {
+                state.is_downloading = true;
+                state.is_paused = false;
+                state.app_id = appid;
+                state.abort_signal.store(false, std::sync::atomic::Ordering::Release);
+                state.operation_controller.resume();
+            }
             let _ = tx
                 .send(DownloadProgress {
                     state: DownloadProgressState::Queued,
@@ -882,9 +889,12 @@ impl SteamClient {
                     );
 
                 let state_for_closure = shared_state_clone.clone();
-                let on_progress = Arc::new(move |bytes: u64| {
+                let on_progress = Arc::new(move |completed: u64, total: u64| {
                     if let Ok(mut state) = state_for_closure.write() {
-                        state.downloaded_bytes += bytes;
+                        // completed/total are depot-wide aggregates (all files),
+                        // so store them directly — no per-chunk += accumulation.
+                        state.downloaded_bytes = completed;
+                        state.total_bytes = total;
                     }
                 });
 
@@ -902,6 +912,10 @@ impl SteamClient {
                     .read()
                     .ok()
                     .map(|s| s.abort_signal.clone());
+                let operation_controller = shared_state_clone
+                    .read()
+                    .ok()
+                    .map(|s| s.operation_controller.clone());
 
                     match cdn_client
                         .download_depot(
@@ -913,6 +927,7 @@ impl SteamClient {
                             manifest_code,
                             false, // verify_mode: false
                             abort_signal,
+                            operation_controller,
                             Some(on_progress),
                             Some(on_manifest.clone()),
                         )
@@ -1702,6 +1717,8 @@ impl SteamClient {
                 state.app_name = game_name.clone();
                 state.downloaded_bytes = 0;
                 state.status_text = format!("Preparing operation for {}...", game_name);
+                state.abort_signal.store(false, std::sync::atomic::Ordering::Release);
+                state.operation_controller.resume();
             }
 
             let _ = tx
@@ -1818,15 +1835,15 @@ impl SteamClient {
 
                     let tx_clone = tx.clone();
                     let selection_depot_id = selection.depot_id;
-                    let on_progress = Arc::new(move |bytes: u64| {
+                    let on_progress = Arc::new(move |completed: u64, total: u64| {
                         let _ = tx_clone.try_send(DownloadProgress {
                             state: if verify_mode {
                                 DownloadProgressState::Verifying
                             } else {
                                 DownloadProgressState::Downloading
                             },
-                            bytes_downloaded: bytes,
-                            total_bytes: 0, // We don't have total file size here easily
+                            bytes_downloaded: completed,
+                            total_bytes: total,
                             current_file: format!("Depot {}", selection_depot_id),
                         });
                     });
@@ -1841,6 +1858,10 @@ impl SteamClient {
                         .read()
                         .ok()
                         .map(|s| s.abort_signal.clone());
+                    let operation_controller = shared_state_clone
+                        .read()
+                        .ok()
+                        .map(|s| s.operation_controller.clone());
 
                     match cdn_client
                         .download_depot(
@@ -1852,6 +1873,7 @@ impl SteamClient {
                             manifest_code,
                             verify_mode,
                             abort_signal,
+                            operation_controller,
                             Some(on_progress),
                             Some(on_manifest),
                         )

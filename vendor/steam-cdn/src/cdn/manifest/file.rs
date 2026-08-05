@@ -9,7 +9,7 @@ use tokio::{
     sync::Semaphore,
 };
 
-use crate::{cdn::inner::InnerClient, Error};
+use crate::{cdn::{inner::InnerClient, OperationController}, Error};
 
 #[derive(Debug)]
 pub struct ChunkData {
@@ -117,13 +117,21 @@ impl ManifestFile {
         target_path: &std::path::Path,
         verify_mode: bool,
         abort_signal: Option<Arc<AtomicBool>>,
+        operation_controller: Option<OperationController>,
         max_tasks: Option<usize>,
         on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
         let max_tasks = max_tasks.unwrap_or(4);
         let semaphore = Arc::new(Semaphore::new(max_tasks));
 
-        let metadata_before = tokio::fs::metadata(target_path).await;
+        // Case-insensitive path resolution: Windows depot manifests are
+        // case-insensitive, Linux is not. If the manifest path does not match
+        // the on-disk casing exactly, resolve the actual file/dir so verify
+        // does not treat every chunk as missing (which would re-download the
+        // whole depot). The resolved path is used for ALL subsequent opens.
+        let resolved_path = resolve_case_insensitive(target_path);
+
+        let metadata_before = tokio::fs::metadata(&resolved_path).await;
         let file_exists_before = metadata_before.is_ok();
         let current_len_before = metadata_before.as_ref().map(|m| m.len()).unwrap_or(0);
 
@@ -140,7 +148,7 @@ impl ManifestFile {
                     let mode = perms.mode();
                     if mode & 0o200 == 0 {
                         perms.set_mode(mode | 0o200);
-                        let _ = tokio::fs::set_permissions(target_path, perms).await;
+                        let _ = tokio::fs::set_permissions(&resolved_path, perms).await;
                     }
                 }
             }
@@ -149,7 +157,7 @@ impl ManifestFile {
         let mut out = tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .open(target_path)
+            .open(&resolved_path)
             .await
             .map_err(|e| Error::Unexpected(e.to_string()))?;
 
@@ -167,13 +175,25 @@ impl ManifestFile {
                 let semaphore_owned = semaphore.clone();
                 let verify_mode = verify_mode;
                 let abort_signal = abort_signal.clone();
-                let target_path = target_path.to_path_buf();
+                let operation_controller = operation_controller.clone();
+                let target_path = resolved_path.clone();
                 let on_progress = on_progress.clone();
                 async move {
                     // Cancellation check
                     if let Some(signal) = &abort_signal {
                         if signal.load(Ordering::Relaxed) {
                             return Ok((chunk_data.offset, None));
+                        }
+                        if let Some(controller) = &operation_controller {
+                            if controller.is_cancelled() {
+                                return Ok((chunk_data.offset, None));
+                            }
+                            while controller.is_paused() {
+                                if controller.is_cancelled() {
+                                    return Ok((chunk_data.offset, None));
+                                }
+                                tokio::task::yield_now().await;
+                            }
                         }
                     }
 
@@ -237,6 +257,20 @@ impl ManifestFile {
                 if signal.load(Ordering::Relaxed) {
                     break;
                 }
+                if let Some(controller) = &operation_controller {
+                    if controller.is_cancelled() {
+                        break;
+                    }
+                    while controller.is_paused() {
+                        if controller.is_cancelled() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    if controller.is_cancelled() {
+                        break;
+                    }
+                }
             }
             let (offset, data) = result?;
             if let Some(data) = data {
@@ -255,4 +289,68 @@ impl ManifestFile {
         out.flush().await.map_err(|e| Error::Unexpected(e.to_string()))?;
         Ok(())
     }
+}
+
+/// Resolve a path to the actual on-disk path when the given (manifest) path
+/// does not exist but a case-insensitive variant does. Steam depot manifests
+/// use Windows-style case (e.g. `NativePC\Stm\Data00.pak`), while a game
+/// installed/moved on Linux may have different casing on disk. Without this,
+/// verify mode would treat every chunk of such files as missing and
+/// re-download the entire depot.
+///
+/// Walks the path components top-down; for each component that does not match
+/// exactly, scans the parent directory for an entry that matches
+/// case-insensitively. Returns the original path if no case-insensitive match
+/// is found (the file is genuinely absent — a fresh install).
+fn resolve_case_insensitive(path: &std::path::Path) -> std::path::PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+
+    let mut current = path.to_path_buf();
+    // Collect components from the deepest missing one upward so we can rebuild.
+    let mut missing: Vec<std::path::PathBuf> = Vec::new();
+
+    while let Some(name) = current.file_name() {
+        if current.exists() {
+            break;
+        }
+        missing.push(std::path::PathBuf::from(name));
+        match current.parent() {
+            Some(p) => current = p.to_path_buf(),
+            None => break,
+        }
+    }
+    // `current` now exists (or is empty/root); rebuild downward resolving each
+    // missing component case-insensitively.
+    let mut base = current;
+    for component in missing.into_iter().rev() {
+        let found = std::fs::read_dir(&base)
+            .ok()
+            .and_then(|entries| {
+                entries.flatten().find(|e| {
+                    e.file_name().to_string_lossy().eq_ignore_ascii_case(
+                        &component.to_string_lossy(),
+                    )
+                })
+            })
+            .map(|e| e.path());
+        match found {
+            Some(p) => base = p,
+            None => {
+                // No case-insensitive match either — keep the manifest path so
+                // the file gets created at the canonical location.
+                base = base.join(component);
+            }
+        }
+    }
+
+    if base != path {
+        tracing::debug!(
+            "case-insensitive path resolved: {} -> {}",
+            path.display(),
+            base.display()
+        );
+    }
+    base
 }

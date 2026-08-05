@@ -2,7 +2,7 @@ use depot::AppDepots;
 use inner::InnerClient;
 use manifest::DepotManifest;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use steam_vent::{
     proto::{
         steammessages_clientserver_2::{
@@ -19,6 +19,39 @@ pub mod depot;
 pub mod depot_chunk;
 pub mod inner;
 pub mod manifest;
+
+#[derive(Clone, Debug)]
+pub struct OperationController {
+    state: Arc<AtomicU8>,
+}
+
+impl OperationController {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    pub fn pause(&self) {
+        self.state.store(1, Ordering::Release);
+    }
+
+    pub fn resume(&self) {
+        self.state.store(0, Ordering::Release);
+    }
+
+    pub fn cancel(&self) {
+        self.state.store(2, Ordering::Release);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 2
+    }
+}
 
 pub const MANIFEST_VERSION: usize = 5;
 
@@ -130,7 +163,8 @@ impl CDNClient {
         manifest_request_code: Option<u64>,
         verify_mode: bool,
         abort_signal: Option<Arc<AtomicBool>>,
-        on_progress: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
+        operation_controller: Option<OperationController>,
+        on_progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync + 'static>>,
         on_manifest: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
         let request_code = if manifest_request_code.is_some() {
@@ -148,14 +182,53 @@ impl CDNClient {
             .get_manifest(app_id, depot_id, manifest_id, request_code, Some(key_arr))
             .await?;
 
+        // Pre-calculate the total depot size across ALL manifest files before
+        // downloading anything, so the progress denominator is stable for the
+        // whole depot instead of being per-file (or 0). Files with size 0
+        // (directories/links) contribute 0 to both total and completed.
+        let total_depot_bytes: u64 = manifest
+            .files()
+            .iter()
+            .map(|f| f.size())
+            .sum::<u64>();
+
         if let Some(ref cb) = on_manifest {
-            cb(manifest.original_size());
+            cb(total_depot_bytes);
         }
+
+        // Shared aggregate counter across every file in this depot. Verified
+        // (hash-skipped) chunks and downloaded chunks both increment it via the
+        // per-file callback, and each increment emits (completed, total) so the
+        // caller can render a smooth 0%..100% progress bar across multi-file
+        // depots instead of resetting per file.
+        let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Adapter: the per-file download callback reports chunk deltas; wrap it
+        // so deltas accumulate into the shared depot counter and the caller's
+        // callback receives (depot_completed, depot_total).
+        let on_progress_inner = on_progress.map(|cb| {
+            let completed = completed.clone();
+            Arc::new(move |bytes: u64| {
+                let done = completed.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst) + bytes;
+                cb(done, total_depot_bytes);
+            }) as Arc<dyn Fn(u64) + Send + Sync + 'static>
+        });
 
         for file in manifest.files() {
             if let Some(signal) = &abort_signal {
                 if signal.load(Ordering::Relaxed) {
                     break;
+                }
+            }
+            if let Some(controller) = &operation_controller {
+                if controller.is_cancelled() {
+                    break;
+                }
+                while controller.is_paused() {
+                    if controller.is_cancelled() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
             }
             let full_path = target_dir.as_ref().join(file.full_path());
@@ -169,8 +242,9 @@ impl CDNClient {
                     &full_path,
                     verify_mode,
                     abort_signal.clone(),
+                    operation_controller.clone(),
                     None,
-                    on_progress.clone(),
+                    on_progress_inner.clone(),
                 )
                 .await?;
             }
