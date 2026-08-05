@@ -625,14 +625,15 @@ impl Runner for WineTkgRunner {
         let glc = ctx.user_config.as_ref()
             .map(|c| c.graphics_layers.clone())
             .unwrap_or_default();
-        let dx12_suppress = ctx.user_config.as_ref()
-            .map(|c| c.dx12_suppress_overlay)
-            .unwrap_or(false);
 
+        // Overlay suppression: the manual per-game "Suppress overlay for DX12
+        // games" flag was removed — DX12 overlay suppression is auto-applied
+        // whenever VKD3D is active (see dx12_requires_overlay_suppress above),
+        // and the in-game overlay itself is controlled by the CEF browser
+        // (steamwebhelper) toggle.
         let no_overlay = ctx.user_config.as_ref()
             .map(|c| c.steam_launch_config.no_overlay)
             .unwrap_or(true)
-            || dx12_suppress
             || dx12_requires_overlay_suppress;
 
 
@@ -929,14 +930,10 @@ impl Runner for WineTkgRunner {
         // so the game's Proton lsteamclient loads normally.
         // Under PlainWine (wine-tkg for background Steam) the override stays:
         // wine-tkg handles Steam IPC itself and the game must not use its own lsteamclient.
-        let game_runner_for_dll = if let Some(game_runner) = ctx.user_config.as_ref()
-            .and_then(|c| c.game_runner.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            game_runner.to_string()
-        } else {
-            effective_game_proton(ctx)
-        };
+        // (The Properties-tab "Compatibility Layer Override" free-text input was
+        // removed — the per-game runner override is Options -> "Force specific
+        // Proton/Wine version", which resolve_effective_proton_name honors here.)
+        let game_runner_for_dll = effective_game_proton(ctx);
         let is_proton_game = matches!(
             crate::utils::classify_runner(
                 &crate::utils::resolve_runner(&game_runner_for_dll, &library_root)
@@ -1298,15 +1295,9 @@ impl Runner for WineTkgRunner {
     async fn build_command(&self, ctx: &LaunchContext) -> std::result::Result<CommandSpec, LaunchError> {
         let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
 
-        // The per-game runner override takes precedence over the global runner.
-        let effective_proton = if let Some(game_runner) = ctx.user_config.as_ref()
-            .and_then(|c| c.game_runner.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            game_runner.to_string()
-        } else {
-            effective_game_proton(ctx)
-        };
+        // The per-game runner override (Options -> "Force specific Proton/Wine
+        // version") takes precedence over the global runner.
+        let effective_proton = effective_game_proton(ctx);
         let active_runner = crate::utils::resolve_runner(&effective_proton, &library_root);
         let game_runner_kind = crate::utils::classify_runner(&active_runner);
         if matches!(game_runner_kind, crate::utils::RunnerKind::Unknown) {

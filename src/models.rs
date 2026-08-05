@@ -174,16 +174,6 @@ pub struct UserAppConfig {
     /// Shown as informational indicator — does not override the global `Use Windows Steam Runtime` setting.
     #[serde(default)]
     pub requires_steam_api: bool,
-
-    /// Per-game option: suppress Steam overlay for DX12 games where it causes black screens.
-    #[serde(default)]
-    pub dx12_suppress_overlay: bool,
-
-    /// Per-game override for the Compatibility Layer (runner) used to launch this game.
-    /// When set, this runner is used instead of the global proton_version setting.
-    /// Does not affect the Steam Runtime runner used for Windows Steam background.
-    #[serde(default)]
-    pub game_runner: Option<String>,
 }
 
 pub type UserConfigStore = HashMap<u32, UserAppConfig>;
@@ -203,8 +193,6 @@ impl Default for UserAppConfig {
             hidden: false,
             favorite: false,
             requires_steam_api: false,
-            dx12_suppress_overlay: false,
-            game_runner: None,
         }
     }
 }
@@ -334,9 +322,16 @@ pub enum DownloadProgressState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadProgress {
     pub state: DownloadProgressState,
+    /// Depot-wide aggregate progress (all files of the active depot).
     pub bytes_downloaded: u64,
     pub total_bytes: u64,
+    /// Human-readable label for the aggregate bar (e.g. "Depot 883711").
     pub current_file: String,
+    /// Relative path of the file currently being processed ("" when idle).
+    pub file_path: String,
+    /// File-level byte progress for the active file.
+    pub file_bytes_downloaded: u64,
+    pub file_total_bytes: u64,
 }
 
 #[derive(Clone)]
