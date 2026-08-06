@@ -51,6 +51,15 @@ struct PlatformSelectionState {
 }
 
 #[derive(Debug, Clone)]
+struct DepotInstallSelectionState {
+    app_id: u32,
+    game_name: String,
+    platform: DepotPlatform,
+    cached_vdf: Vec<u8>,
+    depots: Vec<crate::steam_client::DepotInfo>,
+}
+
+#[derive(Debug, Clone)]
 struct LaunchSelectorState {
     app_id: u32,
     game_name: String,
@@ -126,6 +135,12 @@ pub enum AsyncOp {
     BranchesFetched(u32, Vec<String>),
     DepotsFetched(u32, Vec<BrowserDepotInfo>),
     DepotListFetched(u32, Vec<crate::steam_client::DepotInfo>),
+    InstallDepotsFetched(
+        u32,
+        DepotPlatform,
+        Vec<u8>,
+        Vec<crate::steam_client::DepotInfo>,
+    ),
     DepotOwnershipVerified(HashMap<u64, bool>),
     ManifestFilesFetched(Vec<ManifestFileEntry>),
     LaunchOptionsFetched(u32, Vec<crate::steam_client::LaunchInfo>, Option<String>),
@@ -256,6 +271,7 @@ pub struct SteamLauncher {
     uninstall_modal: Option<UninstallModalState>,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
+    depot_install_selection: Option<DepotInstallSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
     proton_manager: ProtonManagerState,
     proton_remove_confirm: Option<ProtonRemoveConfirmState>,
@@ -343,6 +359,7 @@ impl SteamLauncher {
             uninstall_modal: None,
             depot_browser: None,
             platform_selection: None,
+            depot_install_selection: None,
             launch_selector: None,
             proton_manager: ProtonManagerState::default(),
             proton_remove_confirm: None,
@@ -623,7 +640,10 @@ impl SteamLauncher {
                         if self.install_log.len() > 8 {
                             self.install_log.drain(0..self.install_log.len() - 8);
                         }
-                        self.status = format!("Downloading {file_label}: {cur} / {tot} bytes");
+                        self.status = format!(
+                            "Downloading {}: {} / {} bytes",
+                            progress.current_file, cur, tot
+                        );
                     }
                     DownloadProgressState::Verifying => {
                         Self::record_progress_sample(&mut task.samples, progress.bytes_downloaded);
@@ -640,7 +660,10 @@ impl SteamLauncher {
                                 progress.total_bytes,
                             )
                         };
-                        self.status = format!("Verifying {file_label}: {cur} / {tot} bytes");
+                        self.status = format!(
+                            "Verifying {}: {} / {} bytes",
+                            progress.current_file, cur, tot
+                        );
                     }
                     DownloadProgressState::Completed => {
                         self.status = format!("{game_name}: operation complete");
@@ -725,6 +748,31 @@ impl SteamLauncher {
         });
     }
 
+    fn begin_depot_selection(
+        &mut self,
+        app_id: u32,
+        platform: DepotPlatform,
+        cached_vdf: Vec<u8>,
+    ) {
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        self.status = "Loading depot access...".to_string();
+        self.runtime.spawn(async move {
+            match client.get_depot_list_with_access(app_id).await {
+                Ok(depots) => {
+                    let _ = tx.send(AsyncOp::InstallDepotsFetched(
+                        app_id, platform, cached_vdf, depots,
+                    ));
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!(
+                        "Failed to load depots for {app_id}: {err}"
+                    )));
+                }
+            }
+        });
+    }
+
     fn poll_async_ops(&mut self) {
         while let Ok(op) = self.operation_rx.try_recv() {
             match op {
@@ -783,8 +831,28 @@ impl SteamLauncher {
                         });
                     } else {
                         let platform = platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
-                        self.start_install(appid, platform, Some(buffer), None);
+                        self.begin_depot_selection(appid, platform, buffer);
                     }
+                }
+                AsyncOp::InstallDepotsFetched(appid, platform, cached_vdf, depots) => {
+                    let game_name = self
+                        .library
+                        .iter()
+                        .find(|g| g.app_id == appid)
+                        .map(|g| g.name.clone())
+                        .unwrap_or_else(|| format!("App {appid}"));
+                    self.depot_selection = depots
+                        .iter()
+                        .filter(|depot| depot.is_owned == Some(true))
+                        .map(|depot| depot.id)
+                        .collect();
+                    self.depot_install_selection = Some(DepotInstallSelectionState {
+                        app_id: appid,
+                        game_name,
+                        platform,
+                        cached_vdf,
+                        depots,
+                    });
                 }
                 AsyncOp::ExtendedInfoFetched(appid, info) => {
                     self.extended_info.insert(appid, info);
@@ -1437,10 +1505,75 @@ impl SteamLauncher {
             });
 
             self.extended_info.remove(&app_id);
-            self.start_install(app_id, platform, Some(cached_vdf), None);
+            self.begin_depot_selection(app_id, platform, cached_vdf);
             self.platform_selection = None;
         } else if close {
             self.platform_selection = None;
+        }
+
+        fn draw_depot_install_selection_modal(&mut self, ctx: &egui::Context) {
+            let mut proceed = None;
+            let mut close = false;
+            if let Some(state) = &self.depot_install_selection {
+                egui::Window::new("Select Depots to Install")
+                    .collapsible(false)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        ui.label(format!("Select depots for {}:", state.game_name));
+                        ui.small("Locked depots are not owned or have no available decryption key.");
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            for depot in &state.depots {
+                                let accessible = depot.is_owned == Some(true);
+                                let mut selected = self.depot_selection.contains(&depot.id);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(accessible, egui::Checkbox::new(&mut selected, ""))
+                                        .changed()
+                                    {
+                                        if selected {
+                                            self.depot_selection.insert(depot.id);
+                                        } else {
+                                            self.depot_selection.remove(&depot.id);
+                                        }
+                                    }
+                                    ui.label(format!("Depot {} — {}", depot.id, depot.name));
+                                    if !accessible {
+                                        ui.colored_label(egui::Color32::RED, "Unavailable");
+                                    } else if !depot.config.is_empty() {
+                                        ui.small(&depot.config);
+                                    }
+                                });
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.depot_selection.is_empty(),
+                                    egui::Button::new("Proceed to Install"),
+                                )
+                                .clicked()
+                            {
+                                proceed = Some((
+                                    state.app_id,
+                                    state.platform,
+                                    state.cached_vdf.clone(),
+                                    self.depot_selection.iter().copied().collect::<Vec<_>>(),
+                                ));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            }
+            if let Some((app_id, platform, cached_vdf, depots)) = proceed {
+                self.start_install(app_id, platform, Some(cached_vdf), Some(depots));
+                self.depot_install_selection = None;
+            } else if close {
+                self.depot_install_selection = None;
+            }
         }
     }
 
@@ -1511,8 +1644,8 @@ impl SteamLauncher {
                             / progress.file_total_bytes as f64;
                         (
                             format!(
-                                "{action_word}: {} — {} / {} ({:.0}%)",
-                                progress.file_path,
+                                "{action_word} {}: {} / {} ({:.0}%)",
+                                progress.current_file,
                                 Self::format_bytes(progress.file_bytes_downloaded),
                                 Self::format_bytes(progress.file_total_bytes),
                                 file_pct
@@ -1536,7 +1669,7 @@ impl SteamLauncher {
                         };
                         (
                             format!(
-                                "{action_word}: {} — {} / {} ({:.0}%)",
+                                "{action_word} {}: {} / {} ({:.0}%)",
                                 progress.current_file,
                                 Self::format_bytes(progress.bytes_downloaded),
                                 Self::format_bytes(progress.total_bytes),
@@ -4019,7 +4152,34 @@ impl eframe::App for SteamLauncher {
                                         ui.add_space(20.0);
 
                                         ui.horizontal(|ui| {
-                                            if game.is_installed {
+                                            let operation_active =
+                                                self.download_tasks.contains_key(&game.app_id);
+                                            if operation_active {
+                                                let label = if self
+                                                    .download_tasks
+                                                    .get(&game.app_id)
+                                                    .and_then(|task| task.progress.as_ref())
+                                                    .map(|progress| {
+                                                        progress.state
+                                                            == DownloadProgressState::Verifying
+                                                    })
+                                                    .unwrap_or(false)
+                                                {
+                                                    "◌  VERIFYING…"
+                                                } else {
+                                                    "◌  INSTALLING…"
+                                                };
+                                                ui.add_enabled(
+                                                    false,
+                                                    egui::Button::new(
+                                                        egui::RichText::new(label)
+                                                            .color(egui::Color32::WHITE)
+                                                            .strong(),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(117, 117, 117))
+                                                    .min_size(egui::vec2(140.0, 40.0)),
+                                                );
+                                            } else if game.is_installed {
                                                 let process_state = self.game_processes.get(&game.app_id).copied();
                                                 let (label, color) = match process_state {
                                                     Some(GameProcessState::Launching) => ("◌  LAUNCHING…", egui::Color32::from_rgb(117, 117, 117)),
@@ -4178,7 +4338,8 @@ impl eframe::App for SteamLauncher {
                                                 egui::ProgressBar::new(fraction)
                                                     .show_percentage()
                                                     .text(format!(
-                                                        "{action_word} [{task_name}]: {cur_str} / {tot_str} ({pct:.0}%){eta_suffix}"
+                                                        "{action_word} {}: {cur_str} / {tot_str} ({pct:.0}%){eta_suffix}",
+                                                        progress.current_file
                                                     )),
                                             );
 
@@ -4252,6 +4413,7 @@ impl eframe::App for SteamLauncher {
         self.draw_uninstall_modal(ctx);
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
+        self.draw_depot_install_selection_modal(ctx);
         self.draw_launch_selector_modal(ctx);
         self.draw_proton_remove_confirm_modal(ctx);
         ctx.request_repaint();
