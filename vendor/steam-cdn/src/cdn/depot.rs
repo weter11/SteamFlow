@@ -1,4 +1,4 @@
-use keyvalues_parser::{Value, Vdf};
+use keyvalues_parser::{PartialVdf, Value, Vdf};
 use std::str;
 
 use crate::error::Error;
@@ -111,7 +111,7 @@ impl AppDepots {
 
     pub fn vdf_parse(&mut self, buffer: &[u8]) -> Result<(), Error> {
         if let Ok(vdf) = str::from_utf8(buffer) {
-            let kv = Vdf::parse(vdf)?;
+            let kv = vdf.parse::<PartialVdf>().map(Vdf::from)?;
             let appinfo = kv
                 .value
                 .get_obj()

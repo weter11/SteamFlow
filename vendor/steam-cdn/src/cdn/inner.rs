@@ -79,16 +79,6 @@ impl InnerClient {
         Ok(product_info)
     }
 
-    pub async fn remote_cmd<C: AsRef<str>, A: AsRef<str>>(
-        &self,
-        command: C,
-        args: A,
-        manifest_request_code: Option<u64>,
-    ) -> Result<Response, Error> {
-        self.remote_cmd_with_auth(command, args, manifest_request_code, None, None)
-            .await
-    }
-
     pub async fn remote_cmd_with_auth<C: AsRef<str>, A: AsRef<str>>(
         &self,
         command: C,
