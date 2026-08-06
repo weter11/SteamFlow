@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::mpsc::{self, Receiver, Sender};
 use tokio::runtime::Runtime;
+use serde::{Deserialize, Serialize};
 
 pub type AppId = u32;
 
@@ -191,23 +192,44 @@ struct ActiveDownloadTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CoverVariant {
     HeroCapsule2x,
+    HeroCapsule,
+    LibraryHero2x,
+    LibraryHero,
     LibraryCapsule2x,
+    LibraryCapsule,
     HeaderImage,
 }
 
 impl CoverVariant {
-    const ALL: [CoverVariant; 3] = [
+    const ALL: [CoverVariant; 7] = [
         CoverVariant::HeroCapsule2x,
+        CoverVariant::HeroCapsule,
+        CoverVariant::LibraryHero2x,
+        CoverVariant::LibraryHero,
         CoverVariant::LibraryCapsule2x,
+        CoverVariant::LibraryCapsule,
         CoverVariant::HeaderImage,
     ];
 
-    /// Cache file suffix — each variant has its OWN cache file so a lower-priority
-    /// image never blocks re-downloading a better one (e.g. upgrade header→hero).
+    fn tier(self) -> usize {
+        match self {
+            CoverVariant::HeroCapsule2x | CoverVariant::HeroCapsule => 0,
+            CoverVariant::LibraryHero2x
+            | CoverVariant::LibraryHero
+            | CoverVariant::LibraryCapsule2x
+            | CoverVariant::LibraryCapsule => 1,
+            CoverVariant::HeaderImage => 2,
+        }
+    }
+
     fn file_suffix(self) -> &'static str {
         match self {
             CoverVariant::HeroCapsule2x => "hero_capsule_2x",
+            CoverVariant::HeroCapsule => "hero_capsule",
+            CoverVariant::LibraryHero2x => "library_hero_2x",
+            CoverVariant::LibraryHero => "library_hero",
             CoverVariant::LibraryCapsule2x => "library_capsule_2x",
+            CoverVariant::LibraryCapsule => "library_capsule",
             CoverVariant::HeaderImage => "header_image",
         }
     }
@@ -217,8 +239,20 @@ impl CoverVariant {
             CoverVariant::HeroCapsule2x => {
                 format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/hero_capsule_2x.jpg")
             }
+            CoverVariant::HeroCapsule => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/hero_capsule.jpg")
+            }
+            CoverVariant::LibraryHero2x => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_hero_2x.jpg")
+            }
+            CoverVariant::LibraryHero => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_hero.jpg")
+            }
             CoverVariant::LibraryCapsule2x => {
                 format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_capsule_2x.jpg")
+            }
+            CoverVariant::LibraryCapsule => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_capsule.jpg")
             }
             CoverVariant::HeaderImage => {
                 format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg")
@@ -231,6 +265,15 @@ impl CoverVariant {
         Self::ALL.iter().position(|v| *v == self) < Self::ALL.iter().position(|v| *v == other)
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoverFetchState {
+    cached_variant: Option<String>,
+    last_checked_unix_secs: u64,
+    failed: bool,
+}
+
+const COVER_RECHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 pub struct SteamLauncher {
     runtime: Runtime,
@@ -469,18 +512,11 @@ impl SteamLauncher {
             return;
         }
 
-        // Best variant currently loaded (None = nothing cached yet). If the
-        // hero capsule is already shown there is nothing better to fetch.
         let best = self.image_variant.get(&appid).copied();
         if best == Some(CoverVariant::HeroCapsule2x) {
             return;
         }
 
-        // Pick the highest-priority variant we don't already have AND haven't
-        // failed on this session. This implements the upgrade chain the Steam
-        // client uses (hero_capsule_2x → library_capsule_2x → header_image):
-        // a game with only the small header cached will be re-downloaded with
-        // the better capsule as soon as it is available.
         let target = CoverVariant::ALL.iter().copied().find(|v| {
             best.map(|b| v.better_than(b)).unwrap_or(true)
                 && !self.cover_fetch_failures.contains(&(appid, *v))
@@ -502,74 +538,105 @@ impl SteamLauncher {
                 return;
             }
 
-            let target_path =
-                cache_dir.join(format!("{appid_for_task}_{}.jpg", variant.file_suffix()));
+            let state_path = cache_dir.join(format!("{appid_for_task}_cover_state.json"));
+            let mut state = tokio::fs::read(&state_path)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<CoverFetchState>(&bytes).ok());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            let cached = state.as_ref().and_then(|s| {
+                s.cached_variant.as_deref().and_then(|name| {
+                    CoverVariant::ALL
+                        .iter()
+                        .copied()
+                        .find(|v| v.file_suffix() == name)
+                })
+            });
 
-            // Validate any existing cache entry BEFORE trusting it: a zero-byte
-            // or undecodable file (from a failed/partial earlier download) is
-            // deleted so it can be re-fetched — it must never be treated as a
-            // valid cached cover.
-            if let Ok(meta) = tokio::fs::metadata(&target_path).await {
-                if meta.len() == 0 {
-                    let _ = tokio::fs::remove_file(&target_path).await;
-                } else if let Ok(bytes) = tokio::fs::read(&target_path).await {
-                    if image::load_from_memory(&bytes).is_err() {
-                        let _ = tokio::fs::remove_file(&target_path).await;
+            let cache_path = |v: CoverVariant| {
+                cache_dir.join(format!("{appid_for_task}_{}.jpg", v.file_suffix()))
+            };
+            let valid_cache = |path: &std::path::Path| async move {
+                let Ok(bytes) = tokio::fs::read(path).await else {
+                    return false;
+                };
+                !bytes.is_empty() && image::load_from_memory(&bytes).is_ok()
+            };
+
+            if state
+                .as_ref()
+                .is_some_and(|s| now.saturating_sub(s.last_checked_unix_secs) < COVER_RECHECK_INTERVAL_SECS)
+            {
+                if let Some(cached) = cached {
+                    let path = cache_path(cached);
+                    if valid_cache(&path).await {
+                        let _ = tx.send((
+                            appid_for_task,
+                            cached,
+                            Some(path.to_string_lossy().to_string()),
+                        ));
+                        return;
                     }
                 }
-            }
-
-            // Fast path: a valid cache file already exists for this variant.
-            if tokio::fs::metadata(&target_path).await.is_ok() {
-                let _ = tx.send((
-                    appid_for_task,
-                    variant,
-                    Some(target_path.to_string_lossy().to_string()),
-                ));
-                return;
-            }
-
-            // Per-variant 5s timeout: a stalled CDN (no internet, weak signal,
-            // hung connection) must never leave the cover stuck on
-            // "Loading cover art…" indefinitely — the fetch resolves to the
-            // styled title-card fallback instead.
-            let fetch = async { reqwest::get(&variant.url(appid_for_task)).await };
-            let timed = tokio::time::timeout(std::time::Duration::from_secs(5), fetch).await;
-            let Ok(Ok(response)) = timed else {
                 let _ = tx.send((appid_for_task, variant, None));
                 return;
-            };
-            if response.status().is_success() {
-                if let Ok(bytes) = response.bytes().await {
-                    // Only persist a body that is non-empty and actually
-                    // decodes — never write a zero-byte or garbage file that
-                    // would poison the cache and block future retries.
-                    if !bytes.is_empty() && image::load_from_memory(&bytes).is_ok() {
-                        if tokio::fs::write(&target_path, bytes).await.is_ok() {
-                            // Upgrade: drop lower-priority variant files so the
-                            // cache keeps only the best available image.
-                            for lower in
-                                CoverVariant::ALL.iter().filter(|v| variant.better_than(**v))
-                            {
-                                let _ = tokio::fs::remove_file(
-                                    cache_dir.join(format!(
-                                        "{appid_for_task}_{}.jpg",
-                                        lower.file_suffix()
-                                    )),
-                                )
-                                .await;
-                            }
-                            let _ = tx.send((
-                                appid_for_task,
-                                variant,
-                                Some(target_path.to_string_lossy().to_string()),
-                            ));
-                            return;
-                        }
+            }
+
+            let candidates: Vec<CoverVariant> = CoverVariant::ALL
+                .iter()
+                .copied()
+                .filter(|v| cached.map(|c| v.better_than(c)).unwrap_or(true))
+                .collect();
+            let mut selected = cached;
+            for candidate in candidates {
+                let path = cache_path(candidate);
+                if valid_cache(&path).await {
+                    selected = Some(candidate);
+                    break;
+                }
+
+                let fetch = async { reqwest::get(candidate.url(appid_for_task)).await };
+                let Ok(Ok(response)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), fetch).await
+                else {
+                    continue;
+                };
+                if !response.status().is_success() {
+                    continue;
+                }
+                let Ok(bytes) = response.bytes().await else {
+                    continue;
+                };
+                if bytes.is_empty() || image::load_from_memory(&bytes).is_err() {
+                    continue;
+                }
+                if tokio::fs::write(&path, bytes).await.is_ok() {
+                    selected = Some(candidate);
+                    for lower in CoverVariant::ALL
+                        .iter()
+                        .filter(|v| candidate.tier() < v.tier())
+                    {
+                        let _ = tokio::fs::remove_file(cache_path(**lower)).await;
                     }
+                    break;
                 }
             }
-            let _ = tx.send((appid_for_task, variant, None));
+
+            state = Some(CoverFetchState {
+                cached_variant: selected.map(|v| v.file_suffix().to_string()),
+                last_checked_unix_secs: now,
+                failed: selected.is_none(),
+            });
+            if let Some(state) = &state {
+                if let Ok(bytes) = serde_json::to_vec(state) {
+                    let _ = tokio::fs::write(&state_path, bytes).await;
+                }
+            }
+            let result = selected.map(|v| cache_path(v).to_string_lossy().to_string());
+            let _ = tx.send((appid_for_task, selected.unwrap_or(variant), result));
         });
     }
 
