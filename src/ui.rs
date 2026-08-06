@@ -171,15 +171,68 @@ struct ActiveDownloadTask {
     samples: VecDeque<(std::time::Instant, u64)>,
 }
 
+/// Cover-art image variant, ordered by preference (Steam client / Proton 10.0
+/// convention): hero capsule (landscape) → library capsule → small header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum CoverVariant {
+    HeroCapsule2x,
+    LibraryCapsule2x,
+    HeaderImage,
+}
+
+impl CoverVariant {
+    const ALL: [CoverVariant; 3] = [
+        CoverVariant::HeroCapsule2x,
+        CoverVariant::LibraryCapsule2x,
+        CoverVariant::HeaderImage,
+    ];
+
+    /// Cache file suffix — each variant has its OWN cache file so a lower-priority
+    /// image never blocks re-downloading a better one (e.g. upgrade header→hero).
+    fn file_suffix(self) -> &'static str {
+        match self {
+            CoverVariant::HeroCapsule2x => "hero_capsule_2x",
+            CoverVariant::LibraryCapsule2x => "library_capsule_2x",
+            CoverVariant::HeaderImage => "header_image",
+        }
+    }
+
+    fn url(self, appid: AppId) -> String {
+        match self {
+            CoverVariant::HeroCapsule2x => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/hero_capsule_2x.jpg")
+            }
+            CoverVariant::LibraryCapsule2x => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_capsule_2x.jpg")
+            }
+            CoverVariant::HeaderImage => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg")
+            }
+        }
+    }
+
+    /// Strictly-better variants (lower index = higher priority).
+    fn better_than(self, other: CoverVariant) -> bool {
+        Self::ALL.iter().position(|v| *v == self) < Self::ALL.iter().position(|v| *v == other)
+    }
+}
+
 pub struct SteamLauncher {
     runtime: Runtime,
     pub client: SteamClient,
     pub library: Vec<LibraryGame>,
     pub image_cache: HashMap<AppId, TextureHandle>,
+    /// Which variant the texture in `image_cache` was loaded from (used to
+    /// decide whether a better variant should be fetched/upgraded).
+    image_variant: HashMap<AppId, CoverVariant>,
     pending_images: HashSet<AppId>,
     pending_metadata: HashSet<AppId>,
-    image_tx: Sender<(AppId, Option<String>)>,
-    image_rx: Receiver<(AppId, Option<String>)>,
+    /// Session-only record of variants that failed to fetch (offline, timeout,
+    /// 404). Skipped on retry within the session; cleared by Refresh Library so
+    /// nothing is permanently negative-cached.
+    cover_fetch_failures: HashSet<(AppId, CoverVariant)>,
+    image_tx: Sender<(AppId, CoverVariant, Option<String>)>,
+    image_rx: Receiver<(AppId, CoverVariant, Option<String>)>,
     selected_app: Option<AppId>,
     show_installed_only: bool,
     search_text: String,
@@ -259,8 +312,10 @@ impl SteamLauncher {
             client,
             library,
             image_cache: HashMap::new(),
+            image_variant: HashMap::new(),
             pending_images: HashSet::new(),
             pending_metadata: HashSet::new(),
+            cover_fetch_failures: HashSet::new(),
             image_tx,
             image_rx,
             selected_app: None,
@@ -332,9 +387,10 @@ impl SteamLauncher {
     }
 
     fn poll_image_results(&mut self, ctx: &egui::Context) {
-        while let Ok((appid, result)) = self.image_rx.try_recv() {
+        while let Ok((appid, variant, result)) = self.image_rx.try_recv() {
             match result {
                 Some(path) => {
+                    self.cover_fetch_failures.remove(&(appid, variant));
                     if let Ok(bytes) = std::fs::read(&path) {
                         if let Ok(img) = image::load_from_memory(&bytes) {
                             let rgba = img.to_rgba8();
@@ -346,6 +402,7 @@ impl SteamLauncher {
                                 egui::TextureOptions::LINEAR,
                             );
                             self.image_cache.insert(appid, texture);
+                            self.image_variant.insert(appid, variant);
                         } else {
                             // Cache file exists but cannot be decoded — remove
                             // it so a later selection/refresh can re-download
@@ -355,10 +412,12 @@ impl SteamLauncher {
                     }
                 }
                 None => {
-                    // Fetch failed (offline, timeout, or non-200 response). The
-                    // pending flag was already cleared by the worker, so the
-                    // cover will be retried the next time the game is selected
-                    // or Refresh Library is clicked. No negative caching.
+                    // Fetch failed (offline, timeout, or non-200 response).
+                    // Remember the variant for THIS session only, so we don't
+                    // hammer the CDN every frame; Refresh Library clears it.
+                    // Any lower-priority cached texture stays visible meanwhile.
+                    // No permanent negative caching.
+                    self.cover_fetch_failures.insert((appid, variant));
                 }
             }
             self.pending_images.remove(&appid);
@@ -389,12 +448,33 @@ impl SteamLauncher {
     }
 
     fn ensure_image_requested(&mut self, appid: AppId) {
-        if self.image_cache.contains_key(&appid) || self.pending_images.contains(&appid) {
+        if self.pending_images.contains(&appid) {
             return;
         }
 
+        // Best variant currently loaded (None = nothing cached yet). If the
+        // hero capsule is already shown there is nothing better to fetch.
+        let best = self.image_variant.get(&appid).copied();
+        if best == Some(CoverVariant::HeroCapsule2x) {
+            return;
+        }
+
+        // Pick the highest-priority variant we don't already have AND haven't
+        // failed on this session. This implements the upgrade chain the Steam
+        // client uses (hero_capsule_2x → library_capsule_2x → header_image):
+        // a game with only the small header cached will be re-downloaded with
+        // the better capsule as soon as it is available.
+        let target = CoverVariant::ALL.iter().copied().find(|v| {
+            best.map(|b| v.better_than(b)).unwrap_or(true)
+                && !self.cover_fetch_failures.contains(&(appid, *v))
+        });
+        let Some(variant) = target else {
+            return;
+        };
+
         self.pending_images.insert(appid);
         let tx = self.image_tx.clone();
+        let appid_for_task = appid;
 
         self.runtime.spawn(async move {
             let Ok(cache_dir) = opensteam_image_cache_dir() else {
@@ -405,7 +485,8 @@ impl SteamLauncher {
                 return;
             }
 
-            let target_path = cache_dir.join(format!("{appid}_library.jpg"));
+            let target_path =
+                cache_dir.join(format!("{appid_for_task}_{}.jpg", variant.file_suffix()));
 
             // Validate any existing cache entry BEFORE trusting it: a zero-byte
             // or undecodable file (from a failed/partial earlier download) is
@@ -421,57 +502,57 @@ impl SteamLauncher {
                 }
             }
 
-            if tokio::fs::metadata(&target_path).await.is_err() {
-                let candidates = [
-                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_600x900_2x.jpg"),
-                    format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg"),
-                    format!("https://steamcdn-a.akamaihd.net/steam/apps/{appid}/library_capsule_2x.jpg"),
-                ];
-
-                for url in candidates {
-                    // Per-candidate 5s timeout: a stalled CDN (no internet,
-                    // weak signal, hung connection) must never leave the cover
-                    // stuck on "Loading cover art…" indefinitely — the fetch
-                    // resolves to the styled title-card fallback instead, and
-                    // the pending flag clears so it retries on next selection.
-                    let fetch = async { reqwest::get(&url).await };
-                    let timed = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        fetch,
-                    )
-                    .await;
-                    let Ok(Ok(response)) = timed else {
-                        continue;
-                    };
-                    if response.status().is_success() {
-                        if let Ok(bytes) = response.bytes().await {
-                            // Only persist a body that is non-empty and
-                            // actually decodes — never write a zero-byte or
-                            // garbage file that would poison the cache and
-                            // block future retries.
-                            if !bytes.is_empty() && image::load_from_memory(&bytes).is_ok() {
-                                if tokio::fs::write(&target_path, bytes).await.is_ok() {
-                                    let _ = tx.send((
-                                        appid,
-                                        Some(target_path.to_string_lossy().to_string()),
-                                    ));
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Every candidate failed (offline, timeout, non-200). Report the
-                // failure so the pending flag is cleared — the next selection or
-                // Refresh Library will retry. No permanent negative caching.
-                let _ = tx.send((appid, None));
+            // Fast path: a valid cache file already exists for this variant.
+            if tokio::fs::metadata(&target_path).await.is_ok() {
+                let _ = tx.send((
+                    appid_for_task,
+                    variant,
+                    Some(target_path.to_string_lossy().to_string()),
+                ));
                 return;
             }
 
-            if tokio::fs::metadata(&target_path).await.is_ok() {
-                let _ = tx.send((appid, Some(target_path.to_string_lossy().to_string())));
+            // Per-variant 5s timeout: a stalled CDN (no internet, weak signal,
+            // hung connection) must never leave the cover stuck on
+            // "Loading cover art…" indefinitely — the fetch resolves to the
+            // styled title-card fallback instead.
+            let fetch = async { reqwest::get(&variant.url(appid_for_task)).await };
+            let timed = tokio::time::timeout(std::time::Duration::from_secs(5), fetch).await;
+            let Ok(Ok(response)) = timed else {
+                let _ = tx.send((appid_for_task, variant, None));
+                return;
+            };
+            if response.status().is_success() {
+                if let Ok(bytes) = response.bytes().await {
+                    // Only persist a body that is non-empty and actually
+                    // decodes — never write a zero-byte or garbage file that
+                    // would poison the cache and block future retries.
+                    if !bytes.is_empty() && image::load_from_memory(&bytes).is_ok() {
+                        if tokio::fs::write(&target_path, bytes).await.is_ok() {
+                            // Upgrade: drop lower-priority variant files so the
+                            // cache keeps only the best available image.
+                            for lower in
+                                CoverVariant::ALL.iter().filter(|v| variant.better_than(**v))
+                            {
+                                let _ = tokio::fs::remove_file(
+                                    cache_dir.join(format!(
+                                        "{appid_for_task}_{}.jpg",
+                                        lower.file_suffix()
+                                    )),
+                                )
+                                .await;
+                            }
+                            let _ = tx.send((
+                                appid_for_task,
+                                variant,
+                                Some(target_path.to_string_lossy().to_string()),
+                            ));
+                            return;
+                        }
+                    }
+                }
             }
+            let _ = tx.send((appid_for_task, variant, None));
         });
     }
 
@@ -994,10 +1075,13 @@ impl SteamLauncher {
     }
 
     /// Clears transient cover-art load failures and re-enqueues background
-    /// downloads for every library game whose cover is still missing or
-    /// invalid. Games with a usable cached texture are skipped.
+    /// downloads for every library game whose best cover variant is still
+    /// missing or outdated. Games already showing the hero capsule are skipped;
+    /// games with only a lower-priority image cached get the upgrade chain
+    /// re-attempted (header_image → library_capsule_2x → hero_capsule_2x).
     fn recheck_missing_covers(&mut self) {
         self.pending_images.clear();
+        self.cover_fetch_failures.clear();
         let appids: Vec<AppId> = self.library.iter().map(|g| g.app_id).collect();
         for appid in appids {
             self.ensure_image_requested(appid);
