@@ -2059,6 +2059,53 @@ pub fn steam_wineprefix_for_game(
     }
 }
 
+/// Open a native file-selection dialog (zenity → kdialog → qarma, in that
+/// order) starting at `initial_dir`, returning the chosen absolute path.
+/// Returns None when the user cancels or no dialog tool is available.
+pub fn open_file_dialog(initial_dir: &Path) -> Option<String> {
+    // zenity: --filename with a trailing slash opens the directory.
+    let zenity_dir = initial_dir.to_string_lossy();
+    let zenity_args = [
+        "--file-selection",
+        "--title=Select a custom executable or script",
+        &format!("--filename={}/", zenity_dir.trim_end_matches('/')),
+    ];
+    if let Ok(out) = std::process::Command::new("zenity").args(zenity_args).output() {
+        if out.status.success() {
+            let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !picked.is_empty() {
+                return Some(picked);
+            }
+        }
+    }
+
+    if let Ok(out) = std::process::Command::new("kdialog")
+        .args(["--getopenfilename", initial_dir.to_str().unwrap_or(".")])
+        .output()
+    {
+        if out.status.success() {
+            let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !picked.is_empty() {
+                return Some(picked);
+            }
+        }
+    }
+
+    if let Ok(out) = std::process::Command::new("qarma")
+        .args(["--file-selection", initial_dir.to_str().unwrap_or(".")])
+        .output()
+    {
+        if out.status.success() {
+            let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !picked.is_empty() {
+                return Some(picked);
+            }
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod runner_kind_tests {
     use super::*;

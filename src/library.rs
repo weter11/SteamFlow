@@ -11,6 +11,11 @@ pub struct InstalledAppInfo {
     pub install_path: PathBuf,
     pub active_branch: String,
     pub name: Option<String>,
+    /// Manifest `"type"` field ("game", "mod", "tool", "application", …).
+    /// Parsed for transparency/auditing only — no type-based filtering is
+    /// applied: standalone Steam mods (e.g. Portal: Revolution, AppID 601300)
+    /// and free community mods must appear alongside native titles.
+    pub app_type: Option<String>,
 }
 
 pub async fn find_local_games() -> Result<Vec<LocalGame>> {
@@ -250,7 +255,18 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
     let raw = fs::read(path)
         .await
         .with_context(|| format!("failed reading {}", path.display()))?;
-    let raw = std::str::from_utf8(&raw)
+    parse_app_manifest_info_sync(&raw, path)
+}
+
+/// Synchronous core of [`parse_app_manifest_info`] (mirrors the
+/// `parse_library_folders_sync` pattern) so the parser logic can be unit-tested
+/// without tokio. NO filtering by `"type"` is applied here — mod/tool/application
+/// manifests are all accepted, the same way Steam itself lists them.
+fn parse_app_manifest_info_sync(
+    raw: &[u8],
+    path: &Path,
+) -> Result<Option<(u32, InstalledAppInfo)>> {
+    let raw = std::str::from_utf8(raw)
         .with_context(|| format!("{} is not UTF-8 text VDF", path.display()))?;
     let parsed = parse_text(raw)
         .with_context(|| format!("failed to parse {}", path.display()))?;
@@ -263,6 +279,7 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("public")
         .to_owned();
+    let app_type = parsed.get_str(&["type"]).map(str::to_owned);
 
     match (app_id, install_dir_name) {
         (Some(id), Some(dir)) => {
@@ -276,6 +293,7 @@ async fn parse_app_manifest_info(path: &Path) -> Result<Option<(u32, InstalledAp
                     install_path,
                     active_branch,
                     name,
+                    app_type,
                 },
             )))
         }
@@ -424,5 +442,39 @@ mod library_folders_parser_tests {
         let p = std::env::temp_dir().join("steamflow_lf_nonexistent_does_not_exist.vdf");
         let libs = parse_library_folders_sync(p).unwrap();
         assert!(libs.is_empty());
+    }
+
+    #[test]
+    fn includes_mod_type_manifests() {
+        // Standalone Steam mod (Portal: Revolution, AppID 601300) appmanifest
+        // shape: "type" "mod" must NOT be filtered out by the library scanner.
+        let acf = "appmanifest_601300.acf";
+        let path = std::env::temp_dir().join(acf);
+        let content = "\"AppState\"\n{\n\t\"appid\"\t\t\"601300\"\n\t\"type\"\t\t\"mod\"\n\t\"name\"\t\t\"Portal Revolution\"\n\t\"installdir\"\t\"Portal Revolution\"\n\t\"StateFlags\"\t\t\"4\"\n}\n";
+        std::fs::write(&path, content).unwrap();
+
+        let parsed = parse_app_manifest_info_sync(content.as_bytes(), &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let (app_id, info) = parsed.expect("mod manifest must be indexed, not filtered");
+        assert_eq!(app_id, 601300);
+        assert_eq!(info.name.as_deref(), Some("Portal Revolution"));
+        assert_eq!(info.app_type.as_deref(), Some("mod"));
+        assert!(info.install_path.ends_with("common/Portal Revolution"));
+    }
+
+    #[test]
+    fn includes_plain_game_manifests() {
+        let acf = "appmanifest_883710_test.acf";
+        let path = std::env::temp_dir().join(acf);
+        let content = "\"AppState\"\n{\n\t\"appid\"\t\t\"883710\"\n\t\"type\"\t\t\"game\"\n\t\"name\"\t\t\"Resident Evil 2\"\n\t\"installdir\"\t\"RESIDENT EVIL 2\"\n}\n";
+        std::fs::write(&path, content).unwrap();
+
+        let parsed = parse_app_manifest_info_sync(content.as_bytes(), &path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let (app_id, info) = parsed.unwrap();
+        assert_eq!(app_id, 883710);
+        assert_eq!(info.app_type.as_deref(), Some("game"));
     }
 }

@@ -1400,6 +1400,14 @@ impl SteamClient {
             steamid: Some(u64::from(connection.steam_id())),
             include_appinfo: Some(true),
             include_played_free_games: Some(true),
+            // Standalone Steam mods (e.g. Portal: Revolution, AppID 601300)
+            // and free community mods are classified by Steam as "unvetted
+            // apps" and are dropped from GetOwnedGames unless explicitly
+            // requested. include_free_sub pulls in free subscriptions held on
+            // the account; skip_unvetted_apps=false keeps mod-type entries in
+            // the result so they appear in the library alongside native titles.
+            include_free_sub: Some(true),
+            skip_unvetted_apps: Some(false),
             ..Default::default()
         };
 
@@ -1422,6 +1430,50 @@ impl SteamClient {
                 update_available: false,
             });
         }
+
+        // SECOND PASS (no appinfo): GetOwnedGames with include_appinfo=true can
+        // silently DROP entries whose appinfo the service cannot attach — the
+        // typical case for standalone Steam mods such as Portal: Revolution
+        // (AppID 601300), which the user sees in the Steam web library but
+        // never arrives here. Without appinfo the raw appids come through
+        // (empty names); they are merged in as "App <id>" and hydrated later by
+        // ensure_metadata_requested / fetch_app_metadata when selected.
+        let bare_request = CPlayer_GetOwnedGames_Request {
+            steamid: Some(u64::from(connection.steam_id())),
+            include_appinfo: Some(false),
+            include_played_free_games: Some(true),
+            include_free_sub: Some(true),
+            skip_unvetted_apps: Some(false),
+            ..Default::default()
+        };
+        let bare_response: CPlayer_GetOwnedGames_Response = connection
+            .service_method(bare_request)
+            .await
+            .context("failed calling Player.GetOwnedGames (appinfo-less pass)")?;
+
+        let mut known: std::collections::HashSet<u32> =
+            owned.iter().map(|g| g.app_id).collect();
+        let mut merged = 0usize;
+        for game in bare_response.games {
+            let app_id = game.appid() as u32;
+            if known.insert(app_id) {
+                owned.push(OwnedGame {
+                    app_id,
+                    name: format!("App {app_id}"),
+                    playtime_forever_minutes: game.playtime_forever() as u32,
+                    local_manifest_ids: HashMap::new(),
+                    update_available: false,
+                });
+                merged += 1;
+            }
+        }
+        tracing::info!(
+            total = owned.len(),
+            merged_from_bare_pass = merged,
+            portal_revolution_present =
+                owned.iter().any(|g| g.app_id == 601300),
+            "fetch_owned_games: appinfo pass + appinfo-less merge complete"
+        );
 
         save_library_cache(&owned).await.ok();
         Ok(owned)
