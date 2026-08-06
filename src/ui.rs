@@ -513,17 +513,8 @@ impl SteamLauncher {
         }
 
         let best = self.image_variant.get(&appid).copied();
-        if best == Some(CoverVariant::HeroCapsule2x) {
-            return;
-        }
-
-        let target = CoverVariant::ALL.iter().copied().find(|v| {
-            best.map(|b| v.better_than(b)).unwrap_or(true)
-                && !self.cover_fetch_failures.contains(&(appid, *v))
-        });
-        let Some(variant) = target else {
-            return;
-        };
+        // The top variant still needs a once-per-day availability check.
+        let variant = best.unwrap_or(CoverVariant::HeroCapsule2x);
 
         self.pending_images.insert(appid);
         let tx = self.image_tx.clone();
@@ -559,7 +550,7 @@ impl SteamLauncher {
             let cache_path = |v: CoverVariant| {
                 cache_dir.join(format!("{appid_for_task}_{}.jpg", v.file_suffix()))
             };
-            let valid_cache = |path: &std::path::Path| async move {
+            let valid_cache = |path: PathBuf| async move {
                 let Ok(bytes) = tokio::fs::read(path).await else {
                     return false;
                 };
@@ -572,7 +563,7 @@ impl SteamLauncher {
             {
                 if let Some(cached) = cached {
                     let path = cache_path(cached);
-                    if valid_cache(&path).await {
+                    if valid_cache(path.clone()).await {
                         let _ = tx.send((
                             appid_for_task,
                             cached,
@@ -585,15 +576,37 @@ impl SteamLauncher {
                 return;
             }
 
+            let cached = match cached {
+                Some(cached) if valid_cache(cache_path(cached)).await => Some(cached),
+                _ => None,
+            };
             let candidates: Vec<CoverVariant> = CoverVariant::ALL
                 .iter()
                 .copied()
-                .filter(|v| cached.map(|c| v.better_than(c)).unwrap_or(true))
+                .filter(|v| {
+                    cached
+                        .map(|c| v.better_than(c) || (c.tier() == 0 && *v == c))
+                        .unwrap_or(true)
+                })
                 .collect();
             let mut selected = cached;
             for candidate in candidates {
                 let path = cache_path(candidate);
-                if valid_cache(&path).await {
+                let should_revalidate = cached == Some(candidate) && candidate.tier() == 0;
+                if should_revalidate {
+                    let client = reqwest::Client::new();
+                    let check = async { client.head(candidate.url(appid_for_task)).send().await };
+                    if let Ok(Ok(response)) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), check).await
+                    {
+                        if response.status().is_success() {
+                            selected = Some(candidate);
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if !should_revalidate && valid_cache(path.clone()).await {
                     selected = Some(candidate);
                     break;
                 }
@@ -619,7 +632,7 @@ impl SteamLauncher {
                         .iter()
                         .filter(|v| candidate.tier() < v.tier())
                     {
-                        let _ = tokio::fs::remove_file(cache_path(**lower)).await;
+                        let _ = tokio::fs::remove_file(cache_path(*lower)).await;
                     }
                     break;
                 }
