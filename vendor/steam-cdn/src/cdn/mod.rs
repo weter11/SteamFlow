@@ -166,6 +166,7 @@ impl CDNClient {
         operation_controller: Option<OperationController>,
         on_progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync + 'static>>,
         on_manifest: Option<Arc<dyn Fn(u64) + Send + Sync + 'static>>,
+        on_file_progress: Option<Arc<dyn Fn(String, u64, u64) + Send + Sync + 'static>>,
     ) -> Result<(), Error> {
         let request_code = if manifest_request_code.is_some() {
             manifest_request_code
@@ -203,17 +204,6 @@ impl CDNClient {
         // depots instead of resetting per file.
         let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        // Adapter: the per-file download callback reports chunk deltas; wrap it
-        // so deltas accumulate into the shared depot counter and the caller's
-        // callback receives (depot_completed, depot_total).
-        let on_progress_inner = on_progress.map(|cb| {
-            let completed = completed.clone();
-            Arc::new(move |bytes: u64| {
-                let done = completed.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst) + bytes;
-                cb(done, total_depot_bytes);
-            }) as Arc<dyn Fn(u64) + Send + Sync + 'static>
-        });
-
         for file in manifest.files() {
             if let Some(signal) = &abort_signal {
                 if signal.load(Ordering::Relaxed) {
@@ -237,6 +227,35 @@ impl CDNClient {
             }
 
             if file.size() > 0 {
+                // Per-file progress adapter: the download callback reports
+                // chunk deltas; accumulate them into both a per-file counter
+                // (for the file-level callback) and the shared depot counter
+                // (for the aggregate callback). Each chunk therefore emits the
+                // active file's relative path + file-level byte offsets AND
+                // the depot-wide (completed, total).
+                let file_completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let file_path = file.full_path();
+                let file_size = file.size();
+                let completed = completed.clone();
+                let on_progress = on_progress.clone();
+                let on_file_progress = on_file_progress.clone();
+                let on_progress_inner = Arc::new(move |bytes: u64| {
+                    let file_done =
+                        file_completed.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst) + bytes;
+                    if let Some(cb) = &on_file_progress {
+                        cb(file_path.clone(), file_done, file_size);
+                    }
+                    if let Some(cb) = &on_progress {
+                        let done =
+                            completed.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst) + bytes;
+                        cb(done, total_depot_bytes);
+                    }
+                }) as Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+                // Announce the active file immediately (0 bytes) so callers can
+                // show the file name before its first chunk completes.
+                on_progress_inner(0);
+
                 file.download(
                     key_arr,
                     &full_path,
@@ -244,7 +263,7 @@ impl CDNClient {
                     abort_signal.clone(),
                     operation_controller.clone(),
                     None,
-                    on_progress_inner.clone(),
+                    Some(on_progress_inner),
                 )
                 .await?;
             }

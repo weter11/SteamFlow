@@ -629,7 +629,11 @@ impl SteamClient {
                     bytes_downloaded: 0,
                     total_bytes: 0,
                     current_file: String::new(),
-                })
+                
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                 .await;
 
 
@@ -656,7 +660,11 @@ impl SteamClient {
                                 bytes_downloaded: 0,
                                 total_bytes: 0,
                                 current_file: format!("failed requesting appinfo: {e}"),
-                            })
+                            
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                             .await;
                         return;
                     }
@@ -670,7 +678,11 @@ impl SteamClient {
                             bytes_downloaded: 0,
                             total_bytes: 0,
                             current_file: "missing appinfo payload".to_string(),
-                        })
+                        
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                         .await;
                     return;
                 };
@@ -770,7 +782,11 @@ impl SteamClient {
                         bytes_downloaded: 0,
                         total_bytes: 0,
                         current_file: msg.to_string(),
-                    })
+                    
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                     .await;
                 return;
             }
@@ -781,7 +797,11 @@ impl SteamClient {
                     bytes_downloaded: 0,
                     total_bytes: 0,
                     current_file: format!("starting download of {} depots", selections.len()),
-                })
+                
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                 .await;
 
             // Update shared state for the start of the download
@@ -806,7 +826,11 @@ impl SteamClient {
                             bytes_downloaded: 0,
                             total_bytes: 0,
                             current_file: format!("Failed to fetch content servers: {}", e),
-                        })
+                        
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                         .await;
                     return;
                 }
@@ -889,6 +913,25 @@ impl SteamClient {
                     );
 
                 let state_for_closure = shared_state_clone.clone();
+                let tx_for_progress = tx.clone();
+                let selection_depot_id = selection.depot_id;
+                // Bridge: the per-file callback stores the active file's
+                // relative path + file-level offsets; the aggregate callback
+                // picks them up so every progress message carries BOTH the
+                // depot-wide aggregate and the active-file detail.
+                let file_info = Arc::new(std::sync::Mutex::new((
+                    String::new(),
+                    0u64,
+                    0u64,
+                )));
+                let file_info_cb = file_info.clone();
+                let on_file_progress = Arc::new(move |file_path: String, done: u64, total: u64| {
+                    if let Ok(mut guard) = file_info_cb.lock() {
+                        guard.0 = file_path;
+                        guard.1 = done;
+                        guard.2 = total;
+                    }
+                });
                 let on_progress = Arc::new(move |completed: u64, total: u64| {
                     if let Ok(mut state) = state_for_closure.write() {
                         // completed/total are depot-wide aggregates (all files),
@@ -896,6 +939,19 @@ impl SteamClient {
                         state.downloaded_bytes = completed;
                         state.total_bytes = total;
                     }
+                    let (file_path, file_done, file_total) = {
+                        let guard = file_info.lock().unwrap_or_else(|p| p.into_inner());
+                        (guard.0.clone(), guard.1, guard.2)
+                    };
+                    let _ = tx_for_progress.try_send(DownloadProgress {
+                        state: DownloadProgressState::Downloading,
+                        bytes_downloaded: completed,
+                        total_bytes: total,
+                        current_file: format!("Depot {selection_depot_id}"),
+                        file_path,
+                        file_bytes_downloaded: file_done,
+                        file_total_bytes: file_total,
+                    });
                 });
 
                 let state_for_manifest = shared_state_clone.clone();
@@ -930,6 +986,7 @@ impl SteamClient {
                             operation_controller,
                             Some(on_progress),
                             Some(on_manifest.clone()),
+                            Some(on_file_progress),
                         )
                         .await
                     {
@@ -979,7 +1036,11 @@ impl SteamClient {
                                 "Failed to download depot {} from all available servers",
                                 selection.depot_id
                             ),
-                        })
+                        
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                         .await;
                     success = false;
                     break;
@@ -1007,7 +1068,11 @@ impl SteamClient {
                         bytes_downloaded: 1,
                         total_bytes: 1,
                         current_file: "completed".to_string(),
-                    })
+                    
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                     .await;
             } else {
                 if let Ok(mut state) = shared_state_clone.write() {
@@ -1731,7 +1796,11 @@ impl SteamClient {
                     } else {
                         "resolving latest manifest".to_string()
                     },
-                })
+                
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                 .await;
 
             let remote_manifests = if verify_mode {
@@ -1759,7 +1828,11 @@ impl SteamClient {
                         bytes_downloaded: 0,
                         total_bytes: 0,
                         current_file: "no manifest/depot available for download".to_string(),
-                    })
+                    
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                     .await;
                 return;
             };
@@ -1773,7 +1846,11 @@ impl SteamClient {
                             bytes_downloaded: 0,
                             total_bytes: 0,
                             current_file: format!("Failed to fetch content servers: {}", e),
-                        })
+                        
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                         .await;
                     return;
                 }
@@ -1835,7 +1912,29 @@ impl SteamClient {
 
                     let tx_clone = tx.clone();
                     let selection_depot_id = selection.depot_id;
+                    // Bridge: the per-file callback stores the active file's
+                    // relative path + file-level byte offsets; the aggregate
+                    // callback attaches them to every progress message so the
+                    // UI can render the depot-wide aggregate AND the active
+                    // file detail from a single stream.
+                    let file_info = Arc::new(std::sync::Mutex::new((
+                        String::new(),
+                        0u64,
+                        0u64,
+                    )));
+                    let file_info_cb = file_info.clone();
+                    let on_file_progress = Arc::new(move |file_path: String, done: u64, total: u64| {
+                        if let Ok(mut guard) = file_info_cb.lock() {
+                            guard.0 = file_path;
+                            guard.1 = done;
+                            guard.2 = total;
+                        }
+                    });
                     let on_progress = Arc::new(move |completed: u64, total: u64| {
+                        let (file_path, file_done, file_total) = {
+                            let guard = file_info.lock().unwrap_or_else(|p| p.into_inner());
+                            (guard.0.clone(), guard.1, guard.2)
+                        };
                         let _ = tx_clone.try_send(DownloadProgress {
                             state: if verify_mode {
                                 DownloadProgressState::Verifying
@@ -1844,7 +1943,10 @@ impl SteamClient {
                             },
                             bytes_downloaded: completed,
                             total_bytes: total,
-                            current_file: format!("Depot {}", selection_depot_id),
+                            current_file: format!("Depot {selection_depot_id}"),
+                            file_path,
+                            file_bytes_downloaded: file_done,
+                            file_total_bytes: file_total,
                         });
                     });
 
@@ -1876,6 +1978,7 @@ impl SteamClient {
                             operation_controller,
                             Some(on_progress),
                             Some(on_manifest),
+                            Some(on_file_progress),
                         )
                         .await
                     {
@@ -1920,7 +2023,11 @@ impl SteamClient {
                                 "Failed to download/verify depot {} from all servers",
                                 selection.depot_id
                             ),
-                        })
+                        
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                         .await;
                     success = false;
                     break;
@@ -1951,7 +2058,11 @@ impl SteamClient {
                         } else {
                             "update completed".to_string()
                         },
-                    })
+                    
+            file_path: String::new(),
+            file_bytes_downloaded: 0,
+            file_total_bytes: 0,
+})
                     .await;
             } else {
                 if let Ok(mut state) = shared_state_clone.write() {
