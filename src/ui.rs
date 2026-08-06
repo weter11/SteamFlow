@@ -647,7 +647,7 @@ impl SteamLauncher {
                     }
                     DownloadProgressState::Verifying => {
                         Self::record_progress_sample(&mut task.samples, progress.bytes_downloaded);
-                        let (file_label, cur, tot) = if progress.file_total_bytes > 0 {
+                        let (_file_label, cur, tot) = if progress.file_total_bytes > 0 {
                             (
                                 progress.file_path.clone(),
                                 progress.file_bytes_downloaded,
@@ -1510,8 +1510,9 @@ impl SteamLauncher {
         } else if close {
             self.platform_selection = None;
         }
+    }
 
-        fn draw_depot_install_selection_modal(&mut self, ctx: &egui::Context) {
+    fn draw_depot_install_selection_modal(&mut self, ctx: &egui::Context) {
             let mut proceed = None;
             let mut close = false;
             if let Some(state) = &self.depot_install_selection {
@@ -1575,7 +1576,6 @@ impl SteamLauncher {
                 self.depot_install_selection = None;
             }
         }
-    }
 
     fn draw_properties_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
         let mut config = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
