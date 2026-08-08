@@ -339,6 +339,18 @@ pub fn launch_custom_exec(
         c
     };
 
+    // Forward the user's Launch Options (minus the mangohud shims) to the mod
+    // executable/script, mirroring the main game-launch path in wine_tkg.rs.
+    // Without this, launch options (e.g. `+map ...`) never reach the game when
+    // launched via the Mods tab "Play Mod".
+    for arg in user_config
+        .launch_options
+        .split_whitespace()
+        .filter(|a| *a != "-mangohud" && *a != "--mangohud")
+    {
+        cmd.arg(arg);
+    }
+
     cmd.current_dir(&cwd);
     cmd.env("WINEPREFIX", &prefix);
     cmd.env("STEAM_COMPAT_DATA_PATH", &prefix);
@@ -368,9 +380,15 @@ pub fn launch_custom_exec(
     );
 
     // Non-executable scripts get a bash shim.
+    let launch_args: Vec<&str> = user_config
+        .launch_options
+        .split_whitespace()
+        .filter(|a| *a != "-mangohud" && *a != "--mangohud")
+        .collect();
     let spawn_result = if is_script && !is_executable(exec_path) {
         let mut sh = std::process::Command::new("bash");
         sh.arg(exec_path);
+        sh.args(&launch_args);
         sh.current_dir(&cwd);
         for (k, v) in cmd.get_envs() {
             match v {
