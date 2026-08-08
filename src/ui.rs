@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::mpsc::{self, Receiver, Sender};
 use tokio::runtime::Runtime;
+use serde::{Deserialize, Serialize};
 
 pub type AppId = u32;
 
@@ -48,6 +49,15 @@ struct PlatformSelectionState {
     game_name: String,
     available: Vec<DepotPlatform>,
     cached_vdf: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct DepotInstallSelectionState {
+    app_id: u32,
+    game_name: String,
+    platform: DepotPlatform,
+    cached_vdf: Vec<u8>,
+    depots: Vec<crate::steam_client::DepotInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +136,12 @@ pub enum AsyncOp {
     BranchesFetched(u32, Vec<String>),
     DepotsFetched(u32, Vec<BrowserDepotInfo>),
     DepotListFetched(u32, Vec<crate::steam_client::DepotInfo>),
+    InstallDepotsFetched(
+        u32,
+        DepotPlatform,
+        Vec<u8>,
+        Vec<crate::steam_client::DepotInfo>,
+    ),
     DepotOwnershipVerified(HashMap<u64, bool>),
     ManifestFilesFetched(Vec<ManifestFileEntry>),
     LaunchOptionsFetched(u32, Vec<crate::steam_client::LaunchInfo>, Option<String>),
@@ -176,23 +192,44 @@ struct ActiveDownloadTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CoverVariant {
     HeroCapsule2x,
+    HeroCapsule,
+    LibraryHero2x,
+    LibraryHero,
     LibraryCapsule2x,
+    LibraryCapsule,
     HeaderImage,
 }
 
 impl CoverVariant {
-    const ALL: [CoverVariant; 3] = [
+    const ALL: [CoverVariant; 7] = [
         CoverVariant::HeroCapsule2x,
+        CoverVariant::HeroCapsule,
+        CoverVariant::LibraryHero2x,
+        CoverVariant::LibraryHero,
         CoverVariant::LibraryCapsule2x,
+        CoverVariant::LibraryCapsule,
         CoverVariant::HeaderImage,
     ];
 
-    /// Cache file suffix — each variant has its OWN cache file so a lower-priority
-    /// image never blocks re-downloading a better one (e.g. upgrade header→hero).
+    fn tier(self) -> usize {
+        match self {
+            CoverVariant::HeroCapsule2x | CoverVariant::HeroCapsule => 0,
+            CoverVariant::LibraryHero2x
+            | CoverVariant::LibraryHero
+            | CoverVariant::LibraryCapsule2x
+            | CoverVariant::LibraryCapsule => 1,
+            CoverVariant::HeaderImage => 2,
+        }
+    }
+
     fn file_suffix(self) -> &'static str {
         match self {
             CoverVariant::HeroCapsule2x => "hero_capsule_2x",
+            CoverVariant::HeroCapsule => "hero_capsule",
+            CoverVariant::LibraryHero2x => "library_hero_2x",
+            CoverVariant::LibraryHero => "library_hero",
             CoverVariant::LibraryCapsule2x => "library_capsule_2x",
+            CoverVariant::LibraryCapsule => "library_capsule",
             CoverVariant::HeaderImage => "header_image",
         }
     }
@@ -202,8 +239,20 @@ impl CoverVariant {
             CoverVariant::HeroCapsule2x => {
                 format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/hero_capsule_2x.jpg")
             }
+            CoverVariant::HeroCapsule => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/hero_capsule.jpg")
+            }
+            CoverVariant::LibraryHero2x => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_hero_2x.jpg")
+            }
+            CoverVariant::LibraryHero => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_hero.jpg")
+            }
             CoverVariant::LibraryCapsule2x => {
                 format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_capsule_2x.jpg")
+            }
+            CoverVariant::LibraryCapsule => {
+                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_capsule.jpg")
             }
             CoverVariant::HeaderImage => {
                 format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg")
@@ -216,6 +265,15 @@ impl CoverVariant {
         Self::ALL.iter().position(|v| *v == self) < Self::ALL.iter().position(|v| *v == other)
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoverFetchState {
+    cached_variant: Option<String>,
+    last_checked_unix_secs: u64,
+    failed: bool,
+}
+
+const COVER_RECHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 pub struct SteamLauncher {
     runtime: Runtime,
@@ -256,6 +314,7 @@ pub struct SteamLauncher {
     uninstall_modal: Option<UninstallModalState>,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
+    depot_install_selection: Option<DepotInstallSelectionState>,
     launch_selector: Option<LaunchSelectorState>,
     proton_manager: ProtonManagerState,
     proton_remove_confirm: Option<ProtonRemoveConfirmState>,
@@ -343,6 +402,7 @@ impl SteamLauncher {
             uninstall_modal: None,
             depot_browser: None,
             platform_selection: None,
+            depot_install_selection: None,
             launch_selector: None,
             proton_manager: ProtonManagerState::default(),
             proton_remove_confirm: None,
@@ -452,25 +512,9 @@ impl SteamLauncher {
             return;
         }
 
-        // Best variant currently loaded (None = nothing cached yet). If the
-        // hero capsule is already shown there is nothing better to fetch.
         let best = self.image_variant.get(&appid).copied();
-        if best == Some(CoverVariant::HeroCapsule2x) {
-            return;
-        }
-
-        // Pick the highest-priority variant we don't already have AND haven't
-        // failed on this session. This implements the upgrade chain the Steam
-        // client uses (hero_capsule_2x → library_capsule_2x → header_image):
-        // a game with only the small header cached will be re-downloaded with
-        // the better capsule as soon as it is available.
-        let target = CoverVariant::ALL.iter().copied().find(|v| {
-            best.map(|b| v.better_than(b)).unwrap_or(true)
-                && !self.cover_fetch_failures.contains(&(appid, *v))
-        });
-        let Some(variant) = target else {
-            return;
-        };
+        // The top variant still needs a once-per-day availability check.
+        let variant = best.unwrap_or(CoverVariant::HeroCapsule2x);
 
         self.pending_images.insert(appid);
         let tx = self.image_tx.clone();
@@ -485,74 +529,127 @@ impl SteamLauncher {
                 return;
             }
 
-            let target_path =
-                cache_dir.join(format!("{appid_for_task}_{}.jpg", variant.file_suffix()));
+            let state_path = cache_dir.join(format!("{appid_for_task}_cover_state.json"));
+            let mut state = tokio::fs::read(&state_path)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<CoverFetchState>(&bytes).ok());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            let cached = state.as_ref().and_then(|s| {
+                s.cached_variant.as_deref().and_then(|name| {
+                    CoverVariant::ALL
+                        .iter()
+                        .copied()
+                        .find(|v| v.file_suffix() == name)
+                })
+            });
 
-            // Validate any existing cache entry BEFORE trusting it: a zero-byte
-            // or undecodable file (from a failed/partial earlier download) is
-            // deleted so it can be re-fetched — it must never be treated as a
-            // valid cached cover.
-            if let Ok(meta) = tokio::fs::metadata(&target_path).await {
-                if meta.len() == 0 {
-                    let _ = tokio::fs::remove_file(&target_path).await;
-                } else if let Ok(bytes) = tokio::fs::read(&target_path).await {
-                    if image::load_from_memory(&bytes).is_err() {
-                        let _ = tokio::fs::remove_file(&target_path).await;
+            let cache_path = |v: CoverVariant| {
+                cache_dir.join(format!("{appid_for_task}_{}.jpg", v.file_suffix()))
+            };
+            let valid_cache = |path: PathBuf| async move {
+                let Ok(bytes) = tokio::fs::read(path).await else {
+                    return false;
+                };
+                !bytes.is_empty() && image::load_from_memory(&bytes).is_ok()
+            };
+
+            if state
+                .as_ref()
+                .is_some_and(|s| now.saturating_sub(s.last_checked_unix_secs) < COVER_RECHECK_INTERVAL_SECS)
+            {
+                if let Some(cached) = cached {
+                    let path = cache_path(cached);
+                    if valid_cache(path.clone()).await {
+                        let _ = tx.send((
+                            appid_for_task,
+                            cached,
+                            Some(path.to_string_lossy().to_string()),
+                        ));
+                        return;
                     }
                 }
-            }
-
-            // Fast path: a valid cache file already exists for this variant.
-            if tokio::fs::metadata(&target_path).await.is_ok() {
-                let _ = tx.send((
-                    appid_for_task,
-                    variant,
-                    Some(target_path.to_string_lossy().to_string()),
-                ));
-                return;
-            }
-
-            // Per-variant 5s timeout: a stalled CDN (no internet, weak signal,
-            // hung connection) must never leave the cover stuck on
-            // "Loading cover art…" indefinitely — the fetch resolves to the
-            // styled title-card fallback instead.
-            let fetch = async { reqwest::get(&variant.url(appid_for_task)).await };
-            let timed = tokio::time::timeout(std::time::Duration::from_secs(5), fetch).await;
-            let Ok(Ok(response)) = timed else {
                 let _ = tx.send((appid_for_task, variant, None));
                 return;
+            }
+
+            let cached = match cached {
+                Some(cached) if valid_cache(cache_path(cached)).await => Some(cached),
+                _ => None,
             };
-            if response.status().is_success() {
-                if let Ok(bytes) = response.bytes().await {
-                    // Only persist a body that is non-empty and actually
-                    // decodes — never write a zero-byte or garbage file that
-                    // would poison the cache and block future retries.
-                    if !bytes.is_empty() && image::load_from_memory(&bytes).is_ok() {
-                        if tokio::fs::write(&target_path, bytes).await.is_ok() {
-                            // Upgrade: drop lower-priority variant files so the
-                            // cache keeps only the best available image.
-                            for lower in
-                                CoverVariant::ALL.iter().filter(|v| variant.better_than(**v))
-                            {
-                                let _ = tokio::fs::remove_file(
-                                    cache_dir.join(format!(
-                                        "{appid_for_task}_{}.jpg",
-                                        lower.file_suffix()
-                                    )),
-                                )
-                                .await;
-                            }
-                            let _ = tx.send((
-                                appid_for_task,
-                                variant,
-                                Some(target_path.to_string_lossy().to_string()),
-                            ));
-                            return;
+            let candidates: Vec<CoverVariant> = CoverVariant::ALL
+                .iter()
+                .copied()
+                .filter(|v| {
+                    cached
+                        .map(|c| v.better_than(c) || (c.tier() == 0 && *v == c))
+                        .unwrap_or(true)
+                })
+                .collect();
+            let mut selected = cached;
+            for candidate in candidates {
+                let path = cache_path(candidate);
+                let should_revalidate = cached == Some(candidate) && candidate.tier() == 0;
+                if should_revalidate {
+                    let client = reqwest::Client::new();
+                    let check = async { client.head(candidate.url(appid_for_task)).send().await };
+                    if let Ok(Ok(response)) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), check).await
+                    {
+                        if response.status().is_success() {
+                            selected = Some(candidate);
+                            break;
                         }
                     }
+                    continue;
+                }
+                if !should_revalidate && valid_cache(path.clone()).await {
+                    selected = Some(candidate);
+                    break;
+                }
+
+                let fetch = async { reqwest::get(candidate.url(appid_for_task)).await };
+                let Ok(Ok(response)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), fetch).await
+                else {
+                    continue;
+                };
+                if !response.status().is_success() {
+                    continue;
+                }
+                let Ok(bytes) = response.bytes().await else {
+                    continue;
+                };
+                if bytes.is_empty() || image::load_from_memory(&bytes).is_err() {
+                    continue;
+                }
+                if tokio::fs::write(&path, bytes).await.is_ok() {
+                    selected = Some(candidate);
+                    for lower in CoverVariant::ALL
+                        .iter()
+                        .filter(|v| candidate.tier() < v.tier())
+                    {
+                        let _ = tokio::fs::remove_file(cache_path(*lower)).await;
+                    }
+                    break;
                 }
             }
-            let _ = tx.send((appid_for_task, variant, None));
+
+            state = Some(CoverFetchState {
+                cached_variant: selected.map(|v| v.file_suffix().to_string()),
+                last_checked_unix_secs: now,
+                failed: selected.is_none(),
+            });
+            if let Some(state) = &state {
+                if let Ok(bytes) = serde_json::to_vec(state) {
+                    let _ = tokio::fs::write(&state_path, bytes).await;
+                }
+            }
+            let result = selected.map(|v| cache_path(v).to_string_lossy().to_string());
+            let _ = tx.send((appid_for_task, selected.unwrap_or(variant), result));
         });
     }
 
@@ -623,11 +720,14 @@ impl SteamLauncher {
                         if self.install_log.len() > 8 {
                             self.install_log.drain(0..self.install_log.len() - 8);
                         }
-                        self.status = format!("Downloading {file_label}: {cur} / {tot} bytes");
+                        self.status = format!(
+                            "Downloading {}: {} / {} bytes",
+                            progress.current_file, cur, tot
+                        );
                     }
                     DownloadProgressState::Verifying => {
                         Self::record_progress_sample(&mut task.samples, progress.bytes_downloaded);
-                        let (file_label, cur, tot) = if progress.file_total_bytes > 0 {
+                        let (_file_label, cur, tot) = if progress.file_total_bytes > 0 {
                             (
                                 progress.file_path.clone(),
                                 progress.file_bytes_downloaded,
@@ -640,7 +740,10 @@ impl SteamLauncher {
                                 progress.total_bytes,
                             )
                         };
-                        self.status = format!("Verifying {file_label}: {cur} / {tot} bytes");
+                        self.status = format!(
+                            "Verifying {}: {} / {} bytes",
+                            progress.current_file, cur, tot
+                        );
                     }
                     DownloadProgressState::Completed => {
                         self.status = format!("{game_name}: operation complete");
@@ -725,6 +828,31 @@ impl SteamLauncher {
         });
     }
 
+    fn begin_depot_selection(
+        &mut self,
+        app_id: u32,
+        platform: DepotPlatform,
+        cached_vdf: Vec<u8>,
+    ) {
+        let client = self.client.clone();
+        let tx = self.operation_tx.clone();
+        self.status = "Loading depot access...".to_string();
+        self.runtime.spawn(async move {
+            match client.get_depot_list_with_access(app_id).await {
+                Ok(depots) => {
+                    let _ = tx.send(AsyncOp::InstallDepotsFetched(
+                        app_id, platform, cached_vdf, depots,
+                    ));
+                }
+                Err(err) => {
+                    let _ = tx.send(AsyncOp::Error(format!(
+                        "Failed to load depots for {app_id}: {err}"
+                    )));
+                }
+            }
+        });
+    }
+
     fn poll_async_ops(&mut self) {
         while let Ok(op) = self.operation_rx.try_recv() {
             match op {
@@ -783,8 +911,28 @@ impl SteamLauncher {
                         });
                     } else {
                         let platform = platforms.first().cloned().unwrap_or(DepotPlatform::Windows);
-                        self.start_install(appid, platform, Some(buffer), None);
+                        self.begin_depot_selection(appid, platform, buffer);
                     }
+                }
+                AsyncOp::InstallDepotsFetched(appid, platform, cached_vdf, depots) => {
+                    let game_name = self
+                        .library
+                        .iter()
+                        .find(|g| g.app_id == appid)
+                        .map(|g| g.name.clone())
+                        .unwrap_or_else(|| format!("App {appid}"));
+                    self.depot_selection = depots
+                        .iter()
+                        .filter(|depot| depot.is_owned == Some(true))
+                        .map(|depot| depot.id)
+                        .collect();
+                    self.depot_install_selection = Some(DepotInstallSelectionState {
+                        app_id: appid,
+                        game_name,
+                        platform,
+                        cached_vdf,
+                        depots,
+                    });
                 }
                 AsyncOp::ExtendedInfoFetched(appid, info) => {
                     self.extended_info.insert(appid, info);
@@ -1437,12 +1585,77 @@ impl SteamLauncher {
             });
 
             self.extended_info.remove(&app_id);
-            self.start_install(app_id, platform, Some(cached_vdf), None);
+            self.begin_depot_selection(app_id, platform, cached_vdf);
             self.platform_selection = None;
         } else if close {
             self.platform_selection = None;
         }
     }
+
+    fn draw_depot_install_selection_modal(&mut self, ctx: &egui::Context) {
+            let mut proceed = None;
+            let mut close = false;
+            if let Some(state) = &self.depot_install_selection {
+                egui::Window::new("Select Depots to Install")
+                    .collapsible(false)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        ui.label(format!("Select depots for {}:", state.game_name));
+                        ui.small("Locked depots are not owned or have no available decryption key.");
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                            for depot in &state.depots {
+                                let accessible = depot.is_owned == Some(true);
+                                let mut selected = self.depot_selection.contains(&depot.id);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(accessible, egui::Checkbox::new(&mut selected, ""))
+                                        .changed()
+                                    {
+                                        if selected {
+                                            self.depot_selection.insert(depot.id);
+                                        } else {
+                                            self.depot_selection.remove(&depot.id);
+                                        }
+                                    }
+                                    ui.label(format!("Depot {} — {}", depot.id, depot.name));
+                                    if !accessible {
+                                        ui.colored_label(egui::Color32::RED, "Unavailable");
+                                    } else if !depot.config.is_empty() {
+                                        ui.small(&depot.config);
+                                    }
+                                });
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.depot_selection.is_empty(),
+                                    egui::Button::new("Proceed to Install"),
+                                )
+                                .clicked()
+                            {
+                                proceed = Some((
+                                    state.app_id,
+                                    state.platform,
+                                    state.cached_vdf.clone(),
+                                    self.depot_selection.iter().copied().collect::<Vec<_>>(),
+                                ));
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            }
+            if let Some((app_id, platform, cached_vdf, depots)) = proceed {
+                self.start_install(app_id, platform, Some(cached_vdf), Some(depots));
+                self.depot_install_selection = None;
+            } else if close {
+                self.depot_install_selection = None;
+            }
+        }
 
     fn draw_properties_tab(&mut self, game: &LibraryGame, ui: &mut egui::Ui) {
         let mut config = self.user_configs.get(&game.app_id).cloned().unwrap_or_default();
@@ -1511,8 +1724,8 @@ impl SteamLauncher {
                             / progress.file_total_bytes as f64;
                         (
                             format!(
-                                "{action_word}: {} — {} / {} ({:.0}%)",
-                                progress.file_path,
+                                "{action_word} {}: {} / {} ({:.0}%)",
+                                progress.current_file,
                                 Self::format_bytes(progress.file_bytes_downloaded),
                                 Self::format_bytes(progress.file_total_bytes),
                                 file_pct
@@ -1536,7 +1749,7 @@ impl SteamLauncher {
                         };
                         (
                             format!(
-                                "{action_word}: {} — {} / {} ({:.0}%)",
+                                "{action_word} {}: {} / {} ({:.0}%)",
                                 progress.current_file,
                                 Self::format_bytes(progress.bytes_downloaded),
                                 Self::format_bytes(progress.total_bytes),
@@ -4019,7 +4232,34 @@ impl eframe::App for SteamLauncher {
                                         ui.add_space(20.0);
 
                                         ui.horizontal(|ui| {
-                                            if game.is_installed {
+                                            let operation_active =
+                                                self.download_tasks.contains_key(&game.app_id);
+                                            if operation_active {
+                                                let label = if self
+                                                    .download_tasks
+                                                    .get(&game.app_id)
+                                                    .and_then(|task| task.progress.as_ref())
+                                                    .map(|progress| {
+                                                        progress.state
+                                                            == DownloadProgressState::Verifying
+                                                    })
+                                                    .unwrap_or(false)
+                                                {
+                                                    "◌  VERIFYING…"
+                                                } else {
+                                                    "◌  INSTALLING…"
+                                                };
+                                                ui.add_enabled(
+                                                    false,
+                                                    egui::Button::new(
+                                                        egui::RichText::new(label)
+                                                            .color(egui::Color32::WHITE)
+                                                            .strong(),
+                                                    )
+                                                    .fill(egui::Color32::from_rgb(117, 117, 117))
+                                                    .min_size(egui::vec2(140.0, 40.0)),
+                                                );
+                                            } else if game.is_installed {
                                                 let process_state = self.game_processes.get(&game.app_id).copied();
                                                 let (label, color) = match process_state {
                                                     Some(GameProcessState::Launching) => ("◌  LAUNCHING…", egui::Color32::from_rgb(117, 117, 117)),
@@ -4178,7 +4418,8 @@ impl eframe::App for SteamLauncher {
                                                 egui::ProgressBar::new(fraction)
                                                     .show_percentage()
                                                     .text(format!(
-                                                        "{action_word} [{task_name}]: {cur_str} / {tot_str} ({pct:.0}%){eta_suffix}"
+                                                        "{action_word} {}: {cur_str} / {tot_str} ({pct:.0}%){eta_suffix}",
+                                                        progress.current_file
                                                     )),
                                             );
 
@@ -4252,6 +4493,7 @@ impl eframe::App for SteamLauncher {
         self.draw_uninstall_modal(ctx);
         self.draw_depot_browser_window(ctx);
         self.draw_platform_selection_modal(ctx);
+        self.draw_depot_install_selection_modal(ctx);
         self.draw_launch_selector_modal(ctx);
         self.draw_proton_remove_confirm_modal(ctx);
         ctx.request_repaint();

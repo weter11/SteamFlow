@@ -1290,6 +1290,23 @@ impl SteamClient {
         Ok(out)
     }
 
+    /// Return app depots annotated with the access the current account has.
+    ///
+    /// PICS appinfo can contain optional DLC/language depots which are visible
+    /// to everyone, but only a successful decryption-key request proves that
+    /// the account can actually download them.
+    pub async fn get_depot_list_with_access(&self, app_id: u32) -> Result<Vec<DepotInfo>> {
+        let mut depots = self.get_depot_list(app_id).await?;
+        for depot in &mut depots {
+            depot.is_owned = Some(
+                self.get_depot_key(app_id, depot.id as u32)
+                    .await
+                    .is_ok(),
+            );
+        }
+        Ok(depots)
+    }
+
     pub async fn get_depot_key(&self, app_id: u32, depot_id: u32) -> Result<Vec<u8>> {
         let connection = self
             .connection

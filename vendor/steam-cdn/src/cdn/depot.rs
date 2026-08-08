@@ -111,7 +111,7 @@ impl AppDepots {
 
     pub fn vdf_parse(&mut self, buffer: &[u8]) -> Result<(), Error> {
         if let Ok(vdf) = str::from_utf8(buffer) {
-            let kv = Vdf::parse(vdf)?;
+            let kv = keyvalues_parser::parse(vdf).map(Vdf::from)?;
             let appinfo = kv
                 .value
                 .get_obj()
