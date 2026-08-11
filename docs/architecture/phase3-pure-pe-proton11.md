@@ -134,6 +134,56 @@ This is a build-config patch to Proton's `Makefile.in` (or a
 3. `dist/lib/wine/i386-windows/` (PE32) + `x86_64-windows/` (PE32+) present
 4. `file dist/bin/wine` → PE32+ loader; `wine64` ELF 64-bit
 
+## 3b. PURE-PE BUILD VERIFIED (2026-08-11, later same day)
+
+**Patch applied to `proton/Makefile.in` (3 edits, all build-config only, no
+wine source changes):**
+1. `ARCHS += i386-unix x86_64-unix` → `ARCHS += x86_64-unix` (line 78) —
+   drops the i386-unix side; `rules-common.mk`/`rules-wine-tools.mk`/
+   `rules-makedep.mk`/`rules-autoconf.mk` all gate on `$(arch)-$(os) ∈ ARCHS`,
+   so every i386-unix tree (wine, kaldi, vosk, openfst, gstreamer family,
+   ffmpeg, dav1d, libsoup, graphene, glslang, gst_plugins_rs, lsteamclient,
+   steamexe, vrclient) is skipped automatically. i386-windows PE components
+   (dxvk, dxvk-nvapi, vkd3d, vkd3d-proton, vulkan-headers, spirv-headers)
+   remain, as their rules are `i386,windows`.
+2. `WINE_x86_64_AUTOCONF_ARGS` then expands to `--enable-archs=x86_64,i386
+   --enable-win64` — single 64-bit host tree cross-compiling BOTH PE halves
+   (verified in `make -n` dry run; `--host=x86_64-linux-gnu`, `i386_CC=
+   i686-w64-mingw32-gcc` retained for PE32 cross-compile).
+3. **kaldi serialization block gated** on `findstring i386-unix` (the
+   `.kaldi-x86_64-configure: .kaldi-i386-configure` edges hard-coded the
+   i386 tree; broke with "No rule to make target .kaldi-i386-configure").
+4. **module64 aliased to module32** — in pure-PE the single tree builds both
+   PE halves; running both recipes concurrently raced on shared archives
+   (`dlls/ntdll/i386-windows/libntdll.a: file truncated`).
+
+**Module build (after cleanup + wine-x86_64 reconfigure):**
+`make -j8 module=winex11.drv module` → **MODULE_EXIT: 0**
+
+**Pure-PE gate scan on `obj-wine-x86_64/dlls/winex11.drv`:**
+- `x86_64-windows/winex11.drv` → **PE32+** (x86-64) ✅
+- `i386-windows/winex11.drv` → **PE32** (Intel 80386) ✅
+- `winex11.so` (the only .so) → **ELF 64-bit** (unix side; 64-bit host libs
+  only) ✅
+- ELF 32-bit files in module output → **0** ✅
+
+**Tree-wide gate on the whole build dir:**
+- ELF 32-bit files → **0** ✅
+- `i386-unix` dirs → **0** ✅
+
+**Disk pre-flight:** freed 10G→14G by deleting the now-dead i386-unix obj/dst
+trees (obj-wine-i386, obj-kaldi-i386, obj-vosk-i386, obj-openfst-i386,
+gstreamer family, ffmpeg, dav1d, libsoup, graphene, glslang, gst_plugins_rs,
+lsteamclient, steamexe, vrclient — NOT the i386-windows PE ones). NOTE: the
+`/home/wer/devis/tmp/p2-*` dirs are P2-RTX research artifacts (stock-runtime
+backup 5.8G, mod backups) — deliberately left untouched (research policy).
+
+**Remaining caveat:** this verified the module-level proof (winex11.drv both
+PE halves, zero 32-bit ELF). The full `make` still needs to complete (wine
+tree is only partially built — kernel32/ntdll/ucrtbase i386-windows archives
+exist, but a full dist needs all dlls + dxvk/vkd3d-proton i386-windows PE
+staging), then `make redist` for the compat tool tree and the dist-level gate.
+
 ## 4. Pure-PE gate — status: DEFINITION FINALIZED (build-verified)
 
 **Correction from the earlier plan:** the gate is NOT "no `i386-unix/` dir" —
