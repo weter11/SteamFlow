@@ -1,5 +1,5 @@
 --- /tmp/Makefile.in.pristine	2026-08-11 15:45:39.307229465 -0200
-+++ proton/Makefile.in	2026-08-11 15:37:27.030374762 -0200
++++ /home/wer/devis/steamflow-phase3/proton/Makefile.in	2026-08-11 17:00:13.949542527 -0200
 @@ -75,7 +75,11 @@
  TARGET_ARCH ?= x86_64
  
@@ -13,7 +13,20 @@
  else ifeq ($(TARGET_ARCH),arm64)
  	ARCHS += aarch64-unix aarch64-windows arm64ec-windows
  else
-@@ -565,9 +569,13 @@
+@@ -445,6 +449,12 @@
+ WINEOPENXR_DEPENDS = wine openxr
+ 
+ WINEOPENXR_aarch64_PE_ARCHS = arm64ec x86_64
++# Pure-PE (Phase 3): the single x86_64 wine tree configures
++# --enable-archs=x86_64,i386, which would make wineopenxr's makedep build try
++# to cross-compile an i386-windows half — its openxr_loader.c is not
++# 32-bit-clean (casts pointer to UINT64; fails -Werror=pointer-to-int-cast)
++# and Valve never builds 32-bit wineopenxr. Restrict to x86_64 PE only.
++WINEOPENXR_x86_64_PE_ARCHS = x86_64
+ 
+ $(eval $(call rules-source,wineopenxr,$(SRCDIR)/wineopenxr))
+ $(eval $(call rules-makedep,wineopenxr,x86_64))
+@@ -565,9 +575,13 @@
  # the same source directory.
  #
  # The below assures that only a single configure/build step can run at a time.
@@ -27,7 +40,37 @@
  
  ##
  ## vosk
-@@ -1445,14 +1453,17 @@
+@@ -629,6 +643,29 @@
+   VKD3D_PE_CFLAGS="-I$(VULKAN_HEADERS_x86_64_DST)/include -I$(VKD3D_x86_64_DST)/include/vkd3d" \
+   VKD3D_PE_LIBS="-L$(VKD3D_x86_64_LIBDIR)/vkd3d/x86_64-windows -l:libvkd3d-1.dll -l:libvkd3d-shader-1.dll -l:libvkd3d-utils-1.dll"
+ 
++# Pure-PE single-tree build (Phase 3): the one x86_64 wine tree cross-compiles
++# BOTH i386-windows and x86_64-windows DLLs, but a single -L dir in
++# VKD3D_PE_LIBS can only serve one arch: makedep passes -L args verbatim to
++# every arch link (add_import_libs, case 'L'), so a -L in VKD3D_PE_LIBS would
++# precede any per-arch -L and the i386-windows wined3d.dll link would pick the
++# x86_64-windows libvkd3d-1.dll (PE32+ in a PE32 link) → "file not recognized:
++# file format not recognized". Wine's generated Makefile appends
++# $(i386_LDFLAGS)/$(x86_64_LDFLAGS) per link (makedep.c arch_make_variable
++# "LDFLAGS"), so route the -L dirs through those instead and keep only the
++# -l: names in VKD3D_PE_LIBS (later assignment on the configure command line
++# wins). The per-arch LDFLAGS are appended to the make variables — the
++# rules-common ENV compose (rules-common.mk "x86_64_LDFLAGS=... $(x86_64_LDFLAGS)
++# $(LDFLAGS)") picks them up while keeping the media LIBFLAGS.
++ifneq ($(findstring i386-unix,$(ARCHS)),)
++# classic-wow64: each wine tree builds a single arch; VKD3D_PE_LIBS above is
++# already per-tree (WINE_i386_*/WINE_x86_64_*), nothing extra needed.
++else
++WINE_x86_64_AUTOCONF_ARGS += \
++  VKD3D_PE_LIBS="-l:libvkd3d-1.dll -l:libvkd3d-shader-1.dll -l:libvkd3d-utils-1.dll"
++x86_64_LDFLAGS += -L$(VKD3D_x86_64_LIBDIR)/vkd3d/x86_64-windows
++i386_LDFLAGS += -L$(VKD3D_i386_LIBDIR)/vkd3d/i386-windows
++endif
++
+ WINE_DEPENDS = gst_orc gstreamer gst_base ffmpeg openfst kaldi vosk
+ WINE_i386_DEPENDS = vkd3d
+ WINE_x86_64_DEPENDS = piper vkd3d
+@@ -1445,14 +1482,17 @@
  
  .PHONY: module32 module64 module
  
