@@ -63,61 +63,104 @@ shim check).
 - Size: **3.9G**; disk free dropped 22G → **19G**
 - `configure.sh`, `Makefile`, `Makefile.in`, `proton`, `default_pfx.py` all present
 
-## 3. Configure & build — status: BLOCKED on podman install
+## 3. Configure & build — status: ✅ MODULE TEST BUILD PASSED (classic-wow64)
 
-Once podman is installed, in a fresh build dir (per README):
+### Environment solved (2026-08-11, this session)
+- podman 4.9.3 installed (user action); **`uidmap`** package installed (user
+  action) → rootless works
+- **`slirp4netns` missing** (no sudo) → solved with host networking via
+  `~/.local/bin/podman` wrapper injecting `--network=host` (configure.sh
+  `--container-engine=$HOME/.local/bin/podman`); container only needs
+  outbound HTTPS for gecko/mono/xalia fetches, so host networking suffices
+- **root `/` partition full during image pull** → `~/.config/containers/
+  containers.conf` `[engine] image_copy_tmp_dir = "/home/wer/.cache/
+  podman-image-tmp"` (image unpack now lands on the big /home NVMe)
+- SDK image `proton/steamrt4/sdk/x86_64:4.0.20260331.220802-0` pulled (~7G;
+  /home 27G→20G)
+- ccache NOT installed (needs sudo) — skipped; disk is the constraint anyway
+
+### Build commands (validated)
 ```bash
-mkdir -p /home/wer/devis/steamflow-phase3/build && cd /home/wer/devis/steamflow-phase3/build
-../proton/configure.sh --container-engine=podman --enable-ccache --build-name=steamflow-pure
-make 2>&1 | tee build.log          # first full pass
-make module=winex11.drv module     # single-module iteration loop (both 32/64-bit)
+mkdir -p /home/wer/devis/steamflow-phase3/build && cd ...
+../proton/configure.sh --container-engine=$HOME/.local/bin/podman \
+  --build-name=pure_pe_wow64
+make -j8 module=winex11.drv module   # -j8 not -j16: 14G-RAM box hung at -j16
 ```
-- `configure.sh` runs container permission checks (UID mapping, rootless
-  detection); with podman rootless the inner UID maps to `$(id -u)` →
-  `ROOTLESS_CONTAINER=0` path.
-- ccache is highly recommended (`--enable-ccache`; `$CCACHE_DIR` mounted into
-  the container) — the first full wine build is many GB of object files and
-  the disk budget is tight (19G free).
-- **Disk risk (flagged):** full build artifacts + ccache will likely exceed
-  19G free. Plan: build in `/home/wer/devis/steamflow-phase3/build` and free
-  space before the full pass, or clear `~/.ccache` after the module test.
+- `configure.sh` ✅ generated build/Makefile
+- `make module=winex11.drv module` ✅ **MODULE_EXIT: 0** after regenerating
+  `src-wine/include/wine/server_protocol.h` (`perl tools/make_requests` —
+  the module target's `wine-configure` prerequisite doesn't regenerate it;
+  the tracked header in the wine repo is stale vs `server/protocol.def`)
+- Build artifacts verified:
+  - `obj-wine-x86_64/dlls/winex11.drv/x86_64-windows/winex11.drv` → **PE32+**
+  - `obj-wine-i386/dlls/winex11.drv/i386-windows/winex11.drv` → **PE32**
+  - `obj-wine-i386/dlls/winex11.drv/winex11.so` → **ELF 32-bit** ← PROBLEM
+- First attempt hung the box at `-j16` (14G RAM, kaldi/parallel gcc);
+  `-j8` completed. System hang + RAM limitation were the interruption cause.
 
-## 4. Pure-PE gate — status: DEFINITION CORRECTED (source-verified)
+### ⚠️ CRITICAL FINDING: Valve's default build is CLASSIC-WOW64, not pure-PE
+The `module` target built **both** PE halves AND a full 32-bit unix tree:
+- `obj-wine-i386` is configured `--host=i686-linux-gnu` (a real 32-bit host
+  build producing ELF-32 `.so` unix libs) — this is exactly the layout that
+  requires host `i386-multilib` and is **permanently rejected** on this host.
+- Proton's `Makefile.in:73-78`:
+  ```make
+  ARCHS := i386-windows x86_64-windows
+  ifeq ($(TARGET_ARCH),x86_64)
+      ARCHS += i386-unix x86_64-unix     # ← adds the 32-bit ELF unix side
+  ```
+  and `WINE_x86_64_AUTOCONF_ARGS` (line 619) maps `unix_ARCHS` into
+  `--enable-archs=…`. The official Proton 11.0 depot ships this classic
+  layout (verified: `files/lib/wine/i386-unix/bcrypt.so` etc. are ELF 32-bit
+  with `/lib/ld-linux.so.2`).
 
-**Correction to the earlier Phase 2 plan:** the gate is NOT "no `i386-unix/`
-dir". Valve's own Makefile.in (`proton_11.0`) always creates
-`dist/lib/wine/i386-unix/` and installs ONLY the **64-bit** loader there:
-```make
-# Makefile.in lines 661-663 (.wine-x86_64-post-build)
-mkdir -p $(DST_DIR)/lib/wine/i386-unix
-$(call install-strip,$(WINE_x86_64_DST)/lib/wine/x86_64-unix/wine64,$(DST_DIR)/lib/wine/i386-unix)
-$(call install-strip,$(WINE_x86_64_DST)/lib/wine/x86_64-unix/wine64-preloader,$(DST_DIR)/lib/wine/i386-unix)
-```
-Wine is configured `--enable-win64` (Makefile.in:620) → 32-bit side is
-**PE-only** (`i386-windows`), no 32-bit ELF unix build.
+### The pure-PE path (Phase 3 next step)
+Wine 11's **new WoW64 mode** is PE-only: `--enable-archs=i386-windows,
+x86_64-windows` in a **single 64-bit tree** — the 32-bit side ships as PE32
+DLLs (`i386-windows/`) with NO `i386-unix` ELF loader at all. The Proton
+Makefile's `windows_ARCHS` machinery (line 86) already supports this; the
+needed change is to drop `i386-unix` from `ARCHS` for `TARGET_ARCH=x86_64`
+(i.e. `ARCHS := i386-windows x86_64-windows`, no `+= i386-unix …`), so:
+- wine x86_64 tree gets `--enable-archs=i386-windows,x86_64-windows`
+- the separate `obj-wine-i386` full-32-bit tree is not built
+- dist has `lib/wine/i386-windows/` (PE32) + `lib/wine/x86_64-windows/`
+  (PE32+) + `lib/wine/x86_64-unix/` — **zero 32-bit ELF**
+This is a build-config patch to Proton's `Makefile.in` (or a
+`--target-arch`-style override); it does not touch wine source.
+
+**Revised gate after this finding:**
+1. `find dist/lib/wine -name '*.so' -path '*i386*'` → empty (no i386-unix)
+2. `find dist -type f -exec file {} + | grep 'ELF 32-bit'` → empty
+3. `dist/lib/wine/i386-windows/` (PE32) + `x86_64-windows/` (PE32+) present
+4. `file dist/bin/wine` → PE32+ loader; `wine64` ELF 64-bit
+
+## 4. Pure-PE gate — status: DEFINITION FINALIZED (build-verified)
+
+**Correction from the earlier plan:** the gate is NOT "no `i386-unix/` dir" —
+Valve's own Makefile.in (`proton_11.0`) always creates `dist/lib/wine/
+i386-unix/` and installs ONLY the **64-bit** loader there. And the module
+build proved the default build ALSO produces a full 32-bit ELF unix tree
+(`obj-wine-i386` with `--host=i686-linux-gnu` ELF-32 `.so` libs) — i.e.
+**classic-wow64** layout. See §3 "CRITICAL FINDING" for the build-config
+change needed (drop `i386-unix` from `ARCHS`).
 
 **Verified classic-wow64 reference (official Proton 11.0 depot on disk):**
 `files/lib/wine/i386-unix/` contains **32-bit ELF `.so` files** — bcrypt.so,
 crypt32.so, dwrite.so, kerberos.so, … — and an ELF-32 `wine` executable
 (interpreter `/lib/ld-linux.so.2`). Those are what need host 32-bit libs.
 
-**The gate (source-grounded):**
-1. `dist/lib/wine/i386-unix/` may exist but must contain ONLY 64-bit ELF
-   (`wine64`, `wine64-preloader`) — **no `*.so` files, no ELF-32 binaries**:
-   ```bash
-   find dist/lib/wine/i386-unix -name '*.so'          # must be EMPTY
-   file dist/lib/wine/i386-unix/*                     # all must say ELF 64-bit
-   ```
-2. 32-bit PE side present: `dist/lib/wine/i386-windows/` (PE32 DLLs) +
+**The gate (final, build-grounded):**
+1. `find dist/lib/wine -name '*.so' -path '*i386*'` → **empty** (no i386-unix
+   ELF side)
+2. `find dist -type f -exec file {} + | grep 'ELF 32-bit'` → **empty**
+3. 32-bit PE side present: `dist/lib/wine/i386-windows/` (PE32 DLLs) +
    `dist/lib/wine/x86_64-windows/` (PE32+).
-3. `file dist/bin/wine` → PE32+ (or the 64-bit ELF loader with a PE32
-   wow64 32-bit half) — i.e. **no ELF 32-bit anywhere in dist**:
-   ```bash
-   find dist -type f -exec file {} + | grep 'ELF 32-bit'   # must be EMPTY
-   ```
+4. `file dist/bin/wine` → PE32+ (or ELF-64 loader); `wine64` ELF 64-bit.
+5. `i386-unix/` may exist but must contain ONLY 64-bit ELF (`wine64`,
+   `wine64-preloader`) — no `*.so`, no ELF-32 binaries.
 
-**Expected result:** a dist tree with `i386-unix` holding only the 64-bit
-loader → boots on this pure-64-bit host (64-bit host GL/Vulkan/X libs only).
+**Expected result:** a dist tree with PE-only 32-bit side → boots on this
+pure-64-bit host (64-bit host GL/Vulkan/X libs only), no i386-multilib.
 
 ## 5. Post-build install + conformance (next session)
 
