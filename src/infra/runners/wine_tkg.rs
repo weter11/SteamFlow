@@ -69,6 +69,62 @@ impl Runner for WineTkgRunner {
         std::fs::create_dir_all(&effective_game_prefix)
             .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", effective_game_prefix.display())).with_source(anyhow!(e)))?;
 
+        // === Native prefix seeding (Phase 2 tail, valve-stack directive) ===
+        // Port of Proton's `default_pfx.py`/`CompatData.setup_prefix`: when the
+        // game's prefix is fresh (no `system.reg` yet) and the runner is a
+        // Proton-kind tree shipping `files/share/default_pfx`, seed the prefix
+        // directly from it (copy tree + dosdevices symlinks + version marker)
+        // WITHOUT invoking external Python init scripts. Non-fatal: a seeding
+        // failure logs and the launch proceeds (wine would create an empty
+        // prefix anyway); the version marker comes from the runner's `version`
+        // file (e.g. `proton-11.0-1b`) or the runner dir name.
+        if !effective_game_prefix.join("system.reg").exists() {
+            let runner_root = crate::utils::derive_runner_root(&active_runner);
+            let default_pfx_candidates = [
+                "files/share/default_pfx",
+                "share/default_pfx",
+                "dist/share/default_pfx",
+            ];
+            let default_pfx = default_pfx_candidates
+                .iter()
+                .map(|p| runner_root.join(p))
+                .find(|p| p.is_dir());
+            if let Some(default_pfx_dir) = default_pfx {
+                let proton_version = std::fs::read_to_string(runner_root.join("version"))
+                    .ok()
+                    .map(|s| crate::utils::parse_short_version(&s))
+                    .filter(|v| v != "unknown" && !v.is_empty())
+                    .unwrap_or_else(|| {
+                        active_runner
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    });
+                match crate::runner::proton_abi::seed_prefix(
+                    &default_pfx_dir,
+                    &effective_game_prefix,
+                    &proton_version,
+                ) {
+                    Ok(created) => tracing::info!(
+                        "Native prefix seeding: seeded {} from {} ({} paths, version {})",
+                        effective_game_prefix.display(),
+                        default_pfx_dir.display(),
+                        created.len(),
+                        proton_version
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Native prefix seeding failed for {} (continuing with wine's own init): {e}",
+                        effective_game_prefix.display()
+                    ),
+                }
+            } else {
+                tracing::debug!(
+                    "No default_pfx in runner {} — skipping native prefix seeding",
+                    runner_root.display()
+                );
+            }
+        }
+
         tracing::info!("Effective game prefix: {}", effective_game_prefix.display());
         tracing::info!("Shared steam compatibility data enabled: {}", ctx.launcher_config.use_shared_compat_data);
         tracing::info!("Steam Runtime Prefix Mode: {:?}", steam_prefix_mode);
@@ -989,7 +1045,63 @@ impl Runner for WineTkgRunner {
         }
 
         tracing::info!("Final WINEDLLOVERRIDES: {}", dll_overrides);
-        env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
+        env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides.clone());
+
+        // === Native Rust Proton ABI (Phase 2 item 2, valve-stack directive) ===
+        // Port of Valve's `proton` script launch semantics, applied WITHOUT
+        // invoking Python. Computes the per-app compat-option set
+        // (default_compat_config + forcelgadd default + per-game
+        // proton_compat_options), then merges Proton's env rules and base
+        // DLL overrides into the env SteamFlow already assembled.
+        //
+        // This resolves the two real env gaps the test-diff harness found on
+        // RE2 (883710): PROTON_FORCE_LARGE_ADDRESS_AWARE (forcelgadd default)
+        // and the wined3d option were set by native Steam but never emitted
+        // by SteamFlow. See docs/architecture/valve-stack-replication.md.
+        {
+            let mut compat = crate::runner::proton_abi::default_compat_config(ctx.app.app_id);
+            if let Some(user_config) = &ctx.user_config {
+                for opt in &user_config.proton_compat_options {
+                    compat.insert(opt.clone());
+                }
+            }
+            crate::runner::proton_abi::apply_forcelgadd_default(&mut compat);
+
+            // Merge Proton's env rules (WINE_LARGE_ADDRESS_AWARE, WINE_HEAP_*,
+            // DXVK_ENABLE_NVAPI, WINE_MONO_HIDETYPES, __GLVND_DISALLOW_PATCHING,
+            // PROTON_USE_XALIA, …). SteamFlow's existing env values win.
+            //
+            // Order-preserving merge: WINEDLLOVERRIDES is order-sensitive for
+            // per-DLL settings (dll=setting pairs), so keep SteamFlow's
+            // original sequence and append Proton-only entries at the end.
+            let mut proton_dll_overrides: Vec<(String, String)> = Vec::new();
+            for seg in dll_overrides.split(';').filter(|s| !s.trim().is_empty()) {
+                if let Some((dll, setting)) = seg.split_once('=') {
+                    let dll = dll.trim().to_string();
+                    let setting = setting.trim().to_string();
+                    // Last occurrence wins (SteamFlow sometimes emits a DLL
+                    // twice); drop earlier duplicates.
+                    if let Some(prev) = proton_dll_overrides.iter_mut().find(|(d, _)| *d == dll) {
+                        prev.1 = setting;
+                    } else {
+                        proton_dll_overrides.push((dll, setting));
+                    }
+                }
+            }
+            crate::runner::proton_abi::apply_proton_env_rules(
+                ctx.app.app_id,
+                &compat,
+                &mut env,
+                &mut proton_dll_overrides,
+            );
+            let merged = crate::runner::proton_abi::serialize_dll_overrides(&proton_dll_overrides);
+            env.insert("WINEDLLOVERRIDES".to_string(), merged.clone());
+            tracing::info!(
+                "Proton ABI: compat={:?} → WINEDLLOVERRIDES={}",
+                compat,
+                merged
+            );
+        }
         if let Some(fixup) = &ctx.fixup_result {
             for (key, value) in &fixup.extra_env {
                 env.insert(key.clone(), value.clone());

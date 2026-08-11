@@ -3,7 +3,7 @@ use zip::ZipArchive;
 
 use crate::{
     crypto::aes256::{self, IV_LENGTH},
-    utils::lzma,
+    utils::{lzma, zstd},
     Error,
 };
 
@@ -15,6 +15,8 @@ pub async fn decrypt_and_decompress(data: &mut [u8], key: [u8; 32]) -> Result<Ve
     let decrypted = aes256::decrypt_cbc_with_iv_extraction(data, key)?;
     if lzma::is_vz(&decrypted) {
         Ok(lzma::decompress(&decrypted).await?)
+    } else if zstd::is_vzstd(&decrypted) {
+        Ok(zstd::decompress(&decrypted)?)
     } else {
         let cursor = Cursor::new(decrypted);
         let mut buffer = Vec::new();

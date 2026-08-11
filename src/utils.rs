@@ -1383,6 +1383,9 @@ pub struct RunnerVersions {
     pub wine_mono: Option<String>,
     pub wine_gecko: Option<String>,
     pub build_date: Option<String>,
+    /// The runner's own version (the tarball/release version SteamFlow
+    /// extracted). Written by `write_runner_versions_txt` during extraction.
+    pub runner_version: Option<String>,
 }
 
 /// Parse VERSIONS.txt from the runner root. Each line is KEY=VALUE.
@@ -1410,11 +1413,134 @@ pub fn read_versions_txt(root: &Path) -> RunnerVersions {
                 "WINE_MONO_VERSION" => versions.wine_mono = Some(val.to_string()),
                 "WINE_GECKO_VERSION" => versions.wine_gecko = Some(val.to_string()),
                 "BUILD_DATE" => versions.build_date = Some(val.to_string()),
+                "RUNNER_VERSION" => versions.runner_version = Some(val.to_string()),
                 _ => {}
             }
         }
     }
     versions
+}
+
+/// Write a canonical `VERSIONS.txt` at the runner root after extracting a
+/// runner tarball (Phase 2 item 3 of the valve-stack directive — kill the
+/// `found(bundled)` display bug).
+///
+/// Detection (`detect_*`) returns the placeholder `"found"` when no `version`
+/// file sits next to a component DLL (flat WoW64 layout). `apply_versions_override`
+/// treats `"found"` as needing the `VERSIONS.txt` override — but the override
+/// only exists if SteamFlow writes the file. This function:
+///
+/// 1. Harvests the component versions the tarball ships (the classic
+///    `files/lib/wine/<component>/version` files, root `version` file), and
+/// 2. Stamps the runner's own tarball/release version as `RUNNER_VERSION`.
+///
+/// It never overwrites an existing `VERSIONS.txt` (e.g. the custom
+/// `steamflow-runner` ships an authoritative one). Non-fatal: failures log and
+/// return `Ok(false)` so extraction is never blocked by version bookkeeping.
+pub fn write_runner_versions_txt(runner_root: &Path, tarball_version: &str) -> bool {
+    let path = runner_root.join("VERSIONS.txt");
+    if path.exists() {
+        tracing::debug!(
+            "VERSIONS.txt already exists at {} — leaving it untouched",
+            path.display()
+        );
+        return false;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // (VERSIONS.txt key, candidate version-file paths under the runner root)
+    let harvest: &[(&str, &[&str])] = &[
+        (
+            "DXVK_VERSION",
+            &[
+                "files/lib/wine/dxvk/version",
+                "lib/wine/dxvk/version",
+                "dist/lib/wine/dxvk/version",
+            ],
+        ),
+        (
+            "D7VK_VERSION",
+            &[
+                "files/lib/wine/d7vk/version",
+                "lib/wine/d7vk/version",
+                "dist/lib/wine/d7vk/version",
+            ],
+        ),
+        (
+            "VKD3D_PROTON_VERSION",
+            &[
+                "files/lib/wine/vkd3d-proton/version",
+                "lib/wine/vkd3d-proton/version",
+                "dist/lib/wine/vkd3d-proton/version",
+            ],
+        ),
+        (
+            "VKD3D_VERSION",
+            &[
+                "files/lib/vkd3d/version",
+                "lib/vkd3d/version",
+                "dist/lib/vkd3d/version",
+            ],
+        ),
+        (
+            "DXVK_NVAPI_VERSION",
+            &[
+                "files/lib/wine/nvapi/version",
+                "lib/wine/nvapi/version",
+                "dist/lib/wine/nvapi/version",
+                "files/lib/wine/dxvk-nvapi/version",
+            ],
+        ),
+    ];
+
+    for (key, candidates) in harvest {
+        let found = candidates.iter().find_map(|rel| {
+            let p = runner_root.join(rel);
+            std::fs::read_to_string(&p)
+                .ok()
+                .map(|s| parse_short_version(&s))
+                .filter(|v| v != "unknown" && !v.is_empty())
+        });
+        if let Some(v) = found {
+            lines.push(format!("{key}={v}"));
+        }
+    }
+
+    // Runner's own version: root `version` file (Proton layout, e.g.
+    // "1785138253 proton-11.0-1b") takes precedence; else the tarball version.
+    let runner_version = std::fs::read_to_string(runner_root.join("version"))
+        .ok()
+        .map(|s| parse_short_version(&s))
+        .filter(|v| v != "unknown" && !v.is_empty())
+        .unwrap_or_else(|| tarball_version.trim().to_string());
+    if !runner_version.is_empty() {
+        lines.push(format!("RUNNER_VERSION={runner_version}"));
+    }
+
+    if lines.is_empty() {
+        tracing::debug!(
+            "No version info harvestable from {} — not writing VERSIONS.txt",
+            runner_root.display()
+        );
+        return false;
+    }
+
+    let content = format!("{}\n", lines.join("\n"));
+    match std::fs::write(&path, content) {
+        Ok(()) => {
+            tracing::info!(
+                "Wrote VERSIONS.txt at {} ({} entries, runner {runner_version})",
+                path.display(),
+                lines.len()
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Failed to write {}: {e}", path.display());
+            false
+        }
+    }
 }
 
 fn apply_versions_override(
@@ -2164,5 +2290,79 @@ mod runner_kind_tests {
         assert!(is_bg_bare(wine.path()) && !game_uses_protonfixes(wine.path())); // row 4
         assert!(is_bg_bare(wine.path()) && game_uses_protonfixes(proton.path())); // row 5
         assert!(is_bg_bare(proton.path()) && !game_uses_protonfixes(wine.path())); // row 6
+    }
+}
+
+#[cfg(test)]
+mod versions_txt_tests {
+    use super::*;
+
+    #[test]
+    fn write_runner_versions_txt_harvests_and_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Classic Proton component layout: version files in component dirs.
+        std::fs::create_dir_all(root.join("files/lib/wine/dxvk")).unwrap();
+        std::fs::create_dir_all(root.join("files/lib/wine/vkd3d-proton")).unwrap();
+        std::fs::write(
+            root.join("files/lib/wine/dxvk/version"),
+            "1a5919b7e dxvk (v3.0.2-5-g1a5919b7e)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("files/lib/wine/vkd3d-proton/version"),
+            "3dfc6f07 vkd3d-proton (vkd3d-1.1-5438-g3dfc6f07d)\n",
+        )
+        .unwrap();
+        // Runner root `version` file (Proton style) wins for RUNNER_VERSION.
+        std::fs::write(root.join("version"), "1785138253 proton-11.0-1b\n").unwrap();
+
+        assert!(write_runner_versions_txt(root, "fallback-tag"));
+
+        let versions = read_versions_txt(root);
+        // parse_short_version strips -g<hex> git suffixes.
+        assert_eq!(versions.dxvk.as_deref(), Some("3.0.2-5"));
+        assert_eq!(versions.vkd3d_proton.as_deref(), Some("1.1-5438"));
+        assert_eq!(versions.runner_version.as_deref(), Some("proton-11.0-1b"));
+    }
+
+    #[test]
+    fn write_runner_versions_txt_uses_tarball_version_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No root `version` file → the tarball version is stamped instead.
+        std::fs::create_dir_all(root.join("files/lib/wine/dxvk")).unwrap();
+        std::fs::write(
+            root.join("files/lib/wine/dxvk/version"),
+            "dxvk (v3.0.2)\n",
+        )
+        .unwrap();
+
+        assert!(write_runner_versions_txt(root, "GE-Proton11-3"));
+        let versions = read_versions_txt(root);
+        assert_eq!(versions.dxvk.as_deref(), Some("3.0.2"));
+        assert_eq!(versions.runner_version.as_deref(), Some("GE-Proton11-3"));
+    }
+
+    #[test]
+    fn write_runner_versions_txt_never_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("VERSIONS.txt"), "DXVK_VERSION=9.9.9\n").unwrap();
+        std::fs::create_dir_all(root.join("files/lib/wine/dxvk")).unwrap();
+        std::fs::write(root.join("files/lib/wine/dxvk/version"), "dxvk (v3.0.2)\n").unwrap();
+
+        assert!(!write_runner_versions_txt(root, "tarball-tag"));
+        let versions = read_versions_txt(root);
+        assert_eq!(versions.dxvk.as_deref(), Some("9.9.9")); // untouched
+    }
+
+    #[test]
+    fn write_runner_versions_txt_skips_empty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Nothing harvestable → no VERSIONS.txt written.
+        assert!(!write_runner_versions_txt(root, ""));
+        assert!(!root.join("VERSIONS.txt").exists());
     }
 }

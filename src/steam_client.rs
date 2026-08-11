@@ -26,7 +26,8 @@ use steam_vent::auth::{
 use steam_vent::connection::Connection;
 use steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicket;
 use steam_vent::proto::steammessages_clientserver_2::{
-    CMsgClientGetDepotDecryptionKey, CMsgClientGetDepotDecryptionKeyResponse,
+    CMsgClientGetCDNAuthToken, CMsgClientGetCDNAuthTokenResponse, CMsgClientGetDepotDecryptionKey,
+    CMsgClientGetDepotDecryptionKeyResponse,
 };
 use steam_vent::proto::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
@@ -1062,6 +1063,14 @@ impl SteamClient {
                 ) {
                     tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
                 }
+                // Phase 2 item 3 (valve-stack directive): after a successful
+                // depot download, surface the runner's version into
+                // VERSIONS.txt at the install root so bundled components
+                // display real versions instead of `found(bundled)`. Only
+                // fires when version info is harvestable (Proton tool trees
+                // ship `version` files; a plain game dir yields nothing and
+                // the write is skipped).
+                crate::utils::write_runner_versions_txt(&install_dir, &installdir);
                 let _ = tx
                     .send(DownloadProgress {
                         state: DownloadProgressState::Completed,
@@ -1190,15 +1199,22 @@ impl SteamClient {
         host_name: &str,
     ) -> Result<String> {
         let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
-        let mut request = CContentServerDirectory_GetCDNAuthToken_Request::new();
-        request.set_app_id(app_id);
+        let mut request = CMsgClientGetCDNAuthToken::new();
         request.set_depot_id(depot_id);
         request.set_host_name(host_name.to_string());
+        request.set_app_id(app_id);
 
-        let response: CContentServerDirectory_GetCDNAuthToken_Response = connection
-            .service_method(request)
+        // NOTE: the ContentServerDirectory.GetCDNAuthToken SERVICE variant returns
+        // ERESULT Fail server-side; the real client uses the job-based
+        // CMsgClientGetCDNAuthToken (same shape as GetDepotDecryptionKey).
+        let response: CMsgClientGetCDNAuthTokenResponse = connection
+            .job(request)
             .await
-            .context("failed calling ContentServerDirectory.GetCDNAuthToken")?;
+            .context("failed calling GetCDNAuthToken job")?;
+
+        if response.eresult() != 1 {
+            return Err(anyhow!("GetCDNAuthToken returned eresult {}", response.eresult()));
+        }
 
         if response.token().is_empty() {
             return Err(anyhow!("Empty Auth Token returned"));
@@ -2325,6 +2341,51 @@ impl SteamClient {
                                 }
                                 if let Some(dir) = &common.installdir {
                                     installdir = Some(dir.clone());
+                                }
+                            }
+                        }
+                        // Tool apps (Proton etc.) carry installdir under
+                        // appinfo.config.installdir, NOT common.installdir —
+                        // and parse_appinfo can fail entirely on them. Fall back
+                        // to a direct VDF walk so tools install into the same
+                        // directory real Steam uses (e.g. "Proton - Experimental").
+                        if installdir.is_none() || display_name.starts_with("App ") {
+                            if let Ok(vdf) = find_vdf_in_pics(app.buffer()) {
+                                let info_obj = vdf.as_obj().and_then(|root| {
+                                    if vdf.key() == "appinfo" || vdf.key() == appid.to_string() {
+                                        Some(root)
+                                    } else {
+                                        root.get("appinfo")
+                                            .and_then(|v| v.as_obj())
+                                            .or(Some(root))
+                                    }
+                                });
+                                if let Some(info) = info_obj {
+                                    if display_name.starts_with("App ") {
+                                        if let Some(name) = info
+                                            .get("common")
+                                            .and_then(|v| v.as_obj())
+                                            .and_then(|c| c.get("name"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            display_name = name.to_string();
+                                        }
+                                    }
+                                    if installdir.is_none() {
+                                        let from_common = info
+                                            .get("common")
+                                            .and_then(|v| v.as_obj())
+                                            .and_then(|c| c.get("installdir"))
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string);
+                                        let from_config = info
+                                            .get("config")
+                                            .and_then(|v| v.as_obj())
+                                            .and_then(|c| c.get("installdir"))
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string);
+                                        installdir = from_common.or(from_config);
+                                    }
                                 }
                             }
                         }

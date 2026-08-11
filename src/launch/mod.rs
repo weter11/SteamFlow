@@ -155,6 +155,19 @@ pub async fn install_master_steam(config: &LauncherConfig) -> Result<()> {
             "Proton (bare wine) Steam launch: STEAM_COMPAT_CLIENT_INSTALL_PATH={} (real client)",
             client_win
         );
+        // Valve-stack directive (docs/architecture/valve-stack-replication.md §Key
+        // findings 1): the 32-bit Windows Steam client needs the wine builtin
+        // steamclient shim suppressed on ANY runner kind — Proton-kind envs that
+        // leave it active crash with `create_win_interface Don't recognize
+        // interface name: CLIENTENGINE_INTERFACE_VERSION005` (assert
+        // client_api.cpp:601) or `steamclient_init` access violation. Same
+        // override set as the PlainWine path, while keeping the REAL
+        // STEAM_COMPAT_CLIENT_INSTALL_PATH above (games still see a live
+        // Windows Steam via the real client dir).
+        cmd.env(
+            "WINEDLLOVERRIDES",
+            "vstdlib_s=n;tier0_s=n;steamclient=n;steamclient64=n;steam_api=n;steam_api64=n;lsteamclient=",
+        );
     } else {
         // Plain wine-tkg: the original working hack. The fake_env trap (dummy
         // steam/steam.sh) plus steamclient/steam_api=n keeps Wine-Steam from hijacking
@@ -300,7 +313,7 @@ pub fn launch_custom_exec(
     game_app_id: u32,
     game_name: &str,
     exec_path: &Path,
-) -> Result<()> {
+) -> Result<std::process::Child> {
     if !exec_path.exists() {
         bail!("Custom executable not found: {}", exec_path.display());
     }
@@ -405,8 +418,7 @@ pub fn launch_custom_exec(
         cmd.spawn().context("Failed to spawn custom mod executable")
     };
 
-    spawn_result?;
-    Ok(())
+    spawn_result
 }
 
 fn is_executable(path: &Path) -> bool {

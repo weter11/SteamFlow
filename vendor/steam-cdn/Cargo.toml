@@ -96,3 +96,6 @@ features = [
 
 [dependencies.zip]
 version = "2.2.2"
+
+[dependencies.zstd]
+version = "0.13"

@@ -2102,7 +2102,7 @@ impl SteamLauncher {
                             &game_name,
                             std::path::Path::new(&exec_path),
                         ) {
-                            Ok(()) => {
+                            Ok(_child) => {
                                 let _ = tx.send(AsyncOp::ModLauncherLaunched);
                             }
                             Err(e) => {
