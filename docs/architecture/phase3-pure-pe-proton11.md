@@ -274,6 +274,55 @@ now spawns background Steam with the **game's own runner**. Verified:
 cleanly, no exit 53. (Also fixed `deploy_dll_symlinks` EEXIST on dangling
 runner symlinks — `symlink_metadata()` instead of `exists()`, `3ff4347`.)
 
+### Post-Phase-3 follow-up: Shared→PerGame runner-mismatch guard (2026-08-12)
+
+**Context:** the pure-PE client investigation (see the
+`steamflow-proton-runtime-debugging` skill) determined that the Windows Steam
+client cannot boot under the purepe runner (CEF GPU-process crash + a second
+32-bit `steam.exe` network-init stall), so the recommended split is **Steam
+Runtime runner = wine-tkg** (hosts the client) + **per-game runner = purepe**
+(games). But `effective_game_proton` no longer force-equals the game runner
+to the runtime runner, so a **Shared** prefix would host two different wine
+builds (two wineservers, different pipe protocols) →
+`wine client error: version mismatch ... your wine binary was not upgraded
+correctly` at launch.
+
+**Change:** `WineTkgRunner` resolves an **effective prefix mode**
+(`effective_prefix_mode(ctx)` + pure core `effective_prefix_mode_impl`, both
+in `src/infra/runners/wine_tkg.rs`): it applies the configured mode (per-game
+user config → launcher default) and, when that mode is `Shared` **and** the
+Steam Runtime runner resolves to a different path than the game runner,
+auto-falls back to `PerGame` with a visible warning:
+
+```
+[SteamFlow] Runner mismatch detected (Steam Runtime: "{steam}", Game: "{game}").
+Automatically switching to PerGame prefix mode to prevent wineserver protocol collision.
+```
+
+The effective mode is threaded through every prefix decision point:
+
+- `steam_wineprefix_for_game` (src/utils.rs) gained an
+  `Option<SteamPrefixMode>` parameter: `Some(mode)` = effective mode from the
+  launch pipeline; `None` = legacy configured-mode callers (UI management
+  buttons, `launch_custom_exec` Mods-tab path).
+- `prepare_prefix` + `build_env` (game WINEPREFIX, background-Steam spawn,
+  CEF-enforcement prefix, the Shared+Steam-running warning gate) use the
+  effective mode.
+- Pipeline stages `prepare_prefix.rs` (symlink deployment),
+  `resolve_game_fixups.rs` (registry fixups) and `resolve_dll_providers.rs`
+  (component detection) resolve the same effective mode so nothing targets
+  the wrong prefix.
+
+**Tests** (`src/infra/runners/tests.rs`):
+- Shared + `"wine-tkg"` runtime runner + `"steamflow-proton-11.0-purepe"`
+  game runner → `PerGame` (the exact recommended split).
+- Matching runners → stays `Shared`.
+- No runtime runner configured → stays `Shared`.
+
+**Effect:** the recommended split-runner config now works with the global
+prefix mode left at its default — the launcher detects the mismatch and
+isolates the runners into separate prefixes automatically.
+
 ### Conformance gates (Phase 1 reuse) — status
 - Windows Steam client boots without client_api.cpp:601 → ✅ (wine-tkg master
   stack unchanged; pure-PE runs game-side)

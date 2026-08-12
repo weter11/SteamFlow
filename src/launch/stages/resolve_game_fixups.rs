@@ -30,7 +30,18 @@ impl PipelineStage for ResolveGameFixupsStage {
             _ => {
                 ctx.verification.protonfixes_routed = false;
                 let store: crate::models::UserConfigStore = ctx.user_config.as_ref().map(|c| { let mut s = HashMap::new(); s.insert(ctx.app_id, c.clone()); s }).unwrap_or_default().into();
-                let wineprefix = crate::utils::steam_wineprefix_for_game(config, ctx.app_id, &store);
+                // Use the EFFECTIVE prefix mode so registry fixups target the
+                // same prefix the launch uses (runner-mismatch guard).
+                let configured_mode = ctx.user_config.as_ref()
+                    .map(|c| c.steam_prefix_mode.clone())
+                    .unwrap_or(config.steam_prefix_mode.clone());
+                let effective_mode = crate::infra::runners::wine_tkg::effective_prefix_mode_impl(
+                    configured_mode,
+                    &config.steam_runtime_runner,
+                    proton,
+                    &library_root,
+                );
+                let wineprefix = crate::utils::steam_wineprefix_for_game(config, ctx.app_id, &store, Some(effective_mode));
                 let install_dir = app.install_path.clone().unwrap_or_default();
                 let arch = match ctx.target_architecture { crate::models::ExecutableArchitecture::X86 => "x86", _ => "x86_64" };
                 let fctx = crate::launch::fixups::FixupContext::new(ctx.app_id, app.name.clone(), install_dir, wineprefix.to_string_lossy().to_string(), arch.into());

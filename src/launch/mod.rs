@@ -322,7 +322,10 @@ pub fn launch_custom_exec(
         crate::models::UserConfigStore::new();
     user_config_store.insert(game_app_id, user_config.clone());
 
-    let prefix = crate::utils::steam_wineprefix_for_game(config, game_app_id, &user_config_store);
+    // Custom-exec (Mods tab "Play Mod") keeps the CONFIGURED prefix mode; the
+    // standard pipeline applies the runner-mismatch guard (see
+    // wine_tkg::effective_prefix_mode).
+    let prefix = crate::utils::steam_wineprefix_for_game(config, game_app_id, &user_config_store, None);
     std::fs::create_dir_all(&prefix)
         .with_context(|| format!("failed creating Wine prefix {}", prefix.display()))?;
 

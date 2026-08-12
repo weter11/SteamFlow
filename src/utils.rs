@@ -2164,6 +2164,7 @@ pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,
     user_configs: &crate::models::UserConfigStore,
+    effective_prefix_mode: Option<crate::models::SteamPrefixMode>,
 ) -> std::path::PathBuf {
     let use_steam_runtime = match user_configs.get(&app_id).map(|c| &c.steam_runtime_policy) {
         Some(crate::models::SteamRuntimePolicy::Enabled) => true,
@@ -2173,9 +2174,16 @@ pub fn steam_wineprefix_for_game(
         }
     };
 
-    let use_per_game_compat_data = user_configs.get(&app_id)
-        .map(|c| use_steam_runtime && c.steam_prefix_mode == crate::models::SteamPrefixMode::PerGame)
-        .unwrap_or(config.use_shared_compat_data);
+    let use_per_game_compat_data = match effective_prefix_mode {
+        // Launch pipeline: honor the EFFECTIVE mode. The runner-mismatch guard
+        // (wine_tkg::effective_prefix_mode) may have auto-fallbacked a Shared
+        // configuration to PerGame so the two different runners never share one
+        // WINEPREFIX (wineserver protocol collision).
+        Some(mode) => use_steam_runtime && mode == crate::models::SteamPrefixMode::PerGame,
+        None => user_configs.get(&app_id)
+            .map(|c| use_steam_runtime && c.steam_prefix_mode == crate::models::SteamPrefixMode::PerGame)
+            .unwrap_or(config.use_shared_compat_data),
+    };
 
     if use_per_game_compat_data {
         std::path::PathBuf::from(&config.steam_library_path)

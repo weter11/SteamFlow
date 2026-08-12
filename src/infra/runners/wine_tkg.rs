@@ -28,6 +28,67 @@ fn effective_game_proton(ctx: &LaunchContext) -> String {
     ).to_string()
 }
 
+/// Compare two runner paths for equality, tolerating symlinked installs and
+/// paths that do not exist yet (resolve_runner falls back to the raw name when
+/// a runner is not installed).
+fn runner_paths_equal(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+/// Pure decision core of the runner-mismatch guard (testable without a
+/// `LaunchContext`): when the configured prefix mode is `Shared` but the Steam
+/// Runtime runner differs from the game runner, return `PerGame`.
+///
+/// A Shared prefix cannot host two different Wine/Proton runners at the same
+/// time: each wine build speaks its own `wineserver` protocol, so mixing them
+/// in one WINEPREFIX fails with
+/// "wine client error: version mismatch ... your wine binary was not upgraded
+/// correctly". Falling back to PerGame gives each runner its own prefix.
+pub(crate) fn effective_prefix_mode_impl(
+    configured: crate::models::SteamPrefixMode,
+    steam_runtime_runner: &Path,
+    game_runner_name: &str,
+    library_root: &Path,
+) -> crate::models::SteamPrefixMode {
+    if configured != crate::models::SteamPrefixMode::Shared {
+        return configured;
+    }
+    let steam_runner = steam_runtime_runner.to_string_lossy();
+    if steam_runner.is_empty() {
+        // No Steam Runtime runner configured — nothing can collide in the prefix.
+        return configured;
+    }
+    let steam_runner_path = crate::utils::resolve_runner(&steam_runner, library_root);
+    let game_runner_path = crate::utils::resolve_runner(game_runner_name, library_root);
+    if runner_paths_equal(&steam_runner_path, &game_runner_path) {
+        return configured;
+    }
+    tracing::warn!(
+        "[SteamFlow] Runner mismatch detected (Steam Runtime: \"{}\", Game: \"{}\"). Automatically switching to PerGame prefix mode to prevent wineserver protocol collision.",
+        steam_runner_path.display(),
+        game_runner_path.display()
+    );
+    crate::models::SteamPrefixMode::PerGame
+}
+
+/// Resolve the EFFECTIVE Steam prefix mode for a launch: the user-configured
+/// mode (per-game user config → global launcher default), auto-fallbacked to
+/// `PerGame` when a `Shared` prefix would host two different Wine/Proton
+/// runners (see `effective_prefix_mode_impl`).
+pub(crate) fn effective_prefix_mode(ctx: &LaunchContext) -> crate::models::SteamPrefixMode {
+    let configured = ctx.user_config.as_ref()
+        .map(|c| c.steam_prefix_mode.clone())
+        .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
+    let game_runner = effective_game_proton(ctx);
+    effective_prefix_mode_impl(
+        configured,
+        &ctx.launcher_config.steam_runtime_runner,
+        &game_runner,
+        Path::new(&ctx.launcher_config.steam_library_path),
+    )
+}
+
 #[async_trait::async_trait]
 impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
@@ -51,9 +112,11 @@ impl Runner for WineTkgRunner {
                 }
             }
         };
-        let steam_prefix_mode = ctx.user_config.as_ref()
-            .map(|c| c.steam_prefix_mode.clone())
-            .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
+        // Effective prefix mode: the configured mode, auto-fallbacked from
+        // Shared to PerGame when the Steam Runtime runner and the game runner
+        // differ (two wineservers with different protocols cannot share one
+        // WINEPREFIX). See `effective_prefix_mode_impl`.
+        let steam_prefix_mode = effective_prefix_mode(ctx);
 
         let user_config_store: crate::models::UserConfigStore = ctx.user_config.as_ref().map(|c| {
             let mut store = HashMap::new();
@@ -64,7 +127,8 @@ impl Runner for WineTkgRunner {
         let effective_game_prefix = crate::utils::steam_wineprefix_for_game(
             &ctx.launcher_config,
             ctx.app.app_id,
-            &user_config_store
+            &user_config_store,
+            Some(steam_prefix_mode.clone()),
         );
         std::fs::create_dir_all(&effective_game_prefix)
             .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", effective_game_prefix.display())).with_source(anyhow!(e)))?;
@@ -525,6 +589,7 @@ impl Runner for WineTkgRunner {
                 &ctx.launcher_config,
                 ctx.app.app_id,
                 &user_config_store,
+                Some(steam_prefix_mode.clone()),
             );
             let slc = ctx.user_config.as_ref()
                 .map(|c| c.steam_launch_config.clone())
@@ -604,6 +669,10 @@ impl Runner for WineTkgRunner {
             .join("compatdata")
             .join(&app_id_str);
 
+        // Effective prefix mode (runner-mismatch guard), used for the game's
+        // WINEPREFIX below AND the background-Steam spawn decision.
+        let steam_prefix_mode = effective_prefix_mode(ctx);
+
         let user_config_store: crate::models::UserConfigStore = ctx.user_config.as_ref().map(|c| {
             let mut store = HashMap::new();
             store.insert(ctx.app.app_id, c.clone());
@@ -613,7 +682,8 @@ impl Runner for WineTkgRunner {
         let effective_game_prefix = crate::utils::steam_wineprefix_for_game(
             &ctx.launcher_config,
             ctx.app.app_id,
-            &user_config_store
+            &user_config_store,
+            Some(steam_prefix_mode.clone()),
         );
 
         // === Pre-launch Steam API readiness check ===
@@ -1125,10 +1195,8 @@ impl Runner for WineTkgRunner {
             }
         }
 
-        let steam_prefix_mode = ctx.user_config.as_ref()
-            .map(|c| c.steam_prefix_mode.clone())
-            .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
-
+        // NOTE: `steam_prefix_mode` is the EFFECTIVE mode, resolved at the top
+        // of this fn via `effective_prefix_mode(ctx)` (runner-mismatch guard).
         if steam_prefix_mode == crate::models::SteamPrefixMode::Shared && SteamClient::is_steam_running_in_prefix(&effective_game_prefix) {
             let msg = "Shared prefix mode: Steam is already running in this prefix. Launching a second game with a different runner will crash. Consider switching to per-game prefix mode in Settings.";
             tracing::warn!("{}", msg);

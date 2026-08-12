@@ -96,7 +96,11 @@ pinned, vendored dependencies with an upgrade button.
    `effective_game_proton` doc-comment claims per-game freedom, but in Shared
    prefix mode the game runner must equal the runtime runner (or get its own
    prefix). The stale-wineserver guard spares Steam's server, so the mismatch
-   is not cleaned up automatically.
+   is not cleaned up automatically. **IMPLEMENTED 2026-08-12:** the
+   runner-mismatch guard `effective_prefix_mode` (wine_tkg.rs) now auto-falls
+   a Shared configuration back to PerGame when the Steam Runtime runner ≠ the
+   game runner (with a visible warning) — see
+   `phase3-pure-pe-proton11.md` "Post-Phase-3 follow-up".
 5. **`proton run` via the script path does NOT SIGSYS anymore** (unlike the old
    skill note) — but on this host the classic-wow64 proton scripts can't load
    their display driver anyway (missing 32-bit host libs).
