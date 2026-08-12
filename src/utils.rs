@@ -2013,9 +2013,12 @@ pub fn deploy_dll_symlinks(
 
             let dest_path = dest_dir.join(&dll_name);
 
-            // Safety check: if it exists and is not a symlink, back it up or skip?
-            // Usually we want to replace it if it's a Wine builtin.
-            if dest_path.exists() {
+            // Safety check: if it exists (including as a dangling symlink,
+            // which `Path::exists()` follows and reports as missing — e.g. a
+            // link to a runner dir that was renamed/removed) and is not a
+            // symlink, back it up or skip? Usually we want to replace it if
+            // it's a Wine builtin.
+            if dest_path.symlink_metadata().is_ok() {
                 let meta = std::fs::symlink_metadata(&dest_path)?;
                 if !meta.file_type().is_symlink() {
                     let backup = dest_path.with_extension("dll.bak");
