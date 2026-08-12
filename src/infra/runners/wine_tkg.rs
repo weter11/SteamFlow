@@ -293,7 +293,24 @@ impl Runner for WineTkgRunner {
                         // pass (after readiness gate) will handle newly spawned
                         // helpers to ensure user-disabled features are enforced.
                     } else {
-                        let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                        // PerGame mode: the per-game prefix is seeded by the
+                        // game's own runner (seed_prefix copies its
+                        // default_pfx), so the background Steam client MUST run
+                        // under that same wine family. A mismatched runner
+                        // cannot initialize inside the seeded prefix — e.g. a
+                        // classic-wow64 wine-tkg client in a pure-PE-seeded
+                        // prefix fails with
+                        //   "init_wow64: could not load wow64.dll" → exit 53
+                        // (pure-PE wine has no wow64.dll; its 32-bit half is
+                        // PE-only). Shared mode keeps the configured runtime
+                        // runner, which owns the master prefix.
+                        let steam_runner = if steam_prefix_mode == crate::models::SteamPrefixMode::PerGame {
+                            tracing::info!(
+                                "PerGame mode: using the game's runner ({}) for background Steam (prefix is seeded by it)",
+                                active_runner.display()
+                            );
+                            active_runner.clone()
+                        } else if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {
                             let discovered = crate::utils::resolve_runner("wine-tkg", &library_root);
