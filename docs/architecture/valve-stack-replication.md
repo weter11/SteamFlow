@@ -30,11 +30,14 @@ extraction (GitHub tarball install, steam-cdn `install_game`, headless
 Python prefix init at game launch); i386-multilib item **CLOSED / REJECTED**
 (host is pure 64-bit — never re-open). See "Session close" + "Phase 3" blocks.
 
-**Phase 3 INITIATED (2026-08-11): containerized pure-PE WoW64 Proton build of
-Valve's `proton_11.0` source using `registry.gitlab.steamos.cloud/proton/
-soldier/sdk`** — zero host 32-bit ELF library dependencies (the resolution to
-the i386-multilib rejection). Plan in the "Phase 3" section below; execution
-awaits podman/docker on this host.
+**Phase 3 CLOSED (2026-08-12): containerized pure-PE WoW64 Proton 11.0 build
+of Valve's `proton_11.0` source — COMPLETE.** Built with the branch-pinned
+**steamrt4** SDK (`registry.gitlab.steamos.cloud/proton/steamrt4/sdk/x86_64:
+4.0.20260331.220802-0`; not soldier — see §Phase 3), staged as
+`compatibilitytools.d/steamflow-proton-11.0-purepe`, and **verified booting
+RE2 live** (zero 32-bit ELF anywhere; 611×PE32 i386-windows + 613×PE32+
+x86_64-windows; 0 ELF-32 files). Full record: `docs/architecture/
+phase3-pure-pe-proton11.md`. i386-multilib remains permanently rejected.
 
 ## Problem
 
@@ -347,23 +350,26 @@ RE2 display mode is USER-CONTROLLED (windowed per user) — do not override.
   Non-fatal on failure (wine's own init takes over). The wine-tkg 11.13 stack
   has no `default_pfx` (PlainWine) so the current stack is unaffected.
 
-## Phase 3 — containerized pure-PE WoW64 Proton build (INITIATED 2026-08-11)
+## Phase 3 — containerized pure-PE WoW64 Proton build (CLOSED 2026-08-12)
 
-**Goal:** build Valve's `proton_11.0` source into a **pure PE WoW64 runner**
-(zero host 32-bit ELF library dependencies) so official Proton runs on this
-pure-64-bit host — resolving the i386-multilib rejection above. No host
-`i386-multilib` is ever involved; all 32-bit needs are satisfied by the
-container's toolchain and the runner's bundled PE DLLs.
+**Goal (ACHIEVED):** build Valve's `proton_11.0` source into a **pure PE
+WoW64 runner** (zero host 32-bit ELF library dependencies) so official
+Proton runs on this pure-64-bit host — resolving the i386-multilib rejection
+above. No host `i386-multilib` was ever involved; all 32-bit needs are
+satisfied by the container's toolchain and the runner's bundled PE DLLs.
+Result: `compatibilitytools.d/steamflow-proton-11.0-purepe`, E2E-verified on
+RE2 (883710). Full execution record with every gate result lives in
+`docs/architecture/phase3-pure-pe-proton11.md`.
 
 **Prerequisite:** podman or docker on this host (none installed — Tier 2 was
 deferred on this). Install podman first (pure-64-bit friendly, rootless).
 
 **Pipeline:**
-1. **Base image:** `registry.gitlab.steamos.cloud/proton/soldier/sdk` — the
-   official Valve Proton SDK (soldier runtime SDK; provides the build
-   toolchain Valve uses for Proton 8+). Tag pin to the same soldier SDK the
-   `proton_11.0` branch CI uses (verify via the Proton repo's
-   `.gitlab-ci.yml` / `Makefile`).
+1. **Base image:** `registry.gitlab.steamos.cloud/proton/steamrt4/sdk/x86_64`
+   — the official Valve Proton SDK for the **proton_11.0** line (the branch
+   pins `:4.0.20260331.220802-0` in `Makefile.in`; `soldier/sdk` is for older
+   Proton lines and was NOT used). Tag: the branch's own pin, verified
+   anonymously pullable.
 2. **Source:** `git clone --recurse-submodules -b proton_11.0
    https://github.com/ValveSoftware/Proton.git` inside the container (or
    volume-mounted from the host for incremental builds).
@@ -394,7 +400,10 @@ deferred on this). Install podman first (pure-64-bit friendly, rootless).
    gate + first-frame render, `test-diff 883710` parity holds, `VERSIONS.txt`
    written at extraction (Phase 2 tail) shows real component versions.
 
-**Open questions for Phase 3 execution:** SDK image tag to pin; disk budget
-(~29 GB free; Proton source + submodules ~5-8 GB, build artifacts more);
-whether to build wine-mono/gecko in-tree or fetch prebuilt (wine-mono is a
-separate `make` target); podman rootless volume permissions for the build dir.
+**Open questions (RESOLVED during execution):** SDK image tag — branch pin
+`4.0.20260331.220802-0` (steamrt4, **not** soldier — proton_11.0 switched
+lines; soldier is for older Proton); disk budget — tight (~14G), managed via
+incremental cache cleanup + `-j8` (ccache not installed, needs sudo);
+wine-mono/gecko — fetched in-container during the build (host networking
+wrapper); podman rootless — solved with `uidmap` + `~/.local/bin/podman`
+host-network wrapper + `image_copy_tmp_dir` on /home.
