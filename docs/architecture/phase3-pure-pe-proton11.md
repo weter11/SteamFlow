@@ -323,6 +323,40 @@ The effective mode is threaded through every prefix decision point:
 prefix mode left at its default — the launcher detects the mismatch and
 isolates the runners into separate prefixes automatically.
 
+### Post-Phase-3 follow-up: prefix self-heal for dangling builtin DLL symlinks (2026-08-12)
+
+**Context:** the RE2 prefix (`compatdata/883710/pfx`) was seeded on
+2026-08-11 while the game ran the vendored cachyos copy
+(`compatibilitytools.d/steamflow-proton-11.0`). Seeding created **absolute
+symlinks** into that runner's `files/lib/wine/{x86_64,i386}-windows/` tree
+for every builtin DLL (kernel32, ntdll, user32, …). When the vendored copy
+was later removed (only `steamflow-proton-11.0-purepe` remained), **599 of
+609 system32 links dangled** and ANY wine — game runner or background Steam
+— died before launch with:
+
+```
+wine: could not load kernel32.dll, status c0000135   →  exit 53
+```
+
+`seed_prefix` only seeds when `system.reg` is absent, and
+`deploy_dll_symlinks` only covers game-DLL providers (dxvk/vkd3d/nvapi), so
+the broken prefix was never repaired automatically.
+
+**Change:** `utils::repair_dangling_prefix_symlinks(prefix, runner_root)`
+walks `drive_c/windows/{system32,syswow64}`, re-points dangling links at the
+**active runner's** equivalent `lib/wine` file (same relative subpath), and
+drops links the active runner doesn't ship (pure-PE omits amdxc64/atidxx64/
+winsqlite3/winewayland/wpcap/umu — a fresh prefix wouldn't have them).
+`WineTkgRunner::prepare_prefix` runs it on every launch (no-op scan on
+healthy prefixes; non-fatal on error).
+
+**Verification:**
+- Unit test `test_repair_dangling_prefix_symlinks` (repoint / drop /
+  untouched-healthy / idempotent second pass).
+- Live: after re-pointing the RE2 prefix's 1,306 links (16 dropped), the
+  exact background-Steam invocation boots `steam.exe` under pure-PE wine
+  (was exit 53 in ~1s; now alive past 20s with CEF/explorer/uiautomation).
+
 ### Conformance gates (Phase 1 reuse) — status
 - Windows Steam client boots without client_api.cpp:601 → ✅ (wine-tkg master
   stack unchanged; pure-PE runs game-side)
