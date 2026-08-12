@@ -193,6 +193,25 @@ impl Runner for WineTkgRunner {
         tracing::info!("Shared steam compatibility data enabled: {}", ctx.launcher_config.use_shared_compat_data);
         tracing::info!("Steam Runtime Prefix Mode: {:?}", steam_prefix_mode);
 
+        // Self-healing: a prefix seeded by an older runner keeps absolute
+        // symlinks into that runner's lib/wine tree. If the runner dir was
+        // renamed/removed, every builtin DLL link dangles and ANY wine fails
+        // with `could not load kernel32.dll` (exit 53) before Steam even
+        // spawns. Re-point dangling links at the active runner's files (or
+        // drop links it doesn't ship). Cheap on healthy prefixes (no-op scan).
+        let active_root = crate::utils::derive_runner_root(&active_runner);
+        match crate::utils::repair_dangling_prefix_symlinks(&effective_game_prefix, &active_root) {
+            Ok((repointed, removed)) if repointed > 0 || removed > 0 => tracing::warn!(
+                "Prefix self-heal: re-pointed {repointed} dangling DLL symlink(s), removed {removed} (runner {} owns the prefix now)",
+                active_root.display()
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "Prefix self-heal scan failed for {}: {e}",
+                effective_game_prefix.display()
+            ),
+        }
+
         if use_steam_runtime {
             let steam_cfg = crate::utils::get_master_steam_config();
             tracing::info!("Unified Master Steam resolution (Game Launch):");

@@ -1975,6 +1975,116 @@ pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
     }
 }
 
+pub fn repair_dangling_prefix_symlinks(prefix: &Path, runner_root: &Path) -> Result<(usize, usize)> {
+    // A prefix seeded by an older runner keeps absolute symlinks into that
+    // runner's lib/wine tree (system32/*.dll, syswow64/*.dll → …/files/lib/wine/
+    // {x86_64,i386}-windows/…). If that runner dir is renamed/removed, every
+    // builtin DLL link dangles and wine dies with `could not load kernel32.dll,
+    // status c0000135` (exit 53) — regardless of which runner is then used.
+    // This walks the prefix's windows DLL dirs, re-points dangling links at the
+    // ACTIVE runner's equivalent file (same relative lib/wine subpath), and
+    // drops links whose target the active runner does not ship (a fresh prefix
+    // wouldn't have them at all). Returns (repointed, removed).
+    let mut repointed = 0usize;
+    let mut removed = 0usize;
+
+    let dirs = [
+        prefix.join("drive_c/windows/system32"),
+        prefix.join("drive_c/windows/syswow64"),
+    ];
+
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("repair_dangling_prefix_symlinks: cannot read {}: {e}", dir.display());
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let link = entry.path();
+            let meta = match std::fs::symlink_metadata(&link) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.file_type().is_symlink() {
+                continue;
+            }
+            let target = match std::fs::read_link(&link) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if target.exists() {
+                continue; // healthy link
+            }
+            // Dangling. If the target points into a lib/wine tree (the seeding
+            // layout), map it onto the active runner; otherwise drop it.
+            if let Some(rel) = lib_wine_relative(&target) {
+                let candidate = runner_root.join(&rel);
+                if candidate.exists() {
+                    tracing::info!(
+                        "Re-pointing dangling prefix symlink {} -> {}",
+                        link.display(),
+                        candidate.display()
+                    );
+                    let _ = std::fs::remove_file(&link);
+                    #[cfg(unix)]
+                    {
+                        if let Err(e) = std::os::unix::fs::symlink(&candidate, &link) {
+                            tracing::warn!("repoint failed for {}: {e}", link.display());
+                            continue;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        if let Err(e) = std::fs::copy(&candidate, &link) {
+                            tracing::warn!("repoint failed for {}: {e}", link.display());
+                            continue;
+                        }
+                    }
+                    repointed += 1;
+                } else {
+                    tracing::warn!(
+                        "Removing dangling prefix symlink {} (active runner ships no {}: {})",
+                        link.display(),
+                        rel.display(),
+                        target.display()
+                    );
+                    let _ = std::fs::remove_file(&link);
+                    removed += 1;
+                }
+            } else {
+                tracing::warn!(
+                    "Removing dangling prefix symlink {} (not a runner lib/wine link: {})",
+                    link.display(),
+                    target.display()
+                );
+                let _ = std::fs::remove_file(&link);
+                removed += 1;
+            }
+        }
+    }
+
+    Ok((repointed, removed))
+}
+
+/// If `target` points into a runner's `files/lib/wine/…` (or `lib/wine/…`)
+/// tree, return the path relative to the runner root (e.g.
+/// `files/lib/wine/x86_64-windows/kernel32.dll`).
+fn lib_wine_relative(target: &Path) -> Option<PathBuf> {
+    let s = target.to_string_lossy();
+    for marker in ["/files/lib/wine/", "/lib/wine/"] {
+        if let Some(idx) = s.find(marker) {
+            let rel = &s[idx + 1..]; // strip leading '/'
+            return Some(PathBuf::from(rel));
+        }
+    }
+    None
+}
+
 pub fn deploy_dll_symlinks(
     prefix: &Path,
     resolutions: &[crate::launch::dll_provider_resolver::DllResolution],

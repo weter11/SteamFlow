@@ -97,3 +97,75 @@ fn test_symlink_deployment_dual_arch() {
     assert!(!system32.join("d3d11.dll").exists()); // no backup existed, so it's gone (or should it stay gone? in this case yes because no backup)
     assert!(!syswow64.join("d3d11.dll").exists());
 }
+
+#[test]
+fn test_repair_dangling_prefix_symlinks() {
+    // Regression for exit-53 after a runner dir is removed: a prefix seeded by
+    // an old runner keeps absolute symlinks into that runner's lib/wine tree;
+    // when the dir vanishes every builtin DLL link dangles and wine dies with
+    // `could not load kernel32.dll`. The repair must re-point them at the
+    // active runner and drop links the active runner doesn't ship.
+    use steamflow::utils::repair_dangling_prefix_symlinks;
+
+    let tmp = tempdir().unwrap();
+    let prefix = tmp.path().join("prefix");
+    let system32 = prefix.join("drive_c/windows/system32");
+    let syswow64 = prefix.join("drive_c/windows/syswow64");
+    fs::create_dir_all(&system32).unwrap();
+    fs::create_dir_all(&syswow64).unwrap();
+
+    // Old (deleted) runner tree the prefix was seeded from.
+    let old_runner = tmp.path().join("old-runner");
+    let old_x64 = old_runner.join("files/lib/wine/x86_64-windows");
+    let old_x86 = old_runner.join("files/lib/wine/i386-windows");
+    fs::create_dir_all(&old_x64).unwrap();
+    fs::create_dir_all(&old_x86).unwrap();
+
+    // Dangling links: target the old runner dir, which we then delete.
+    let kernel32_link = system32.join("kernel32.dll");
+    std::os::unix::fs::symlink(old_x64.join("kernel32.dll"), &kernel32_link).unwrap();
+    let acledit_link = syswow64.join("acledit.dll");
+    std::os::unix::fs::symlink(old_x86.join("acledit.dll"), &acledit_link).unwrap();
+
+    // A healthy link pointing at the current runner must be left alone.
+    let healthy_src = tmp.path().join("healthy-source.dll");
+    fs::write(&healthy_src, "x").unwrap();
+    let healthy_link = system32.join("healthy.dll");
+    std::os::unix::fs::symlink(&healthy_src, &healthy_link).unwrap();
+
+    // Delete the old runner → both seed links now dangle.
+    fs::remove_dir_all(&old_runner).unwrap();
+    assert!(!kernel32_link.exists()); // dangling
+    assert!(!acledit_link.exists()); // dangling
+
+    // New active runner ships kernel32 (x64) + acledit (x86) but NOT winipcfg.dll.
+    let new_runner = tmp.path().join("new-runner");
+    let new_x64 = new_runner.join("files/lib/wine/x86_64-windows");
+    let new_x86 = new_runner.join("files/lib/wine/i386-windows");
+    fs::create_dir_all(&new_x64).unwrap();
+    fs::create_dir_all(&new_x86).unwrap();
+    fs::write(new_x64.join("kernel32.dll"), "k32").unwrap();
+    fs::write(new_x86.join("acledit.dll"), "ace").unwrap();
+
+    // A link to a file the new runner doesn't ship → must be dropped.
+    let winipcfg_link = system32.join("winipcfg.dll");
+    std::os::unix::fs::symlink(old_x64.join("winipcfg.dll"), &winipcfg_link).unwrap();
+
+    let (repointed, removed) = repair_dangling_prefix_symlinks(&prefix, &new_runner).unwrap();
+    assert_eq!(repointed, 2);
+    assert_eq!(removed, 1);
+
+    // Re-pointed links now resolve to the new runner's files.
+    assert!(kernel32_link.exists());
+    assert!(acledit_link.exists());
+    assert_eq!(fs::read_to_string(&kernel32_link).unwrap(), "k32");
+    assert_eq!(fs::read_to_string(&acledit_link).unwrap(), "ace");
+
+    // Dropped link is gone; healthy link untouched.
+    assert!(!winipcfg_link.symlink_metadata().is_ok());
+    assert!(healthy_link.exists());
+
+    // Second pass is a no-op (idempotent).
+    let (r2, m2) = repair_dangling_prefix_symlinks(&prefix, &new_runner).unwrap();
+    assert_eq!((r2, m2), (0, 0));
+}
