@@ -240,6 +240,16 @@ impl Runner for WineTkgRunner {
                             (master_steam_dir.clone(), steam_cfg.wine_prefix.clone())
                         }
                         crate::models::SteamPrefixMode::PerGame => {
+                            // The per-game prefix is seeded by the GAME's runner
+                            // (pure-PE), which cannot host the Windows Steam
+                            // client (documented: CEF GPU crash + network-init
+                            // stall — two independent purepe client defects,
+                            // 2026-08-12). The client therefore ALWAYS belongs
+                            // in the master prefix under the Steam Runtime
+                            // runner (wine-tkg), exactly like Shared mode. The
+                            // per-game prefix only receives a Steam client FILE
+                            // deployment (below) so the game's
+                            // STEAM_COMPAT_CLIENT_INSTALL_PATH resolves.
                             let target_steam_dir = effective_game_prefix
                                 .join("drive_c/Program Files (x86)/Steam");
 
@@ -262,17 +272,35 @@ impl Runner for WineTkgRunner {
                             for file in required_files {
                                 let src = master_steam_dir.join(file);
                                 let dst = target_steam_dir.join(file);
-                                if src.exists() && !dst.exists() {
-                                    #[cfg(unix)]
-                                    {
-                                        if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
-                                            tracing::warn!("Symlink failed for {}, falling back to copy: {}", file, e);
+                                if src.exists() {
+                                    let needs_refresh = match std::fs::symlink_metadata(&dst) {
+                                        // Symlink to the master file → up to date by construction.
+                                        Ok(m) if m.file_type().is_symlink() => false,
+                                        // Real file: refresh when it differs from master (stale
+                                        // client copies self-exit with code 1 on launch — e.g. the
+                                        // old steam.exe that predates the current client build).
+                                        Ok(_) => {
+                                            let same = std::fs::read(&src)
+                                                .and_then(|a| std::fs::read(&dst).map(|b| a == b))
+                                                .unwrap_or(false);
+                                            !same
+                                        }
+                                        Err(_) => true, // missing
+                                    };
+                                    if needs_refresh {
+                                        tracing::info!("Refreshing stale Steam runtime file {} from master", file);
+                                        let _ = std::fs::remove_file(&dst);
+                                        #[cfg(unix)]
+                                        {
+                                            if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                                                tracing::warn!("Symlink failed for {}, falling back to copy: {}", file, e);
+                                                let _ = std::fs::copy(&src, &dst);
+                                            }
+                                        }
+                                        #[cfg(not(unix))]
+                                        {
                                             let _ = std::fs::copy(&src, &dst);
                                         }
-                                    }
-                                    #[cfg(not(unix))]
-                                    {
-                                        let _ = std::fs::copy(&src, &dst);
                                     }
                                 }
                             }
@@ -297,16 +325,18 @@ impl Runner for WineTkgRunner {
                                 }
                             }
 
-                    (target_steam_dir, effective_game_prefix.clone())
-                }
-            };
+                            // Client process + readiness gate target the MASTER
+                            // prefix (the runner that owns the client).
+                            (master_steam_dir.clone(), steam_cfg.wine_prefix.clone())
+                        }
+                    };
 
             tracing::debug!("Runtime Steam dir : {}", prefix_steam_dir.display());
                     tracing::debug!("Runtime WINEPREFIX : {}", steam_wineprefix.display());
 
                     if !matches!(crate::utils::classify_runner(&active_runner), crate::utils::RunnerKind::Unknown) {
                         if let Some(active_wine) =
-                            crate::utils::detect_wineserver_for_runner(&steam_wineprefix, &active_runner)
+                            crate::utils::detect_wineserver_for_runner(&effective_game_prefix, &active_runner)
                         {
                             let active_root = crate::utils::derive_runner_root(&active_wine);
                             let runner_root = crate::utils::derive_runner_root(&active_runner);
@@ -317,9 +347,9 @@ impl Runner for WineTkgRunner {
                             if active_canonical != runner_canonical {
                                 tracing::warn!(
                                     "Stale wineserver (different runner {:?}) detected in prefix {}. Terminating it before launch.",
-                                    active_canonical, steam_wineprefix.display()
+                                    active_canonical, effective_game_prefix.display()
                                 );
-                                crate::utils::kill_wineserver_in_prefix(&steam_wineprefix);
+                                crate::utils::kill_wineserver_in_prefix(&effective_game_prefix);
                                 std::thread::sleep(std::time::Duration::from_millis(500));
                             }
                         }
@@ -376,24 +406,16 @@ impl Runner for WineTkgRunner {
                         // pass (after readiness gate) will handle newly spawned
                         // helpers to ensure user-disabled features are enforced.
                     } else {
-                        // PerGame mode: the per-game prefix is seeded by the
-                        // game's own runner (seed_prefix copies its
-                        // default_pfx), so the background Steam client MUST run
-                        // under that same wine family. A mismatched runner
-                        // cannot initialize inside the seeded prefix — e.g. a
-                        // classic-wow64 wine-tkg client in a pure-PE-seeded
-                        // prefix fails with
-                        //   "init_wow64: could not load wow64.dll" → exit 53
-                        // (pure-PE wine has no wow64.dll; its 32-bit half is
-                        // PE-only). Shared mode keeps the configured runtime
-                        // runner, which owns the master prefix.
-                        let steam_runner = if steam_prefix_mode == crate::models::SteamPrefixMode::PerGame {
-                            tracing::info!(
-                                "PerGame mode: using the game's runner ({}) for background Steam (prefix is seeded by it)",
-                                active_runner.display()
-                            );
-                            active_runner.clone()
-                        } else if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                        // The background Steam client ALWAYS runs under the
+                        // Steam Runtime runner (wine-tkg) in the MASTER prefix —
+                        // in PerGame mode too. The per-game prefix is seeded by
+                        // the game's runner (pure-PE) which CANNOT host the
+                        // Windows Steam client at all (documented 2026-08-12:
+                        // CEF GPU crash + network-init stall — two independent
+                        // purepe client defects). Running the client with the
+                        // game's runner (as an earlier revision did) dies in
+                        // ~2s with exit 1 before writing any Steam logs.
+                        let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {
                             let discovered = crate::utils::resolve_runner("wine-tkg", &library_root);
