@@ -357,6 +357,35 @@ healthy prefixes; non-fatal on error).
   exact background-Steam invocation boots `steam.exe` under pure-PE wine
   (was exit 53 in ~1s; now alive past 20s with CEF/explorer/uiautomation).
 
+### Post-Phase-3 follow-up: background Steam in master prefix under runtime runner (2026-08-13)
+
+**Context:** with the pure-PE game runner split, PerGame mode spawned the
+background Steam client with the **game's runner (purepe)** in the
+**per-game prefix**. The client cannot boot under purepe (documented
+2026-08-12: CEF GPU crash + network-init stall) → `exit 1` in ~2s, no
+Steam logs, launch aborted at PreparePrefix. The stale-wineserver guard
+and the "is Steam running" check also targeted the per-game prefix, so even
+a running master-prefix client (launched via Manage) was not detected and
+a doomed duplicate was spawned anyway. A second, compounding cause: the
+per-game client-file deployment only symlinked `if !dst.exists()`, so a
+stale real `steam.exe` (Feb-14 copy) was never refreshed and self-exited
+with code 1.
+
+**Change (commit b5f5c0a):** the client ALWAYS belongs to the master prefix
+under the Steam Runtime runner (wine-tkg), in Shared AND PerGame mode:
+- PerGame `prefix_steam_dir`/`steam_wineprefix` resolve to the master Steam
+  dir + master prefix; the per-game prefix still receives the client-file
+  deployment for `STEAM_COMPAT_CLIENT_INSTALL_PATH`.
+- `steam_runner` is always the configured runtime runner, never the game's.
+- Stale-wineserver guard targets the GAME prefix (`effective_game_prefix`),
+  so it cannot kill the running master client.
+- Deployed client files are REFRESHED from master when a stale real-file
+  copy differs (byte-compare; symlinks are up-to-date by construction).
+
+**Verification:** `test-launch 883710` → background Steam under wine-tkg,
+ready signal in 6s, `effective_steam_wineprefix` = master prefix, game
+launches under purepe (DXVK cache + swapchain), session `result: Success`.
+
 ### Conformance gates (Phase 1 reuse) — status
 - Windows Steam client boots without client_api.cpp:601 → ✅ (wine-tkg master
   stack unchanged; pure-PE runs game-side)
