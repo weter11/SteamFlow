@@ -356,10 +356,11 @@ impl LaunchPipeline {
     async fn verify_launch_health(&self, ctx: &mut PipelineContext) {
         if let Some(child) = &mut ctx.child {
             let start_wait = std::time::Instant::now();
-            let verify_duration = std::time::Duration::from_millis(2000);
 
-            // Initial wait
-            tokio::time::sleep(verify_duration).await;
+            // Phase 1 — fast-fail window (2s): catches instant crashes (bad DLL
+            // load, missing exe, immediate Steam client death) without delaying
+            // healthy launches.
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -367,16 +368,54 @@ impl LaunchPipeline {
                     ctx.verification.status = "failed_after_spawn".to_string();
                     ctx.verification.process_lifetime_ms = Some(start_wait.elapsed().as_millis() as u64);
                     ctx.verification.exit_code = status.code();
+                    return;
                 }
                 Ok(None) => {
-                    // Process still running
-                    ctx.verification.status = "verified".to_string();
-                    ctx.verification.process_lifetime_ms = Some(start_wait.elapsed().as_millis() as u64);
+                    // Still alive at 2s — but a graceful self-exit can happen
+                    // 3-5s AFTER the game window appears (e.g. SteamAPI_Init
+                    // failing against an unreachable client: RE2 self-exits ~3s
+                    // after the window, Portal 2 shows "Steam must be running").
+                    // A single 2s alive-check records those as "Success", so
+                    // Phase 2 requires the process to survive a sustained
+                    // window before we trust it.
                 }
                 Err(e) => {
                     ctx.verification.status = "uncertain".to_string();
                     if let Some(logger) = &ctx.logger {
-                         let _ = logger.error("verification_error", format!("Failed to poll process status: {}", e), None, HashMap::new());
+                        let _ = logger.error("verification_error", format!("Failed to poll process status: {}", e), None, HashMap::new());
+                    }
+                    return;
+                }
+            }
+
+            // Phase 2 — sustained-liveness window (up to 8s total, polled every
+            // 500ms): any exit inside this window is a post-spawn failure (the
+            // game came up, then decided to quit — failed Steam handshake,
+            // renderer init failure the game handles by exiting, etc.). Only a
+            // process still alive after the full window is "verified".
+            let sustained_deadline = start_wait + std::time::Duration::from_millis(8000);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        ctx.verification.status = "failed_after_spawn".to_string();
+                        ctx.verification.process_lifetime_ms = Some(start_wait.elapsed().as_millis() as u64);
+                        ctx.verification.exit_code = status.code();
+                        return;
+                    }
+                    Ok(None) => {
+                        if std::time::Instant::now() >= sustained_deadline {
+                            ctx.verification.status = "verified".to_string();
+                            ctx.verification.process_lifetime_ms = Some(start_wait.elapsed().as_millis() as u64);
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        ctx.verification.status = "uncertain".to_string();
+                        if let Some(logger) = &ctx.logger {
+                            let _ = logger.error("verification_error", format!("Failed to poll process status: {}", e), None, HashMap::new());
+                        }
+                        return;
                     }
                 }
             }

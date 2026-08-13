@@ -10,6 +10,10 @@ use steamflow::infra::runners::{Runner, CommandSpec, LaunchContext};
 
 struct MockRunner {
     exit_immediately: bool,
+    /// If set, the child sleeps this many seconds then exits 0 — simulating a
+    /// graceful self-exit a few seconds after the window appears (the RE2
+    /// SteamAPI-init failure signature that a 2s alive-check missed).
+    self_exit_after_secs: Option<u64>,
 }
 
 #[async_trait]
@@ -19,10 +23,12 @@ impl Runner for MockRunner {
     async fn build_env(&self, _ctx: &LaunchContext) -> Result<HashMap<String, String>, LaunchError> { Ok(HashMap::new()) }
     async fn build_command(&self, _ctx: &LaunchContext) -> Result<CommandSpec, LaunchError> { Ok(CommandSpec::default()) }
     fn launch(&self, _spec: &CommandSpec) -> Result<Child, LaunchError> {
-        let cmd = if self.exit_immediately {
-            "exit 0"
+        let cmd = if let Some(secs) = self.self_exit_after_secs {
+            format!("sleep {secs}")
+        } else if self.exit_immediately {
+            "exit 0".to_string()
         } else {
-            "sleep 10"
+            "sleep 10".to_string()
         };
         Command::new("sh")
             .arg("-c")
@@ -47,7 +53,7 @@ async fn test_launch_verification_early_exit() {
     let mut ctx = PipelineContext::new(123);
     ctx.logger = Some(logger);
     ctx.session = Some(session);
-    ctx.runner = Some(Box::new(MockRunner { exit_immediately: true }));
+    ctx.runner = Some(Box::new(MockRunner { exit_immediately: true, self_exit_after_secs: None }));
     ctx.command_spec = Some(CommandSpec {
         program: PathBuf::from("sh"),
         args: vec!["-c".to_string(), "exit 0".to_string()],
@@ -68,6 +74,37 @@ async fn test_launch_verification_early_exit() {
 }
 
 #[tokio::test]
+async fn test_launch_verification_graceful_self_exit_caught() {
+    // Regression test: a game that spawns, appears to start fine, then
+    // self-exits a few seconds later (e.g. SteamAPI_Init failure → clean
+    // ExitProcess ~3-5s after the window) must be reported as a failure,
+    // NOT "Success". The old implementation only checked alive-at-2s.
+    let mut pipeline = LaunchPipeline::new();
+    pipeline.add_stage(Box::new(steamflow::launch::stages::spawn_process::SpawnProcessStage));
+
+    let tmp = tempdir().unwrap();
+    let session = LaunchSession::new(tmp.path());
+    let logger = EventLogger::new(&session).unwrap();
+
+    let mut ctx = PipelineContext::new(123);
+    ctx.logger = Some(logger);
+    ctx.session = Some(session);
+    ctx.runner = Some(Box::new(MockRunner { exit_immediately: false, self_exit_after_secs: Some(4) }));
+    ctx.command_spec = Some(CommandSpec {
+        program: PathBuf::from("sh"),
+        args: vec!["-c".to_string(), "sleep 4".to_string()],
+        ..Default::default()
+    });
+
+    let _ = pipeline.run(&mut ctx).await;
+
+    // Survived the 2s fast-fail, but died inside the sustained window (8s).
+    assert_eq!(ctx.verification.status, "failed_after_spawn");
+    assert!(ctx.verification.process_lifetime_ms.unwrap_or(0) >= 2000);
+    assert_eq!(ctx.verification.exit_code, Some(0));
+}
+
+#[tokio::test]
 async fn test_launch_verification_success() {
     let mut pipeline = LaunchPipeline::new();
     pipeline.add_stage(Box::new(steamflow::launch::stages::spawn_process::SpawnProcessStage));
@@ -79,7 +116,7 @@ async fn test_launch_verification_success() {
     let mut ctx = PipelineContext::new(123);
     ctx.logger = Some(logger);
     ctx.session = Some(session);
-    ctx.runner = Some(Box::new(MockRunner { exit_immediately: false }));
+    ctx.runner = Some(Box::new(MockRunner { exit_immediately: false, self_exit_after_secs: None }));
     ctx.command_spec = Some(CommandSpec {
         program: PathBuf::from("sh"),
         args: vec!["-c".to_string(), "sleep 10".to_string()],

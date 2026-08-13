@@ -386,6 +386,52 @@ under the Steam Runtime runner (wine-tkg), in Shared AND PerGame mode:
 ready signal in 6s, `effective_steam_wineprefix` = master prefix, game
 launches under purepe (DXVK cache + swapchain), session `result: Success`.
 
+### Follow-up: master-prefix split was a REGRESSION — client returns to per-game prefix (2026-08-13)
+
+**b5f5c0a's verification was insufficient.** It checked "Steam ready in 6s +
+swapchain created" — the same shallow 2s alive-check that masks graceful
+post-spawn exits — so the split shipped green while breaking every launch.
+
+**Observed failures (all `result: Success` per SteamFlow, all real failures):**
+- RE2 (883710): game window appears, then clean self-exit ~3s later
+  (`mfplat:MFShutdown`, no segfault, `MainMenu=False` written to
+  `re2_config.ini`). Confirmed across policy `Enabled` AND `Disabled`
+  (no client at all → SteamAPI_Init fails the same way).
+- Portal 2 (620): "Steam must be running" dialog while the master-prefix
+  client WAS running (`steam_running_before_launch=true`) — the game in
+  `compatdata/620/pfx` simply cannot reach a client in the master prefix.
+
+**Root cause:** Wine named pipes are **per-wineserver**. A game's
+`steamclient.dll` connects to the client via `\\.\pipe\SteamClient…`, which
+exists only in the client's own wineserver. b5f5c0a parked the client in the
+master prefix (wine-tkg wineserver) while the game runs in the per-game
+prefix (pure-PE wineserver) → pipe unreachable → `SteamAPI_Init` fails →
+games self-exit or show "Steam must be running".
+
+**Control case (the config that demonstrably worked):** the 08-12 E2E
+sessions (16:09/16:56) had `effective_steam_wineprefix ==
+effective_game_wineprefix == compatdata/883710/pfx` — client in the SAME
+prefix as the game → ran stable until the user closed it. That is 8a56ed2's
+layout (client with the game's runner in the per-game prefix).
+
+**Change (revert of b5f5c0a's placement, keeping its file-refresh):**
+- PerGame `prefix_steam_dir`/`steam_wineprefix` resolve back to the
+  per-game prefix (client runs in the game's wineserver).
+- `steam_runner` in PerGame mode is the GAME's runner again (8a56ed2);
+  Shared mode keeps the configured runtime runner.
+- The client-file REFRESH logic from b5f5c0a is kept (byte-compare vs
+  master, refresh stale real copies — this fixed the real exit-1 cause,
+  the stale Feb-14 `steam.exe`).
+- The stale-wineserver guard still targets `effective_game_prefix`.
+
+**Also fixed: `launch_verification` masked the whole class.** It only
+checked the process was alive at 2s, so a game that self-exits 3-5s after
+the window was recorded as "Success". Now two-phase: 2s fast-fail (instant
+crashes) + sustained-liveness window to 8s (polled every 500ms) — any exit
+inside the window is `failed_after_spawn` with the real lifetime. New test
+`test_launch_verification_graceful_self_exit_caught` covers the 4s self-exit
+case that the old 2s check missed.
+
 ### Conformance gates (Phase 1 reuse) — status
 - Windows Steam client boots without client_api.cpp:601 → ✅ (wine-tkg master
   stack unchanged; pure-PE runs game-side)

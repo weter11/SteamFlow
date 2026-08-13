@@ -240,16 +240,17 @@ impl Runner for WineTkgRunner {
                             (master_steam_dir.clone(), steam_cfg.wine_prefix.clone())
                         }
                         crate::models::SteamPrefixMode::PerGame => {
-                            // The per-game prefix is seeded by the GAME's runner
-                            // (pure-PE), which cannot host the Windows Steam
-                            // client (documented: CEF GPU crash + network-init
-                            // stall — two independent purepe client defects,
-                            // 2026-08-12). The client therefore ALWAYS belongs
-                            // in the master prefix under the Steam Runtime
-                            // runner (wine-tkg), exactly like Shared mode. The
-                            // per-game prefix only receives a Steam client FILE
-                            // deployment (below) so the game's
-                            // STEAM_COMPAT_CLIENT_INSTALL_PATH resolves.
+                            // The client must live in the SAME prefix (and thus
+                            // same wineserver) as the game: Steam's client API
+                            // (steamclient.dll → named pipe) is wineserver-scoped.
+                            // A client parked in the master prefix is unreachable
+                            // from a per-game-prefix game — SteamAPI_Init fails,
+                            // games self-exit ~3s after the window (RE2) or show
+                            // "Steam must be running" (Portal 2, 2026-08-13).
+                            // The per-game prefix therefore hosts BOTH the client
+                            // process and the game. It receives a full client-file
+                            // deployment below (refresh-on-stale) so steam.exe can
+                            // boot from it under the game's runner.
                             let target_steam_dir = effective_game_prefix
                                 .join("drive_c/Program Files (x86)/Steam");
 
@@ -325,9 +326,13 @@ impl Runner for WineTkgRunner {
                                 }
                             }
 
-                            // Client process + readiness gate target the MASTER
-                            // prefix (the runner that owns the client).
-                            (master_steam_dir.clone(), steam_cfg.wine_prefix.clone())
+                            // Client process + readiness gate target the PER-GAME
+                            // prefix — the same wineserver the game runs in.
+                            // (This is the 8a56ed2 layout restored after b5f5c0a
+                            // split the client into the master prefix and broke
+                            // Steam API reachability for every per-game-prefix
+                            // launch.)
+                            (target_steam_dir, effective_game_prefix.clone())
                         }
                     };
 
@@ -406,16 +411,28 @@ impl Runner for WineTkgRunner {
                         // pass (after readiness gate) will handle newly spawned
                         // helpers to ensure user-disabled features are enforced.
                     } else {
-                        // The background Steam client ALWAYS runs under the
-                        // Steam Runtime runner (wine-tkg) in the MASTER prefix —
-                        // in PerGame mode too. The per-game prefix is seeded by
-                        // the game's runner (pure-PE) which CANNOT host the
-                        // Windows Steam client at all (documented 2026-08-12:
-                        // CEF GPU crash + network-init stall — two independent
-                        // purepe client defects). Running the client with the
-                        // game's runner (as an earlier revision did) dies in
-                        // ~2s with exit 1 before writing any Steam logs.
-                        let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                        // The background Steam client runs in the SAME prefix
+                        // as the game (PerGame: per-game prefix seeded by the
+                        // game's runner; Shared: master prefix owned by the
+                        // runtime runner). It must therefore be spawned with
+                        // the runner that owns that prefix:
+                        // - PerGame mode → the GAME's runner (pure-PE family
+                        //   that seeded the prefix). This is the 8a56ed2 layout:
+                        //   client + game in one wineserver, so the game's
+                        //   steamclient.dll can reach the client's named pipe.
+                        //   (b5f5c0a moved the client to the master prefix
+                        //   under wine-tkg, splitting the wineservers; every
+                        //   Steam API init then failed — RE2 self-exit, Portal 2
+                        //   "Steam must be running".)
+                        // - Shared mode → the configured Steam Runtime runner
+                        //   (it owns the master prefix).
+                        let steam_runner = if steam_prefix_mode == crate::models::SteamPrefixMode::PerGame {
+                            tracing::info!(
+                                "PerGame mode: using the game's runner ({}) for background Steam (same prefix/wineserver as the game)",
+                                active_runner.display()
+                            );
+                            active_runner.clone()
+                        } else if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {
                             let discovered = crate::utils::resolve_runner("wine-tkg", &library_root);
