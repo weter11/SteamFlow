@@ -432,6 +432,82 @@ inside the window is `failed_after_spawn` with the real lifetime. New test
 `test_launch_verification_graceful_self_exit_caught` covers the 4s self-exit
 case that the old 2s check missed.
 
+### Session-auth sync for per-game prefixes — implemented; Portal 2 blocker root-caused (2026-08-14)
+
+**What shipped (commit `feat(steam): …` 2026-08-14):**
+`SteamClient::sync_master_session_to_prefix()` copies the master client's auth
+state into a per-game prefix's Steam dir before the headless client spawns there:
+`config/loginusers.vdf` (wholesale), the `config/config.vdf` Authentication block
+— the `RememberedMachineID` JWT — (merged, target's other keys preserved), legacy
+`ssfn*` sentries, and the `HKCU\Software\Valve\Steam` section of `user.reg`
+(per-key overlay, EOL preserved). Guards: no-op if master has no session; never
+downgrades a per-game login as fresh as master's; non-fatal. Wired into the
+PerGame spawn path in `wine_tkg.rs` (runs only when no client is running in the
+target prefix). 8 new unit tests; 105 lib tests + 15 suites green. Live run
+verified the 620 prefix receives master's loginusers.vdf timestamp (1786715012),
+the fresh machine JWT (iss `r:0012_28A6B9E0_68319`, exp 2027-03), and the
+registry login keys.
+
+**What it does NOT do (hard fact):** it does not produce a logged-in per-game
+client. Sync is necessary but not sufficient — see the two blockers below.
+
+**CONCLUSION — a second client process in the per-game prefix IS required; the
+pointer-only model is disproven.** b5f5c0a parked the client in the master prefix
+(wine-tkg wineserver) while games run in per-game prefixes (pure-PE wineserver);
+Wine named pipes are per-wineserver, so the game's steamclient.dll cannot reach
+the client's pipe → `SteamAPI_Init` failed (RE2 self-exit ~3s, Portal 2 "Steam
+must be running"). That is exactly why 284e697 reverted b5f5c0a (client back in
+the per-game prefix, 8a56ed2 layout) and why `STEAM_COMPAT_CLIENT_INSTALL_PATH`
+alone cannot bridge the gap — it is a location hint (it already points at the
+master client), not an IPC bridge. Do not re-derive this; the b5f5c0a experiment
+already answered it.
+
+**Portal 2 (620) blocker — hard state, evidence on disk:**
+1. **purepe ClientAPI failure:** every per-game client run under purepe writes an
+   assert dump whose message is `Assert( ClientAPI_InitGlobalInstance:
+   InternalAPI_Init_Internal failed, most likely because you are missing a 32-bit
+   dependency of steamclient.dll (the Steam client is a 32-bit app).
+   ):…\src\common\steam\client_api.cpp:601` (identical text in every dump under
+   `compatdata/620/pfx/drive_c/Program Files (x86)/Steam/dumps/`).
+   `WINEDEBUG=+loaddll` shows zero unresolved modules — it is Steam's generic
+   catch-all, not a literal missing file. Result: client runs but stays anonymous
+   forever (webhelper `-steamid=0`; `connection_log.txt` has zero login attempts).
+   Note: this is the same `client_api.cpp:601` the conformance gate below claims
+   "✅" for — the gate only covers the master (wine-tkg) stack, not purepe.
+2. **Machine-bound token rejection:** the SAME 620 prefix with the client spawned
+   under **wine-tkg** (not purepe) boots fine AND connects to Steam CM for the
+   first time ever (connection_log.txt 2026-08-14 16:22:39 `Connect() … 
+   ConnectionCompleted() (185.25.182.20:27030, WebSocket)`) but login is refused:
+   `Clearing in-memory token - 5 (Invalid Password): LogonFailureReceived` — the
+   copied RememberedMachineID JWT is bound to the source install's machine
+   identity and the server rejects it. Copying credentials into a second prefix
+   creates a second machine identity; the token does not follow.
+
+**MachineGuid doc/code mismatch (real bug, NOT yet fixed):** module doc in
+`src/runner/proton_abi.rs:16` claims `seed_prefix()` does "MachineGuid
+preservation"; the body (lines 480–511) does only copy_tree + dosdevices symlinks
++ version marker. Measured: MachineGuid is UNIQUE per prefix (master
+`705bc93a-fec3-4716-b240-ef3304859be3`; 620 `4e849ba2-31f0-483a-8e17-a0b9bf066a08`;
+883710 `92cfc9d1-…`; 203160 `e6056f5f-…`; 108710 `e10b7828-…`) — wine generates a
+fresh one per prefix. Whether Steam's machine-token validation keys on MachineGuid
+is UNPROVEN — that is the next probe.
+
+**Committed vs open:** the sync machinery + this doc section are committed
+(2026-08-14). Still open: (1) the per-game client must run under a runner whose
+ClientAPI works (wine-tkg proven; requires relaxing the stale-wineserver guard
+for the client's wineserver, since it currently kills foreign-runner wineservers
+in the game prefix); (2) the machine-bound token rejection must be solved for a
+per-game client to log in without the one-time `steam.exe -login` bridge.
+
+**Single next step:** run the wine-tkg client in the 620 prefix with master's
+MachineGuid injected into `compatdata/620/pfx/system.reg`
+(`HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`), watch
+`connection_log.txt` ~90s. Login completes → MachineGuid is the binding:
+implement preservation in `seed_prefix()` + include it in the sync, and the sync
+work becomes sufficient. Still `Invalid Password` → MachineGuid is not the
+binding; probe the client's own key store next, with the one-time `-login` bridge
+per prefix as the fallback.
+
 ### Conformance gates (Phase 1 reuse) — status
 - Windows Steam client boots without client_api.cpp:601 → ✅ (wine-tkg master
   stack unchanged; pure-PE runs game-side)
