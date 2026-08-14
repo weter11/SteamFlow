@@ -411,6 +411,44 @@ impl Runner for WineTkgRunner {
                         // pass (after readiness gate) will handle newly spawned
                         // helpers to ensure user-disabled features are enforced.
                     } else {
+                        // Session-state sync (PerGame only): seed the per-game
+                        // client with the master client's authentication before
+                        // spawning it — loginusers.vdf, the config.vdf
+                        // RememberedMachineID machine token, ssfn* sentries and
+                        // the HKCU\Software\Valve\Steam login keys. A prefix
+                        // seeded months ago carries an EXPIRED machine token, so
+                        // the headless client starts anonymous (SteamID 0) and
+                        // SteamAPI_Init fails with "Steam is not running" even
+                        // though the client process is up. No-op when the master
+                        // client has no session or the target is already as
+                        // fresh; non-fatal on error. In Shared mode the target
+                        // IS the master prefix — nothing to sync.
+                        if steam_prefix_mode == crate::models::SteamPrefixMode::PerGame {
+                            match SteamClient::sync_master_session_to_prefix(
+                                &master_steam_dir,
+                                &steam_cfg.wine_prefix,
+                                &prefix_steam_dir,
+                                &steam_wineprefix,
+                            ) {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        tracing::info!(
+                                            "Steam session sync: {n} item(s) synchronized from master into per-game prefix"
+                                        );
+                                        unsafe {
+                                            if !ctx.verification_ptr.is_null() {
+                                                (*ctx.verification_ptr).steam_runtime_milestone =
+                                                    "steam_session_synced".to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    "Steam session sync failed (non-fatal, launch proceeds): {e}"
+                                ),
+                            }
+                        }
+
                         // The background Steam client runs in the SAME prefix
                         // as the game (PerGame: per-game prefix seeded by the
                         // game's runner; Shared: master prefix owned by the
