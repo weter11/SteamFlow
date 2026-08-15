@@ -302,6 +302,29 @@ pub fn launch_winecfg(config: &LauncherConfig) -> Result<()> {
     Ok(())
 }
 
+/// Prefer a prefix that actually has a persisted Steam login session.
+///
+/// Given the effective-mode choice (`chosen`) and the alternate per-game
+/// candidate, prefer the one with a session. When neither has one, keep the
+/// effective-mode choice — the launch pipeline's login onboarding handles the
+/// missing session; we do not guess. PURE decision (injected predicate) so
+/// the precedence rule is unit-testable without touching real prefixes.
+///
+/// NOTE: this must ONLY be applied when the effective mode is `Shared`. Under
+/// `PerGame` (runner mismatch) the guard wins unconditionally — a purepe game
+/// cannot run in the wine-tkg master prefix even if it has a session.
+pub(crate) fn prefer_session_prefix(
+    chosen: &Path,
+    per_game_candidate: &Path,
+    has_session: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if !has_session(chosen) && has_session(per_game_candidate) {
+        per_game_candidate.to_path_buf()
+    } else {
+        chosen.to_path_buf()
+    }
+}
+
 /// Resolve the EFFECTIVE Wine prefix for a custom-exec (Mods tab "Play Mod" /
 /// `test-mod`) launch.
 ///
@@ -334,12 +357,34 @@ pub(crate) fn custom_exec_effective_prefix(
     let mut user_config_store: crate::models::UserConfigStore =
         crate::models::UserConfigStore::new();
     user_config_store.insert(game_app_id, user_config.clone());
-    crate::utils::steam_wineprefix_for_game(
+    let is_shared = effective == crate::models::SteamPrefixMode::Shared;
+    let prefix = crate::utils::steam_wineprefix_for_game(
         config,
         game_app_id,
         &user_config_store,
         Some(effective),
-    )
+    );
+
+    // Session-aware refinement (Task 2): when the effective mode is SHARED
+    // (no runner collision — both prefixes would run the same runner), prefer
+    // the per-game prefix if it has a persisted login session while the
+    // master prefix does not. Under PerGame the runner-mismatch guard wins
+    // unconditionally (see prefer_session_prefix doc): a purepe game must
+    // never be routed to the wine-tkg master prefix even if it has a session.
+    if is_shared {
+        let per_game_candidate = crate::utils::steam_wineprefix_for_game(
+            config,
+            game_app_id,
+            &user_config_store,
+            Some(crate::models::SteamPrefixMode::PerGame),
+        );
+        return prefer_session_prefix(
+            &prefix,
+            &per_game_candidate,
+            crate::steam_client::SteamClient::windows_client_has_session,
+        );
+    }
+    prefix
 }
 
 /// Launch a custom mod executable/script (Mods tab "Play Mod") through the
