@@ -483,30 +483,31 @@ already answered it.
    identity and the server rejects it. Copying credentials into a second prefix
    creates a second machine identity; the token does not follow.
 
-**MachineGuid doc/code mismatch (real bug, NOT yet fixed):** module doc in
-`src/runner/proton_abi.rs:16` claims `seed_prefix()` does "MachineGuid
-preservation"; the body (lines 480–511) does only copy_tree + dosdevices symlinks
-+ version marker. Measured: MachineGuid is UNIQUE per prefix (master
-`705bc93a-fec3-4716-b240-ef3304859be3`; 620 `4e849ba2-31f0-483a-8e17-a0b9bf066a08`;
-883710 `92cfc9d1-…`; 203160 `e6056f5f-…`; 108710 `e10b7828-…`) — wine generates a
-fresh one per prefix. Whether Steam's machine-token validation keys on MachineGuid
-is UNPROVEN — that is the next probe.
+**MachineGuid cross-prefix injection test — EXECUTED 2026-08-14, verdict: NOT sufficient.** The doc/code mismatch in `src/runner/proton_abi.rs:16` (claims `seed_prefix()` does "MachineGuid preservation"; body does only copy_tree + dosdevices symlinks + version marker) remains a REAL, unfixed bug — do not mark it resolved or irrelevant. Measured: MachineGuid is UNIQUE per prefix (master `705bc93a-fec3-4716-b240-ef3304859be3`; 620 `4e849ba2-31f0-483a-8e17-a0b9bf066a08`; 883710 `92cfc9d1-…`; 203160 `e6056f5f-…`; 108710 `e10b7828-…`) — wine generates a fresh one per prefix.
 
-**Committed vs open:** the sync machinery + this doc section are committed
-(2026-08-14). Still open: (1) the per-game client must run under a runner whose
-ClientAPI works (wine-tkg proven; requires relaxing the stale-wineserver guard
-for the client's wineserver, since it currently kills foreign-runner wineservers
-in the game prefix); (2) the machine-bound token rejection must be solved for a
-per-game client to log in without the one-time `steam.exe -login` bridge.
+The three-run injection test (same copied JWT, different GUID pairing):
 
-**Single next step:** run the wine-tkg client in the 620 prefix with master's
-MachineGuid injected into `compatdata/620/pfx/system.reg`
-(`HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`), watch
-`connection_log.txt` ~90s. Login completes → MachineGuid is the binding:
-implement preservation in `seed_prefix()` + include it in the sync, and the sync
-work becomes sufficient. Still `Invalid Password` → MachineGuid is not the
-binding; probe the client's own key store next, with the one-time `-login` bridge
-per prefix as the fallback.
+| Run | MachineGuid in 620 | Client behavior | Verdict |
+|---|---|---|---|
+| 16:22 | 620's own `4e849ba2…` | attempted LogOn → server rejected: `Clearing in-memory token - 5 (Invalid Password): LogonFailureReceived` | server-side rejection of copied JWT |
+| 18:21 | **master's `705bc93a…` injected** into `system.reg` (verified live via `reg query` = `705bc93a…`) | client **never attempts**: `Clearing in-memory token - 1 (OK): cached creds not available`, straight to `WaitingForCredentials` login window | local rejection before contacting server |
+| 18:34–47 | 620's own GUID restored + **interactive login** (password + email code) | `RecvMsgClientLogOnResponse(): 'OK'` → `Logged On` `[U:1:137551487]`; fresh JWT persisted | **working path** |
+
+Precise conclusion: MachineGuid is **not sufficient** to make a copied JWT work — but it is not inert either: it **affects which failure mode the client hits** (server-side `Invalid Password` with the prefix's own GUID vs local `cached creds not available` with a foreign GUID), meaning the client's local identity check keys on MachineGuid (or a fingerprint including it). Neither GUID pairing gave the client what it actually needed — a token minted for that machine identity. The `seed_prefix()` doc/code mismatch stays open as a real, lower-priority bug (preserving MachineGuid across prefix seeds is still correct hygiene; it is just not the auth binding).
+
+**Working auth mechanism (proven 2026-08-14): one-time interactive login per prefix.** The client's own key store can only be populated by a real login — file/registry sync cannot fabricate it. After one interactive login (password + email code) under wine-tkg in the per-game prefix: `loginusers.vdf` gains AutoLogin=1 + fresh `Timestamp` (1786740468), and `config.vdf` gains a **fresh machine-bound JWT** (`iss r:0001_28A6B125_2FF1F`, iat 18:47:39, exp 2027-03; vs master's `r:0012_28A6B9E0_68319` — the `r:00xx` prefix is the machine-instance identifier). The prefix then auto-logs-in on subsequent boots. This is the "one-time `-login` bridge per prefix" fallback the sync work anticipated.
+
+**PITFALL (disk-full, 2026-08-14):** with `/home` at 100% (1.4G free), a freshly-logged-in client **crashes post-login** with `Assert( Assertion Failed: Failed to create thread (error 0x3e6) ):…src\tier0\threadtools.cpp:3870` — the UI freezes at "entering", the JWT never persists, and the crash handler kills the client ~3 min later (assert dump grows 13KB → 1.1MB). ERROR_NOACCESS on `NtCreateThread` with no user-visible signal; looks like a random client crash. Freed 11G (`rm -rf target/debug`, rebuildable) → clean re-login → token persisted. **Backlog item (NOT urgent, NOT fixed this session):** add a defensive free-space check (warn/abort before client spawn when free space is low) so this doesn't resurface as a confusing crash.
+
+**Committed vs open:** the sync machinery + this doc section are committed (2026-08-14). Remaining blockers before this can ship as an AUTOMATIC flow:
+
+1. **Shared/PerGame wineserver routing gap — the actual next blocker (ahead of winproc 1400), investigated 2026-08-14, fix NOT yet implemented.** The only reason the 18:59 Portal 2 test worked is MANUAL intervention: the game was launched directly with wine-tkg + `compatdata/620/pfx`, bypassing the automated path. A real user clicking Play still dies before reaching Steam. Actual decision logic (verified in code, not guessed):
+   - Standard game-launch path (UI Play / `test-launch`): `wine_tkg.rs:119,770` → `effective_prefix_mode(ctx)` (line 79) → `effective_prefix_mode_impl` (line 48): if configured `Shared` AND `steam_runtime_runner ≠ game_runner` → **auto-fallback to `PerGame`** → `steam_wineprefix_for_game(..., Some(PerGame))` → `compatdata/620/pfx`. For 620 (Shared + wine-tkg vs purepe) this is why the 16:16 session ran in the per-game prefix. Also applies the stale-wineserver guard (line 343) which kills a foreign-runner wineserver in the game prefix.
+   - **Custom-exec path** (Mods tab "Play Mod" / `test-mod`; `launch/mod.rs:310`): calls `steam_wineprefix_for_game(config, appid, store, None)` — **no effective mode, no runner-mismatch guard**. The `None` branch (`utils.rs:2293–2295`) computes `use_per_game_compat_data = use_steam_runtime && steam_prefix_mode == PerGame` from the **raw** user config: 620 is `use_steam_runtime=true` (policy Enabled) but `steam_prefix_mode=Shared` → **false** → `resolve_master_wineprefix()` → **master prefix**. Game spawns there under purepe, no stale-wineserver check, no per-game client detection → dies before Steam.
+   - **Gap, precisely:** `launch_custom_exec` bypasses `effective_prefix_mode()` entirely. A Shared-configured game with a logged-in per-game client under `compatdata/620` is never detected or preferred; the raw config (Shared → master) wins. Fix direction (NOT yet implemented, standalone + testable independent of winproc 1400): make the custom-exec path honor the effective prefix mode (runner-mismatch guard) and/or prefer a prefix with a running logged-in client; verify separately.
+2. **winproc 1400 — pre-existing, separate, patch unbuilt:** wine-11 `dlls/win32u/window.c::get_window_thread()` regression → `Message channel UWM_REMIX_BRIDGE_REGISTER_THREADPROC_MSG handshake failed with 1400` right after `Server side D3D9 Device created successfully!` (game exit code 5). Full analysis: `refs/winproc-1400-wine11-regression.md`. NOT a Steam/auth issue — Portal 2 now boots past SteamAPI_Init, loads the full p2-rtx chain (dxwrapper → p2-rtx.dll → winmm, `Steam game detected!`), Remix selects `NVIDIA GeForce RTX 3070 (mobile)`, and dies only at the bridge handshake.
+
+**OPEN PRODUCT DECISION (do NOT resolve unilaterally):** the one-time interactive login per prefix is now the ONLY proven working path for per-game session auth — and it is the exact approach previously deprioritized for end-users. Before writing this up as "the answer": accept one-time-manual-login-per-prefix as the **shipped default** (now that it is the only thing proven to work), or make it an **opt-in "advanced/isolated session" mode** rather than the default flow? Written as an open decision point, clearly separated from the settled technical findings above.
 
 ### Conformance gates (Phase 1 reuse) — status
 - Windows Steam client boots without client_api.cpp:601 → ✅ (wine-tkg master
