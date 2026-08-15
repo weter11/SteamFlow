@@ -346,6 +346,21 @@ where F: FnMut(u64, u64) + Send + 'static
         return Err(anyhow!("Extraction failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
 
+    // Phase 2 item 3 (valve-stack directive): write a VERSIONS.txt at the
+    // extracted runner root (harvesting the component version files the
+    // tarball ships + stamping the release version) so the UI shows real
+    // versions instead of `found(bundled)`. The tarball extracts to a
+    // top-level dir named after the package.
+    let extracted_root = target_dir.join(&package.name);
+    if extracted_root.is_dir() {
+        crate::utils::write_runner_versions_txt(&extracted_root, &package.version);
+    } else {
+        tracing::warn!(
+            "Extracted runner root {} not found — skipping VERSIONS.txt write",
+            extracted_root.display()
+        );
+    }
+
     // Remove archive
     let _ = std::fs::remove_file(archive_path);
 

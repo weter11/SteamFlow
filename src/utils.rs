@@ -1383,6 +1383,9 @@ pub struct RunnerVersions {
     pub wine_mono: Option<String>,
     pub wine_gecko: Option<String>,
     pub build_date: Option<String>,
+    /// The runner's own version (the tarball/release version SteamFlow
+    /// extracted). Written by `write_runner_versions_txt` during extraction.
+    pub runner_version: Option<String>,
 }
 
 /// Parse VERSIONS.txt from the runner root. Each line is KEY=VALUE.
@@ -1410,11 +1413,134 @@ pub fn read_versions_txt(root: &Path) -> RunnerVersions {
                 "WINE_MONO_VERSION" => versions.wine_mono = Some(val.to_string()),
                 "WINE_GECKO_VERSION" => versions.wine_gecko = Some(val.to_string()),
                 "BUILD_DATE" => versions.build_date = Some(val.to_string()),
+                "RUNNER_VERSION" => versions.runner_version = Some(val.to_string()),
                 _ => {}
             }
         }
     }
     versions
+}
+
+/// Write a canonical `VERSIONS.txt` at the runner root after extracting a
+/// runner tarball (Phase 2 item 3 of the valve-stack directive — kill the
+/// `found(bundled)` display bug).
+///
+/// Detection (`detect_*`) returns the placeholder `"found"` when no `version`
+/// file sits next to a component DLL (flat WoW64 layout). `apply_versions_override`
+/// treats `"found"` as needing the `VERSIONS.txt` override — but the override
+/// only exists if SteamFlow writes the file. This function:
+///
+/// 1. Harvests the component versions the tarball ships (the classic
+///    `files/lib/wine/<component>/version` files, root `version` file), and
+/// 2. Stamps the runner's own tarball/release version as `RUNNER_VERSION`.
+///
+/// It never overwrites an existing `VERSIONS.txt` (e.g. the custom
+/// `steamflow-runner` ships an authoritative one). Non-fatal: failures log and
+/// return `Ok(false)` so extraction is never blocked by version bookkeeping.
+pub fn write_runner_versions_txt(runner_root: &Path, tarball_version: &str) -> bool {
+    let path = runner_root.join("VERSIONS.txt");
+    if path.exists() {
+        tracing::debug!(
+            "VERSIONS.txt already exists at {} — leaving it untouched",
+            path.display()
+        );
+        return false;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+
+    // (VERSIONS.txt key, candidate version-file paths under the runner root)
+    let harvest: &[(&str, &[&str])] = &[
+        (
+            "DXVK_VERSION",
+            &[
+                "files/lib/wine/dxvk/version",
+                "lib/wine/dxvk/version",
+                "dist/lib/wine/dxvk/version",
+            ],
+        ),
+        (
+            "D7VK_VERSION",
+            &[
+                "files/lib/wine/d7vk/version",
+                "lib/wine/d7vk/version",
+                "dist/lib/wine/d7vk/version",
+            ],
+        ),
+        (
+            "VKD3D_PROTON_VERSION",
+            &[
+                "files/lib/wine/vkd3d-proton/version",
+                "lib/wine/vkd3d-proton/version",
+                "dist/lib/wine/vkd3d-proton/version",
+            ],
+        ),
+        (
+            "VKD3D_VERSION",
+            &[
+                "files/lib/vkd3d/version",
+                "lib/vkd3d/version",
+                "dist/lib/vkd3d/version",
+            ],
+        ),
+        (
+            "DXVK_NVAPI_VERSION",
+            &[
+                "files/lib/wine/nvapi/version",
+                "lib/wine/nvapi/version",
+                "dist/lib/wine/nvapi/version",
+                "files/lib/wine/dxvk-nvapi/version",
+            ],
+        ),
+    ];
+
+    for (key, candidates) in harvest {
+        let found = candidates.iter().find_map(|rel| {
+            let p = runner_root.join(rel);
+            std::fs::read_to_string(&p)
+                .ok()
+                .map(|s| parse_short_version(&s))
+                .filter(|v| v != "unknown" && !v.is_empty())
+        });
+        if let Some(v) = found {
+            lines.push(format!("{key}={v}"));
+        }
+    }
+
+    // Runner's own version: root `version` file (Proton layout, e.g.
+    // "1785138253 proton-11.0-1b") takes precedence; else the tarball version.
+    let runner_version = std::fs::read_to_string(runner_root.join("version"))
+        .ok()
+        .map(|s| parse_short_version(&s))
+        .filter(|v| v != "unknown" && !v.is_empty())
+        .unwrap_or_else(|| tarball_version.trim().to_string());
+    if !runner_version.is_empty() {
+        lines.push(format!("RUNNER_VERSION={runner_version}"));
+    }
+
+    if lines.is_empty() {
+        tracing::debug!(
+            "No version info harvestable from {} — not writing VERSIONS.txt",
+            runner_root.display()
+        );
+        return false;
+    }
+
+    let content = format!("{}\n", lines.join("\n"));
+    match std::fs::write(&path, content) {
+        Ok(()) => {
+            tracing::info!(
+                "Wrote VERSIONS.txt at {} ({} entries, runner {runner_version})",
+                path.display(),
+                lines.len()
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("Failed to write {}: {e}", path.display());
+            false
+        }
+    }
 }
 
 fn apply_versions_override(
@@ -1849,6 +1975,116 @@ pub fn detect_custom_components(path: &Path) -> crate::utils::RunnerComponents {
     }
 }
 
+pub fn repair_dangling_prefix_symlinks(prefix: &Path, runner_root: &Path) -> Result<(usize, usize)> {
+    // A prefix seeded by an older runner keeps absolute symlinks into that
+    // runner's lib/wine tree (system32/*.dll, syswow64/*.dll → …/files/lib/wine/
+    // {x86_64,i386}-windows/…). If that runner dir is renamed/removed, every
+    // builtin DLL link dangles and wine dies with `could not load kernel32.dll,
+    // status c0000135` (exit 53) — regardless of which runner is then used.
+    // This walks the prefix's windows DLL dirs, re-points dangling links at the
+    // ACTIVE runner's equivalent file (same relative lib/wine subpath), and
+    // drops links whose target the active runner does not ship (a fresh prefix
+    // wouldn't have them at all). Returns (repointed, removed).
+    let mut repointed = 0usize;
+    let mut removed = 0usize;
+
+    let dirs = [
+        prefix.join("drive_c/windows/system32"),
+        prefix.join("drive_c/windows/syswow64"),
+    ];
+
+    for dir in dirs {
+        if !dir.is_dir() {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("repair_dangling_prefix_symlinks: cannot read {}: {e}", dir.display());
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let link = entry.path();
+            let meta = match std::fs::symlink_metadata(&link) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.file_type().is_symlink() {
+                continue;
+            }
+            let target = match std::fs::read_link(&link) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if target.exists() {
+                continue; // healthy link
+            }
+            // Dangling. If the target points into a lib/wine tree (the seeding
+            // layout), map it onto the active runner; otherwise drop it.
+            if let Some(rel) = lib_wine_relative(&target) {
+                let candidate = runner_root.join(&rel);
+                if candidate.exists() {
+                    tracing::info!(
+                        "Re-pointing dangling prefix symlink {} -> {}",
+                        link.display(),
+                        candidate.display()
+                    );
+                    let _ = std::fs::remove_file(&link);
+                    #[cfg(unix)]
+                    {
+                        if let Err(e) = std::os::unix::fs::symlink(&candidate, &link) {
+                            tracing::warn!("repoint failed for {}: {e}", link.display());
+                            continue;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        if let Err(e) = std::fs::copy(&candidate, &link) {
+                            tracing::warn!("repoint failed for {}: {e}", link.display());
+                            continue;
+                        }
+                    }
+                    repointed += 1;
+                } else {
+                    tracing::warn!(
+                        "Removing dangling prefix symlink {} (active runner ships no {}: {})",
+                        link.display(),
+                        rel.display(),
+                        target.display()
+                    );
+                    let _ = std::fs::remove_file(&link);
+                    removed += 1;
+                }
+            } else {
+                tracing::warn!(
+                    "Removing dangling prefix symlink {} (not a runner lib/wine link: {})",
+                    link.display(),
+                    target.display()
+                );
+                let _ = std::fs::remove_file(&link);
+                removed += 1;
+            }
+        }
+    }
+
+    Ok((repointed, removed))
+}
+
+/// If `target` points into a runner's `files/lib/wine/…` (or `lib/wine/…`)
+/// tree, return the path relative to the runner root (e.g.
+/// `files/lib/wine/x86_64-windows/kernel32.dll`).
+fn lib_wine_relative(target: &Path) -> Option<PathBuf> {
+    let s = target.to_string_lossy();
+    for marker in ["/files/lib/wine/", "/lib/wine/"] {
+        if let Some(idx) = s.find(marker) {
+            let rel = &s[idx + 1..]; // strip leading '/'
+            return Some(PathBuf::from(rel));
+        }
+    }
+    None
+}
+
 pub fn deploy_dll_symlinks(
     prefix: &Path,
     resolutions: &[crate::launch::dll_provider_resolver::DllResolution],
@@ -1887,9 +2123,12 @@ pub fn deploy_dll_symlinks(
 
             let dest_path = dest_dir.join(&dll_name);
 
-            // Safety check: if it exists and is not a symlink, back it up or skip?
-            // Usually we want to replace it if it's a Wine builtin.
-            if dest_path.exists() {
+            // Safety check: if it exists (including as a dangling symlink,
+            // which `Path::exists()` follows and reports as missing — e.g. a
+            // link to a runner dir that was renamed/removed) and is not a
+            // symlink, back it up or skip? Usually we want to replace it if
+            // it's a Wine builtin.
+            if dest_path.symlink_metadata().is_ok() {
                 let meta = std::fs::symlink_metadata(&dest_path)?;
                 if !meta.file_type().is_symlink() {
                     let backup = dest_path.with_extension("dll.bak");
@@ -2035,6 +2274,7 @@ pub fn steam_wineprefix_for_game(
     config: &crate::config::LauncherConfig,
     app_id: u32,
     user_configs: &crate::models::UserConfigStore,
+    effective_prefix_mode: Option<crate::models::SteamPrefixMode>,
 ) -> std::path::PathBuf {
     let use_steam_runtime = match user_configs.get(&app_id).map(|c| &c.steam_runtime_policy) {
         Some(crate::models::SteamRuntimePolicy::Enabled) => true,
@@ -2044,9 +2284,16 @@ pub fn steam_wineprefix_for_game(
         }
     };
 
-    let use_per_game_compat_data = user_configs.get(&app_id)
-        .map(|c| use_steam_runtime && c.steam_prefix_mode == crate::models::SteamPrefixMode::PerGame)
-        .unwrap_or(config.use_shared_compat_data);
+    let use_per_game_compat_data = match effective_prefix_mode {
+        // Launch pipeline: honor the EFFECTIVE mode. The runner-mismatch guard
+        // (wine_tkg::effective_prefix_mode) may have auto-fallbacked a Shared
+        // configuration to PerGame so the two different runners never share one
+        // WINEPREFIX (wineserver protocol collision).
+        Some(mode) => use_steam_runtime && mode == crate::models::SteamPrefixMode::PerGame,
+        None => user_configs.get(&app_id)
+            .map(|c| use_steam_runtime && c.steam_prefix_mode == crate::models::SteamPrefixMode::PerGame)
+            .unwrap_or(config.use_shared_compat_data),
+    };
 
     if use_per_game_compat_data {
         std::path::PathBuf::from(&config.steam_library_path)
@@ -2164,5 +2411,79 @@ mod runner_kind_tests {
         assert!(is_bg_bare(wine.path()) && !game_uses_protonfixes(wine.path())); // row 4
         assert!(is_bg_bare(wine.path()) && game_uses_protonfixes(proton.path())); // row 5
         assert!(is_bg_bare(proton.path()) && !game_uses_protonfixes(wine.path())); // row 6
+    }
+}
+
+#[cfg(test)]
+mod versions_txt_tests {
+    use super::*;
+
+    #[test]
+    fn write_runner_versions_txt_harvests_and_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Classic Proton component layout: version files in component dirs.
+        std::fs::create_dir_all(root.join("files/lib/wine/dxvk")).unwrap();
+        std::fs::create_dir_all(root.join("files/lib/wine/vkd3d-proton")).unwrap();
+        std::fs::write(
+            root.join("files/lib/wine/dxvk/version"),
+            "1a5919b7e dxvk (v3.0.2-5-g1a5919b7e)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("files/lib/wine/vkd3d-proton/version"),
+            "3dfc6f07 vkd3d-proton (vkd3d-1.1-5438-g3dfc6f07d)\n",
+        )
+        .unwrap();
+        // Runner root `version` file (Proton style) wins for RUNNER_VERSION.
+        std::fs::write(root.join("version"), "1785138253 proton-11.0-1b\n").unwrap();
+
+        assert!(write_runner_versions_txt(root, "fallback-tag"));
+
+        let versions = read_versions_txt(root);
+        // parse_short_version strips -g<hex> git suffixes.
+        assert_eq!(versions.dxvk.as_deref(), Some("3.0.2-5"));
+        assert_eq!(versions.vkd3d_proton.as_deref(), Some("1.1-5438"));
+        assert_eq!(versions.runner_version.as_deref(), Some("proton-11.0-1b"));
+    }
+
+    #[test]
+    fn write_runner_versions_txt_uses_tarball_version_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No root `version` file → the tarball version is stamped instead.
+        std::fs::create_dir_all(root.join("files/lib/wine/dxvk")).unwrap();
+        std::fs::write(
+            root.join("files/lib/wine/dxvk/version"),
+            "dxvk (v3.0.2)\n",
+        )
+        .unwrap();
+
+        assert!(write_runner_versions_txt(root, "GE-Proton11-3"));
+        let versions = read_versions_txt(root);
+        assert_eq!(versions.dxvk.as_deref(), Some("3.0.2"));
+        assert_eq!(versions.runner_version.as_deref(), Some("GE-Proton11-3"));
+    }
+
+    #[test]
+    fn write_runner_versions_txt_never_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("VERSIONS.txt"), "DXVK_VERSION=9.9.9\n").unwrap();
+        std::fs::create_dir_all(root.join("files/lib/wine/dxvk")).unwrap();
+        std::fs::write(root.join("files/lib/wine/dxvk/version"), "dxvk (v3.0.2)\n").unwrap();
+
+        assert!(!write_runner_versions_txt(root, "tarball-tag"));
+        let versions = read_versions_txt(root);
+        assert_eq!(versions.dxvk.as_deref(), Some("9.9.9")); // untouched
+    }
+
+    #[test]
+    fn write_runner_versions_txt_skips_empty_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Nothing harvestable → no VERSIONS.txt written.
+        assert!(!write_runner_versions_txt(root, ""));
+        assert!(!root.join("VERSIONS.txt").exists());
     }
 }

@@ -29,7 +29,11 @@ impl PipelineStage for PreparePrefixStage {
             };
             runner.prepare_prefix(&runner_ctx).await?;
 
-            // Post-runner prefix preparation: handle symlinks
+            // Post-runner prefix preparation: handle symlinks. Must use the
+            // EFFECTIVE prefix mode (the runner-mismatch guard may have fallen
+            // back from Shared to PerGame) so the symlinks land in the same
+            // prefix the launch actually uses.
+            let effective_mode = crate::infra::runners::wine_tkg::effective_prefix_mode(&runner_ctx);
             let prefix_path = crate::utils::steam_wineprefix_for_game(
                 &runner_ctx.launcher_config,
                 runner_ctx.app.app_id,
@@ -37,7 +41,8 @@ impl PipelineStage for PreparePrefixStage {
                     let mut store = std::collections::HashMap::new();
                     store.insert(runner_ctx.app.app_id, c.clone());
                     store
-                }).unwrap_or_default().into()
+                }).unwrap_or_default().into(),
+                Some(effective_mode),
             );
 
             if use_symlinks {

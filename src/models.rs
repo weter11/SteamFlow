@@ -180,6 +180,15 @@ pub struct UserAppConfig {
     /// direct exec for scripts) inside the game's Wine prefix.
     #[serde(default)]
     pub custom_exec_path: Option<String>,
+
+    /// Valve-Proton compat options for this game (Phase 2 item 2 of the
+    /// valve-stack directive). Mirrors Proton's `STEAM_COMPAT_CONFIG` /
+    /// launch-option set: `forcelgadd`, `wined3d`, `nod3d11`, `nofsync`, …
+    /// The native Rust Proton ABI (`crate::runner::proton_abi`) translates
+    /// these into `PROTON_*`/`WINE_*` env vars and DLL overrides at launch,
+    /// without invoking Proton's Python script.
+    #[serde(default)]
+    pub proton_compat_options: Vec<String>,
 }
 
 pub type UserConfigStore = HashMap<u32, UserAppConfig>;
@@ -200,6 +209,7 @@ impl Default for UserAppConfig {
             favorite: false,
             requires_steam_api: false,
             custom_exec_path: None,
+            proton_compat_options: Vec::new(),
         }
     }
 }

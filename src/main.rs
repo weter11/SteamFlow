@@ -8,6 +8,13 @@ use tokio::runtime::Runtime;
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    // Headless test-driving: `steamflow <subcommand> ...` runs without the GUI.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        let runtime = Runtime::new()?;
+        return runtime.block_on(steamflow::headless::run(&args));
+    }
+
     let runtime = Runtime::new()?;
     runtime.block_on(steamflow::config::ensure_config_dirs())?;
     let mut client = SteamClient::new()?;

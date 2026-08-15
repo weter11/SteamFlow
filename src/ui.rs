@@ -2102,7 +2102,7 @@ impl SteamLauncher {
                             &game_name,
                             std::path::Path::new(&exec_path),
                         ) {
-                            Ok(()) => {
+                            Ok(_child) => {
                                 let _ = tx.send(AsyncOp::ModLauncherLaunched);
                             }
                             Err(e) => {
@@ -2275,6 +2275,7 @@ impl SteamLauncher {
                     &self.launcher_config,
                     game_app_id,
                     &self.user_configs,
+                    None, // UI ops use the configured mode (display/management)
                 );
                 SteamClient::kill_steam_in_prefix(&prefix, true);
                 self.status = "Steam stopped".to_string();
@@ -2287,6 +2288,7 @@ impl SteamLauncher {
                     &self.launcher_config,
                     game_app_id,
                     &self.user_configs,
+                    None, // UI ops use the configured mode (display/management)
                 );
                 crate::utils::kill_all_wine_in_prefix(&prefix, false);
                 self.status = "All Wine processes in prefix terminated".to_string();
@@ -2475,6 +2477,7 @@ impl SteamLauncher {
                     &self.launcher_config,
                     game_app_id,
                     &self.user_configs,
+                    None, // UI ops use the configured mode (display/management)
                 );
                 SteamClient::kill_steam_in_prefix(&prefix, kill_webhelper);
                 self.status = "Steam feature settings changed; Steam will restart on next launch".to_string();
@@ -2809,6 +2812,7 @@ impl SteamLauncher {
                 &self.launcher_config,
                 app_id,
                 &self.user_configs,
+                None, // UI ops use the configured mode (display/management)
             )
         } else {
             std::path::PathBuf::from(&self.launcher_config.steam_library_path)

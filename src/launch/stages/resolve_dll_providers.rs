@@ -45,8 +45,18 @@ impl PipelineStage for ResolveDllProvidersStage {
         let library_root = PathBuf::from(&launcher_config.steam_library_path);
         let resolved_runner = crate::utils::resolve_runner(proton_path, &library_root);
 
-        // Resolve WINEPREFIX for component detection
+        // Resolve WINEPREFIX for component detection (uses the EFFECTIVE prefix
+        // mode so detection matches the prefix the launch will actually use).
         let wineprefix = if let (Some(config), Some(app)) = (&ctx.launcher_config, &ctx.app) {
+            let configured_mode = ctx.user_config.as_ref()
+                .map(|c| c.steam_prefix_mode.clone())
+                .unwrap_or(config.steam_prefix_mode.clone());
+            let effective_mode = crate::infra::runners::wine_tkg::effective_prefix_mode_impl(
+                configured_mode,
+                &config.steam_runtime_runner,
+                proton_path,
+                &library_root,
+            );
             Some(crate::utils::steam_wineprefix_for_game(
                 config,
                 app.app_id,
@@ -55,7 +65,8 @@ impl PipelineStage for ResolveDllProvidersStage {
                     let mut store = std::collections::HashMap::new();
                     store.insert(app.app_id, ctx.user_config.clone().unwrap());
                     store
-                }).unwrap_or_default().into()
+                }).unwrap_or_default().into(),
+                Some(effective_mode),
             ))
         } else {
             None

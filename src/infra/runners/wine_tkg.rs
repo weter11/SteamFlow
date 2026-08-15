@@ -28,6 +28,67 @@ fn effective_game_proton(ctx: &LaunchContext) -> String {
     ).to_string()
 }
 
+/// Compare two runner paths for equality, tolerating symlinked installs and
+/// paths that do not exist yet (resolve_runner falls back to the raw name when
+/// a runner is not installed).
+fn runner_paths_equal(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+/// Pure decision core of the runner-mismatch guard (testable without a
+/// `LaunchContext`): when the configured prefix mode is `Shared` but the Steam
+/// Runtime runner differs from the game runner, return `PerGame`.
+///
+/// A Shared prefix cannot host two different Wine/Proton runners at the same
+/// time: each wine build speaks its own `wineserver` protocol, so mixing them
+/// in one WINEPREFIX fails with
+/// "wine client error: version mismatch ... your wine binary was not upgraded
+/// correctly". Falling back to PerGame gives each runner its own prefix.
+pub(crate) fn effective_prefix_mode_impl(
+    configured: crate::models::SteamPrefixMode,
+    steam_runtime_runner: &Path,
+    game_runner_name: &str,
+    library_root: &Path,
+) -> crate::models::SteamPrefixMode {
+    if configured != crate::models::SteamPrefixMode::Shared {
+        return configured;
+    }
+    let steam_runner = steam_runtime_runner.to_string_lossy();
+    if steam_runner.is_empty() {
+        // No Steam Runtime runner configured — nothing can collide in the prefix.
+        return configured;
+    }
+    let steam_runner_path = crate::utils::resolve_runner(&steam_runner, library_root);
+    let game_runner_path = crate::utils::resolve_runner(game_runner_name, library_root);
+    if runner_paths_equal(&steam_runner_path, &game_runner_path) {
+        return configured;
+    }
+    tracing::warn!(
+        "[SteamFlow] Runner mismatch detected (Steam Runtime: \"{}\", Game: \"{}\"). Automatically switching to PerGame prefix mode to prevent wineserver protocol collision.",
+        steam_runner_path.display(),
+        game_runner_path.display()
+    );
+    crate::models::SteamPrefixMode::PerGame
+}
+
+/// Resolve the EFFECTIVE Steam prefix mode for a launch: the user-configured
+/// mode (per-game user config → global launcher default), auto-fallbacked to
+/// `PerGame` when a `Shared` prefix would host two different Wine/Proton
+/// runners (see `effective_prefix_mode_impl`).
+pub(crate) fn effective_prefix_mode(ctx: &LaunchContext) -> crate::models::SteamPrefixMode {
+    let configured = ctx.user_config.as_ref()
+        .map(|c| c.steam_prefix_mode.clone())
+        .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
+    let game_runner = effective_game_proton(ctx);
+    effective_prefix_mode_impl(
+        configured,
+        &ctx.launcher_config.steam_runtime_runner,
+        &game_runner,
+        Path::new(&ctx.launcher_config.steam_library_path),
+    )
+}
+
 #[async_trait::async_trait]
 impl Runner for WineTkgRunner {
     fn name(&self) -> &str { "Wine-TKG" }
@@ -51,9 +112,11 @@ impl Runner for WineTkgRunner {
                 }
             }
         };
-        let steam_prefix_mode = ctx.user_config.as_ref()
-            .map(|c| c.steam_prefix_mode.clone())
-            .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
+        // Effective prefix mode: the configured mode, auto-fallbacked from
+        // Shared to PerGame when the Steam Runtime runner and the game runner
+        // differ (two wineservers with different protocols cannot share one
+        // WINEPREFIX). See `effective_prefix_mode_impl`.
+        let steam_prefix_mode = effective_prefix_mode(ctx);
 
         let user_config_store: crate::models::UserConfigStore = ctx.user_config.as_ref().map(|c| {
             let mut store = HashMap::new();
@@ -64,14 +127,90 @@ impl Runner for WineTkgRunner {
         let effective_game_prefix = crate::utils::steam_wineprefix_for_game(
             &ctx.launcher_config,
             ctx.app.app_id,
-            &user_config_store
+            &user_config_store,
+            Some(steam_prefix_mode.clone()),
         );
         std::fs::create_dir_all(&effective_game_prefix)
             .map_err(|e| LaunchError::new(LaunchErrorKind::Permission, format!("failed creating {}", effective_game_prefix.display())).with_source(anyhow!(e)))?;
 
+        // === Native prefix seeding (Phase 2 tail, valve-stack directive) ===
+        // Port of Proton's `default_pfx.py`/`CompatData.setup_prefix`: when the
+        // game's prefix is fresh (no `system.reg` yet) and the runner is a
+        // Proton-kind tree shipping `files/share/default_pfx`, seed the prefix
+        // directly from it (copy tree + dosdevices symlinks + version marker)
+        // WITHOUT invoking external Python init scripts. Non-fatal: a seeding
+        // failure logs and the launch proceeds (wine would create an empty
+        // prefix anyway); the version marker comes from the runner's `version`
+        // file (e.g. `proton-11.0-1b`) or the runner dir name.
+        if !effective_game_prefix.join("system.reg").exists() {
+            let runner_root = crate::utils::derive_runner_root(&active_runner);
+            let default_pfx_candidates = [
+                "files/share/default_pfx",
+                "share/default_pfx",
+                "dist/share/default_pfx",
+            ];
+            let default_pfx = default_pfx_candidates
+                .iter()
+                .map(|p| runner_root.join(p))
+                .find(|p| p.is_dir());
+            if let Some(default_pfx_dir) = default_pfx {
+                let proton_version = std::fs::read_to_string(runner_root.join("version"))
+                    .ok()
+                    .map(|s| crate::utils::parse_short_version(&s))
+                    .filter(|v| v != "unknown" && !v.is_empty())
+                    .unwrap_or_else(|| {
+                        active_runner
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    });
+                match crate::runner::proton_abi::seed_prefix(
+                    &default_pfx_dir,
+                    &effective_game_prefix,
+                    &proton_version,
+                ) {
+                    Ok(created) => tracing::info!(
+                        "Native prefix seeding: seeded {} from {} ({} paths, version {})",
+                        effective_game_prefix.display(),
+                        default_pfx_dir.display(),
+                        created.len(),
+                        proton_version
+                    ),
+                    Err(e) => tracing::warn!(
+                        "Native prefix seeding failed for {} (continuing with wine's own init): {e}",
+                        effective_game_prefix.display()
+                    ),
+                }
+            } else {
+                tracing::debug!(
+                    "No default_pfx in runner {} — skipping native prefix seeding",
+                    runner_root.display()
+                );
+            }
+        }
+
         tracing::info!("Effective game prefix: {}", effective_game_prefix.display());
         tracing::info!("Shared steam compatibility data enabled: {}", ctx.launcher_config.use_shared_compat_data);
         tracing::info!("Steam Runtime Prefix Mode: {:?}", steam_prefix_mode);
+
+        // Self-healing: a prefix seeded by an older runner keeps absolute
+        // symlinks into that runner's lib/wine tree. If the runner dir was
+        // renamed/removed, every builtin DLL link dangles and ANY wine fails
+        // with `could not load kernel32.dll` (exit 53) before Steam even
+        // spawns. Re-point dangling links at the active runner's files (or
+        // drop links it doesn't ship). Cheap on healthy prefixes (no-op scan).
+        let active_root = crate::utils::derive_runner_root(&active_runner);
+        match crate::utils::repair_dangling_prefix_symlinks(&effective_game_prefix, &active_root) {
+            Ok((repointed, removed)) if repointed > 0 || removed > 0 => tracing::warn!(
+                "Prefix self-heal: re-pointed {repointed} dangling DLL symlink(s), removed {removed} (runner {} owns the prefix now)",
+                active_root.display()
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "Prefix self-heal scan failed for {}: {e}",
+                effective_game_prefix.display()
+            ),
+        }
 
         if use_steam_runtime {
             let steam_cfg = crate::utils::get_master_steam_config();
@@ -101,6 +240,17 @@ impl Runner for WineTkgRunner {
                             (master_steam_dir.clone(), steam_cfg.wine_prefix.clone())
                         }
                         crate::models::SteamPrefixMode::PerGame => {
+                            // The client must live in the SAME prefix (and thus
+                            // same wineserver) as the game: Steam's client API
+                            // (steamclient.dll → named pipe) is wineserver-scoped.
+                            // A client parked in the master prefix is unreachable
+                            // from a per-game-prefix game — SteamAPI_Init fails,
+                            // games self-exit ~3s after the window (RE2) or show
+                            // "Steam must be running" (Portal 2, 2026-08-13).
+                            // The per-game prefix therefore hosts BOTH the client
+                            // process and the game. It receives a full client-file
+                            // deployment below (refresh-on-stale) so steam.exe can
+                            // boot from it under the game's runner.
                             let target_steam_dir = effective_game_prefix
                                 .join("drive_c/Program Files (x86)/Steam");
 
@@ -123,17 +273,35 @@ impl Runner for WineTkgRunner {
                             for file in required_files {
                                 let src = master_steam_dir.join(file);
                                 let dst = target_steam_dir.join(file);
-                                if src.exists() && !dst.exists() {
-                                    #[cfg(unix)]
-                                    {
-                                        if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
-                                            tracing::warn!("Symlink failed for {}, falling back to copy: {}", file, e);
+                                if src.exists() {
+                                    let needs_refresh = match std::fs::symlink_metadata(&dst) {
+                                        // Symlink to the master file → up to date by construction.
+                                        Ok(m) if m.file_type().is_symlink() => false,
+                                        // Real file: refresh when it differs from master (stale
+                                        // client copies self-exit with code 1 on launch — e.g. the
+                                        // old steam.exe that predates the current client build).
+                                        Ok(_) => {
+                                            let same = std::fs::read(&src)
+                                                .and_then(|a| std::fs::read(&dst).map(|b| a == b))
+                                                .unwrap_or(false);
+                                            !same
+                                        }
+                                        Err(_) => true, // missing
+                                    };
+                                    if needs_refresh {
+                                        tracing::info!("Refreshing stale Steam runtime file {} from master", file);
+                                        let _ = std::fs::remove_file(&dst);
+                                        #[cfg(unix)]
+                                        {
+                                            if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                                                tracing::warn!("Symlink failed for {}, falling back to copy: {}", file, e);
+                                                let _ = std::fs::copy(&src, &dst);
+                                            }
+                                        }
+                                        #[cfg(not(unix))]
+                                        {
                                             let _ = std::fs::copy(&src, &dst);
                                         }
-                                    }
-                                    #[cfg(not(unix))]
-                                    {
-                                        let _ = std::fs::copy(&src, &dst);
                                     }
                                 }
                             }
@@ -158,16 +326,22 @@ impl Runner for WineTkgRunner {
                                 }
                             }
 
-                    (target_steam_dir, effective_game_prefix.clone())
-                }
-            };
+                            // Client process + readiness gate target the PER-GAME
+                            // prefix — the same wineserver the game runs in.
+                            // (This is the 8a56ed2 layout restored after b5f5c0a
+                            // split the client into the master prefix and broke
+                            // Steam API reachability for every per-game-prefix
+                            // launch.)
+                            (target_steam_dir, effective_game_prefix.clone())
+                        }
+                    };
 
             tracing::debug!("Runtime Steam dir : {}", prefix_steam_dir.display());
                     tracing::debug!("Runtime WINEPREFIX : {}", steam_wineprefix.display());
 
                     if !matches!(crate::utils::classify_runner(&active_runner), crate::utils::RunnerKind::Unknown) {
                         if let Some(active_wine) =
-                            crate::utils::detect_wineserver_for_runner(&steam_wineprefix, &active_runner)
+                            crate::utils::detect_wineserver_for_runner(&effective_game_prefix, &active_runner)
                         {
                             let active_root = crate::utils::derive_runner_root(&active_wine);
                             let runner_root = crate::utils::derive_runner_root(&active_runner);
@@ -178,9 +352,9 @@ impl Runner for WineTkgRunner {
                             if active_canonical != runner_canonical {
                                 tracing::warn!(
                                     "Stale wineserver (different runner {:?}) detected in prefix {}. Terminating it before launch.",
-                                    active_canonical, steam_wineprefix.display()
+                                    active_canonical, effective_game_prefix.display()
                                 );
-                                crate::utils::kill_wineserver_in_prefix(&steam_wineprefix);
+                                crate::utils::kill_wineserver_in_prefix(&effective_game_prefix);
                                 std::thread::sleep(std::time::Duration::from_millis(500));
                             }
                         }
@@ -237,7 +411,66 @@ impl Runner for WineTkgRunner {
                         // pass (after readiness gate) will handle newly spawned
                         // helpers to ensure user-disabled features are enforced.
                     } else {
-                        let steam_runner = if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
+                        // Session-state sync (PerGame only): seed the per-game
+                        // client with the master client's authentication before
+                        // spawning it — loginusers.vdf, the config.vdf
+                        // RememberedMachineID machine token, ssfn* sentries and
+                        // the HKCU\Software\Valve\Steam login keys. A prefix
+                        // seeded months ago carries an EXPIRED machine token, so
+                        // the headless client starts anonymous (SteamID 0) and
+                        // SteamAPI_Init fails with "Steam is not running" even
+                        // though the client process is up. No-op when the master
+                        // client has no session or the target is already as
+                        // fresh; non-fatal on error. In Shared mode the target
+                        // IS the master prefix — nothing to sync.
+                        if steam_prefix_mode == crate::models::SteamPrefixMode::PerGame {
+                            match SteamClient::sync_master_session_to_prefix(
+                                &master_steam_dir,
+                                &steam_cfg.wine_prefix,
+                                &prefix_steam_dir,
+                                &steam_wineprefix,
+                            ) {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        tracing::info!(
+                                            "Steam session sync: {n} item(s) synchronized from master into per-game prefix"
+                                        );
+                                        unsafe {
+                                            if !ctx.verification_ptr.is_null() {
+                                                (*ctx.verification_ptr).steam_runtime_milestone =
+                                                    "steam_session_synced".to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    "Steam session sync failed (non-fatal, launch proceeds): {e}"
+                                ),
+                            }
+                        }
+
+                        // The background Steam client runs in the SAME prefix
+                        // as the game (PerGame: per-game prefix seeded by the
+                        // game's runner; Shared: master prefix owned by the
+                        // runtime runner). It must therefore be spawned with
+                        // the runner that owns that prefix:
+                        // - PerGame mode → the GAME's runner (pure-PE family
+                        //   that seeded the prefix). This is the 8a56ed2 layout:
+                        //   client + game in one wineserver, so the game's
+                        //   steamclient.dll can reach the client's named pipe.
+                        //   (b5f5c0a moved the client to the master prefix
+                        //   under wine-tkg, splitting the wineservers; every
+                        //   Steam API init then failed — RE2 self-exit, Portal 2
+                        //   "Steam must be running".)
+                        // - Shared mode → the configured Steam Runtime runner
+                        //   (it owns the master prefix).
+                        let steam_runner = if steam_prefix_mode == crate::models::SteamPrefixMode::PerGame {
+                            tracing::info!(
+                                "PerGame mode: using the game's runner ({}) for background Steam (same prefix/wineserver as the game)",
+                                active_runner.display()
+                            );
+                            active_runner.clone()
+                        } else if !ctx.launcher_config.steam_runtime_runner.as_os_str().is_empty() {
                             ctx.launcher_config.steam_runtime_runner.clone()
                         } else {
                             let discovered = crate::utils::resolve_runner("wine-tkg", &library_root);
@@ -452,6 +685,7 @@ impl Runner for WineTkgRunner {
                 &ctx.launcher_config,
                 ctx.app.app_id,
                 &user_config_store,
+                Some(steam_prefix_mode.clone()),
             );
             let slc = ctx.user_config.as_ref()
                 .map(|c| c.steam_launch_config.clone())
@@ -531,6 +765,10 @@ impl Runner for WineTkgRunner {
             .join("compatdata")
             .join(&app_id_str);
 
+        // Effective prefix mode (runner-mismatch guard), used for the game's
+        // WINEPREFIX below AND the background-Steam spawn decision.
+        let steam_prefix_mode = effective_prefix_mode(ctx);
+
         let user_config_store: crate::models::UserConfigStore = ctx.user_config.as_ref().map(|c| {
             let mut store = HashMap::new();
             store.insert(ctx.app.app_id, c.clone());
@@ -540,7 +778,8 @@ impl Runner for WineTkgRunner {
         let effective_game_prefix = crate::utils::steam_wineprefix_for_game(
             &ctx.launcher_config,
             ctx.app.app_id,
-            &user_config_store
+            &user_config_store,
+            Some(steam_prefix_mode.clone()),
         );
 
         // === Pre-launch Steam API readiness check ===
@@ -989,17 +1228,71 @@ impl Runner for WineTkgRunner {
         }
 
         tracing::info!("Final WINEDLLOVERRIDES: {}", dll_overrides);
-        env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides);
+        env.insert("WINEDLLOVERRIDES".to_string(), dll_overrides.clone());
+
+        // === Native Rust Proton ABI (Phase 2 item 2, valve-stack directive) ===
+        // Port of Valve's `proton` script launch semantics, applied WITHOUT
+        // invoking Python. Computes the per-app compat-option set
+        // (default_compat_config + forcelgadd default + per-game
+        // proton_compat_options), then merges Proton's env rules and base
+        // DLL overrides into the env SteamFlow already assembled.
+        //
+        // This resolves the two real env gaps the test-diff harness found on
+        // RE2 (883710): PROTON_FORCE_LARGE_ADDRESS_AWARE (forcelgadd default)
+        // and the wined3d option were set by native Steam but never emitted
+        // by SteamFlow. See docs/architecture/valve-stack-replication.md.
+        {
+            let mut compat = crate::runner::proton_abi::default_compat_config(ctx.app.app_id);
+            if let Some(user_config) = &ctx.user_config {
+                for opt in &user_config.proton_compat_options {
+                    compat.insert(opt.clone());
+                }
+            }
+            crate::runner::proton_abi::apply_forcelgadd_default(&mut compat);
+
+            // Merge Proton's env rules (WINE_LARGE_ADDRESS_AWARE, WINE_HEAP_*,
+            // DXVK_ENABLE_NVAPI, WINE_MONO_HIDETYPES, __GLVND_DISALLOW_PATCHING,
+            // PROTON_USE_XALIA, …). SteamFlow's existing env values win.
+            //
+            // Order-preserving merge: WINEDLLOVERRIDES is order-sensitive for
+            // per-DLL settings (dll=setting pairs), so keep SteamFlow's
+            // original sequence and append Proton-only entries at the end.
+            let mut proton_dll_overrides: Vec<(String, String)> = Vec::new();
+            for seg in dll_overrides.split(';').filter(|s| !s.trim().is_empty()) {
+                if let Some((dll, setting)) = seg.split_once('=') {
+                    let dll = dll.trim().to_string();
+                    let setting = setting.trim().to_string();
+                    // Last occurrence wins (SteamFlow sometimes emits a DLL
+                    // twice); drop earlier duplicates.
+                    if let Some(prev) = proton_dll_overrides.iter_mut().find(|(d, _)| *d == dll) {
+                        prev.1 = setting;
+                    } else {
+                        proton_dll_overrides.push((dll, setting));
+                    }
+                }
+            }
+            crate::runner::proton_abi::apply_proton_env_rules(
+                ctx.app.app_id,
+                &compat,
+                &mut env,
+                &mut proton_dll_overrides,
+            );
+            let merged = crate::runner::proton_abi::serialize_dll_overrides(&proton_dll_overrides);
+            env.insert("WINEDLLOVERRIDES".to_string(), merged.clone());
+            tracing::info!(
+                "Proton ABI: compat={:?} → WINEDLLOVERRIDES={}",
+                compat,
+                merged
+            );
+        }
         if let Some(fixup) = &ctx.fixup_result {
             for (key, value) in &fixup.extra_env {
                 env.insert(key.clone(), value.clone());
             }
         }
 
-        let steam_prefix_mode = ctx.user_config.as_ref()
-            .map(|c| c.steam_prefix_mode.clone())
-            .unwrap_or(ctx.launcher_config.steam_prefix_mode.clone());
-
+        // NOTE: `steam_prefix_mode` is the EFFECTIVE mode, resolved at the top
+        // of this fn via `effective_prefix_mode(ctx)` (runner-mismatch guard).
         if steam_prefix_mode == crate::models::SteamPrefixMode::Shared && SteamClient::is_steam_running_in_prefix(&effective_game_prefix) {
             let msg = "Shared prefix mode: Steam is already running in this prefix. Launching a second game with a different runner will crash. Consider switching to per-game prefix mode in Settings.";
             tracing::warn!("{}", msg);

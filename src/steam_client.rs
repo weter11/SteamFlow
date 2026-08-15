@@ -26,7 +26,8 @@ use steam_vent::auth::{
 use steam_vent::connection::Connection;
 use steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicket;
 use steam_vent::proto::steammessages_clientserver_2::{
-    CMsgClientGetDepotDecryptionKey, CMsgClientGetDepotDecryptionKeyResponse,
+    CMsgClientGetCDNAuthToken, CMsgClientGetCDNAuthTokenResponse, CMsgClientGetDepotDecryptionKey,
+    CMsgClientGetDepotDecryptionKeyResponse,
 };
 use steam_vent::proto::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
@@ -1062,6 +1063,14 @@ impl SteamClient {
                 ) {
                     tracing::warn!("failed writing appmanifest for {}: {}", appid, err);
                 }
+                // Phase 2 item 3 (valve-stack directive): after a successful
+                // depot download, surface the runner's version into
+                // VERSIONS.txt at the install root so bundled components
+                // display real versions instead of `found(bundled)`. Only
+                // fires when version info is harvestable (Proton tool trees
+                // ship `version` files; a plain game dir yields nothing and
+                // the write is skipped).
+                crate::utils::write_runner_versions_txt(&install_dir, &installdir);
                 let _ = tx
                     .send(DownloadProgress {
                         state: DownloadProgressState::Completed,
@@ -1190,15 +1199,22 @@ impl SteamClient {
         host_name: &str,
     ) -> Result<String> {
         let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
-        let mut request = CContentServerDirectory_GetCDNAuthToken_Request::new();
-        request.set_app_id(app_id);
+        let mut request = CMsgClientGetCDNAuthToken::new();
         request.set_depot_id(depot_id);
         request.set_host_name(host_name.to_string());
+        request.set_app_id(app_id);
 
-        let response: CContentServerDirectory_GetCDNAuthToken_Response = connection
-            .service_method(request)
+        // NOTE: the ContentServerDirectory.GetCDNAuthToken SERVICE variant returns
+        // ERESULT Fail server-side; the real client uses the job-based
+        // CMsgClientGetCDNAuthToken (same shape as GetDepotDecryptionKey).
+        let response: CMsgClientGetCDNAuthTokenResponse = connection
+            .job(request)
             .await
-            .context("failed calling ContentServerDirectory.GetCDNAuthToken")?;
+            .context("failed calling GetCDNAuthToken job")?;
+
+        if response.eresult() != 1 {
+            return Err(anyhow!("GetCDNAuthToken returned eresult {}", response.eresult()));
+        }
 
         if response.token().is_empty() {
             return Err(anyhow!("Empty Auth Token returned"));
@@ -2328,6 +2344,51 @@ impl SteamClient {
                                 }
                             }
                         }
+                        // Tool apps (Proton etc.) carry installdir under
+                        // appinfo.config.installdir, NOT common.installdir —
+                        // and parse_appinfo can fail entirely on them. Fall back
+                        // to a direct VDF walk so tools install into the same
+                        // directory real Steam uses (e.g. "Proton - Experimental").
+                        if installdir.is_none() || display_name.starts_with("App ") {
+                            if let Ok(vdf) = find_vdf_in_pics(app.buffer()) {
+                                let info_obj = vdf.as_obj().and_then(|root| {
+                                    if vdf.key() == "appinfo" || vdf.key() == appid.to_string() {
+                                        Some(root)
+                                    } else {
+                                        root.get("appinfo")
+                                            .and_then(|v| v.as_obj())
+                                            .or(Some(root))
+                                    }
+                                });
+                                if let Some(info) = info_obj {
+                                    if display_name.starts_with("App ") {
+                                        if let Some(name) = info
+                                            .get("common")
+                                            .and_then(|v| v.as_obj())
+                                            .and_then(|c| c.get("name"))
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            display_name = name.to_string();
+                                        }
+                                    }
+                                    if installdir.is_none() {
+                                        let from_common = info
+                                            .get("common")
+                                            .and_then(|v| v.as_obj())
+                                            .and_then(|c| c.get("installdir"))
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string);
+                                        let from_config = info
+                                            .get("config")
+                                            .and_then(|v| v.as_obj())
+                                            .and_then(|c| c.get("installdir"))
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string);
+                                        installdir = from_common.or(from_config);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2549,6 +2610,370 @@ impl SteamClient {
             && raw.contains("Timestamp\"\t\t\"")
             && !raw.contains("Timestamp\"\t\t\"0\"");
         has_autologin
+    }
+
+    /// Parses the login Timestamp (unix seconds) from a prefix's
+    /// `config/loginusers.vdf`, if present. Used as a freshness comparison
+    /// between master and per-game login state.
+    fn loginusers_timestamp(steam_dir: &Path) -> Option<u64> {
+        let raw = std::fs::read_to_string(steam_dir.join("config/loginusers.vdf")).ok()?;
+        for line in raw.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("\"Timestamp\"") {
+                let rest = rest.trim_start().strip_prefix('"')?;
+                let v = rest.split('"').next()?;
+                return v.trim().parse::<u64>().ok();
+            }
+        }
+        None
+    }
+
+    /// Locates a VDF block whose header line is exactly `"key"` (on its own
+    /// line) followed by an opening brace, and returns
+    /// `(header_idx, brace_idx, end_idx_exclusive)` — the whole block from the
+    /// header through the matching closing brace. `prefer_last` picks the last
+    /// occurrence (used for the `"Steam"` insertion anchor, since nested
+    /// config keys may reuse the name).
+    fn find_vdf_block(
+        lines: &[&str],
+        key: &str,
+        prefer_last: bool,
+    ) -> Option<(usize, usize, usize)> {
+        let header = format!("\"{key}\"");
+        let mut found = None;
+        for i in 0..lines.len() {
+            if lines[i].trim() != header {
+                continue;
+            }
+            // Next non-empty line must be the opening brace.
+            let Some(j) = (i + 1..lines.len()).find(|&j| !lines[j].trim().is_empty()) else {
+                continue;
+            };
+            if lines[j].trim() != "{" {
+                continue;
+            }
+            // Match braces to find the block end (header .. closing brace).
+            let mut depth = 0i32;
+            let mut end = None;
+            for (k, line) in lines.iter().enumerate().skip(j) {
+                let t = line.trim();
+                if t.starts_with('{') {
+                    depth += 1;
+                }
+                if t == "}" {
+                    depth -= 1;
+                }
+                if depth == 0 {
+                    end = Some((i, j, k + 1));
+                    break;
+                }
+            }
+            if let Some(e) = end {
+                if !prefer_last {
+                    return Some(e);
+                }
+                found = Some(e);
+            }
+        }
+        found
+    }
+
+    /// Joins lines preserving the original line ending (`\r\n` when the source
+    /// used it, else `\n`), so a merged file keeps its original EOL style.
+    fn join_lines_preserving_eol(lines: Vec<String>, source_used_crlf: bool) -> String {
+        let sep = if source_used_crlf { "\r\n" } else { "\n" };
+        lines.join(sep)
+    }
+
+    /// Merges the `"Authentication"` block (RememberedMachineID JWT — the
+    /// machine-bound login token) from the master `config.vdf` into the
+    /// target's `config.vdf`.
+    ///
+    /// The target's other per-prefix keys (Streaming, language, …) are
+    /// preserved verbatim. When the target lacks an Authentication block, the
+    /// master's is inserted right after the `"Steam"` section's opening brace.
+    /// Returns the target unchanged when master has no auth block or the
+    /// insertion anchor cannot be found.
+    fn merge_vdf_authentication(target_raw: &str, master_raw: &str) -> String {
+        const KEY: &str = "Authentication";
+        let t_lines: Vec<&str> = target_raw.lines().collect();
+        let m_lines: Vec<&str> = master_raw.lines().collect();
+        let crlf = target_raw.contains("\r\n");
+
+        let Some((_, _, m_end)) = Self::find_vdf_block(&m_lines, KEY, false) else {
+            return target_raw.to_string(); // master has no auth block — nothing to sync
+        };
+        let m_block: Vec<String> = m_lines[..m_end].iter().map(|s| s.to_string()).collect();
+
+        let mut out: Vec<String> = Vec::new();
+        match Self::find_vdf_block(&t_lines, KEY, false) {
+            Some((t_start, _, t_end)) => {
+                out.extend(t_lines[..t_start].iter().map(|s| s.to_string()));
+                out.extend(m_block);
+                out.extend(t_lines[t_end..].iter().map(|s| s.to_string()));
+            }
+            None => {
+                // Insert after the LAST "Steam" section's opening brace (the
+                // real config section; nested keys may reuse the name).
+                let Some((_, brace_idx, _)) = Self::find_vdf_block(&t_lines, "Steam", true) else {
+                    return target_raw.to_string();
+                };
+                out.extend(t_lines[..=brace_idx].iter().map(|s| s.to_string()));
+                out.extend(m_block);
+                out.extend(t_lines[brace_idx + 1..].iter().map(|s| s.to_string()));
+            }
+        }
+        Self::join_lines_preserving_eol(out, crlf)
+    }
+
+    /// Locates a `user.reg` section `[key] timestamp` (exact key match — a
+    /// subkey like `[Software\\Valve\\Steam\\Apps]` does NOT match the key
+    /// `Software\\Valve\\Steam`). Returns `(header_idx, end_idx_exclusive)`,
+    /// where the section runs from its header line to the next `[` line (or
+    /// EOF).
+    fn find_user_reg_section(lines: &[&str], key: &str) -> Option<(usize, usize)> {
+        let header_prefix = format!("[{key}]");
+        for i in 0..lines.len() {
+            let t = lines[i].trim_start();
+            if !t.starts_with(&header_prefix) {
+                continue;
+            }
+            let rest = t[header_prefix.len()..].trim();
+            // Header may be `[key]`, `[key] <unix_ts>` — but never `[key\\sub]`.
+            if !rest.is_empty() && !rest.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let end = (i + 1..lines.len())
+                .find(|&j| lines[j].trim_start().starts_with('['))
+                .unwrap_or(lines.len());
+            return Some((i, end));
+        }
+        None
+    }
+
+    /// Overlays the `[Software\\Valve\\Steam]` section (AutoLoginUser,
+    /// RememberPassword, …) from the master's `user.reg` onto the target's.
+    ///
+    /// Per-key merge: master's values win for keys present in both, master-only
+    /// keys are appended, and the target's own keys/subkeys (registry fixups,
+    /// Steam\\Apps, Steam\\ActiveProcess, unrelated apps) are preserved. When
+    /// the target lacks the section entirely, the master's section is inserted
+    /// before the first `[Software\\…]` sibling (or before the first `[` line,
+    /// or appended). Returns the target unchanged when master has no such
+    /// section.
+    fn merge_user_reg_steam_section(target_raw: &str, master_raw: &str) -> String {
+        const KEY: &str = "Software\\\\Valve\\\\Steam";
+        let t_lines: Vec<&str> = target_raw.lines().collect();
+        let m_lines: Vec<&str> = master_raw.lines().collect();
+        let crlf = target_raw.contains("\r\n");
+
+        let Some((m_start, m_end)) = Self::find_user_reg_section(&m_lines, KEY) else {
+            return target_raw.to_string();
+        };
+
+        // key(lowercased) → master's line, for keys inside master's section.
+        let mut master_keys: HashMap<String, String> = HashMap::new();
+        for line in &m_lines[m_start + 1..m_end] {
+            let t = line.trim_start();
+            if let Some(close) = t.strip_prefix('"').and_then(|r| r.find('"')) {
+                master_keys.insert(t[1..1 + close].to_lowercase(), (*line).to_string());
+            }
+        }
+        if master_keys.is_empty() {
+            return target_raw.to_string();
+        }
+
+        let mut out: Vec<String> = Vec::new();
+        match Self::find_user_reg_section(&t_lines, KEY) {
+            Some((t_start, t_end)) => {
+                // Header from master (carries the fresh login timestamp);
+                // content = target's lines with master's keys overlaid.
+                out.push(m_lines[m_start].to_string());
+                for line in &t_lines[t_start + 1..t_end] {
+                    let t = line.trim_start();
+                    if let Some(close) = t.strip_prefix('"').and_then(|r| r.find('"')) {
+                        let k = t[1..1 + close].to_lowercase();
+                        if let Some(mv) = master_keys.remove(&k) {
+                            out.push(mv);
+                            continue;
+                        }
+                    }
+                    out.push((*line).to_string());
+                }
+                // Master-only keys, appended in master order.
+                let mut extra: Vec<String> = master_keys.into_values().collect();
+                out.append(&mut extra);
+                out.extend(t_lines[t_end..].iter().map(|s| s.to_string()));
+            }
+            None => {
+                let m_section: Vec<String> = m_lines[m_start..m_end]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                // Insert before the first `[Software\\` sibling if any.
+                let mut inserted = false;
+                for line in &t_lines {
+                    if !inserted && line.trim_start().starts_with("[Software\\\\") {
+                        out.extend(m_section.clone());
+                        inserted = true;
+                    }
+                    out.push((*line).to_string());
+                }
+                if !inserted {
+                    // Otherwise before the first `[` line, else append.
+                    match t_lines.iter().position(|l| l.trim_start().starts_with('[')) {
+                        Some(i) => {
+                            out.clear();
+                            out.extend(t_lines[..i].iter().map(|s| s.to_string()));
+                            out.extend(m_section);
+                            out.extend(t_lines[i..].iter().map(|s| s.to_string()));
+                        }
+                        None => {
+                            out.clear();
+                            out.extend(m_section);
+                            out.extend(t_lines.iter().map(|s| s.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        Self::join_lines_preserving_eol(out, crlf)
+    }
+
+    /// Synchronizes the Windows Steam client's authentication/session state
+    /// from the master Steam install into a per-game prefix's Steam directory.
+    ///
+    /// The background client in a per-game prefix is spawned headless
+    /// (`-silent -noreactlogin`) and must auto-login to answer Steamworks
+    /// ownership queries. Modern Steam (2026+) persists auth via:
+    ///   - `config/loginusers.vdf`  (account entry: AutoLogin/RememberPassword
+    ///     plus a fresh `Timestamp`)
+    ///   - `config/config.vdf`      (`Authentication → RememberedMachineID`
+    ///     JWT — the machine-bound token; it EXPIRES after ~90 days)
+    ///   - `HKCU\Software\Valve\Steam` registry keys (`AutoLoginUser`, …)
+    /// `ssfn*` sentry files are legacy (pre-2026) but copied when present.
+    ///
+    /// A per-game prefix seeded months ago carries an EXPIRED machine token
+    /// (its RememberedMachineID JWT has a past `exp`); the client then starts
+    /// anonymous (SteamID 0) and `SteamAPI_Init` fails with "Steam is not
+    /// running" even though the client process is alive and the pipe is
+    /// reachable. This sync refreshes the token + login state from master.
+    ///
+    /// Guards: does nothing when the master client has no session, and never
+    /// clobbers a per-game login that is as fresh as (or fresher than) the
+    /// master's. Non-fatal: failures log a warning and the launch proceeds.
+    ///
+    /// Returns the number of items synchronized (0 = nothing needed).
+    pub fn sync_master_session_to_prefix(
+        master_steam_dir: &Path,
+        master_prefix: &Path,
+        target_steam_dir: &Path,
+        target_prefix: &Path,
+    ) -> Result<usize, anyhow::Error> {
+        use anyhow::Context;
+
+        // 1) Nothing to share if the master client itself is not logged in.
+        if !Self::windows_client_has_session(master_prefix) {
+            tracing::info!("Steam session sync: master client has no session — skipping");
+            return Ok(0);
+        }
+
+        // 2) Freshness guard: don't downgrade a per-game login newer than
+        //    master's (e.g. the user logged in manually in that prefix).
+        let master_ts = Self::loginusers_timestamp(master_steam_dir);
+        let target_ts = Self::loginusers_timestamp(target_steam_dir);
+        if let (Some(m), Some(t)) = (master_ts, target_ts) {
+            if t >= m {
+                tracing::debug!(
+                    "Steam session sync: target login as fresh as master ({t} >= {m}) — skipping"
+                );
+                return Ok(0);
+            }
+        }
+
+        let mut synced = 0usize;
+        std::fs::create_dir_all(target_steam_dir.join("config")).ok();
+
+        // 3) config/config.vdf — merge the Authentication (RememberedMachineID
+        //    JWT) block from master so the target carries a fresh token while
+        //    preserving the target's other per-prefix keys (streaming
+        //    ClientID, language, …).
+        let master_cfg = master_steam_dir.join("config/config.vdf");
+        let target_cfg = target_steam_dir.join("config/config.vdf");
+        if master_cfg.exists() {
+            let m_raw = std::fs::read_to_string(&master_cfg)
+                .with_context(|| format!("read master config.vdf {}", master_cfg.display()))?;
+            let t_raw = std::fs::read_to_string(&target_cfg).unwrap_or_default();
+            let merged = Self::merge_vdf_authentication(&t_raw, &m_raw);
+            if merged != t_raw {
+                std::fs::write(&target_cfg, merged).with_context(|| {
+                    format!("write synced config.vdf {}", target_cfg.display())
+                })?;
+                synced += 1;
+            }
+        }
+
+        // 4) config/loginusers.vdf — copy wholesale (the account registry).
+        let master_lu = master_steam_dir.join("config/loginusers.vdf");
+        let target_lu = target_steam_dir.join("config/loginusers.vdf");
+        if master_lu.exists() {
+            let m = std::fs::read(&master_lu)
+                .with_context(|| format!("read master loginusers.vdf {}", master_lu.display()))?;
+            let t = std::fs::read(&target_lu).unwrap_or_default();
+            if m != t {
+                std::fs::write(&target_lu, m).with_context(|| {
+                    format!("write synced loginusers.vdf {}", target_lu.display())
+                })?;
+                synced += 1;
+            }
+        }
+
+        // 5) ssfn* sentry files (legacy machine auth, pre-2026 clients).
+        if let Ok(entries) = std::fs::read_dir(master_steam_dir) {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let name_s = name.to_string_lossy();
+                if name_s.starts_with("ssfn") {
+                    let src = e.path();
+                    let dst = target_steam_dir.join(&name);
+                    let m = std::fs::read(&src)
+                        .with_context(|| format!("read master sentry {}", src.display()))?;
+                    let t = std::fs::read(&dst).unwrap_or_default();
+                    if m != t {
+                        std::fs::write(&dst, m).with_context(|| {
+                            format!("write synced sentry {}", dst.display())
+                        })?;
+                        synced += 1;
+                    }
+                }
+            }
+        }
+
+        // 6) HKCU\Software\Valve\Steam — merge the top-level registry section
+        //    from master's user.reg into the target's (preserves subkeys like
+        //    Steam\Apps and ActiveProcess, and all unrelated apps' sections).
+        let master_reg = master_prefix.join("user.reg");
+        let target_reg = target_prefix.join("user.reg");
+        if master_reg.exists() {
+            let m_raw = std::fs::read_to_string(&master_reg)
+                .with_context(|| format!("read master user.reg {}", master_reg.display()))?;
+            let t_raw = std::fs::read_to_string(&target_reg).unwrap_or_default();
+            let merged = Self::merge_user_reg_steam_section(&t_raw, &m_raw);
+            if merged != t_raw {
+                std::fs::write(&target_reg, merged).with_context(|| {
+                    format!("write synced user.reg {}", target_reg.display())
+                })?;
+                synced += 1;
+            }
+        }
+
+        if synced > 0 {
+            tracing::info!(
+                "Steam session sync: {synced} item(s) synchronized from master into {}",
+                target_steam_dir.display()
+            );
+        }
+        Ok(synced)
     }
 
     /// Registers the native Linux Steam library folders into the Windows Steam
@@ -4273,6 +4698,253 @@ mod windows_client_login_tests {
         assert!(after.contains("Program Files (x86)"));
         assert!(after.contains("\\Steam\""));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- merge_vdf_authentication ----
+
+    fn vdf_fixture(remembered: &str, with_streaming: bool) -> String {
+        let streaming = if with_streaming {
+            "\t\t\t\t\"Streaming\"\n\t\t\t\t{\n\t\t\t\t\t\"SteamBroadcast\"\t\t\"1\"\n\t\t\t\t}\n"
+        } else {
+            ""
+        };
+        format!(
+            "\"InstallConfigStore\"\n{{\n\t\"Software\"\n\t{{\n\t\t\"Valve\"\n\t\t{{\n\t\t\t\"Steam\"\n\t\t\t{{\n{streaming}\t\t\t\t\"Authentication\"\n\t\t\t\t{{\n\t\t\t\t\t\"RememberedMachineID\"\t\t\"{remembered}\"\n\t\t\t\t}}\n\t\t\t}}\n\t\t}}\n\t}}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn merge_vdf_authentication_replaces_stale_token() {
+        let target = vdf_fixture("STALE_JWT", true);
+        let master = vdf_fixture("FRESH_JWT_abc123", false);
+
+        let merged = SteamClient::merge_vdf_authentication(&target, &master);
+
+        assert!(merged.contains("FRESH_JWT_abc123"), "fresh JWT must be merged in");
+        assert!(!merged.contains("STALE_JWT"), "stale JWT must be gone");
+        assert!(
+            merged.contains("\"SteamBroadcast\"\t\t\"1\""),
+            "target-only Streaming block must be preserved"
+        );
+        assert!(merged.contains("\"InstallConfigStore\""), "structure intact");
+    }
+
+    #[test]
+    fn merge_vdf_authentication_inserts_when_missing() {
+        // Target config.vdf has no Authentication block at all (fresh prefix).
+        let target = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t\t\"Streaming\"\n\t\t\t\t{\n\t\t\t\t\t\"SteamBroadcast\"\t\t\"1\"\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n";
+        let master = vdf_fixture("FRESH_JWT_xyz", false);
+
+        let merged = SteamClient::merge_vdf_authentication(target, &master);
+
+        assert!(merged.contains("FRESH_JWT_xyz"), "auth block must be inserted");
+        assert!(merged.contains("\"SteamBroadcast\""), "target keys preserved");
+        assert!(merged.contains("\"Authentication\""), "block header present");
+    }
+
+    #[test]
+    fn merge_vdf_authentication_returns_target_when_master_lacks_block() {
+        let target = vdf_fixture("TARGET_JWT", true);
+        let master = "\"InstallConfigStore\"\n{\n\t\"Software\"\n\t{\n\t\t\"Valve\"\n\t\t{\n\t\t\t\"Steam\"\n\t\t\t{\n\t\t\t}\n\t\t}\n\t}\n}\n";
+        let merged = SteamClient::merge_vdf_authentication(&target, master);
+        assert_eq!(merged, target, "no master auth block -> target unchanged");
+    }
+
+    // ---- merge_user_reg_steam_section ----
+
+    fn user_reg_with_steam(steam_keys: &str) -> String {
+        format!(
+            "WINE REGISTRY Version 2\n;; All keys relative to machine and users root.\n\n[Software\\\\Valve\\\\Steam] 1432929821\n{steam_keys}\n[Software\\\\Valve\\\\Steam\\\\Apps] 1432929821\n\"883710\"=dword:00000001\n"
+        )
+    }
+
+    #[test]
+    fn merge_user_reg_steam_section_overlays_login_keys() {
+        let target = user_reg_with_steam("\"D3D12\"=dword:00000001\n\"AutoLoginUser\"=\"otheruser\"\n");
+        let master = user_reg_with_steam(
+            "\"AutoLoginUser\"=\"weterok12\"\n\"RememberPassword\"=dword:00000001\n\"LastLogin\"=dword:5c9e0000\n",
+        );
+
+        let merged = SteamClient::merge_user_reg_steam_section(&target, &master);
+
+        assert!(
+            merged.contains("\"AutoLoginUser\"=\"weterok12\""),
+            "master login user must win"
+        );
+        assert!(!merged.contains("otheruser"), "stale target user replaced");
+        assert!(
+            merged.contains("\"RememberPassword\"=dword:00000001"),
+            "master-only key appended"
+        );
+        assert!(
+            merged.contains("\"D3D12\"=dword:00000001"),
+            "target-only key preserved"
+        );
+        assert!(
+            merged.contains("[Software\\\\Valve\\\\Steam\\\\Apps]") && merged.contains("\"883710\""),
+            "subkey section preserved"
+        );
+    }
+
+    #[test]
+    fn merge_user_reg_steam_section_inserts_when_missing() {
+        let target = "WINE REGISTRY Version 2\n;; All keys relative to machine and users root.\n\n[Software\\\\Valve\\\\Steam\\\\Apps] 1432929821\n\"620\"=dword:00000001\n";
+        let master = user_reg_with_steam("\"AutoLoginUser\"=\"weterok12\"\n");
+
+        let merged = SteamClient::merge_user_reg_steam_section(target, &master);
+
+        assert!(
+            merged.contains("[Software\\\\Valve\\\\Steam] 1432929821"),
+            "Steam section inserted"
+        );
+        assert!(
+            merged.contains("\"AutoLoginUser\"=\"weterok12\""),
+            "login key present"
+        );
+        assert!(
+            merged.contains("[Software\\\\Valve\\\\Steam\\\\Apps]") && merged.contains("\"620\""),
+            "existing subkey section preserved after insert"
+        );
+    }
+
+    #[test]
+    fn merge_user_reg_steam_section_preserves_crlf() {
+        let target = "WINE REGISTRY Version 2\r\n\r\n[Software\\\\Valve\\\\Steam] 1\r\n\"D3D12\"=dword:00000001\r\n";
+        let master = user_reg_with_steam("\"AutoLoginUser\"=\"weterok12\"\n");
+        let merged = SteamClient::merge_user_reg_steam_section(target, &master);
+        assert!(
+            merged.contains("\r\n"),
+            "CRLF line endings preserved for target file"
+        );
+        assert!(merged.contains("\"AutoLoginUser\"=\"weterok12\""));
+    }
+
+    // ---- sync_master_session_to_prefix (end to end) ----
+
+    fn fake_prefix_pair(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = std::env::temp_dir().join(format!("steamflow_sync_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let master_prefix = tmp.join("master");
+        let target_prefix = tmp.join("target");
+        let master_steam = master_prefix.join("drive_c/Program Files (x86)/Steam");
+        let target_steam = target_prefix.join("drive_c/Program Files (x86)/Steam");
+        std::fs::create_dir_all(master_steam.join("config")).unwrap();
+        std::fs::create_dir_all(target_steam.join("config")).unwrap();
+        std::fs::write(master_steam.join("steam.exe"), b"MZ fake").unwrap();
+        std::fs::write(target_steam.join("steam.exe"), b"MZ fake").unwrap();
+        (master_prefix, target_prefix, master_steam, target_steam)
+    }
+
+    #[test]
+    fn sync_master_session_to_prefix_copies_and_merges() {
+        let (master_prefix, target_prefix, master_steam, target_steam) = fake_prefix_pair("e2e");
+
+        // Master: fresh login state.
+        std::fs::write(
+            master_steam.join("config/loginusers.vdf"),
+            b"\"users\"\n{\n\t\"76561198097817215\"\n\t{\n\t\t\"AccountName\"\t\t\"weterok12\"\n\t\t\"AutoLogin\"\t\t\"1\"\n\t\t\"Timestamp\"\t\t\"1786715012\"\n\t}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(master_steam.join("config/config.vdf"), vdf_fixture("MASTER_JWT", false).as_bytes()).unwrap();
+        std::fs::write(
+            master_prefix.join("user.reg"),
+            "WINE REGISTRY Version 2\n\n[Software\\\\Valve\\\\Steam] 2000000000\n\"AutoLoginUser\"=\"weterok12\"\n\"RememberPassword\"=dword:00000001\n",
+        )
+        .unwrap();
+        std::fs::write(master_steam.join("ssfn1234567890123456789"), b"sentry").unwrap();
+
+        // Target: stale login state (Feb-28-era timestamp) + per-prefix keys.
+        std::fs::write(
+            target_steam.join("config/loginusers.vdf"),
+            b"\"users\"\n{\n\t\"76561198097817215\"\n\t{\n\t\t\"AccountName\"\t\t\"weterok12\"\n\t\t\"AutoLogin\"\t\t\"1\"\n\t\t\"Timestamp\"\t\t\"1772269365\"\n\t}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(target_steam.join("config/config.vdf"), vdf_fixture("STALE_JWT", true).as_bytes()).unwrap();
+        std::fs::write(
+            target_prefix.join("user.reg"),
+            "WINE REGISTRY Version 2\n\n[Software\\\\Valve\\\\Steam] 1432929821\n\"D3D12\"=dword:00000001\n",
+        )
+        .unwrap();
+
+        let n = SteamClient::sync_master_session_to_prefix(
+            &master_steam,
+            &master_prefix,
+            &target_steam,
+            &target_prefix,
+        )
+        .unwrap();
+
+        // loginusers.vdf (fresh), config.vdf (JWT), user.reg (login keys), ssfn sentry.
+        assert!(n >= 4, "expected >=4 synced items, got {n}");
+
+        let lu = std::fs::read_to_string(target_steam.join("config/loginusers.vdf")).unwrap();
+        assert!(lu.contains("\"Timestamp\"\t\t\"1786715012\""), "fresh loginusers copied");
+
+        let cfg = std::fs::read_to_string(target_steam.join("config/config.vdf")).unwrap();
+        assert!(cfg.contains("MASTER_JWT"), "fresh machine token merged");
+        assert!(cfg.contains("\"SteamBroadcast\""), "target-only config keys preserved");
+
+        let reg = std::fs::read_to_string(target_prefix.join("user.reg")).unwrap();
+        assert!(reg.contains("\"AutoLoginUser\"=\"weterok12\""), "registry login keys synced");
+        assert!(reg.contains("\"D3D12\"=dword:00000001"), "target-only registry keys preserved");
+
+        assert!(target_steam.join("ssfn1234567890123456789").exists(), "ssfn sentry copied");
+
+        let _ = std::fs::remove_dir_all(&master_prefix.parent().unwrap());
+    }
+
+    #[test]
+    fn sync_master_session_to_prefix_skips_when_master_has_no_session() {
+        let (master_prefix, target_prefix, master_steam, target_steam) = fake_prefix_pair("nosession");
+        // Master has steam.exe but no loginusers.vdf / ssfn -> no session.
+        std::fs::write(
+            target_steam.join("config/loginusers.vdf"),
+            b"\"users\"\n{\n}\n",
+        )
+        .unwrap();
+
+        let n = SteamClient::sync_master_session_to_prefix(
+            &master_steam,
+            &master_prefix,
+            &target_steam,
+            &target_prefix,
+        )
+        .unwrap();
+
+        assert_eq!(n, 0, "no master session -> nothing synced");
+        let lu = std::fs::read_to_string(target_steam.join("config/loginusers.vdf")).unwrap();
+        assert_eq!(lu, "\"users\"\n{\n}\n", "target untouched");
+        let _ = std::fs::remove_dir_all(&master_prefix.parent().unwrap());
+    }
+
+    #[test]
+    fn sync_master_session_to_prefix_skips_when_target_fresher() {
+        let (master_prefix, target_prefix, master_steam, target_steam) = fake_prefix_pair("fresher");
+        // Master logged in OLDER than target (target manually logged in today).
+        std::fs::write(
+            master_steam.join("config/loginusers.vdf"),
+            b"\"users\"\n{\n\t\"76561198097817215\"\n\t{\n\t\t\"AccountName\"\t\t\"weterok12\"\n\t\t\"AutoLogin\"\t\t\"1\"\n\t\t\"Timestamp\"\t\t\"1772269365\"\n\t}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            target_steam.join("config/loginusers.vdf"),
+            b"\"users\"\n{\n\t\"76561198097817215\"\n\t{\n\t\t\"AccountName\"\t\t\"weterok12\"\n\t\t\"AutoLogin\"\t\t\"1\"\n\t\t\"Timestamp\"\t\t\"1786715012\"\n\t}\n}\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(target_steam.join("config/loginusers.vdf")).unwrap();
+
+        let n = SteamClient::sync_master_session_to_prefix(
+            &master_steam,
+            &master_prefix,
+            &target_steam,
+            &target_prefix,
+        )
+        .unwrap();
+
+        assert_eq!(n, 0, "fresher target must not be downgraded");
+        let after = std::fs::read_to_string(target_steam.join("config/loginusers.vdf")).unwrap();
+        assert_eq!(before, after, "target login untouched");
+        let _ = std::fs::remove_dir_all(&master_prefix.parent().unwrap());
     }
 }
 

@@ -180,4 +180,76 @@ mod tests {
         let env_enabled = runner.build_env(&ctx_enabled).await.unwrap();
         assert_eq!(env_enabled.get("SteamAppId").unwrap(), "123");
     }
+
+    #[test]
+    fn test_shared_prefix_auto_falls_back_to_pergame_on_runner_mismatch() {
+        use crate::infra::runners::wine_tkg::effective_prefix_mode;
+        use crate::models::SteamPrefixMode;
+
+        // Shared prefix + Steam Runtime runner ("wine-tkg") DIFFERENT from the
+        // game runner ("steamflow-proton-11.0-purepe") → must auto-fallback to
+        // PerGame so the two runners never share one WINEPREFIX (wineserver
+        // protocol collision).
+        let mut config = LauncherConfig::default();
+        config.steam_prefix_mode = SteamPrefixMode::Shared;
+        config.steam_runtime_runner = PathBuf::from("wine-tkg");
+
+        let mut user_config = UserAppConfig::default();
+        user_config.steam_prefix_mode = SteamPrefixMode::Shared;
+
+        let mut ctx = mock_context();
+        ctx.launcher_config = config;
+        ctx.user_config = Some(user_config);
+        ctx.proton_path = Some("steamflow-proton-11.0-purepe".to_string());
+
+        assert_eq!(
+            effective_prefix_mode(&ctx),
+            SteamPrefixMode::PerGame,
+            "Shared prefix with a Steam Runtime runner different from the game \
+             runner must auto-fallback to PerGame"
+        );
+    }
+
+    #[test]
+    fn test_shared_prefix_stays_shared_when_runners_match() {
+        use crate::infra::runners::wine_tkg::effective_prefix_mode;
+        use crate::models::SteamPrefixMode;
+
+        // Same runner on both sides → no mismatch → Shared is preserved.
+        let mut config = LauncherConfig::default();
+        config.steam_prefix_mode = SteamPrefixMode::Shared;
+        config.steam_runtime_runner = PathBuf::from("steamflow-proton-11.0-purepe");
+
+        let mut user_config = UserAppConfig::default();
+        user_config.steam_prefix_mode = SteamPrefixMode::Shared;
+
+        let mut ctx = mock_context();
+        ctx.launcher_config = config;
+        ctx.user_config = Some(user_config);
+        ctx.proton_path = Some("steamflow-proton-11.0-purepe".to_string());
+
+        assert_eq!(
+            effective_prefix_mode(&ctx),
+            SteamPrefixMode::Shared,
+            "Matching runners must keep the Shared prefix"
+        );
+    }
+
+    #[test]
+    fn test_shared_prefix_stays_shared_without_runtime_runner() {
+        use crate::infra::runners::wine_tkg::effective_prefix_mode;
+        use crate::models::SteamPrefixMode;
+
+        // No Steam Runtime runner configured (launcher default = empty) →
+        // nothing can collide in the prefix → Shared is preserved even though
+        // the game runner differs.
+        let mut user_config = UserAppConfig::default();
+        user_config.steam_prefix_mode = SteamPrefixMode::Shared;
+
+        let mut ctx = mock_context();
+        ctx.user_config = Some(user_config);
+        ctx.proton_path = Some("steamflow-proton-11.0-purepe".to_string());
+
+        assert_eq!(effective_prefix_mode(&ctx), SteamPrefixMode::Shared);
+    }
 }
