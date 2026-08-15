@@ -405,6 +405,14 @@ pub fn print_diff(
 }
 
 /// `steamflow test-diff <appid> [--native-log <path>] [--session <dir>]`
+///
+/// When no reference capture exists for the app (and none was passed with
+/// `--native-log`), Phase 4.4 provisions one automatically: the game is
+/// launched with `PROTON_LOG=1` (and `PROTON_LOG_DIR=$HOME`) so Proton writes
+/// `~/steam-<appid>.log`, which is then diffed as usual. A capture only
+/// materializes when the launch path actually runs through Proton (e.g.
+/// `OnlineContainerized` or a Proton-kind runner) — otherwise the command
+/// falls back to the manual-instruction error.
 pub async fn test_diff(args: &[String]) -> Result<()> {
     let appid = args
         .get(1)
@@ -422,14 +430,18 @@ pub async fn test_diff(args: &[String]) -> Result<()> {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
 
-    let native_path = find_native_log(appid, native_log_arg.as_deref()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no native proton log found for app {appid} (looked for ~/steam-{appid}.log, \
-             ~/Фото, видео/steam-{appid}.log, ~/Emulators/steam-{appid}.log, and a shallow \
-             HOME scan). Capture one by launching the game from native Steam with \
-             PROTON_LOG=1 in its launch options, or pass --native-log <path>."
-        )
-    })?;
+    let native_path = match find_native_log(appid, native_log_arg.as_deref()) {
+        Some(p) => p,
+        None => {
+            if let Some(explicit) = &native_log_arg {
+                anyhow::bail!(
+                    "--native-log path does not exist: {}",
+                    explicit.display()
+                );
+            }
+            capture_native_log(appid).await?
+        }
+    };
     let native = parse_native_proton_log(&native_path)?;
     if native.steam_game_id.as_deref() != Some(&appid.to_string()) {
         println!(
@@ -453,6 +465,65 @@ pub async fn test_diff(args: &[String]) -> Result<()> {
 
     print_diff(appid, &native, &native_path, &flow_env, &flow_dir, &diff);
     Ok(())
+}
+
+/// Generate a `~/steam-<appid>.log` reference capture by launching the game
+/// with `PROTON_LOG=1` when no prior capture exists.
+///
+/// The game is spawned through the same headless pipeline `test-launch` uses
+/// ([`crate::headless::spawn_game`]); `PROTON_LOG=1` + `PROTON_LOG_DIR=$HOME`
+/// are set on the inherited environment so Proton's `proton` script writes the
+/// log header at boot. The process is polled until the log appears (or a
+/// bounded window elapses), then terminated — the capture is what remains.
+pub async fn capture_native_log(appid: u32) -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    let expected = PathBuf::from(&home).join(format!("steam-{appid}.log"));
+
+    println!(
+        "no reference capture for app {appid} — generating one via PROTON_LOG=1 …"
+    );
+
+    // Proton's python script writes `steam-<appid>.log` to `$PROTON_LOG_DIR`
+    // (default `$HOME`). Set it on the inherited environment so the child
+    // (which merges the parent env with `spec.env`) sees it. edition 2021, so
+    // `set_var` is still safe here.
+    std::env::set_var("PROTON_LOG", "1");
+    std::env::set_var("PROTON_LOG_DIR", &home);
+
+    let mut child = crate::headless::spawn_game(appid)
+        .await
+        .with_context(|| format!("failed to spawn game {appid} for log capture"))?;
+
+    // Proton writes the header within a few seconds of boot; poll for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let mut found = false;
+    while std::time::Instant::now() < deadline {
+        if expected.is_file() && expected.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            found = true;
+            break;
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            break; // game already exited — no log will appear
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Always terminate the game — the capture only needs the boot header.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if found {
+        println!("captured reference log: {}", expected.display());
+        Ok(expected)
+    } else {
+        anyhow::bail!(
+            "could not generate a reference log for app {appid} via PROTON_LOG=1 \
+             (no ~/steam-{appid}.log appeared). A capture only materializes when the \
+             launch runs through Proton (OnlineContainerized or a Proton-kind runner). \
+             Otherwise capture one manually by launching from native Steam with \
+             PROTON_LOG=1 in its launch options, or pass --native-log <path>."
+        )
+    }
 }
 
 #[cfg(test)]

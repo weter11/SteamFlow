@@ -295,12 +295,11 @@ impl RuntimeManager {
                 root.display()
             ));
         }
-        if state.manifests.is_empty() {
-            state.errors.push(format!(
-                "no component manifest.json found under {}",
-                root.display()
-            ));
-        }
+        // NOTE: no manifest.json requirement. The real steamrt4 component
+        // layout ships a `metadata` file (not `manifest.json`) alongside
+        // `files/` + `usr-mtree.txt.gz`, so `manifests` may legitimately be
+        // empty. Completeness is gated on the entry point + a parseable
+        // VERSIONS.txt (the same contract as `is_usable_runtime_root`).
 
         state.complete = state.errors.is_empty();
         state
@@ -337,6 +336,43 @@ impl RuntimeManager {
             return Some(find_runtime_root(&self.root));
         }
         None
+    }
+
+    /// Remove the provisioned runtime root (and this line's staged downloads
+    /// archive) so a corrupt or truncated extraction can never be re-used.
+    /// Used by [`RuntimeManager::force_reprovision`] and the `steamflow
+    /// runtime repair` CLI. Never fails on an already-absent root.
+    pub fn purge(&self) -> Result<()> {
+        if self.root.exists() {
+            std::fs::remove_dir_all(&self.root)
+                .with_context(|| format!("failed removing {}", self.root.display()))?;
+        }
+        let archive = downloads_dir().join(format!("{}.tar", self.id.dir_name()));
+        if archive.exists() {
+            std::fs::remove_file(&archive)
+                .with_context(|| format!("failed removing {}", archive.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Force-reprovision this runtime from `source`.
+    ///
+    /// Purges the existing provisioned root unconditionally — regardless of
+    /// whether its checksum/manifest scan currently passes — then re-fetches
+    /// and extracts from `source`, a freshly depot-downloaded runtime tree
+    /// (the client-managed `SteamLinuxRuntime_<line>/` directory). Returns the
+    /// resulting deployment state. The `steamflow runtime repair <line>` CLI
+    /// binds the line name to a manager via [`SteamRuntimeId::from_name`] +
+    /// [`RuntimeManager::for_id`] before calling this.
+    pub async fn force_reprovision(
+        &self,
+        source: &Path,
+        verification: &ArchiveVerification,
+    ) -> Result<RuntimeDeploymentState> {
+        self.purge()
+            .with_context(|| format!("failed purging runtime {}", self.id.dir_name()))?;
+        self.provision_from_depot_dir(source, verification, false)
+            .await
     }
 
     /// Depot hook (Phase 4.3): acquire a runtime through the Steam-CDN depot
@@ -508,12 +544,19 @@ impl RuntimeManager {
     }
 }
 
-/// Whether `root` is a usable runtime root: it has an entry point (`run` or
-/// `_v2-entry-point`) and a `VERSIONS.txt` (so its revision is known). Used
-/// by the client-managed fallback to accept only complete client installs.
+/// Whether `root` is a usable runtime root: it has a non-empty entry point
+/// (`run` or `_v2-entry-point`) and a non-empty `VERSIONS.txt` (so its
+/// revision is known). Used by the client-managed fallback to accept only
+/// complete client installs — a 0-byte `VERSIONS.txt` / entry point left by a
+/// truncated download (e.g. the host's corrupt steamrt4) is rejected.
 pub fn is_usable_runtime_root(root: &Path) -> bool {
-    (root.join("run").exists() || root.join("_v2-entry-point").exists())
-        && root.join("VERSIONS.txt").is_file()
+    let has_entry = non_empty_file(&root.join("run")) || non_empty_file(&root.join("_v2-entry-point"));
+    has_entry && non_empty_file(&root.join("VERSIONS.txt"))
+}
+
+/// Whether `path` is a regular file with non-zero length.
+fn non_empty_file(path: &Path) -> bool {
+    path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
 }
 
 /// Normalize a freshly-extracted tree: if the tarball wrapped everything in a
@@ -547,9 +590,19 @@ pub fn find_runtime_root(root: &Path) -> PathBuf {
 
 /// Parse a runtime `VERSIONS.txt` document.
 ///
-/// Accepts both Valve's space-separated `VERSION <name> <revision>` lines
-/// and SteamFlow's `KEY=VALUE` form; comments (`#`) and blank lines are
-/// skipped. Unrecognized lines are ignored (never fatal).
+/// Accepts three formats:
+/// 1. Valve's legacy space-separated `VERSION <name> <revision>` lines.
+/// 2. SteamFlow's `KEY=VALUE` runner form.
+/// 3. Valve's **current** tab-separated table (the real SLR 3.0/4.0 layout):
+///
+///    ```text
+///    #Name	Version		Runtime	Runtime_Version	Comment
+///    steamrt4	4.0.20260805.254769	steamrt4	4.0.20260805.254769	# …
+///    ```
+///
+/// Comments (`#`) and blank lines are skipped; unrecognized lines are
+/// ignored (never fatal). The first two whitespace-separated fields of a
+/// table row are taken as `(name, version)`.
 pub fn parse_versions_txt(content: &str) -> Vec<RuntimeComponentVersion> {
     let mut out = Vec::new();
     for raw in content.lines() {
@@ -576,6 +629,19 @@ pub fn parse_versions_txt(content: &str) -> Vec<RuntimeComponentVersion> {
                     name: name.to_string(),
                     version: version.to_string(),
                 });
+            }
+        } else if line.contains('\t') {
+            // Tab-separated Valve table row (`name<TAB>version<TAB>…`). The
+            // tab check keeps this branch from swallowing arbitrary
+            // space-separated lines.
+            let mut parts = line.split_whitespace();
+            if let (Some(name), Some(version)) = (parts.next(), parts.next()) {
+                if !name.is_empty() && !version.is_empty() {
+                    out.push(RuntimeComponentVersion {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                    });
+                }
             }
         }
     }
@@ -699,6 +765,23 @@ garbage line that is neither
         let parsed = parse_versions_txt(crlf);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].version, "0.20240304.0");
+    }
+
+    #[test]
+    fn test_versions_txt_tab_separated_valve_table() {
+        // The real SLR 3.0/4.0 VERSIONS.txt is a tab-separated table (the
+        // format `read_versions_txt` encounters on a live runtime).
+        let valve = "#Name\tVersion\t\tRuntime\tRuntime_Version\tComment\n\
+                     depot\t4.0.20260805.254769\t\t\t# Overall version number\n\
+                     pressure-vessel\t0.20260805.0\t\t\t\n\
+                     steamrt4\t4.0.20260805.254769\tsteamrt4\t4.0.20260805.254769\t# steamrt4_platform_4.0.20260805.254769/\n";
+        let parsed = parse_versions_txt(valve);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].name, "depot");
+        assert_eq!(parsed[0].version, "4.0.20260805.254769");
+        assert_eq!(parsed[1].name, "pressure-vessel");
+        assert_eq!(parsed[2].name, "steamrt4");
+        assert_eq!(parsed[2].version, "4.0.20260805.254769");
     }
 
     #[test]
@@ -959,5 +1042,42 @@ garbage line that is neither
         )
         .unwrap();
         assert_eq!(mgr2.resolve_runtime_root(&library), Some(provisioned));
+    }
+
+    #[test]
+    fn test_is_usable_runtime_root_rejects_truncated() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("SteamLinuxRuntime_4");
+
+        // Truncated download: 0-byte `run`, 0-byte VERSIONS.txt (the host's
+        // corrupt steamrt4 shape) — must NOT be usable.
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("run"), "").unwrap();
+        std::fs::write(root.join("_v2-entry-point"), "").unwrap();
+        std::fs::write(root.join("VERSIONS.txt"), "").unwrap();
+        assert!(!is_usable_runtime_root(&root), "0-byte entry point + VERSIONS.txt must be rejected");
+
+        // Healed: non-empty entry point + VERSIONS.txt → usable.
+        std::fs::write(root.join("run"), "#!/bin/sh\n").unwrap();
+        std::fs::write(root.join("VERSIONS.txt"), "VERSION steamrt4_platform 1\n").unwrap();
+        assert!(is_usable_runtime_root(&root));
+    }
+
+    #[test]
+    fn test_purge_removes_provisioned_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("runtimes/steamrt4");
+        let mgr = RuntimeManager::new(SteamRuntimeId::Steamrt4, root.clone());
+
+        // Seed a corrupt/half-provisioned root, then purge it.
+        std::fs::create_dir_all(root.join("steamrt4_platform/files")).unwrap();
+        std::fs::write(root.join("VERSIONS.txt"), "").unwrap();
+        assert!(root.exists());
+
+        mgr.purge().unwrap();
+        assert!(!root.exists(), "purge must remove the provisioned root");
+
+        // Purging an already-absent root is a no-op, not an error.
+        mgr.purge().unwrap();
     }
 }

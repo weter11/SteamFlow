@@ -30,7 +30,8 @@ use steam_vent::proto::steammessages_clientserver_2::{
     CMsgClientGetDepotDecryptionKeyResponse,
 };
 use steam_vent::proto::steammessages_clientserver_appinfo::{
-    cmsg_client_picsproduct_info_request, CMsgClientPICSProductInfoRequest,
+    cmsg_client_picsproduct_info_request, CMsgClientPICSAccessTokenRequest,
+    CMsgClientPICSAccessTokenResponse, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
 };
 use steam_vent::proto::steammessages_contentsystem_steamclient::{
@@ -643,11 +644,32 @@ impl SteamClient {
                 appinfo_vdf_bytes_owned = cached;
                 &appinfo_vdf_bytes_owned
             } else {
+                // Owner-only tool apps (official Valve Protons, Steam Linux
+                // Runtime lines) return public_only=1 with NO depots section
+                // unless the request carries the per-app access token. Fetch
+                // and attach it so runtime/proton depot acquisition works
+                // (e.g. `steamflow runtime repair steamrt4`). A failed token
+                // fetch is non-fatal — the request proceeds anonymously.
+                let app_token: Option<u64> = connection
+                    .job(CMsgClientPICSAccessTokenRequest {
+                        appids: vec![appid],
+                        ..Default::default()
+                    })
+                    .await
+                    .ok()
+                    .and_then(|resp: CMsgClientPICSAccessTokenResponse| {
+                        resp.app_access_tokens
+                            .iter()
+                            .find(|t| t.appid() == appid)
+                            .and_then(|t| t.access_token.clone())
+                    });
+
                 let mut request = CMsgClientPICSProductInfoRequest::new();
                 request
                     .apps
                     .push(cmsg_client_picsproduct_info_request::AppInfo {
                         appid: Some(appid),
+                        access_token: app_token,
                         ..Default::default()
                     });
 
@@ -2315,16 +2337,35 @@ impl SteamClient {
         let mut display_name = format!("App {appid}");
         let mut installdir = None;
 
-        // Try to get info from PICS first as it's authoritative
-        let mut request = CMsgClientPICSProductInfoRequest::new();
-        request
-            .apps
-            .push(cmsg_client_picsproduct_info_request::AppInfo {
-                appid: Some(appid),
-                ..Default::default()
-            });
-
+        // Try to get info from PICS first as it's authoritative. Tool apps
+        // (official Valve Protons, Steam Linux Runtime lines) return
+        // public_only=1 with no installdir unless the request carries the
+        // per-app access token — fetch and attach it so the runtime app
+        // resolves to its real SteamDB installdir (e.g. "SteamLinuxRuntime_4").
         if let Some(conn) = self.connection.as_ref() {
+            let app_token: Option<u64> = conn
+                .job(CMsgClientPICSAccessTokenRequest {
+                    appids: vec![appid],
+                    ..Default::default()
+                })
+                .await
+                .ok()
+                .and_then(|resp: CMsgClientPICSAccessTokenResponse| {
+                    resp.app_access_tokens
+                        .iter()
+                        .find(|t| t.appid() == appid)
+                        .and_then(|t| t.access_token.clone())
+                });
+
+            let mut request = CMsgClientPICSProductInfoRequest::new();
+            request
+                .apps
+                .push(cmsg_client_picsproduct_info_request::AppInfo {
+                    appid: Some(appid),
+                    access_token: app_token,
+                    ..Default::default()
+                });
+
             let res: Result<CMsgClientPICSProductInfoResponse, _> = conn.job(request).await;
             if let Ok(response) = res {
                 if let Some(app) = response.apps.iter().find(|entry| entry.appid() == appid) {

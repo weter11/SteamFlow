@@ -12,7 +12,8 @@ use tempfile::tempdir;
 
 use steamflow::container::pressure_vessel::{CommandKind, PressureVesselBuilder};
 use steamflow::container::runtime::{
-    parse_versions_txt, ArchiveVerification, RuntimeManager, SteamRuntimeId,
+    is_usable_runtime_root, parse_versions_txt, ArchiveVerification, RuntimeManager,
+    SteamRuntimeId,
 };
 
 /// Build an uncompressed tar archive of `source_dir` at `archive_path`.
@@ -239,4 +240,38 @@ async fn test_provision_from_depot_dir() {
         .provision_from_depot_dir(&missing, &ArchiveVerification::default(), false)
         .await
         .is_err());
+}
+
+/// Phase 4.4: `force_reprovision` purges a corrupt provisioned root and
+/// re-fetches + re-extracts from a fresh source tree, leaving a usable state.
+#[tokio::test]
+async fn test_force_reprovision_purges_and_reprovisions() {
+    let dir = tempdir().unwrap();
+    let depot = dir.path().join("downloaded-depot");
+    write_runtime_fixture(&depot);
+
+    let mgr = RuntimeManager::new(SteamRuntimeId::Steamrt4, dir.path().join("runtimes/steamrt4"));
+
+    // Seed a corrupt provisioned root (truncated markers).
+    std::fs::create_dir_all(&mgr.root).unwrap();
+    std::fs::write(mgr.root.join("VERSIONS.txt"), "").unwrap();
+    std::fs::write(mgr.root.join("run"), "").unwrap();
+    assert!(mgr.root.exists());
+    assert!(!mgr.deployment_state().is_usable());
+
+    // force_reprovision purges + re-provisions → usable.
+    let state = mgr
+        .force_reprovision(&depot, &ArchiveVerification::default())
+        .await
+        .unwrap();
+    assert!(state.present, "state: {state:?}");
+    assert!(state.complete, "state errors: {:?}", state.errors);
+    assert!(state.is_usable());
+    assert_eq!(state.revision.as_deref(), Some("0.20240304.0"));
+    // The corrupt (0-byte) markers were replaced by the fresh payload.
+    assert!(is_usable_runtime_root(&mgr.root));
+    assert!(mgr
+        .root
+        .join("sniper_platform/files/hello")
+        .is_file());
 }

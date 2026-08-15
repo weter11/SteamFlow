@@ -32,6 +32,7 @@ use steam_vent::proto::steammessages_clientserver_appinfo::{
 };
 use steam_vent::ConnectionTrait;
 
+use crate::container::runtime::SteamRuntimeId;
 use crate::models::DepotPlatform;
 use crate::steam_client::{
     find_vdf_in_pics, parse_pics_product_info, sanitize_install_dir, should_keep_depot,
@@ -53,6 +54,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         "test-download-proton" => test_download_proton(args).await,
         "test-download-runtime" => test_download_runtime(args).await,
         "test-diff" => crate::parity::test_diff(args).await,
+        "runtime" => runtime_cmd(args).await,
         "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -76,6 +78,8 @@ fn print_help() {
          steamflow list                       list installed games\n  \
          steamflow test-diff <appid>          env-parity: native proton log vs effective_env.json\n  \
          steamflow test-download-runtime <line>  fetch + provision a Steam Linux Runtime (scout/soldier/sniper/steamrt4)\n  \
+         steamflow runtime status [<line>]    show a Steam Linux Runtime's deployment state\n  \
+         steamflow runtime repair <line> [--force]  re-download + re-provision a corrupt runtime\n  \
          steamflow help                       this help"
     );
 }
@@ -126,25 +130,9 @@ pub async fn test_launch(appid: u32, use_mod_path: bool) -> Result<()> {
     let user_configs = crate::config::load_user_configs().await.unwrap_or_default();
     let user_config = user_configs.get(&appid).cloned();
 
-    // Locate the game in the library (needed for name/install path).
-    let installed = crate::library::scan_installed_app_info().await.unwrap_or_default();
-    let game = installed
-        .get(&appid)
-        .map(|info| crate::models::LibraryGame {
-            app_id: appid,
-            name: info.name.clone().unwrap_or_else(|| format!("App {appid}")),
-            playtime_forever_minutes: None,
-            is_installed: true,
-            install_path: Some(info.install_path.to_string_lossy().to_string()),
-            local_manifest_ids: Default::default(),
-            update_available: false,
-            update_queued: false,
-            active_branch: info.active_branch.clone(),
-        })
-        .ok_or_else(|| anyhow!("game {appid} not installed (no appmanifest found)"))?;
-
     // Play Mod path: custom_exec_path via launch_custom_exec.
     if use_mod_path {
+        let game = locate_game(appid).await?;
         let exec_path = user_config
             .as_ref()
             .and_then(|c| c.custom_exec_path.clone())
@@ -163,7 +151,42 @@ pub async fn test_launch(appid: u32, use_mod_path: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Pipeline path (UI "Play" equivalent).
+    let child = spawn_game(appid).await?;
+    println!("CHILD_PID={}", child.id());
+    wait_on(child);
+    Ok(())
+}
+
+/// Locate an installed game by appid (name + install path for launch/UI).
+pub(crate) async fn locate_game(appid: u32) -> Result<crate::models::LibraryGame> {
+    let installed = crate::library::scan_installed_app_info().await.unwrap_or_default();
+    let info = installed
+        .get(&appid)
+        .ok_or_else(|| anyhow!("game {appid} not installed (no appmanifest found)"))?;
+    Ok(crate::models::LibraryGame {
+        app_id: appid,
+        name: info.name.clone().unwrap_or_else(|| format!("App {appid}")),
+        playtime_forever_minutes: None,
+        is_installed: true,
+        install_path: Some(info.install_path.to_string_lossy().to_string()),
+        local_manifest_ids: Default::default(),
+        update_available: false,
+        update_queued: false,
+        active_branch: info.active_branch.clone(),
+    })
+}
+
+/// Build + spawn the game process through the full launch pipeline (the UI
+/// "Play" equivalent) and return the running child. Used by `test-launch` and
+/// by the parity harness's log-capture path
+/// ([`crate::parity::capture_native_log`]).
+pub(crate) async fn spawn_game(appid: u32) -> Result<std::process::Child> {
+    crate::config::ensure_config_dirs().await?;
+    let launcher_config = crate::config::load_launcher_config().await.unwrap_or_default();
+    let user_configs = crate::config::load_user_configs().await.unwrap_or_default();
+    let user_config = user_configs.get(&appid).cloned();
+    let game = locate_game(appid).await?;
+
     let mut client = crate::steam_client::SteamClient::new()?;
     let saved = crate::config::load_session().await.unwrap_or_default();
     if saved.refresh_token.is_some() && saved.account_name.is_some() {
@@ -187,12 +210,9 @@ pub async fn test_launch(appid: u32, use_mod_path: bool) -> Result<()> {
     };
 
     tracing::info!(appid, target = ?launch_info.target, "Launching game (headless pipeline)");
-    let child = client
+    client
         .spawn_game_process(&game, &launch_info, chosen_proton, &launcher_config, user_config.as_ref())
-        .await?;
-    println!("CHILD_PID={}", child.id());
-    wait_on(child);
-    Ok(())
+        .await
 }
 
 /// Block on the child so the headless process stays alive while the game runs.
@@ -552,18 +572,43 @@ pub async fn test_download_proton(args: &[String]) -> Result<()> {
 ///
 /// `line` is one of `scout` / `soldier` / `sniper` / `steamrt4`.
 pub async fn test_download_runtime(args: &[String]) -> Result<()> {
-    use crate::container::runtime::{ArchiveVerification, RuntimeManager, SteamRuntimeId};
-    use crate::models::{DownloadProgressState, DownloadState};
+    use crate::container::runtime::{ArchiveVerification, RuntimeManager};
 
     let name = args
         .get(1)
         .ok_or_else(|| anyhow!("usage: test-download-runtime <scout|soldier|sniper|steamrt4>"))?;
     let id = SteamRuntimeId::from_name(name);
-    let appid = id.app_id();
 
     crate::config::ensure_config_dirs().await?;
     let launcher_config = crate::config::load_launcher_config().await.unwrap_or_default();
 
+    let client_dir = download_runtime_depot(&launcher_config, id).await?;
+    let mgr = RuntimeManager::for_id(id);
+    let state = mgr
+        .provision_from_depot_dir(&client_dir, &ArchiveVerification::default(), false)
+        .await
+        .context("provision_from_depot_dir failed")?;
+    println!(
+        "== provisioned runtime '{}': present={} complete={} revision={:?}",
+        id.dir_name(),
+        state.present,
+        state.complete,
+        state.revision
+    );
+    if !state.is_usable() {
+        bail!("provisioned runtime is not usable: {:?}", state.errors);
+    }
+    Ok(())
+}
+
+/// Download a Steam Linux Runtime app through the `install_game` depot
+/// pipeline and return the client-managed runtime directory it lands in
+/// (`<library>/steamapps/common/SteamLinuxRuntime_<line>/`). Creates + restores
+/// its own session-bound client — the CLI convenience wrapper.
+async fn download_runtime_depot(
+    launcher_config: &crate::config::LauncherConfig,
+    id: SteamRuntimeId,
+) -> Result<PathBuf> {
     let mut client = crate::steam_client::SteamClient::new()?;
     let saved = crate::config::load_session().await.unwrap_or_default();
     if saved.refresh_token.is_some() && saved.account_name.is_some() {
@@ -571,6 +616,20 @@ pub async fn test_download_runtime(args: &[String]) -> Result<()> {
             tracing::warn!("session restore failed: {e}");
         }
     }
+    download_runtime_depot_with_client(&client, launcher_config, id).await
+}
+
+/// Core depot download shared by the CLI and the UI repair path, using an
+/// already-authenticated `client`.
+async fn download_runtime_depot_with_client(
+    client: &crate::steam_client::SteamClient,
+    launcher_config: &crate::config::LauncherConfig,
+    id: SteamRuntimeId,
+) -> Result<PathBuf> {
+    use crate::container::runtime::RuntimeManager;
+    use crate::models::{DownloadProgressState, DownloadState};
+
+    let appid = id.app_id();
 
     println!(
         "== fetching Steam Linux Runtime '{}' (app {}) via the depot pipeline",
@@ -609,7 +668,6 @@ pub async fn test_download_runtime(args: &[String]) -> Result<()> {
         bail!("SLR depot download failed");
     }
 
-    // The asset fetcher landed the runtime in the client-managed location.
     let library_root = PathBuf::from(&launcher_config.steam_library_path);
     let mgr = RuntimeManager::for_id(id);
     let client_dir = mgr
@@ -621,22 +679,126 @@ pub async fn test_download_runtime(args: &[String]) -> Result<()> {
             )
         })?;
     println!("== client-managed runtime: {}", client_dir.display());
+    Ok(client_dir)
+}
 
-    // Wrap the downloaded tree as an archive and provision it into
-    // ~/.config/SteamFlow/runtimes/<line>/ via provision_from_archive.
+/// Phase 4.4: re-download + force-reprovision a runtime through the depot
+/// pipeline using the given authenticated `client`. Returns a human-readable
+/// result for the CLI / UI status line.
+pub async fn repair_runtime(
+    client: &crate::steam_client::SteamClient,
+    launcher_config: &crate::config::LauncherConfig,
+    id: SteamRuntimeId,
+) -> Result<String> {
+    use crate::container::runtime::{ArchiveVerification, RuntimeManager};
+
+    let client_dir = download_runtime_depot_with_client(client, launcher_config, id).await?;
+    let mgr = RuntimeManager::for_id(id);
     let state = mgr
-        .provision_from_depot_dir(&client_dir, &ArchiveVerification::default(), false)
+        .force_reprovision(&client_dir, &ArchiveVerification::default())
         .await
-        .context("provision_from_depot_dir failed")?;
-    println!(
-        "== provisioned runtime '{}': present={} complete={} revision={:?}",
-        id.dir_name(),
-        state.present,
-        state.complete,
-        state.revision
-    );
+        .with_context(|| format!("force_reprovision failed for {}", id.dir_name()))?;
     if !state.is_usable() {
-        bail!("provisioned runtime is not usable: {:?}", state.errors);
+        bail!("repaired runtime is not usable: {:?}", state.errors);
     }
-    Ok(())
+    Ok(format!(
+        "Steam Linux Runtime '{}' repaired (revision {})",
+        id.dir_name(),
+        state.revision.clone().unwrap_or_else(|| "unknown".into())
+    ))
+}
+
+/// Phase 4.4: `steamflow runtime <status|repair> …`.
+///
+/// * `status [<line>]` — print the deployment state of a provisioned runtime.
+/// * `repair <line> [--force]` — re-download the runtime through the
+///   Steam-CDN depot pipeline and force-reprovision it, purging any
+///   corrupt/truncated extraction first. Without `--force`, a usable runtime
+///   is left alone.
+pub async fn runtime_cmd(args: &[String]) -> Result<()> {
+    use crate::container::runtime::{
+        find_runtime_root, is_usable_runtime_root, read_versions_txt, RuntimeManager,
+    };
+
+    let sub = args.get(1).map(String::as_str).unwrap_or("help");
+    match sub {
+        "status" => {
+            let name = args.get(2).map(String::as_str).unwrap_or("steamrt4");
+            let id = SteamRuntimeId::from_name(name);
+            let mgr = RuntimeManager::for_id(id);
+            let state = mgr.deployment_state();
+            println!(
+                "runtime '{}' provisioned state: present={} complete={} usable={} revision={:?} entry_point={:?}",
+                id.dir_name(),
+                state.present,
+                state.complete,
+                state.is_usable(),
+                state.revision,
+                state.entry_point
+            );
+            for e in &state.errors {
+                println!("  - {e}");
+            }
+            Ok(())
+        }
+        "repair" => {
+            let name = args
+                .get(2)
+                .ok_or_else(|| anyhow!("usage: runtime repair <scout|soldier|sniper|steamrt4> [--force]"))?;
+            let force = args.iter().any(|a| a == "--force");
+            let id = SteamRuntimeId::from_name(name);
+            let mgr = RuntimeManager::for_id(id);
+
+            crate::config::ensure_config_dirs().await?;
+            let launcher_config = crate::config::load_launcher_config().await.unwrap_or_default();
+            let library_root = PathBuf::from(&launcher_config.steam_library_path);
+
+            if !force {
+                if let Some(root) = mgr.resolve_runtime_root(&library_root) {
+                    let revision = read_versions_txt(&root)
+                        .into_iter()
+                        .map(|v| v.version)
+                        .max();
+                    println!(
+                        "runtime '{}' is already usable at {} (revision {:?}); pass --force to re-provision anyway",
+                        id.dir_name(),
+                        root.display(),
+                        revision
+                    );
+                    return Ok(());
+                }
+                println!(
+                    "runtime '{}' is NOT usable — repairing (re-fetch + re-extract)",
+                    id.dir_name()
+                );
+            } else {
+                println!("force-reprovisioning runtime '{}'", id.dir_name());
+            }
+
+            // Re-fetch the runtime through the Steam CDN depot pipeline and
+            // force-reprovision it (fixes truncated archives like the host's
+            // corrupt steamrt4).
+            let mut client = crate::steam_client::SteamClient::new()?;
+            let saved = crate::config::load_session().await.unwrap_or_default();
+            if saved.refresh_token.is_some() && saved.account_name.is_some() {
+                if let Err(e) = client.restore_session().await {
+                    tracing::warn!("session restore failed: {e}");
+                }
+            }
+
+            let msg = repair_runtime(&client, &launcher_config, id).await?;
+            println!("✅ {msg}");
+
+            let provisioned = find_runtime_root(&mgr.root);
+            if is_usable_runtime_root(&provisioned) {
+                println!(
+                    "✅ runtime '{}' passes is_usable_runtime_root() at {}",
+                    id.dir_name(),
+                    provisioned.display()
+                );
+            }
+            Ok(())
+        }
+        _ => bail!("usage: runtime <status [<line>] | repair <line> [--force]>"),
+    }
 }

@@ -171,6 +171,8 @@ pub enum AsyncOp {
     MasterSteamRepaired,
     MasterSteamBackedUp,
     MasterSteamRestored,
+    /// Phase 4.4: result of the inline Steam Linux Runtime repair action.
+    RuntimeRepaired(String),
     MetadataFetched(u32, crate::steam_client::AppMetadata),
     UserConfigsFetched(crate::models::UserConfigStore),
     ProtonListFetched(Vec<crate::proton::ProtonPackage>, Vec<crate::proton::InstalledProton>),
@@ -1042,6 +1044,9 @@ impl SteamLauncher {
                 }
                 AsyncOp::MasterSteamRestored => {
                     self.status = "Windows Steam Runtime restored successfully".to_string();
+                }
+                AsyncOp::RuntimeRepaired(msg) => {
+                    self.status = msg;
                 }
                 AsyncOp::WineControlPanelLaunched => {
                     self.status = "Wine Control Panel launched".to_string();
@@ -1976,6 +1981,63 @@ impl SteamLauncher {
             })
             .response
             .on_hover_text("How the game talks to Steam. Auto uses the Windows Steam client when a host session is active and falls back to the offline emulator; Offline Emulated launches fully clientless via a local steam_api emulator; Online Containerized is reserved for the SteamRT4 pressure-vessel launch (Phase 4.2/4.3). Persisted to user_apps.json.");
+
+            // Phase 4.4: active Steam Linux Runtime status + inline repair,
+            // shown next to the Steam Client Mode selector.
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let library_root =
+                    std::path::PathBuf::from(&self.launcher_config.steam_library_path);
+                let mgr = crate::container::runtime::RuntimeManager::default();
+                let active = mgr.resolve_runtime_root(&library_root);
+
+                if let Some(root) = &active {
+                    let revision = crate::container::runtime::read_versions_txt(root)
+                        .into_iter()
+                        .map(|v| v.version)
+                        .max();
+                    let label = match revision {
+                        Some(r) => {
+                            format!("Runtime: Steam Linux Runtime 4.0 (steamrt4) [Valid · {r}]")
+                        }
+                        None => "Runtime: Steam Linux Runtime 4.0 (steamrt4) [Valid]".to_string(),
+                    };
+                    ui.colored_label(egui::Color32::from_rgb(120, 220, 130), &label);
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 140, 120),
+                        "Runtime: Steam Linux Runtime 4.0 (steamrt4) [Missing / Corrupt]",
+                    );
+                    if ui
+                        .small_button("Repair Runtime")
+                        .on_hover_text("Re-download + re-provision the Steam Linux Runtime 4.0 (app 4183110) from the Steam CDN.")
+                        .clicked()
+                    {
+                        let client = self.client.clone();
+                        let launcher_config = self.launcher_config.clone();
+                        let tx = self.operation_tx.clone();
+                        self.status = "Repairing Steam Linux Runtime…".to_string();
+                        self.runtime.spawn(async move {
+                            match crate::headless::repair_runtime(
+                                &client,
+                                &launcher_config,
+                                crate::container::runtime::SteamRuntimeId::Steamrt4,
+                            )
+                            .await
+                            {
+                                Ok(msg) => {
+                                    let _ = tx.send(AsyncOp::RuntimeRepaired(msg));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AsyncOp::Error(format!(
+                                        "Steam Linux Runtime repair failed: {e:#}"
+                                    )));
+                                }
+                            }
+                        });
+                    }
+                }
+            });
 
             let effective_runtime = match config.steam_runtime_policy {
                 crate::models::SteamRuntimePolicy::Enabled => true,
