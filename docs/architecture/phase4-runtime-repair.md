@@ -76,33 +76,30 @@
 
 ## Live test (Portal 2, AppID 620 — OnlineContainerized)
 
-`steamflow test-launch 620` now spawns the container via the repaired
+`steamflow test-launch 620` spawns the container via the repaired
 `SteamLinuxRuntime_4/run` with the correct pressure-vessel argv
 (`--filesystem=…`, `--env-if-host=DISPLAY=:0.0`, one `--`, pure-PE Proton
-`run portal2.exe`) — **Phase 4.3's truncated-archive error is gone** (the
-repaired `usr-mtree.txt.gz` reads cleanly). The game process spawned
-(`CHILD_PID=818745`), then exited (exit 1, lifetime ~2s) at a LATER,
-environment-level stage:
+`run portal2.exe`). **Phase 4.3's truncated-archive error is gone** (the
+repaired `usr-mtree.txt.gz` reads cleanly).
 
-```
-pressure-vessel-wrap: E: None of the supported CPU architectures are common
-to the graphics provider and the container (tried: x86_64-linux-gnu, i386-linux-gnu)
-```
+The next blocker found during the live test — `pressure-vessel-wrap: E: None
+of the supported CPU architectures are common to the graphics provider and
+the container (tried: x86_64-linux-gnu, i386-linux-gnu)` — was **not** a
+missing-32-bit-libs issue. Root cause (empirically confirmed): the Steam-CDN
+depot downloader strips the executable bit, and pressure-vessel's
+graphics-provider detection needs its `pressure-vessel/libexec/steam-runtime-tools-0/*`
+tools (`capsule-capture-libs`, `check-vulkan`, …) to be executable. Without
+them, provider enumeration fails → empty architecture intersection → abort.
+Reproduced with `/bin/true`; fixed by `ensure_runtime_executable()` now
+walking the whole tree (commit `3bf2040`).
 
-Root cause: the host has **no 32-bit graphics libraries**
-(`/usr/lib/i386-linux-gnu/` has glibc but no `libvulkan*`/`libGL*`; the
-64-bit Vulkan ICDs incl. nvidia are present), so pressure-vessel cannot merge
-a common graphics-provider architecture for the 32-bit game. This is the same
-host gap that blocks the native Steam client (32-bit core) — an environment
-prerequisite (install `libvulkan1:i386` + NVIDIA 32-bit driver libs), not a
-launcher defect.
-
-Also fixed during the live test: the Steam-CDN depot downloader writes files
-without the executable bit, so a freshly-downloaded/provisioned runtime failed
-preflight ("Runner binary is not executable"). Added
-`ensure_runtime_executable()` (called from `extract_archive` and
-`download_runtime_depot_with_client`) + unit test
-`test_ensure_runtime_executable_marks_launchers`.
+After the fix, `test-launch 620` boots the game inside the container:
+`bwrap` up, pure-PE Proton running, `portal2.exe` alive (plus the RTX Remix
+bridge), wine log showing d3dx asset loading. A proposed
+`--env-if-host=PRESSURE_VESSEL_ARCHS=x86_64-linux-gnu` knob does **not**
+exist (`PRESSURE_VESSEL_ARCHITECTURES` is the real variable, hardcoded by
+the `run` script) and does not affect the host-side arch selection
+(empirically still failed) — rejected in favor of the exec-bit fix.
 
 ## Decisions / flags
 
