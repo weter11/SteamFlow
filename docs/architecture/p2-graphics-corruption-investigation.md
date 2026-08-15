@@ -78,6 +78,33 @@ by the same game data.
 - **`Texture 0 without valid hash` skips** (60× pre-init per run): skipped
   textures → black materials (benign pre-init volume, but compounds).
 
+## Test log — 2026-08-15 evening (follow-up)
+
+### A/B step 1 (Digital removed) was INVALID — the mod never loaded
+
+User moved `mods/Digital` out, but the 16:53 run rendered with **wine builtin
+wined3d** (`wined3d_dll_init Application name portal2.exe\Direct3D` — 15M trace
+lines; zero bridge/remix logs; `bin/dxwrapper-portal2.log` not updated → the
+winmm → dxwrapper → p2-rtx → d3d9-bridge chain never started). "RTX Remix not
+initialized" + no MangoHud overlay + no RTX menu; only menu/subtitles render.
+
+### Launch-matrix isolation (same mod files, same prefix)
+
+| run | runner / mode | WINEPREFIX | mod chain |
+|---|---|---|---|
+| 15:24 | wine11-wow64 DirectWine | compatdata/620/pfx | ✅ bridge + RTX |
+| 15:54 | wine11-wow64 DirectWine | master_steam_prefix/pfx | ✅ DxWrapper log |
+| 16:19 | purepe **OnlineContainerized** | compatdata/620/pfx | ✅ bridge + RTX + Digital |
+| 16:53 | purepe **DirectWine (bare)** | compatdata/620/pfx | ❌ wined3d fallback |
+
+**Finding: purepe's bare `files/bin/wine` (DirectWine mode) does not engage the
+mod's bin-dir DLL chain** — the game falls back to wine builtin d3d9 (wined3d).
+wine11-wow64 bare and purepe-in-container both load the chain. DirectWine +
+purepe is therefore not a valid configuration for p2-rtx testing; the Digital
+A/B must run under wine11-wow64 DirectWine or purepe OnlineContainerized.
+
+Pending: valid A/B (wine11-wow64 DirectWine, Digital out) → judge visuals.
+
 ## A/B plan (in order)
 
 1. **Move `Digital` out** (backup, don't delete):
