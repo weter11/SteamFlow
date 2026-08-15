@@ -34,6 +34,51 @@ pub enum LaunchMode {
     SteamProtocol,
 }
 
+/// How the game talks to Steam (Phase 4.1 "Steam Client Mode").
+///
+/// - `Auto` (default): standard client integration when a native Windows
+///   Steam host session is active; falls back to the offline emulator when
+///   the game requires Steam API and no session exists.
+/// - `OfflineEmulated`: fully clientless — a local steam_api emulator
+///   (e.g. Goldberg SteamEmu) answers Steamworks calls; NO Steam client
+///   processes are spawned. Reserved for `OnlineContainerized` the
+///   pressure-vessel container launch (Phase 4.2/4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub enum SteamMode {
+    #[default]
+    Auto,
+    OfflineEmulated,
+    OnlineContainerized,
+}
+
+/// Identity the offline Steam API emulator reports to the game
+/// (`steam_settings/force_account_name.txt` / `force_steamid.txt`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineSettings {
+    #[serde(default = "default_offline_account_name")]
+    pub account_name: String,
+    #[serde(default = "default_offline_steam_id")]
+    pub steam_id: u64,
+}
+
+fn default_offline_account_name() -> String {
+    "Slavik".to_string()
+}
+
+fn default_offline_steam_id() -> u64 {
+    76561198000000000
+}
+
+impl Default for OfflineSettings {
+    fn default() -> Self {
+        Self {
+            account_name: default_offline_account_name(),
+            steam_id: default_offline_steam_id(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteamLaunchConfig {
     #[serde(default)]
@@ -161,6 +206,15 @@ pub struct UserAppConfig {
     pub steam_prefix_mode: SteamPrefixMode,
     #[serde(default)]
     pub launch_mode: LaunchMode,
+    /// Steam client integration mode (Phase 4.1). `Auto` keeps the classic
+    /// behavior; `OfflineEmulated` launches clientless via a local steam_api
+    /// emulator; `OnlineContainerized` is reserved for Phase 4.2/4.3.
+    #[serde(default)]
+    pub steam_mode: SteamMode,
+    /// Identity used by the offline steam_api emulator (clientless mode).
+    /// Missing in old configs → `"Slavik"` / `76561198000000000`.
+    #[serde(default)]
+    pub offline_settings: OfflineSettings,
     #[serde(default)]
     pub steam_launch_config: SteamLaunchConfig,
     #[serde(default)]
@@ -202,6 +256,8 @@ impl Default for UserAppConfig {
             steam_runtime_policy: SteamRuntimePolicy::Auto,
             steam_prefix_mode: SteamPrefixMode::Shared,
             launch_mode: LaunchMode::DirectWine,
+            steam_mode: SteamMode::Auto,
+            offline_settings: OfflineSettings::default(),
             steam_launch_config: SteamLaunchConfig::default(),
             graphics_layers: GraphicsLayerConfig::default(),
             gpu_preference: None,

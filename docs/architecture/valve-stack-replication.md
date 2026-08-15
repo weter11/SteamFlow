@@ -39,6 +39,25 @@ RE2 live** (zero 32-bit ELF anywhere; 611×PE32 i386-windows + 613×PE32+
 x86_64-windows; 0 ELF-32 files). Full record: `docs/architecture/
 phase3-pure-pe-proton11.md`. i386-multilib remains permanently rejected.
 
+**Phase 4.1 IMPLEMENTED + VERIFIED (2026-08-15): Offline Steam API Emulator
+Mode (`steam_mode: OfflineEmulated`) — fully clientless game launches via a
+local steam_api emulator (Goldberg SteamEmu).** Schema: `SteamMode`
+(Auto/OfflineEmulated/OnlineContainerized) + `OfflineSettings` in
+`user_apps.json` (`#[serde(default)]` — old configs unaffected). Provisioner
+`src/infra/steam_emulator.rs`: steam_appid.txt (game root/exe dir/staging),
+emulator DLLs from `~/.config/SteamFlow/steam_emulator/`, steam_settings/
+identity files (game root + deploy dirs + staging). **KEY FINDING (falsified
+2026-08-15, +loaddll trace on Portal 2): the Source engine loads
+`%s/bin/steam_api.dll` by CONSTRUCTED path via its tier0 module system —
+path-qualified loads bypass WINEDLLPATH/overrides, so shadowing alone fails
+("Steam is not running"); the provisioner therefore OVERWRITES the game's own
+steam_api*.dll in place (original preserved as `<dll>.steamflow-orig`).**
+All Steam client spawn/readiness gates bypassed (wine_tkg.rs dispatch +
+preflight session gate). UI: Properties → Runtime Settings "Steam Client
+Mode" dropdown. Verified: 118/118 unit tests; live `test-launch 620`
+(clientless, 2560×1440 window, RTX Remix active, zero Steam processes). Full
+record: `docs/architecture/phase4-offline-emulator-mode.md`.
+
 ## Problem
 
 SteamFlow historically maintained a parallel compatibility stack (custom

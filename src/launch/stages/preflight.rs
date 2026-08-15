@@ -36,7 +36,24 @@ impl PipelineStage for PreflightStage {
             .map(|c| c.launch_mode)
             .or_else(|| ctx.launcher_config.as_ref().map(|c| c.launch_mode))
             .unwrap_or_default();
-        if !matches!(launch_mode, crate::models::LaunchMode::DirectWine) {
+        // Phase 4.1: effective Steam client mode. In OfflineEmulated the
+        // steam_api emulator replaces the Windows Steam client, so the
+        // session gate below must NOT apply (no client, no login, no
+        // lsteamclient — the emulator answers Steamworks directly).
+        let effective_steam_mode = crate::infra::steam_emulator::resolve_effective_steam_mode(
+            ctx.user_config.as_ref(),
+            crate::infra::steam_emulator::native_steam_host_session_active(),
+            crate::infra::steam_emulator::game_requires_steam_api(
+                ctx.user_config.as_ref(),
+                ctx.app
+                    .as_ref()
+                    .and_then(|a| a.install_path.as_deref())
+                    .map(Path::new),
+            ),
+        );
+        if !matches!(launch_mode, crate::models::LaunchMode::DirectWine)
+            && effective_steam_mode != crate::models::SteamMode::OfflineEmulated
+        {
             let mut check = PreflightCheck {
                 name: "Windows Steam Session".into(),
                 status: true,
