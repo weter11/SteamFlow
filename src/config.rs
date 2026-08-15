@@ -333,3 +333,128 @@ pub async fn save_user_configs(configs: &UserConfigStore) -> Result<()> {
         .with_context(|| format!("failed writing {}", path.display()))?;
     Ok(())
 }
+
+/// Validate a per-game Steam-mode configuration against the effective runner
+/// (Phase 5 — `OnlineContainerized` guard).
+///
+/// The containerized launch path (`OnlineContainerized`) runs the game through
+/// `<proton>/proton run` inside the Steam Linux Runtime (see
+/// [`crate::container::launch`]); a plain Wine runner has no `proton` entry
+/// script and would fail at launch time with "OnlineContainerized requires a
+/// Proton compatibility tool". Validating at config-save time surfaces the
+/// misconfiguration in the UI/CLI before the user hits that launch error.
+///
+/// The effective runner mirrors [`crate::utils::resolve_effective_proton_name`]
+/// precedence: per-game `forced_proton_version` → global `proton_version`.
+pub fn validate_online_containerized_runner(
+    steam_mode: crate::models::SteamMode,
+    forced_proton_version: Option<&str>,
+    global_proton_version: &str,
+    library_root: &std::path::Path,
+) -> Result<(), String> {
+    if steam_mode != crate::models::SteamMode::OnlineContainerized {
+        return Ok(());
+    }
+    let runner_name = forced_proton_version
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(global_proton_version);
+    let runner_path = crate::utils::resolve_runner(runner_name, library_root);
+    if matches!(
+        crate::utils::classify_runner(&runner_path),
+        crate::utils::RunnerKind::Proton { .. }
+    ) {
+        Ok(())
+    } else {
+        Err("OnlineContainerized mode requires a Proton compatibility tool runner (e.g., steamflow-proton-11.0-purepe). Bare Wine runners are not supported in container mode.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::SteamMode;
+    use std::path::Path;
+
+    /// Create a fake runner root (with or without a `proton` entry script).
+    fn write_runner(dir: &Path, name: &str, with_proton_script: bool) -> std::path::PathBuf {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).expect("create runner dir");
+        if with_proton_script {
+            std::fs::write(root.join("proton"), "#!/bin/sh\n").expect("write proton script");
+        }
+        root
+    }
+
+    #[test]
+    fn online_containerized_rejects_bare_wine_and_accepts_proton() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let purepe = write_runner(tmp.path(), "steamflow-proton-11.0-purepe", true);
+        let wine11 = write_runner(tmp.path(), "steamflow-runner-wine11-wow64", false);
+
+        // Proton runner as the per-game forced override → accepted.
+        assert!(validate_online_containerized_runner(
+            SteamMode::OnlineContainerized,
+            Some(purepe.to_str().unwrap()),
+            "global-default",
+            tmp.path(),
+        )
+        .is_ok());
+
+        // Proton runner via the global default (no forced override) → accepted.
+        assert!(validate_online_containerized_runner(
+            SteamMode::OnlineContainerized,
+            None,
+            purepe.to_str().unwrap(),
+            tmp.path(),
+        )
+        .is_ok());
+
+        // Bare Wine runner as the per-game forced override → rejected with the
+        // exact user-facing message.
+        let err = validate_online_containerized_runner(
+            SteamMode::OnlineContainerized,
+            Some(wine11.to_str().unwrap()),
+            purepe.to_str().unwrap(),
+            tmp.path(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("OnlineContainerized mode requires a Proton compatibility tool runner")
+        );
+        assert!(err.contains("Bare Wine runners are not supported in container mode"));
+
+        // Bare Wine runner via the global default → rejected too.
+        assert!(validate_online_containerized_runner(
+            SteamMode::OnlineContainerized,
+            None,
+            wine11.to_str().unwrap(),
+            tmp.path(),
+        )
+        .is_err());
+
+        // Non-containerized modes are never blocked, even with a bare runner.
+        assert!(validate_online_containerized_runner(
+            SteamMode::OfflineEmulated,
+            Some(wine11.to_str().unwrap()),
+            wine11.to_str().unwrap(),
+            tmp.path(),
+        )
+        .is_ok());
+        assert!(validate_online_containerized_runner(
+            SteamMode::Auto,
+            Some(wine11.to_str().unwrap()),
+            wine11.to_str().unwrap(),
+            tmp.path(),
+        )
+        .is_ok());
+
+        // An empty forced override falls back to the global runner.
+        assert!(validate_online_containerized_runner(
+            SteamMode::OnlineContainerized,
+            Some(""),
+            purepe.to_str().unwrap(),
+            tmp.path(),
+        )
+        .is_ok());
+    }
+}
