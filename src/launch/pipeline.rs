@@ -153,6 +153,10 @@ pub enum LaunchErrorKind {
     GameData,        // appmanifest not found, executable not found
     Process,         // Failed to spawn process
     Dependency,      // Missing MangoHud, etc.
+    /// The effective prefix's Windows Steam client has no persisted login
+    /// session. Distinguishable so the UI can auto-trigger the Stage-1
+    /// one-time login onboarding before booting the game (Phase 4 Task 3).
+    LoginRequired,
     Unknown,
 }
 
@@ -166,6 +170,7 @@ impl fmt::Display for LaunchErrorKind {
             Self::GameData => "Game Data",
             Self::Process => "Process",
             Self::Dependency => "Dependency",
+            Self::LoginRequired => "Login Required",
             Self::Unknown => "Unknown",
         };
         write!(f, "{}", s)
@@ -182,6 +187,7 @@ impl LaunchErrorKind {
             Self::GameData => "Verify integrity of game files or reinstall the game.",
             Self::Process => "Check if the game is already running or if files are locked.",
             Self::Dependency => "Install missing system dependencies.",
+            Self::LoginRequired => "Log the Windows Steam client into the game's prefix once (one-time login).",
             Self::Unknown => "Check the detailed logs for more information.",
         }
     }
@@ -332,6 +338,27 @@ pub struct PipelineError {
     pub stage_name: String,
     pub inner: LaunchError,
 }
+
+/// Distinguishable error surfaced from `spawn_game_process` when the effective
+/// prefix's Windows Steam client has no persisted login session (Phase 4
+/// Task 3). The UI downcasts to this to auto-trigger the Stage-1 one-time
+/// login onboarding and then retry the launch.
+#[derive(Debug)]
+pub struct LoginRequiredError {
+    pub prefix: String,
+}
+
+impl fmt::Display for LoginRequiredError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Windows Steam has no persisted login session in {} — one-time login required",
+            self.prefix
+        )
+    }
+}
+
+impl std::error::Error for LoginRequiredError {}
 
 impl fmt::Display for PipelineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

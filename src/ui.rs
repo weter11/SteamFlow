@@ -69,6 +69,16 @@ struct LaunchSelectorState {
     always_use: bool,
 }
 
+/// Phase 4 Task 3 — a launch that was deferred because the effective prefix's
+/// Windows Steam client had no persisted login session. Auto-retried after the
+/// Stage-1 one-time login completes.
+#[derive(Debug, Clone)]
+struct PendingLoginLaunch {
+    game: LibraryGame,
+    launch_info: crate::steam_client::LaunchInfo,
+    proton_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameTab {
     Options,
@@ -337,6 +347,13 @@ pub struct SteamLauncher {
     operation_tx: Sender<AsyncOp>,
     operation_rx: Receiver<AsyncOp>,
     game_processes: HashMap<u32, GameProcessState>,
+    /// Phase 4 Task 3 — one-time login onboarding as shipped default: when a
+    /// launch fails because the effective prefix's Windows Steam client has no
+    /// persisted session, remember the launch here and auto-trigger the
+    /// Stage-1 login; on success, retry the launch automatically.
+    pending_login_launch: Option<PendingLoginLaunch>,
+    /// The prefix the auto-onboarding login must target (master or per-game).
+    pending_login_prefix: Option<PathBuf>,
 }
 
 impl SteamLauncher {
@@ -416,6 +433,8 @@ impl SteamLauncher {
             is_verifying: false,
             user_configs,
             env_vars_edit_buffer: String::new(),
+            pending_login_launch: None,
+            pending_login_prefix: None,
             runner_components,
             last_scanned_runner: resolved,
             last_scanned_appid: None,
@@ -785,6 +804,8 @@ impl SteamLauncher {
                     let mut finished = true;
                     if let Some(value) = message.strip_prefix("__RUNNING__") {
                         finished = false;
+                        self.pending_login_launch = None;
+                        self.pending_login_prefix = None;
                         if let Some((appid, pid)) = value.split_once(':') {
                             if let (Ok(appid), Ok(pid)) = (appid.parse(), pid.parse()) {
                                 self.game_processes.insert(appid, GameProcessState::Running(pid));
@@ -792,6 +813,18 @@ impl SteamLauncher {
                         }
                     } else if let Some(appid) = message.strip_prefix("__IDLE__").and_then(|v| v.parse().ok()) {
                         self.game_processes.remove(&appid);
+                    } else if let Some(prefix) = message.strip_prefix("__LOGIN_REQUIRED__") {
+                        // Phase 4 Task 3 — one-time login onboarding as shipped
+                        // default: the effective prefix's Windows Steam client
+                        // has no persisted session. Remember the target prefix
+                        // and auto-trigger the Stage-1 login; on success the
+                        // pending launch is retried automatically.
+                        self.pending_login_prefix = Some(PathBuf::from(prefix));
+                        self.status = format!(
+                            "Windows Steam has no login session in {} — starting one-time login…",
+                            prefix
+                        );
+                        self.handle_windows_client_login();
                     } else {
                         self.status = message;
                     }
@@ -960,9 +993,20 @@ impl SteamLauncher {
                                 "Windows Steam client logged in (sentry file present at {})",
                                 path.display()
                             );
+                            // Phase 4 Task 3: one-time login onboarding as
+                            // shipped default — the deferred launch is retried
+                            // automatically now that the effective prefix has a
+                            // persisted session.
+                            if let Some(pending) = self.pending_login_launch.take() {
+                                let game = pending.game;
+                                let launch_info = pending.launch_info;
+                                let proton_path = pending.proton_path;
+                                self.start_launch_task(&game, launch_info, proton_path);
+                            }
                         }
                         Err(err) => {
                             self.status = format!("Windows Steam client login failed: {err}");
+                            self.pending_login_launch = None;
                         }
                     }
                 }
@@ -1322,10 +1366,16 @@ impl SteamLauncher {
         let username = self.auth_username.trim().to_string();
         let password = self.auth_password.clone();
         let tx = self.operation_tx.clone();
+        // Phase 4 Task 3: target the effective prefix (per-game when the
+        // launch was deferred for a per-game login), master by default.
+        let prefix = self
+            .pending_login_prefix
+            .clone()
+            .unwrap_or_else(crate::utils::resolve_master_wineprefix);
         self.status = "Logging into Windows Steam client (check for Steam Guard prompt)…".to_string();
         self.runtime.spawn(async move {
-            let result = crate::steam_client::SteamClient::windows_client_login(
-                &runner, &username, &password,
+            let result = crate::steam_client::SteamClient::windows_client_login_in_prefix(
+                &runner, &prefix, &username, &password,
             )
             .await
             .map_err(|e| e.to_string());
@@ -1386,6 +1436,13 @@ impl SteamLauncher {
     }
 
     fn start_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
+        // Phase 4 Task 3: remember the launch so it can be auto-retried after
+        // the one-time Windows Steam login completes (cleared on success).
+        self.pending_login_launch = Some(PendingLoginLaunch {
+            game: game.clone(),
+            launch_info: launch_info.clone(),
+            proton_path: proton_path.clone(),
+        });
         let game = game.clone();
         let client = self.client.clone();
         let user_config = self.user_configs.get(&game.app_id).cloned();
@@ -1429,6 +1486,13 @@ impl SteamLauncher {
                 match client.spawn_game_process(&game, &launch_info, chosen_proton_path, &launcher_config, user_config.as_ref()).await {
                     Ok(child) => child,
                     Err(e) => {
+                        // Phase 4 Task 3: a missing Windows Steam session is a
+                        // distinguishable error — signal auto-onboarding instead
+                        // of a plain launch failure.
+                        if let Some(login) = e.downcast_ref::<crate::launch::pipeline::LoginRequiredError>() {
+                            let _ = tx.send(format!("__LOGIN_REQUIRED__{}", login.prefix));
+                            return;
+                        }
                         let _ = tx.send(format!("Launch failed for {}: {e}", game.name));
                         return;
                     }
