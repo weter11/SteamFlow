@@ -97,3 +97,39 @@ fn custom_exec_uses_raw_config_when_steam_runtime_disabled() {
         "empty Steam Runtime runner must not force PerGame"
     );
 }
+
+// --- Task 2: prefer a prefix with a running logged-in client ---
+//
+// The session-preference decision is PURE (extracted for testability): given
+// the effective-mode choice and the alternate per-game candidate, prefer the
+// one with a persisted login session. The runner-mismatch guard (PerGame)
+// must NEVER be overridden by session preference — a purepe game cannot run
+// in the wine-tkg master prefix even if it has a session.
+
+#[test]
+fn prefers_per_game_prefix_when_master_lacks_session() {
+    let master = PathBuf::from("/master/pfx");
+    let per_game = PathBuf::from("/lib/steamapps/compatdata/620/pfx");
+    // chosen (master) has NO session; per-game HAS one → prefer per-game.
+    let result = prefer_session_prefix(&master, &per_game, |p| p == &per_game);
+    assert_eq!(result, per_game);
+}
+
+#[test]
+fn keeps_master_prefix_when_it_has_session() {
+    let master = PathBuf::from("/master/pfx");
+    let per_game = PathBuf::from("/lib/steamapps/compatdata/620/pfx");
+    // master HAS a session → keep it (Shared semantics preserved).
+    let result = prefer_session_prefix(&master, &per_game, |p| p == &master);
+    assert_eq!(result, master);
+}
+
+#[test]
+fn keeps_effective_choice_when_neither_prefix_has_session() {
+    let master = PathBuf::from("/master/pfx");
+    let per_game = PathBuf::from("/lib/steamapps/compatdata/620/pfx");
+    // Neither has a session → keep the effective-mode choice (login
+    // onboarding will handle it), do not guess.
+    let result = prefer_session_prefix(&master, &per_game, |_| false);
+    assert_eq!(result, master);
+}
