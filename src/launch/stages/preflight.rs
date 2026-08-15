@@ -42,7 +42,16 @@ impl PipelineStage for PreflightStage {
                 status: true,
                 details: "OK".into(),
             };
-            let prefix = crate::utils::get_master_steam_config().wine_prefix;
+            // Phase 4 Task 3: check the EFFECTIVE prefix — the WINEPREFIX the
+            // game will actually launch under (set by build_command), falling
+            // back to the master prefix. Previously this hardcoded the master
+            // prefix, so a PerGame game whose per-game prefix had no persisted
+            // login session sailed through preflight and died before Steam.
+            let prefix = spec
+                .env
+                .get("WINEPREFIX")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| crate::utils::get_master_steam_config().wine_prefix);
             if !crate::steam_client::SteamClient::windows_client_has_session(&prefix) {
                 check.status = false;
                 check.details = format!(
@@ -50,9 +59,11 @@ impl PipelineStage for PreflightStage {
                     prefix.display()
                 );
                 final_res = Err(LaunchError::new(
-                    LaunchErrorKind::Environment,
+                    LaunchErrorKind::LoginRequired,
                     format!("[Preflight] {}", check.details),
-                ).with_context("launch_mode", format!("{:?}", launch_mode)));
+                )
+                .with_context("wineprefix", prefix.to_string_lossy())
+                .with_context("launch_mode", format!("{:?}", launch_mode)));
             }
             checks.push(check);
         }
@@ -326,5 +337,97 @@ mod tests {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(err.message.contains("is not executable"));
+    }
+
+    /// Phase 4 Task 3: the Windows-Steam session gate must check the
+    /// EFFECTIVE prefix (the WINEPREFIX the game will actually launch under,
+    /// set by build_command), not just the master prefix. A PerGame game whose
+    /// per-game prefix has no persisted login session must fail with
+    /// `LoginRequired` (a distinguishable kind the UI can auto-onboard on),
+    /// even when the master prefix would have a session.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_preflight_login_required_for_unauthenticated_effective_prefix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().unwrap();
+        let runner = tmp.path().join("runner");
+        fs::write(&runner, "dummy").unwrap();
+        let mut perms = fs::metadata(&runner).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&runner, perms).unwrap();
+
+        // Fake per-game prefix: steam.exe present (find_steam_exe_in_prefix
+        // resolves), but NO config/loginusers.vdf → no persisted session.
+        let pfx = tmp.path().join("pfx");
+        let steam_exe = pfx.join("drive_c/Program Files (x86)/Steam/steam.exe");
+        fs::create_dir_all(steam_exe.parent().unwrap()).unwrap();
+        fs::write(&steam_exe, "").unwrap();
+
+        let mut ctx = PipelineContext::new(123);
+        ctx.user_config = Some(crate::models::UserAppConfig {
+            launch_mode: crate::models::LaunchMode::SteamAppLaunch,
+            ..Default::default()
+        });
+        let mut spec = CommandSpec::default();
+        spec.program = runner;
+        spec.env.insert("WINEPREFIX".to_string(), pfx.to_string_lossy().to_string());
+        ctx.command_spec = Some(spec);
+
+        let stage = PreflightStage;
+        let res = stage.execute(&mut ctx).await;
+
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert_eq!(
+            err.kind,
+            crate::launch::pipeline::LaunchErrorKind::LoginRequired,
+            "unauthenticated effective prefix must fail with LoginRequired, got: {err:?}"
+        );
+    }
+
+    /// The session gate passes when the EFFECTIVE prefix has a persisted
+    /// session (loginusers.vdf with AutoLogin + non-zero Timestamp), matching
+    /// SteamClient::windows_client_has_session's modern-auth detection.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_preflight_session_ok_when_effective_prefix_authenticated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().unwrap();
+        let runner = tmp.path().join("runner");
+        fs::write(&runner, "dummy").unwrap();
+        let mut perms = fs::metadata(&runner).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&runner, perms).unwrap();
+
+        // Fake per-game prefix WITH a modern auth session.
+        let pfx = tmp.path().join("pfx");
+        let steam_dir = pfx.join("drive_c/Program Files (x86)/Steam");
+        fs::create_dir_all(steam_dir.join("config")).unwrap();
+        fs::write(steam_dir.join("steam.exe"), "").unwrap();
+        fs::write(
+            steam_dir.join("config/loginusers.vdf"),
+            "\"users\"\n{\n\t\"123456789\"\n\t{\n\t\t\"AccountName\"\t\t\"wer\"\n\t\t\"AutoLogin\"\t\t\"1\"\n\t\t\"Timestamp\"\t\t\"1786740468\"\n\t}\n}\n",
+        )
+        .unwrap();
+
+        let mut ctx = PipelineContext::new(123);
+        ctx.user_config = Some(crate::models::UserAppConfig {
+            launch_mode: crate::models::LaunchMode::SteamAppLaunch,
+            ..Default::default()
+        });
+        let mut spec = CommandSpec::default();
+        spec.program = runner;
+        spec.env.insert("WINEPREFIX".to_string(), pfx.to_string_lossy().to_string());
+        ctx.command_spec = Some(spec);
+
+        let stage = PreflightStage;
+        let res = stage.execute(&mut ctx).await;
+
+        assert!(
+            res.is_ok(),
+            "authenticated effective prefix must pass the session gate: {res:?}"
+        );
     }
 }

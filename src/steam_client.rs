@@ -3122,13 +3122,28 @@ impl SteamClient {
         username: &str,
         password: &str,
     ) -> Result<std::path::PathBuf> {
+        let prefix = crate::utils::resolve_master_wineprefix();
+        Self::windows_client_login_in_prefix(runner_path, &prefix, username, password).await
+    }
+
+    /// One-time interactive login for the Windows Steam client in a SPECIFIC
+    /// prefix (master or per-game). This is the Stage-1 onboarding primitive
+    /// for the two-runner split: after one successful login the prefix's
+    /// `loginusers.vdf` gains AutoLogin and subsequent boots auto-login.
+    /// Phase 4 Task 3 — per-game prefixes need their own one-time login.
+    pub async fn windows_client_login_in_prefix(
+        runner_path: &std::path::Path,
+        prefix: &std::path::Path,
+        username: &str,
+        password: &str,
+    ) -> Result<std::path::PathBuf> {
         use std::time::{Duration, Instant};
 
-        let steam_exe = Self::master_steam_exe()
+        let steam_exe = crate::utils::find_steam_exe_in_prefix(prefix)
+            .or_else(Self::master_steam_exe)
             .ok_or_else(|| anyhow!("Windows Steam client not installed (no steam.exe found)"))?;
-        let prefix = crate::utils::resolve_master_wineprefix();
 
-        if Self::windows_client_has_session(&prefix) {
+        if Self::windows_client_has_session(prefix) {
             return Ok(steam_exe); // already logged in
         }
 
@@ -3142,7 +3157,7 @@ impl SteamClient {
         cmd.arg("-noreactlogin");
         cmd.arg("-cef-disable-gpu");
         cmd.arg("-no-cef-sandbox");
-        cmd.env("WINEPREFIX", &prefix);
+        cmd.env("WINEPREFIX", prefix);
         cmd.env("WINEPATH", "C:\\Program Files (x86)\\Steam");
         if let Ok(display) = std::env::var("DISPLAY") {
             cmd.env("DISPLAY", display);
@@ -3161,7 +3176,7 @@ impl SteamClient {
         // possibly including Steam Guard confirmation on the user's phone).
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            if Self::windows_client_has_session(&prefix) {
+            if Self::windows_client_has_session(prefix) {
                 let _ = child.kill();
                 return Ok(steam_exe);
             }
@@ -3554,7 +3569,18 @@ impl SteamClient {
 
         let pipeline = LaunchPipeline::with_default_stages();
         pipeline.run(&mut ctx).await
-            .map_err(|e| anyhow!(e))?;
+            .map_err(|e| {
+                // Surface the distinguishable LoginRequired kind so the UI can
+                // auto-trigger the Stage-1 one-time login onboarding (Phase 4
+                // Task 3) instead of showing a generic launch failure.
+                if e.inner.kind == crate::launch::pipeline::LaunchErrorKind::LoginRequired {
+                    anyhow!(crate::launch::pipeline::LoginRequiredError {
+                        prefix: e.inner.context.get("wineprefix").cloned().unwrap_or_default(),
+                    })
+                } else {
+                    anyhow!(e)
+                }
+            })?;
 
         ctx.child.ok_or_else(|| anyhow!("Pipeline finished without spawning a process"))
     }
