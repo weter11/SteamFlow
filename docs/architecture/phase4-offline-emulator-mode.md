@@ -97,8 +97,11 @@ belt-and-braces for engines that load by bare name.
    `test-mod 620` in OfflineEmulated would still spawn the background Steam
    client. Extend the same effective-mode logic there if the Mods path needs
    clientless too.
-2. **`OnlineContainerized`** is schema-only; Phase 4.2/4.3 will implement the
-   SteamRT4 pressure-vessel launch (currently behaves like Auto).
+2. **`OnlineContainerized`** is schema-only at the pipeline level; Phase
+   4.2 delivered the infrastructure (`src/container/` —
+   `RuntimeManager` provisioner + `PressureVesselBuilder`) per
+   `docs/architecture/phase4-runtime-provisioning.md`, and Phase 4.3 will
+   wire the launch path (currently behaves like Auto).
 3. In-place override mutates the game install (backed up, Steam-verify
    reversible) — a future per-game "don't touch game files" opt-out is
    possible if a name-loading engine makes shadowing sufficient.

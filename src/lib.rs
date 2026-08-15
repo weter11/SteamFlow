@@ -1,6 +1,7 @@
 pub mod cloud_sync;
 pub mod cm_list;
 pub mod config;
+pub mod container;
 pub mod proton;
 pub mod depot_browser;
 pub mod headless;
