@@ -2166,11 +2166,27 @@ impl SteamLauncher {
         // Proton/Wine version".
 
         if changed {
-            self.user_configs.insert(game.app_id, config);
-            let store = self.user_configs.clone();
-            self.runtime.spawn(async move {
-                let _ = crate::config::save_user_configs(&store).await;
-            });
+            // Phase 5: `OnlineContainerized` runs the game through
+            // `<proton>/proton run` inside the Steam Linux Runtime — a bare
+            // Wine runner cannot satisfy that. Reject the update at save time
+            // with a clear message instead of failing at launch.
+            if let Err(msg) = crate::config::validate_online_containerized_runner(
+                config.steam_mode,
+                self.launcher_config
+                    .game_configs
+                    .get(&game.app_id)
+                    .and_then(|c| c.forced_proton_version.as_deref()),
+                &self.launcher_config.proton_version,
+                std::path::Path::new(&self.launcher_config.steam_library_path),
+            ) {
+                self.status = format!("Configuration rejected: {msg}");
+            } else {
+                self.user_configs.insert(game.app_id, config);
+                let store = self.user_configs.clone();
+                self.runtime.spawn(async move {
+                    let _ = crate::config::save_user_configs(&store).await;
+                });
+            }
         }
     }
 

@@ -3414,7 +3414,7 @@ impl SteamClient {
                     if actual.starts_with(expected) {
                         if let Ok(metadata) = std::fs::metadata(&actual) {
                             let mut permissions = metadata.permissions();
-                            permissions.set_mode(0);
+                            permissions.set_mode(0o0);
                             let _ = std::fs::set_permissions(&actual, permissions);
                         }
                     }
@@ -5036,7 +5036,7 @@ mod steamwebhelper_management_tests {
         std::fs::write(&helper, b"MZ fake webhelper").unwrap();
         // Simulate the per-game "Disable CEF" enforcement lock (chmod 000).
         let mut perms = std::fs::metadata(&helper).unwrap().permissions();
-        perms.set_mode(0);
+        perms.set_mode(0o0);
         std::fs::set_permissions(&helper, perms).unwrap();
         assert_eq!(std::fs::metadata(&helper).unwrap().permissions().mode() & 0o111, 0);
 
