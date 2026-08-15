@@ -2,7 +2,7 @@
 //!
 //! [`RuntimeManager`] owns the on-disk deployment of Valve's official Steam
 //! Linux Runtime (SLR) images. The provisioned runtime lives at
-//! `~/.local/share/SteamFlow/runtimes/<id>/` (e.g. `runtimes/steamrt4/`) and
+//! `~/.config/SteamFlow/runtimes/<id>/` (e.g. `runtimes/steamrt4/`) and
 //! mirrors the layout Valve ships through Steam:
 //!
 //! ```text
@@ -156,7 +156,7 @@ pub struct ArchiveVerification {
     pub gpg_keyring: Option<PathBuf>,
 }
 
-/// Owns the provisioned runtime at `~/.local/share/SteamFlow/runtimes/<id>/`.
+/// Owns the provisioned runtime at `~/.config/SteamFlow/runtimes/<id>/`.
 #[derive(Debug, Clone)]
 pub struct RuntimeManager {
     pub id: SteamRuntimeId,
@@ -165,10 +165,13 @@ pub struct RuntimeManager {
 }
 
 /// Base directory for ALL SteamFlow-provisioned runtimes
-/// (`~/.local/share/SteamFlow/runtimes/`).
+/// (`~/.config/SteamFlow/runtimes/`). Lives under the SteamFlow config dir
+/// (project convention — `data_dir()` and the steam_emulator staging dir
+/// use the same root).
 pub fn runtimes_root() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".local/share/SteamFlow/runtimes")
+    crate::config::config_dir()
+        .map(|d| d.join("runtimes"))
+        .unwrap_or_else(|_| PathBuf::from("runtimes"))
 }
 
 /// Directory for intermediate downloads (archives waiting for verification).
@@ -607,7 +610,7 @@ garbage line that is neither
         assert_eq!(SteamRuntimeId::Steamrt4.dir_name(), "steamrt4");
         assert_eq!(
             runtimes_root(),
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/SteamFlow/runtimes")
+            PathBuf::from(std::env::var("HOME").unwrap()).join(".config/SteamFlow/runtimes")
         );
         assert_eq!(
             RuntimeManager::default().root,

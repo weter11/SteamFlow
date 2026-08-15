@@ -5,7 +5,7 @@
 //!
 //! - [`runtime`] — `RuntimeManager`: provisions SLR images (the `steamrt4`
 //!   line, codename *sniper*, and its siblings) into
-//!   `~/.local/share/SteamFlow/runtimes/<id>/`, verifies archive integrity
+//!   `~/.config/SteamFlow/runtimes/<id>/`, verifies archive integrity
 //!   (SHA256 and/or detached GPG signatures), extracts the runtime image,
 //!   and parses `VERSIONS.txt` + per-component `manifest.json` files into a
 //!   [`runtime::RuntimeDeploymentState`] the application can display and act on.

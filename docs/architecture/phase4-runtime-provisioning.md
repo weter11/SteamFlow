@@ -13,7 +13,7 @@ Valve's official Steam Linux Runtime (SLR) containers:
 
 1. **Runtime provisioner** — download / verify / extract / parse SLR images
    (`steamrt4`, plus the `scout`/`soldier`/`sniper` lines) into
-   `~/.local/share/SteamFlow/runtimes/<id>/`.
+   `~/.config/SteamFlow/runtimes/<id>/`.
 2. **Pressure-vessel command builder** — a native Rust builder that
    programmatically constructs `pressure-vessel-wrap` (and `bwrap`) argv:
    host Vulkan/EGL/dri/nvidia pass-through, display sockets, audio sockets,
@@ -24,7 +24,7 @@ Valve's official Steam Linux Runtime (SLR) containers:
 | File | Change |
 |---|---|
 | `src/container/mod.rs` (new) | Module root; doc-links the two submodules. |
-| `src/container/runtime.rs` (new) | `SteamRuntimeId` (scout/soldier/sniper/steamrt4 + alias parsing), `RuntimeManager` (`for_id` / `new` / `Default` = steamrt4 at `~/.local/share/SteamFlow/runtimes/steamrt4`), `deployment_state()` scan (entry point `run`/`_v2-entry-point`, VERSIONS.txt, per-component `manifest.json` → `RuntimeDeploymentState` with `present`/`complete`/`revision`/`versions`/`manifests`/`errors`), `provision_from_archive` (SHA256 via `sha2` + detached-GPG via `gpgv` → system-`tar` extraction → rescan), `provision_from_url`/`download_to` (reqwest chunk loop, mirrors `src/proton.rs`), `find_runtime_root` (normalizes tarballs that wrap the runtime in one top-level dir), `parse_versions_txt` (Valve `VERSION <name> <rev>` **and** `KEY=VALUE`), `parse_manifest` (all-optional fields, tolerant). |
+| `src/container/runtime.rs` (new) | `SteamRuntimeId` (scout/soldier/sniper/steamrt4 + alias parsing), `RuntimeManager` (`for_id` / `new` / `Default` = steamrt4 at `~/.config/SteamFlow/runtimes/steamrt4`), `deployment_state()` scan (entry point `run`/`_v2-entry-point`, VERSIONS.txt, per-component `manifest.json` → `RuntimeDeploymentState` with `present`/`complete`/`revision`/`versions`/`manifests`/`errors`), `provision_from_archive` (SHA256 via `sha2` + detached-GPG via `gpgv` → system-`tar` extraction → rescan), `provision_from_url`/`download_to` (reqwest chunk loop, mirrors `src/proton.rs`), `find_runtime_root` (normalizes tarballs that wrap the runtime in one top-level dir), `parse_versions_txt` (Valve `VERSION <name> <rev>` **and** `KEY=VALUE`), `parse_manifest` (all-optional fields, tolerant). |
 | `src/container/pressure_vessel.rs` (new) | `CommandKind::{PressureVesselWrap, Bwrap}`, `HostResourceDetector` (Vulkan ICD dirs `/usr/share|/etc/vulkan/icd.d`, EGL `/usr/share|/etc/glvnd/egl_vendor.d`, `/dev/dri`, `/dev/nvidia*`, Wayland socket, `/tmp/.X11-unix`, audio `pulse/native` → `pipewire-0`; env-injectable for tests), `PressureVesselBuilder` (`runtime/arch/launcher/game_pid`, `filesystem`/`filesystem_ro`, `bind_mount`, `device`, `env_if_host`/`env`, `command`, `apply_host_resources`, `build`). pv-wrap emits `<opts> -- <env/mount flags> -- <program> <args>`; bwrap emits the bubblewrap equivalent (`--ro-bind / /`, `--bind`, `--dev-bind`, `--setenv`). |
 | `src/lib.rs` | `pub mod container;` |
 | `Cargo.toml` / `Cargo.lock` | `sha2 = "0.10"` (same RustCrypto family as the existing `sha1`). |
