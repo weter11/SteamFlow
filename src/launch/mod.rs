@@ -5,6 +5,9 @@ pub mod dll_provider_resolver;
 pub mod fixups;
 pub mod diagnostics;
 
+#[cfg(test)]
+mod tests;
+
 use std::path::{Path, PathBuf};
 use anyhow::{Result, Context, anyhow, bail};
 use crate::config::{config_dir, LauncherConfig};
@@ -299,6 +302,46 @@ pub fn launch_winecfg(config: &LauncherConfig) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the EFFECTIVE Wine prefix for a custom-exec (Mods tab "Play Mod" /
+/// `test-mod`) launch.
+///
+/// Custom-exec previously passed `None` to `steam_wineprefix_for_game`, which
+/// fell back to the RAW configured prefix mode: a Shared-configured game whose
+/// game runner differs from the Steam Runtime runner (e.g. 620 Shared + purepe
+/// game runner) resolved to the MASTER prefix, where the purepe game cannot
+/// run against the wine-tkg client's wineserver and dies before Steam. This
+/// helper applies the same runner-mismatch guard the standard launch pipeline
+/// uses (`wine_tkg::effective_prefix_mode`) so both paths agree on the prefix.
+pub(crate) fn custom_exec_effective_prefix(
+    config: &LauncherConfig,
+    user_config: &crate::models::UserAppConfig,
+    game_app_id: u32,
+) -> PathBuf {
+    // Same precedence as `wine_tkg::effective_prefix_mode`: per-game user
+    // config → launcher default.
+    let configured = user_config.steam_prefix_mode.clone();
+    let game_runner = crate::utils::resolve_effective_proton_name(
+        game_app_id,
+        config,
+        None,
+    ).to_string();
+    let effective = crate::infra::runners::wine_tkg::effective_prefix_mode_impl(
+        configured,
+        &config.steam_runtime_runner,
+        &game_runner,
+        Path::new(&config.steam_library_path),
+    );
+    let mut user_config_store: crate::models::UserConfigStore =
+        crate::models::UserConfigStore::new();
+    user_config_store.insert(game_app_id, user_config.clone());
+    crate::utils::steam_wineprefix_for_game(
+        config,
+        game_app_id,
+        &user_config_store,
+        Some(effective),
+    )
+}
+
 /// Launch a custom mod executable/script (Mods tab "Play Mod") through the
 /// game's runner environment:
 ///  * Windows binaries (`.exe`/`.bat`/…) → the selected runner's bare wine
@@ -318,14 +361,13 @@ pub fn launch_custom_exec(
         bail!("Custom executable not found: {}", exec_path.display());
     }
 
-    let mut user_config_store: crate::models::UserConfigStore =
-        crate::models::UserConfigStore::new();
-    user_config_store.insert(game_app_id, user_config.clone());
-
-    // Custom-exec (Mods tab "Play Mod") keeps the CONFIGURED prefix mode; the
-    // standard pipeline applies the runner-mismatch guard (see
-    // wine_tkg::effective_prefix_mode).
-    let prefix = crate::utils::steam_wineprefix_for_game(config, game_app_id, &user_config_store, None);
+    // Custom-exec (Mods tab "Play Mod") honors the EFFECTIVE prefix mode —
+    // the same runner-mismatch guard the standard pipeline applies (see
+    // wine_tkg::effective_prefix_mode). Previously this passed `None`, which
+    // fell back to the raw configured mode: a Shared game whose runner differs
+    // from the Steam Runtime runner (e.g. purepe) resolved to the MASTER
+    // prefix and died before Steam.
+    let prefix = custom_exec_effective_prefix(config, user_config, game_app_id);
     std::fs::create_dir_all(&prefix)
         .with_context(|| format!("failed creating Wine prefix {}", prefix.display()))?;
 
