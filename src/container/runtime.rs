@@ -565,43 +565,46 @@ fn non_empty_file(path: &Path) -> bool {
     path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
 }
 
-/// Ensure a runtime tree's launcher scripts are executable.
+/// Ensure a runtime tree's executables carry the executable bit.
 ///
 /// The Steam-CDN depot downloader writes files without the executable bit
 /// (depot archives store mode as manifest data, not filesystem metadata), so
-/// a freshly-downloaded/provisioned runtime would otherwise fail preflight's
-/// "Runner binary is not executable" check. Real Steam sets these bits on
-/// install; SteamFlow's own acquisition must too. Idempotent.
+/// a freshly-downloaded/provisioned runtime would otherwise fail:
+///
+/// - preflight's "Runner binary is not executable" check (`run` /
+///   `_v2-entry-point`), and
+/// - pressure-vessel's graphics-provider detection, which needs the
+///   `pressure-vessel/libexec/steam-runtime-tools-0/*` tools
+///   (`capsule-capture-libs`, `check-vulkan`, …) to be executable — when they
+///   are not, provider enumeration fails and the container aborts with
+///   "None of the supported CPU architectures are common to the graphics
+///   provider and the container".
+///
+/// Real Steam sets these bits on install; SteamFlow's own acquisition must
+/// too. Every regular file under the tree lacking the exec bit is marked
+/// executable (a superset of what strictly needs it — harmless for data
+/// files). Idempotent.
 pub fn ensure_runtime_executable(root: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut candidates: Vec<PathBuf> = vec![
-            root.join("run"),
-            root.join("_v2-entry-point"),
-            root.join("pressure-vessel/bin/pressure-vessel-wrap"),
-            root.join("files/bin/pressure-vessel-wrap"),
-        ];
-        // Bundled pressure-vessel helpers (pressure-vessel-unruntime, …).
-        for bin_dir in [root.join("pressure-vessel/bin"), root.join("files/bin")] {
-            if let Ok(entries) = std::fs::read_dir(&bin_dir) {
-                for entry in entries.flatten() {
-                    candidates.push(entry.path());
-                }
+        for entry in walkdir::WalkDir::new(root).follow_links(false) {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if !entry.file_type().is_file() {
+                continue;
             }
-        }
-        for path in candidates {
-            if path.is_file() {
-                let metadata = std::fs::metadata(&path)
-                    .with_context(|| format!("failed stat'ing {}", path.display()))?;
-                let mut perms = metadata.permissions();
-                if perms.mode() & 0o111 == 0 {
-                    perms.set_mode(perms.mode() | 0o755);
-                    std::fs::set_permissions(&path, perms).with_context(|| {
-                        format!("failed marking {} executable", path.display())
-                    })?;
-                }
+            let path = entry.path();
+            let metadata = std::fs::metadata(path)
+                .with_context(|| format!("failed stat'ing {}", path.display()))?;
+            let mut perms = metadata.permissions();
+            if perms.mode() & 0o111 == 0 {
+                perms.set_mode(perms.mode() | 0o755);
+                std::fs::set_permissions(path, perms)
+                    .with_context(|| format!("failed marking {} executable", path.display()))?;
             }
         }
     }
@@ -1135,6 +1138,11 @@ garbage line that is neither
         let dir = tempdir().unwrap();
         let root = dir.path().join("SteamLinuxRuntime_4");
         std::fs::create_dir_all(root.join("pressure-vessel/bin")).unwrap();
+        // pressure-vessel's provider detection needs the libexec tools too.
+        std::fs::create_dir_all(
+            root.join("pressure-vessel/libexec/steam-runtime-tools-0"),
+        )
+        .unwrap();
         // Depot-downloader shape: files exist but have no executable bit.
         std::fs::write(root.join("run"), "#!/bin/sh\n").unwrap();
         std::fs::write(root.join("_v2-entry-point"), "#!/bin/sh\n").unwrap();
@@ -1143,6 +1151,14 @@ garbage line that is neither
             "#!/bin/sh\n",
         )
         .unwrap();
+        std::fs::write(
+            root.join("pressure-vessel/libexec/steam-runtime-tools-0/x86_64-linux-gnu-capsule-capture-libs"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        // Data file — exec bit on it is harmless but must not error.
+        std::fs::create_dir_all(root.join("steamrt4_platform/files/usr/lib")).unwrap();
+        std::fs::write(root.join("steamrt4_platform/files/usr/lib/libfoo.so"), "\0").unwrap();
 
         use std::os::unix::fs::PermissionsExt;
         let mode_of = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
@@ -1163,6 +1179,15 @@ garbage line that is neither
             mode_of(&root.join("pressure-vessel/bin/pressure-vessel-wrap")) & 0o111,
             0,
             "bundled pressure-vessel-wrap must become executable"
+        );
+        assert_ne!(
+            mode_of(
+                &root.join(
+                    "pressure-vessel/libexec/steam-runtime-tools-0/x86_64-linux-gnu-capsule-capture-libs"
+                )
+            ) & 0o111,
+            0,
+            "libexec provider tools must become executable"
         );
 
         // Idempotent.
