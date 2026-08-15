@@ -78,6 +78,19 @@ by the same game data.
 - **`Texture 0 without valid hash` skips** (60× pre-init per run): skipped
   textures → black materials (benign pre-init volume, but compounds).
 
+## VERDICT — CONFIRMED (2026-08-15 evening)
+
+User retested after the `.trex` restore (Digital out): **Portal 2 renders perfectly**.
+Root cause confirmed: the partial 2026-08-08 `.trex` restore (missing USD plugin
+resources + foreign d3d9.dll) was the corruption source, not the Digital pack.
+The Digital pack remains a secondary concern only for its oversized 2.1-era
+textures (staging-buffer warnings).
+
+Mel (317400) follow-up: installed the same 2.4.3 chain (bin/.trex + wrapper +
+p2-rtx.dll + known-good rtx.conf) + base mod + real Digital pack into Mel's
+dir; 317400 SteamFlow entry created (purepe + OnlineContainerized,
+`-game portal_stories +map sp_a1_mel_intro`).
+
 ## Test log — 2026-08-15 evening (follow-up)
 
 ### NEW ROOT-CAUSE CANDIDATE — the `.trex` runtime was a partial restore (now fixed)
