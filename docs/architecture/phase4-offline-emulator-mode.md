@@ -2,7 +2,8 @@
 
 > Status: **IMPLEMENTED + VERIFIED (2026-08-15)**. Branch `phase4/one-time-login-automation`.
 > Companion to the Phase 4 one-time-login work (per-prefix session automation).
-> `OnlineContainerized` (SteamRT4 pressure-vessel launch) is RESERVED for Phase 4.2/4.3 — not implemented here.
+> `OnlineContainerized` (SteamRT4 pressure-vessel launch) was implemented in
+> **Phase 4.3** — see `docs/architecture/phase4-containerized-launch.md`.
 
 ## Objective
 
@@ -97,11 +98,12 @@ belt-and-braces for engines that load by bare name.
    `test-mod 620` in OfflineEmulated would still spawn the background Steam
    client. Extend the same effective-mode logic there if the Mods path needs
    clientless too.
-2. **`OnlineContainerized`** is schema-only at the pipeline level; Phase
-   4.2 delivered the infrastructure (`src/container/` —
-   `RuntimeManager` provisioner + `PressureVesselBuilder`) per
-   `docs/architecture/phase4-runtime-provisioning.md`, and Phase 4.3 will
-   wire the launch path (currently behaves like Auto).
+2. **`OnlineContainerized` — RESOLVED in Phase 4.3.** Phase 4.2 delivered the
+   infrastructure (`src/container/` — `RuntimeManager` provisioner +
+   `PressureVesselBuilder`); Phase 4.3 wired the launch path
+   (`docs/architecture/phase4-containerized-launch.md`): the game boots inside
+   the Steam Linux Runtime container under a pure-PE Proton runner, bridged to
+   the native Steam client via Proton's `lsteamclient.dll`.
 3. In-place override mutates the game install (backed up, Steam-verify
    reversible) — a future per-game "don't touch game files" opt-out is
    possible if a name-loading engine makes shadowing sufficient.

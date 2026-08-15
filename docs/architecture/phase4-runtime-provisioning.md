@@ -3,8 +3,17 @@
 > Status: **IMPLEMENTED + VERIFIED (2026-08-15)**. Branch
 > `phase4/runtime-provisioning` (off `phase4/one-time-login-automation`).
 > Delivers the container infrastructure for the `OnlineContainerized`
-> SteamMode (SteamRT4 / sniper); the actual launch-pipeline wiring is
-> Phase 4.3.
+> SteamMode (SteamRT4 / sniper). The launch-pipeline wiring landed in
+> **Phase 4.3** — see `docs/architecture/phase4-containerized-launch.md`.
+>
+> **Note:** Phase 4.3 live-testing discovered that this phase's
+> `PressureVesselBuilder` emitted flags the real `pressure-vessel-wrap` binary
+> does not accept (`--runtime-path`, `--runtime-version`, `--runtime-arch`,
+> `--launcher`, `--game-pid`, `--env`, `--bind-mount`, `--device`,
+> `--filesystem-ro`, a second `--`). The builder was corrected in Phase 4.3:
+> the canonical entry point is the runtime's `run` script, and the valid flag
+> set is `--filesystem` + `--env-if-host` + a single `--`. See
+> `phase4-containerized-launch.md` §"Phase 4.2 builder correction".
 
 ## Objective
 
