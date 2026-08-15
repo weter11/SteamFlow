@@ -274,4 +274,15 @@ async fn test_force_reprovision_purges_and_reprovisions() {
         .root
         .join("sniper_platform/files/hello")
         .is_file());
+    // Depot files arrive without the exec bit; extract_archive must mark the
+    // launcher executable via ensure_runtime_executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let run_mode = std::fs::metadata(mgr.root.join("run"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_ne!(run_mode & 0o111, 0, "provisioned run must be executable");
+    }
 }
