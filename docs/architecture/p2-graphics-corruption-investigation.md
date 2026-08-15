@@ -80,6 +80,31 @@ by the same game data.
 
 ## Test log — 2026-08-15 evening (follow-up)
 
+### NEW ROOT-CAUSE CANDIDATE — the `.trex` runtime was a partial restore (now fixed)
+
+Full audit of `bin/.trex` vs the 2.4.3 archive (the ONLY valid reference — the
+runtime is xoxor's modified build inside the archive, NOT stock 1.5.2):
+
+- **124 of 165 archive files were MISSING**, including **all `usd/` plugin
+  resources** (`plugInfo.json` + Hydra `*.glslfx` shaders) — the USD
+  stage/material loader ran without its plugin registry → broken/black
+  materials, garbage geometry.
+- **37 diag-artifact leftovers** (`d3d9.pdb` 102 MB, `cudart64_13.dll`,
+  `nvrtc64_130_0.dll` 101 MB, `python311.dll`, `tbb*.dll`, 26 `usd_*.dll` +
+  `usd/` folder, 2 crash dumps) from the 2026-08-07 CI deploy.
+- `.trex/d3d9.dll` was a **different binary** than the archive's (`24c7cf…`
+  vs `9e301a…`, same 203,802,112 bytes, same `remix-main+8fc13a51` string) —
+  the bridge server (`NvRemixBridge.exe`, archive-matching) was paired with a
+  foreign runtime DLL.
+- The 2026-08-08 00:04 "restore" was PARTIAL — it brought back only ~41 of
+  165 files (backup dir `~/devis/tmp/p2-stock-runtime-backup/` is now empty).
+
+**Fix applied (reversible, backup at `~/devis/tmp/p2-trex-mixed-backup-20260815/`):**
+extract the archive's full `bin/.trex` over the install + delete artifact
+leftovers. Verified: `d3d9.dll` md5 = `9e301a…` (archive), `usd/` resources
+present, shared top-level files md5-OK. This is runner-independent (shared
+game data) and a far stronger corruption source than the Digital pack.
+
 ### A/B step 1 (Digital removed) was INVALID — the mod never loaded
 
 User moved `mods/Digital` out, but the 16:53 run rendered with **wine builtin
