@@ -534,3 +534,45 @@ post-Phase-3 follow-up, not a blocker for the pure-PE goal.
 **Phase 3 verdict: CLOSED — pure-PE WoW64 Proton 11.0 built, staged, and
 verified booting RE2 on the pure-64-bit host with zero 32-bit ELF
 dependencies. i386-multilib remains permanently rejected (host constraint).**
+
+## 2026-08-15 — Protocol-pin attempt: what purepe's wineserver protocol 931 actually IS (CLOSED, falsifying)
+
+**Question:** could a client-role wine build pinned to the wine commit that
+"corresponds to" protocol 931 let the client and purepe share one prefix /
+wineserver, eliminating session-sync, MachineGuid, and one-time-login?
+
+**Answer: protocol 931 is VALVE's own protocol generation. No wine-master
+commit speaks it.** Identification chain (all evidence local, no guessing):
+
+1. The wineserver protocol number is `SERVER_PROTOCOL_VERSION` in the
+   GENERATED `include/wine/server_protocol.h` (tracked copy is one behind;
+   `tools/make_requests` reads the existing header and writes `$protocol+1`
+   ONLY when the regenerated content differs — i.e. when `server/protocol.def`
+   is stale vs the tracked header).
+2. purepe = `proton-11.0-1b`, wine submodule at **`proton-wine-11.0-1`**
+   (commit `81d78e4`): tracked header 930, stale protocol.def → build
+   regenerates → **931**.
+3. `diff` of Valve's `server/protocol.def` vs wine-master `wine-11.0`:
+   **massive structural deltas** — `cpu_topology_override` VARARG in
+   create_process, `ldt_copy`, `directory_file_entry` +
+   `query_directory_file`, `track_mouse_from_pointer`,
+   `set_user_input_time` (renamed), `flush_key_done` + registry-branch
+   redesign, desktop close timeout, and the whole **fsync shm protocol**
+   (`fsync_free_shm_idx` etc.). This is why no master-wine build can attach:
+   it's not the number, it's the wire format.
+4. Therefore the only protocol-931 wine = **Valve's tree itself**. wine-master
+   `wine-11.0`/`11.1`/`11.2` all carry tracked 930 (built 930 — no bump), and
+   master ≥11.2 has 931+ with a different wire format.
+
+**Two throwaway builds made (2026-08-15, wine-tkg non-makepkg machinery, `_NOLIB32="wow64"`, no userpatches):**
+- `wine-tkg-w11-931-git-11.0.r0.g6cc805ea` — wine master `wine-11.0` pinned via `_plain_version` (modd fork PIN logic, `_staging_version=v11.0` + `_staging_upstreamignore=true`). Built protocol **930** (tracked current → no bump). Also: the `-W` staging exclusions from `earlyhotfixer`/`staging_fixes` reference patches absent in v11.0 staging → `patchinstall.py` dies with `KeyError: 'winex11-_NET_ACTIVE_WINDOW'`; the wine-tkg `(error && exit 1)` subshell quirk swallows it and the build limps on **without staging patches**.
+- `wine-valve-110-proton.wine.11.0.1.r0.g81d78e4` — **the exact Valve tree** via `_localbuild` worktree (`git worktree add` of `steamflow-phase3/proton/wine` at `81d78e4`, zero patches). Built protocol **931** ✓ (header regenerated 930→931, verified). Build fix needed: `--without-opencl` (host has no OpenCL dev lib; Valve's configure enables it → `dlls/opencl/opencl.so` link fail).
+
+**Shared-prefix test (client at `compatdata/620/pfx` + game under purepe, exact prior procedure):**
+- Client under the Valve build: **boots CEF fully (5 webhelpers incl. GPU process — purepe's CEF crash does NOT reproduce), but steam.exe network layer STALLS** — 6 threads, ~0% CPU, blocked on `pipe_read`, `connection_log.txt` absent at 4.5 min. **This is the same stall as purepe, reproduced on a wine-tkg-STYLE build of the same source → the defect is SOURCE-level (Valve's proton-wine-11.0-1 tree), NOT purepe's build config.** (wine-tkg 11.13/11.14 master builds boot the client fine — the control.)
+- Game under purepe at the same prefix: **NO `wine client error: version mismatch`** (previously died <1s with 957/931 and 958/931). portal2.exe attached to the Valve-tree wineserver, booted the FULL engine (main window 977×657, `steam_app_620` class) — never happened in any prior failing run. **Protocols 931/931 MATCH, wineserver attach SUCCESS.**
+- The game then hit an **"Engine Error" dialog** (Steam API layer): `steamclient.dll` cannot complete auth because the client is network-stalled → no login.
+
+**Verdict:** the pin LINES UP (protocol 931 identified + matched + attach proven), but the only wine that speaks 931 (Valve's tree) cannot run the Steam client's network layer — so the shared-prefix setup is impossible for the client role regardless of protocol. **This avenue is closed with a proven protocol match.** The permanent solution remains the two-runner split + one-time-login automation (wine-tkg client + purepe games). The prior "protocol mismatch falsified for every client runner" conclusion is refined: the blocker was never the number — it's that no client-capable wine speaks Valve's protocol.
+
+**Environment notes (reusable):** the wine-tkg `_localbuild` mode (`_localbuild="<dir>"` under `srcdir`, `_localbuild_versionoverride`) is the zero-patch path to build any local wine tree with the same machinery (skips `_src_init`/`_prepare`). `--config` external cfg is sourced LAST (wins over customization.cfg/advanced/legacy). Build space: relocate `/tmp/wine-tkg` → `/home` via symlink when `/` is tight. Both throwaway builds kept under `wine-tkg-git/non-makepkg-builds/` (930-build is useless, deletable; Valve 931-build kept for reference).
