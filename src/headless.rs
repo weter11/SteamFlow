@@ -679,6 +679,10 @@ async fn download_runtime_depot_with_client(
             )
         })?;
     println!("== client-managed runtime: {}", client_dir.display());
+    // The depot downloader writes files without the executable bit — mark the
+    // launcher scripts executable so preflight/launch can use them.
+    crate::container::runtime::ensure_runtime_executable(&client_dir)
+        .with_context(|| format!("failed marking {} executable", client_dir.display()))?;
     Ok(client_dir)
 }
 

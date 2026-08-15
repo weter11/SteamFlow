@@ -540,7 +540,13 @@ impl RuntimeManager {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        Ok(find_runtime_root(&self.root))
+        let root = find_runtime_root(&self.root);
+        // The Steam-CDN depot downloader writes files without the executable
+        // bit; ensure the launcher scripts (run / _v2-entry-point / bundled
+        // pressure-vessel binaries) are executable before any launch/preflight
+        // touches them.
+        ensure_runtime_executable(&root)?;
+        Ok(root)
     }
 }
 
@@ -557,6 +563,49 @@ pub fn is_usable_runtime_root(root: &Path) -> bool {
 /// Whether `path` is a regular file with non-zero length.
 fn non_empty_file(path: &Path) -> bool {
     path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+}
+
+/// Ensure a runtime tree's launcher scripts are executable.
+///
+/// The Steam-CDN depot downloader writes files without the executable bit
+/// (depot archives store mode as manifest data, not filesystem metadata), so
+/// a freshly-downloaded/provisioned runtime would otherwise fail preflight's
+/// "Runner binary is not executable" check. Real Steam sets these bits on
+/// install; SteamFlow's own acquisition must too. Idempotent.
+pub fn ensure_runtime_executable(root: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut candidates: Vec<PathBuf> = vec![
+            root.join("run"),
+            root.join("_v2-entry-point"),
+            root.join("pressure-vessel/bin/pressure-vessel-wrap"),
+            root.join("files/bin/pressure-vessel-wrap"),
+        ];
+        // Bundled pressure-vessel helpers (pressure-vessel-unruntime, …).
+        for bin_dir in [root.join("pressure-vessel/bin"), root.join("files/bin")] {
+            if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+                for entry in entries.flatten() {
+                    candidates.push(entry.path());
+                }
+            }
+        }
+        for path in candidates {
+            if path.is_file() {
+                let metadata = std::fs::metadata(&path)
+                    .with_context(|| format!("failed stat'ing {}", path.display()))?;
+                let mut perms = metadata.permissions();
+                if perms.mode() & 0o111 == 0 {
+                    perms.set_mode(perms.mode() | 0o755);
+                    std::fs::set_permissions(&path, perms).with_context(|| {
+                        format!("failed marking {} executable", path.display())
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Normalize a freshly-extracted tree: if the tarball wrapped everything in a
@@ -1079,5 +1128,45 @@ garbage line that is neither
 
         // Purging an already-absent root is a no-op, not an error.
         mgr.purge().unwrap();
+    }
+
+    #[test]
+    fn test_ensure_runtime_executable_marks_launchers() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("SteamLinuxRuntime_4");
+        std::fs::create_dir_all(root.join("pressure-vessel/bin")).unwrap();
+        // Depot-downloader shape: files exist but have no executable bit.
+        std::fs::write(root.join("run"), "#!/bin/sh\n").unwrap();
+        std::fs::write(root.join("_v2-entry-point"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            root.join("pressure-vessel/bin/pressure-vessel-wrap"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode_of = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode();
+        assert_eq!(mode_of(&root.join("run")) & 0o111, 0, "fixture must start non-executable");
+
+        ensure_runtime_executable(&root).unwrap();
+        assert_ne!(
+            mode_of(&root.join("run")) & 0o111,
+            0,
+            "run must become executable"
+        );
+        assert_ne!(
+            mode_of(&root.join("_v2-entry-point")) & 0o111,
+            0,
+            "_v2-entry-point must become executable"
+        );
+        assert_ne!(
+            mode_of(&root.join("pressure-vessel/bin/pressure-vessel-wrap")) & 0o111,
+            0,
+            "bundled pressure-vessel-wrap must become executable"
+        );
+
+        // Idempotent.
+        ensure_runtime_executable(&root).unwrap();
+        assert_ne!(mode_of(&root.join("run")) & 0o111, 0);
     }
 }
