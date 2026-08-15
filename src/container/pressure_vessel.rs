@@ -1,35 +1,31 @@
 //! Native Rust builder for `pressure-vessel-wrap` / `bwrap` commands
-//! (Phase 4.2 — `OnlineContainerized`).
+//! (Phase 4.2 — `OnlineContainerized`, corrected in Phase 4.3).
 //!
 //! [`PressureVesselBuilder`] programmatically constructs the argv for
 //! launching a game inside a Steam Linux Runtime container:
 //!
-//! - **Host driver & graphics pass-through** — host Vulkan ICD directories
-//!   (`/usr/share/vulkan/icd.d`, `/etc/vulkan/icd.d`), EGL vendor dirs
-//!   (`/usr/share/glvnd/egl_vendor.d`, `/etc/glvnd/egl_vendor.d`), `/dev/dri`
-//!   and `/dev/nvidia*` device nodes (see [`HostResourceDetector`]).
-//! - **Display sockets** — the Wayland socket
-//!   (`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`) as a bind-mount, `/tmp/.X11-unix`
-//!   as a read-write filesystem mount, plus `DISPLAY` / `WAYLAND_DISPLAY` /
-//!   `XDG_RUNTIME_DIR` environment pass-through.
-//! - **Audio sockets** — the active user audio socket
-//!   (`/run/user/$UID/pulse/native` for PulseAudio, otherwise
-//!   `/run/user/$UID/pipewire-0`), with `PULSE_SERVER` / `PIPEWIRE_RUNTIME_DIR`
-//!   forced into the container.
 //! - **Storage & prefixes** — game install directories and per-game prefixes
-//!   (`…/steamapps/compatdata/<appid>/pfx/`) mounted read-write.
-//! - **Environment isolation** — `--env-if-host` / `--env` flags assembled
-//!   programmatically, so the container only sees exactly what SteamFlow
-//!   decides to pass through.
+//!   (`…/steamapps/compatdata/<appid>/pfx/`) mounted read-write via
+//!   `--filesystem=`.
+//! - **Conditional environment** — `--env-if-host=NAME=VALUE` flags so a host
+//!   var is only applied when the container runs with the host `/usr`.
 //!
 //! Two command flavors are supported:
 //!
-//! - [`CommandKind::PressureVesselWrap`] — Valve's official launcher:
-//!   `pressure-vessel-wrap <options> -- <env/mount flags> -- <program> <args>`.
-//!   This is what Steam itself uses (the runtime's `_v2-entry-point`).
+//! - [`CommandKind::PressureVesselWrap`] — Valve's official launcher, invoked
+//!   through the runtime's `run` entry point (which selects the runtime via
+//!   `PRESSURE_VESSEL_RUNTIME*` env and execs `pressure-vessel-unruntime`):
+//!   `pressure-vessel-wrap --filesystem=… --env-if-host=… -- <program> <args>`.
+//!   GPU/display/audio pass-through is automatic (graphics provider + shared
+//!   home/runtime dir), and forced env vars are carried on the process
+//!   environment (`CommandSpec.env`) — the real `pressure-vessel-wrap` CLI has
+//!   no `--runtime-path`/`--runtime-version`/`--device`/`--bind-mount`/`--env`
+//!   flag.
 //! - [`CommandKind::Bwrap`] — the underlying `bubblewrap` engine, for
 //!   environments where pressure-vessel is not available:
-//!   `bwrap --unshare-all --ro-bind / / … -- <program>`.
+//!   `bwrap --unshare-all --ro-bind / / --dev-bind … --setenv … -- <program>`.
+//!   bwrap DOES have `--bind`/`--ro-bind`/`--dev-bind`/`--setenv`, so the
+//!   explicit mounts and forced env are emitted for this flavor.
 
 use std::path::{Path, PathBuf};
 
@@ -213,11 +209,6 @@ impl HostResourceDetector {
 #[derive(Debug, Clone, Default)]
 pub struct PressureVesselBuilder {
     kind: CommandKind,
-    runtime_dir: Option<PathBuf>,
-    runtime_version: Option<String>,
-    runtime_arch: Option<String>,
-    launcher: Option<String>,
-    game_pid: Option<u32>,
     filesystem_rw: Vec<PathBuf>,
     filesystem_ro: Vec<PathBuf>,
     bind_mounts: Vec<(PathBuf, PathBuf)>,
@@ -235,32 +226,6 @@ impl PressureVesselBuilder {
             kind,
             ..Default::default()
         }
-    }
-
-    /// Set the provisioned runtime root and its revision
-    /// (`--runtime-path` / `--runtime-version`).
-    pub fn runtime(&mut self, dir: PathBuf, version: impl Into<String>) -> &mut Self {
-        self.runtime_dir = Some(dir);
-        self.runtime_version = Some(version.into());
-        self
-    }
-
-    /// Set the runtime architecture (`--runtime-arch`, e.g. `amd64`).
-    pub fn runtime_arch(&mut self, arch: impl Into<String>) -> &mut Self {
-        self.runtime_arch = Some(arch.into());
-        self
-    }
-
-    /// Identify the launcher process (`--launcher`, Steam's usage).
-    pub fn launcher(&mut self, launcher: impl Into<String>) -> &mut Self {
-        self.launcher = Some(launcher.into());
-        self
-    }
-
-    /// Attach the container to a parent process (`--game-pid`).
-    pub fn game_pid(&mut self, pid: u32) -> &mut Self {
-        self.game_pid = Some(pid);
-        self
     }
 
     /// Expose a host path read-write inside the container
@@ -373,44 +338,24 @@ impl PressureVesselBuilder {
     }
 
     fn build_pressure_vessel(&self, program: &Path) -> anyhow::Result<Vec<String>> {
+        // argv[0] is a placeholder ("pressure-vessel-wrap") — the caller
+        // replaces it with the resolved engine path (the runtime's `run`
+        // entry point, or a bundled/host `pressure-vessel-wrap`). The real
+        // `pressure-vessel-wrap` CLI accepts only: `--filesystem` (rw),
+        // `--env-if-host` (conditional env), and `--` COMMAND. There is NO
+        // `--runtime-path`/`--runtime-version`/`--runtime-arch`/`--launcher`/
+        // `--game-pid`/`--env`/`--bind-mount`/`--device`/`--filesystem-ro`
+        // flag — runtime selection is done by the runtime's `run` entry point
+        // (via `PRESSURE_VESSEL_RUNTIME*` env), GPU/display/audio pass-through
+        // is automatic (graphics provider + shared home/runtime dir), and
+        // forced env vars are carried on the process environment
+        // (`CommandSpec.env`), which pressure-vessel forwards.
         let mut argv = vec!["pressure-vessel-wrap".to_string()];
-        if let Some(dir) = &self.runtime_dir {
-            argv.push(format!("--runtime-path={}", dir.display()));
-        }
-        if let Some(version) = &self.runtime_version {
-            argv.push(format!("--runtime-version={version}"));
-        }
-        if let Some(arch) = &self.runtime_arch {
-            argv.push(format!("--runtime-arch={arch}"));
-        }
-        if let Some(launcher) = &self.launcher {
-            argv.push(format!("--launcher={launcher}"));
-        }
-        if let Some(pid) = self.game_pid {
-            argv.push(format!("--game-pid={pid}"));
-        }
-        argv.push("--".to_string());
         for path in &self.filesystem_rw {
             argv.push(format!("--filesystem={}", path.display()));
         }
-        for path in &self.filesystem_ro {
-            argv.push(format!("--filesystem-ro={}", path.display()));
-        }
-        for (host, container) in &self.bind_mounts {
-            argv.push(format!(
-                "--bind-mount={}:{}",
-                host.display(),
-                container.display()
-            ));
-        }
-        for dev in &self.devices {
-            argv.push(format!("--device={}", dev.display()));
-        }
         for (name, value) in &self.env_if_host {
             argv.push(format!("--env-if-host={name}={value}"));
-        }
-        for (name, value) in &self.env_forced {
-            argv.push(format!("--env={name}={value}"));
         }
         argv.push("--".to_string());
         argv.push(program.display().to_string());
@@ -587,15 +532,11 @@ mod tests {
         let install = dir.path().join("steamapps/common/Portal 2");
         std::fs::create_dir_all(&prefix).unwrap();
         std::fs::create_dir_all(&install).unwrap();
-        let runtime_dir = dir.path().join("runtimes/steamrt4");
 
         let mut builder = PressureVesselBuilder::new(CommandKind::PressureVesselWrap);
         builder
-            .runtime(runtime_dir.clone(), "0.20240304.0")
-            .runtime_arch("amd64")
-            .game_pid(4242)
             .apply_host_resources(&detector)
-            .filesystem(install)
+            .filesystem(install.clone())
             .filesystem(prefix.clone())
             .command(
                 PathBuf::from("/usr/bin/portal2_linux"),
@@ -604,80 +545,50 @@ mod tests {
 
         let argv = builder.build().unwrap();
         assert_eq!(argv[0], "pressure-vessel-wrap");
-        // pv-wrap options before the first `--`.
-        assert!(argv.contains(&format!("--runtime-path={}", runtime_dir.display())));
-        assert!(argv.iter().any(|a| a == "--runtime-version=0.20240304.0"));
-        assert!(argv.iter().any(|a| a == "--runtime-arch=amd64"));
-        assert!(argv.iter().any(|a| a == "--game-pid=4242"));
-        let first_sep = argv.iter().position(|a| a == "--").unwrap();
 
-        // Env/mount section between the two `--` separators.
-        let second_sep = argv[first_sep + 1..]
+        // The real `pressure-vessel-wrap` CLI accepts only `--filesystem` (rw)
+        // and `--env-if-host`, then a single `--` before the command. Runtime
+        // selection, GPU/display/audio pass-through, and forced env are handled
+        // by the runtime `run` entry point, the graphics provider, and the
+        // process environment respectively — so no `--runtime*`/`--device`/
+        // `--bind-mount`/`--env`/`--filesystem-ro` flags are emitted.
+        let sep = argv
             .iter()
             .position(|a| a == "--")
-            .map(|i| first_sep + 1 + i)
-            .unwrap();
-        let env_section = &argv[first_sep + 1..second_sep];
+            .expect("single `--` separator");
+        let options = &argv[..sep];
 
-        // Vulkan ICD + EGL dirs exposed read-only.
-        let vulkan = detector.vulkan_icds()[0].clone();
-        assert!(env_section.contains(&format!("--filesystem-ro={}", vulkan.display())));
-        assert!(env_section
-            .iter()
-            .any(|a| a.starts_with("--filesystem-ro=") && a.contains("glvnd/egl_vendor.d")));
-        // /dev/dri + nvidia devices.
-        assert!(env_section.contains(&format!(
-            "--device={}",
-            detector.device_root.join("dri").display()
-        )));
-        assert!(env_section
-            .iter()
-            .any(|a| a.starts_with("--device=") && a.contains("nvidia0")));
-        assert!(env_section
-            .iter()
-            .any(|a| a.starts_with("--device=") && a.contains("nvidiactl")));
-        // Display: X11 dir rw, Wayland socket bind, env passthrough.
-        assert!(env_section.contains(&format!("--filesystem={}", detector.x11_unix_dir.display())));
-        let wayland_sock = detector.runtime_dir.join("wayland-1");
-        assert!(env_section.contains(&format!(
-            "--bind-mount={}:{}",
-            wayland_sock.display(),
-            wayland_sock.display()
-        )));
-        assert!(env_section.iter().any(|a| a == "--env-if-host=DISPLAY=:0"));
-        assert!(env_section
+        // RW mounts: game install + prefix + the X11 socket dir (from
+        // apply_host_resources).
+        assert!(options.contains(&format!("--filesystem={}", install.display())));
+        assert!(options.contains(&format!("--filesystem={}", prefix.display())));
+        assert!(options.contains(&format!("--filesystem={}", detector.x11_unix_dir.display())));
+        // Conditional display env passthrough.
+        assert!(options.iter().any(|a| a == "--env-if-host=DISPLAY=:0"));
+        assert!(options
             .iter()
             .any(|a| a == "--env-if-host=WAYLAND_DISPLAY=wayland-1"));
-        assert!(env_section.contains(&format!(
-            "--env=XDG_RUNTIME_DIR={}",
-            detector.runtime_dir.display()
-        )));
-        // Audio: pulse socket bind + forced PULSE_SERVER.
-        let pulse = detector.runtime_dir.join("pulse/native");
-        assert!(env_section.contains(&format!(
-            "--bind-mount={}:{}",
-            pulse.display(),
-            pulse.display()
-        )));
-        assert!(env_section.contains(&format!("--env=PULSE_SERVER=unix:{}", pulse.display())));
-        // Storage: game install + prefix read-write.
-        assert!(env_section.iter().any(|a| a
-            == &format!(
-                "--filesystem={}",
-                dir.path().join("steamapps/common/Portal 2").display()
-            )));
-        assert!(env_section
-            .iter()
-            .any(|a| a.ends_with("compatdata/620/pfx")));
+        // No invented flags leak into the argv.
+        for bad in [
+            "--runtime",
+            "--device=",
+            "--bind-mount=",
+            "--env=",
+            "--filesystem-ro=",
+        ] {
+            assert!(
+                !options.iter().any(|a| a.starts_with(bad)),
+                "unexpected {bad} in {argv:?}"
+            );
+        }
 
-        // Command section: program + args last, after the second `--`.
-        assert_eq!(argv[second_sep + 1], "/usr/bin/portal2_linux");
-        assert_eq!(argv[second_sep + 2], "-novid");
-        assert_eq!(argv.len(), second_sep + 3);
+        // Command section after the `--`.
+        assert_eq!(argv[sep + 1], "/usr/bin/portal2_linux");
+        assert_eq!(argv[sep + 2], "-novid");
+        assert_eq!(argv.len(), sep + 3);
 
         // A builder without a program is a clear error, not a panic.
-        let mut empty = PressureVesselBuilder::new(CommandKind::PressureVesselWrap);
-        empty.runtime(runtime_dir, "0.20240304.0");
+        let empty = PressureVesselBuilder::new(CommandKind::PressureVesselWrap);
         let err = empty.build().unwrap_err();
         assert!(err.to_string().contains("no program set"));
     }

@@ -53,6 +53,7 @@ impl PipelineStage for PreflightStage {
         );
         if !matches!(launch_mode, crate::models::LaunchMode::DirectWine)
             && effective_steam_mode != crate::models::SteamMode::OfflineEmulated
+            && effective_steam_mode != crate::models::SteamMode::OnlineContainerized
         {
             let mut check = PreflightCheck {
                 name: "Windows Steam Session".into(),

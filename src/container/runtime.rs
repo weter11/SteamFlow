@@ -79,6 +79,32 @@ impl SteamRuntimeId {
             _ => SteamRuntimeId::Steamrt4,
         }
     }
+
+    /// The Steam appid that ships this runtime line (for Steam-CDN depot
+    /// acquisition). Verified against SteamDB:
+    /// - scout → 1070560, soldier → 1391110, sniper → 1628350,
+    /// - steamrt4 → 4183110 (Steam Linux Runtime 4.0).
+    pub fn app_id(self) -> u32 {
+        match self {
+            SteamRuntimeId::Steamrt1 => 1070560,
+            SteamRuntimeId::Steamrt2 => 1391110,
+            SteamRuntimeId::Steamrt3 => 1628350,
+            SteamRuntimeId::Steamrt4 => 4183110,
+        }
+    }
+
+    /// Directory names the Steam client uses for this line under
+    /// `steamapps/common/`. A line may ship under more than one name across
+    /// Steam client versions (scout historically lived in a bare
+    /// `SteamLinuxRuntime` dir). Verified against SteamDB `installdir`.
+    pub fn client_dir_names(self) -> &'static [&'static str] {
+        match self {
+            SteamRuntimeId::Steamrt1 => &["SteamLinuxRuntime", "SteamLinuxRuntime_scout"],
+            SteamRuntimeId::Steamrt2 => &["SteamLinuxRuntime_soldier"],
+            SteamRuntimeId::Steamrt3 => &["SteamLinuxRuntime_sniper"],
+            SteamRuntimeId::Steamrt4 => &["SteamLinuxRuntime_4"],
+        }
+    }
 }
 
 /// One `VERSIONS.txt` entry: a runtime component and its revision.
@@ -280,6 +306,83 @@ impl RuntimeManager {
         state
     }
 
+    /// Locate a **client-managed** Steam Linux Runtime installation under the
+    /// Steam library (`<library>/steamapps/common/SteamLinuxRuntime_<line>/`).
+    ///
+    /// The Steam client keeps these self-updating, so a client-managed copy is
+    /// preferred over SteamFlow's own provisioned copy (Phase 4.3). Returns
+    /// the first candidate that is a usable runtime root (entry point +
+    /// `VERSIONS.txt`), or `None` when the client has not installed this line.
+    pub fn client_managed_runtime(&self, library_root: &Path) -> Option<PathBuf> {
+        let common = library_root.join("steamapps").join("common");
+        for name in self.id.client_dir_names() {
+            let candidate = common.join(name);
+            if is_usable_runtime_root(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// Resolve the runtime root to use for a containerized launch:
+    /// the client-managed copy first (self-updating), then the
+    /// SteamFlow-provisioned copy. Returns `None` when neither is usable —
+    /// the caller must then trigger provisioning (depot acquisition).
+    pub fn resolve_runtime_root(&self, library_root: &Path) -> Option<PathBuf> {
+        if let Some(client) = self.client_managed_runtime(library_root) {
+            return Some(client);
+        }
+        let state = self.deployment_state();
+        if state.is_usable() {
+            return Some(find_runtime_root(&self.root));
+        }
+        None
+    }
+
+    /// Depot hook (Phase 4.3): acquire a runtime through the Steam-CDN depot
+    /// pipeline — the asset fetcher downloads the SLR depot files into a
+    /// directory — then wrap that directory as an archive and provision it via
+    /// [`RuntimeManager::provision_from_archive`].
+    pub async fn provision_from_depot_dir(
+        &self,
+        depot_dir: &Path,
+        verification: &ArchiveVerification,
+        keep_archive: bool,
+    ) -> Result<RuntimeDeploymentState> {
+        if !depot_dir.is_dir() {
+            bail!("runtime depot dir {} does not exist", depot_dir.display());
+        }
+        let archive = self.archive_dir(depot_dir)?;
+        self.provision_from_archive(&archive, verification, keep_archive)
+            .await
+    }
+
+    /// Wrap a downloaded depot tree (`src`) into a tar archive under
+    /// `runtimes/downloads/`, ready for `provision_from_archive`. Uses the
+    /// system `tar` binary (project extraction/archiving convention).
+    pub fn archive_dir(&self, src: &Path) -> Result<PathBuf> {
+        let dest_dir = downloads_dir();
+        std::fs::create_dir_all(&dest_dir)
+            .with_context(|| format!("failed creating {}", dest_dir.display()))?;
+        let archive = dest_dir.join(format!("{}.tar", self.id.dir_name()));
+        let output = std::process::Command::new("tar")
+            .arg("-cf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(src)
+            .arg(".")
+            .output()
+            .with_context(|| format!("failed spawning tar to archive {}", src.display()))?;
+        if !output.status.success() {
+            bail!(
+                "tar archiving of {} failed: {}",
+                src.display(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(archive)
+    }
+
     /// Verify + extract a local runtime archive into the provision root, then
     /// return the resulting deployment state.
     ///
@@ -403,6 +506,14 @@ impl RuntimeManager {
         }
         Ok(find_runtime_root(&self.root))
     }
+}
+
+/// Whether `root` is a usable runtime root: it has an entry point (`run` or
+/// `_v2-entry-point`) and a `VERSIONS.txt` (so its revision is known). Used
+/// by the client-managed fallback to accept only complete client installs.
+pub fn is_usable_runtime_root(root: &Path) -> bool {
+    (root.join("run").exists() || root.join("_v2-entry-point").exists())
+        && root.join("VERSIONS.txt").is_file()
 }
 
 /// Normalize a freshly-extracted tree: if the tarball wrapped everything in a
@@ -753,5 +864,100 @@ garbage line that is neither
         std::fs::create_dir_all(ambiguous.join("a")).unwrap();
         std::fs::create_dir_all(ambiguous.join("b")).unwrap();
         assert_eq!(find_runtime_root(&ambiguous), ambiguous);
+    }
+
+    #[test]
+    fn test_runtime_app_id_and_client_dir_names() {
+        assert_eq!(SteamRuntimeId::Steamrt1.app_id(), 1070560);
+        assert_eq!(SteamRuntimeId::Steamrt2.app_id(), 1391110);
+        assert_eq!(SteamRuntimeId::Steamrt3.app_id(), 1628350);
+        assert_eq!(SteamRuntimeId::Steamrt4.app_id(), 4183110);
+        assert!(SteamRuntimeId::Steamrt3
+            .client_dir_names()
+            .contains(&"SteamLinuxRuntime_sniper"));
+        assert!(SteamRuntimeId::Steamrt4
+            .client_dir_names()
+            .contains(&"SteamLinuxRuntime_4"));
+    }
+
+    #[test]
+    fn test_is_usable_runtime_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("SteamLinuxRuntime_sniper");
+        assert!(!is_usable_runtime_root(&root));
+
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("VERSIONS.txt"), "VERSION x 1\n").unwrap();
+        assert!(!is_usable_runtime_root(&root), "entry point still missing");
+
+        std::fs::write(root.join("run"), "#!/bin/sh\n").unwrap();
+        assert!(is_usable_runtime_root(&root));
+
+        // `_v2-entry-point` alone (no `run`) is also acceptable.
+        let root2 = dir.path().join("SteamLinuxRuntime_4");
+        std::fs::create_dir_all(&root2).unwrap();
+        std::fs::write(root2.join("_v2-entry-point"), "#!/bin/sh\n").unwrap();
+        std::fs::write(root2.join("VERSIONS.txt"), "VERSION x 1\n").unwrap();
+        assert!(is_usable_runtime_root(&root2));
+    }
+
+    #[test]
+    fn test_client_managed_runtime_detection() {
+        let dir = tempdir().unwrap();
+        let library = dir.path().join("Steam");
+        let common = library.join("steamapps/common");
+
+        // Client-managed sniper runtime.
+        let sniper = common.join("SteamLinuxRuntime_sniper");
+        std::fs::create_dir_all(&sniper).unwrap();
+        std::fs::write(sniper.join("run"), "#!/bin/sh\n").unwrap();
+        std::fs::write(sniper.join("VERSIONS.txt"), "VERSION sniper_platform 1\n").unwrap();
+
+        let mgr = RuntimeManager::for_id(SteamRuntimeId::Steamrt3);
+        assert_eq!(
+            mgr.client_managed_runtime(&library),
+            Some(sniper.clone()),
+            "must find the client-managed sniper runtime"
+        );
+
+        // The default steamrt4 manager looks for SteamLinuxRuntime_4, not
+        // sniper — so a sniper-only library is NOT a steamrt4 hit.
+        let mgr4 = RuntimeManager::default();
+        assert_eq!(mgr4.client_managed_runtime(&library), None);
+    }
+
+    #[test]
+    fn test_resolve_runtime_root_preference_order() {
+        let dir = tempdir().unwrap();
+        let library = dir.path().join("Steam");
+
+        // Nothing at all → None.
+        let mgr = RuntimeManager::new(SteamRuntimeId::Steamrt3, dir.path().join("runtimes/sniper"));
+        assert_eq!(mgr.resolve_runtime_root(&library), None);
+
+        // Client-managed present → preferred even with a provisioned copy.
+        let common = library.join("steamapps/common");
+        let sniper = common.join("SteamLinuxRuntime_sniper");
+        std::fs::create_dir_all(&sniper).unwrap();
+        std::fs::write(sniper.join("run"), "#!/bin/sh\n").unwrap();
+        std::fs::write(sniper.join("VERSIONS.txt"), "VERSION sniper_platform 1\n").unwrap();
+        assert_eq!(mgr.resolve_runtime_root(&library), Some(sniper.clone()));
+
+        // Provisioned-only → falls back to the provisioned root.
+        let mgr2 = RuntimeManager::new(SteamRuntimeId::Steamrt4, dir.path().join("runtimes/steamrt4"));
+        let provisioned = dir.path().join("runtimes/steamrt4");
+        std::fs::create_dir_all(provisioned.join("sniper_platform")).unwrap();
+        std::fs::write(provisioned.join("run"), "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            provisioned.join("VERSIONS.txt"),
+            "VERSION sniper_platform 0.20240304.0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            provisioned.join("sniper_platform/manifest.json"),
+            r#"{"name":"sniper_platform","version":"0.20240304.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(mgr2.resolve_runtime_root(&library), Some(provisioned));
     }
 }

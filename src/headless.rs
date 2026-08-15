@@ -20,6 +20,7 @@
 //! agent) can monitor or kill the game process.
 
 use anyhow::{anyhow, bail, Context, Result};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use steam_cdn::web_api::content_service::CDNServer;
@@ -50,6 +51,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
         "list" => list_games().await,
         "test-download-proton" => test_download_proton(args).await,
+        "test-download-runtime" => test_download_runtime(args).await,
         "test-diff" => crate::parity::test_diff(args).await,
         "help" | "-h" | "--help" => {
             print_help();
@@ -73,6 +75,7 @@ fn print_help() {
          steamflow test-mod <appid>           launch custom mod executable (Play Mod)\n  \
          steamflow list                       list installed games\n  \
          steamflow test-diff <appid>          env-parity: native proton log vs effective_env.json\n  \
+         steamflow test-download-runtime <line>  fetch + provision a Steam Linux Runtime (scout/soldier/sniper/steamrt4)\n  \
          steamflow help                       this help"
     );
 }
@@ -536,4 +539,104 @@ pub async fn test_download_proton(args: &[String]) -> Result<()> {
         }
     }
     bail!("all hosts/depots failed — see stage output above")
+}
+
+/// Phase 4.3 depot hook: fetch + provision a Steam Linux Runtime.
+///
+/// Wires [`RuntimeManager::provision_from_archive`] into the asset-fetcher
+/// pipeline: the SLR app is downloaded through the SAME `install_game` depot
+/// machinery the UI uses (which lands it in the client-managed
+/// `steamapps/common/SteamLinuxRuntime_<line>/` location), then that tree is
+/// wrapped as an archive and provisioned into
+/// `~/.config/SteamFlow/runtimes/<line>/`.
+///
+/// `line` is one of `scout` / `soldier` / `sniper` / `steamrt4`.
+pub async fn test_download_runtime(args: &[String]) -> Result<()> {
+    use crate::container::runtime::{ArchiveVerification, RuntimeManager, SteamRuntimeId};
+    use crate::models::{DownloadProgressState, DownloadState};
+
+    let name = args
+        .get(1)
+        .ok_or_else(|| anyhow!("usage: test-download-runtime <scout|soldier|sniper|steamrt4>"))?;
+    let id = SteamRuntimeId::from_name(name);
+    let appid = id.app_id();
+
+    crate::config::ensure_config_dirs().await?;
+    let launcher_config = crate::config::load_launcher_config().await.unwrap_or_default();
+
+    let mut client = crate::steam_client::SteamClient::new()?;
+    let saved = crate::config::load_session().await.unwrap_or_default();
+    if saved.refresh_token.is_some() && saved.account_name.is_some() {
+        if let Err(e) = client.restore_session().await {
+            tracing::warn!("session restore failed: {e}");
+        }
+    }
+
+    println!(
+        "== fetching Steam Linux Runtime '{}' (app {}) via the depot pipeline",
+        id.dir_name(),
+        appid
+    );
+
+    let shared_state = Arc::new(std::sync::RwLock::new(DownloadState::default()));
+    let mut rx = client
+        .install_game(appid, DepotPlatform::Linux, None, None, shared_state)
+        .await
+        .context("install_game (asset fetcher) failed to start")?;
+
+    let mut failed = false;
+    while let Some(progress) = rx.recv().await {
+        match progress.state {
+            DownloadProgressState::Completed => println!("  depot download complete"),
+            DownloadProgressState::Failed => {
+                failed = true;
+                println!("  depot download FAILED: {}", progress.current_file);
+                break;
+            }
+            _ => {
+                if progress.total_bytes > 0 {
+                    println!(
+                        "  progress {}/{} ({}%)",
+                        progress.bytes_downloaded,
+                        progress.total_bytes,
+                        progress.bytes_downloaded * 100 / progress.total_bytes
+                    );
+                }
+            }
+        }
+    }
+    if failed {
+        bail!("SLR depot download failed");
+    }
+
+    // The asset fetcher landed the runtime in the client-managed location.
+    let library_root = PathBuf::from(&launcher_config.steam_library_path);
+    let mgr = RuntimeManager::for_id(id);
+    let client_dir = mgr
+        .client_managed_runtime(&library_root)
+        .ok_or_else(|| {
+            anyhow!(
+                "SLR depot downloaded but no client-managed runtime found under {}",
+                library_root.join("steamapps/common").display()
+            )
+        })?;
+    println!("== client-managed runtime: {}", client_dir.display());
+
+    // Wrap the downloaded tree as an archive and provision it into
+    // ~/.config/SteamFlow/runtimes/<line>/ via provision_from_archive.
+    let state = mgr
+        .provision_from_depot_dir(&client_dir, &ArchiveVerification::default(), false)
+        .await
+        .context("provision_from_depot_dir failed")?;
+    println!(
+        "== provisioned runtime '{}': present={} complete={} revision={:?}",
+        id.dir_name(),
+        state.present,
+        state.complete,
+        state.revision
+    );
+    if !state.is_usable() {
+        bail!("provisioned runtime is not usable: {:?}", state.errors);
+    }
+    Ok(())
 }

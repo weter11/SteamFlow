@@ -154,32 +154,32 @@ fn test_pressure_vessel_builder_public_api() {
     std::fs::create_dir_all(&pfx).unwrap();
     std::fs::create_dir_all(&install).unwrap();
 
+    // The real `pressure-vessel-wrap` CLI accepts only `--filesystem` (rw) and
+    // `--env-if-host`, then a single `--` before the command. Runtime selection
+    // is done by the runtime's `run` entry point, GPU/display/audio pass-through
+    // is automatic, and forced env is carried on the process environment.
     let mut builder = PressureVesselBuilder::new(CommandKind::PressureVesselWrap);
     builder
-        .runtime(dir.path().join("runtimes/steamrt4"), "0.20240304.0")
         .filesystem(install.clone())
         .filesystem(pfx.clone())
-        .device(PathBuf::from("/dev/dri"))
         .env_if_host("DISPLAY", ":0")
-        .bind_mount(
-            PathBuf::from("/run/user/1000/pulse/native"),
-            PathBuf::from("/run/user/1000/pulse/native"),
-        )
         .command(PathBuf::from("/usr/bin/true"), vec!["--flag".into()]);
     let argv = builder.build().unwrap();
 
     assert_eq!(argv[0], "pressure-vessel-wrap");
-    assert!(argv.iter().any(|a| a.starts_with("--runtime-path=")));
-    assert!(argv.iter().any(|a| a == "--device=/dev/dri"));
     assert!(argv
         .iter()
-        .any(|a| a.starts_with("--bind-mount=") && a.contains("pulse/native")));
+        .any(|a| a == format!("--filesystem={}", install.display()).as_str()));
+    assert!(argv
+        .iter()
+        .any(|a| a == format!("--filesystem={}", pfx.display()).as_str()));
     assert!(argv.iter().any(|a| a == "--env-if-host=DISPLAY=:0"));
     let sep_count = argv.iter().filter(|a| a.as_str() == "--").count();
-    assert_eq!(sep_count, 2, "pv-wrap needs two `--` separators: {argv:?}");
+    assert_eq!(sep_count, 1, "pv-wrap uses one `--` separator: {argv:?}");
     assert_eq!(argv.last().unwrap(), "--flag");
 
-    // Bwrap flavor: same semantic mounts, bubblewrap syntax.
+    // Bwrap flavor: same semantic mounts, bubblewrap syntax (which DOES have
+    // --bind / --dev-bind / --setenv).
     let mut bwrap = PressureVesselBuilder::new(CommandKind::Bwrap);
     bwrap
         .filesystem(install.clone())
@@ -206,4 +206,37 @@ fn test_versions_txt_public_parser() {
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].name, "steamrt4_platform");
     assert_eq!(parsed[0].version, "0.20250701.0");
+}
+
+/// Phase 4.3 depot hook: a downloaded SLR depot tree is wrapped as an archive
+/// and provisioned via `provision_from_archive` (the same verify + extract
+/// path the Steam-CDN asset fetcher feeds).
+#[tokio::test]
+async fn test_provision_from_depot_dir() {
+    let dir = tempdir().unwrap();
+    let depot = dir.path().join("downloaded-depot");
+    write_runtime_fixture(&depot);
+
+    let mgr = RuntimeManager::new(SteamRuntimeId::Steamrt4, dir.path().join("runtimes/steamrt4"));
+    let state = mgr
+        .provision_from_depot_dir(&depot, &ArchiveVerification::default(), false)
+        .await
+        .unwrap();
+
+    assert!(state.present, "state: {state:?}");
+    assert!(state.complete, "state errors: {:?}", state.errors);
+    assert!(state.is_usable());
+    assert_eq!(state.revision.as_deref(), Some("0.20240304.0"));
+    // Payload landed at the provision root.
+    assert!(dir
+        .path()
+        .join("runtimes/steamrt4/sniper_platform/files/hello")
+        .is_file());
+
+    // A missing depot dir must fail cleanly (no panic, no partial state).
+    let missing = dir.path().join("does-not-exist");
+    assert!(mgr
+        .provision_from_depot_dir(&missing, &ArchiveVerification::default(), false)
+        .await
+        .is_err());
 }

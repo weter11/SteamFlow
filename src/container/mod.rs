@@ -16,5 +16,6 @@
 //!   (PulseAudio / PipeWire), and read-write mounts for game installs and
 //!   per-game `compatdata` prefixes.
 
+pub mod launch;
 pub mod pressure_vessel;
 pub mod runtime;

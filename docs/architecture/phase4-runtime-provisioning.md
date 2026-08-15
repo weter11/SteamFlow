@@ -70,18 +70,21 @@ Design notes:
 
 ## Open items / decisions (FLAG, not resolved)
 
-1. **Depot-based acquisition (Phase 4.3)**: wire the steam-cdn depot
-   pipeline to fetch SLR app 1628350 (sniper) / 4025700 (steamrt4) and feed
-   `RuntimeManager::provision_from_archive`; the direct-HTTP
-   `provision_from_url` (repo.steampowered.com tarballs) is the interim
-   source.
-2. **Launch wiring (Phase 4.3)**: `OnlineContainerized` still behaves like
-   `Auto` in the launch pipeline; the builder + provisioner are the
-   infrastructure it will call (runtime selection from deployment state →
-   `PressureVesselBuilder::apply_host_resources` → spawn).
-3. `--runtime-path` currently points at the provisioned root; when the SLR
-   install also exists under the native Steam library
-   (`SteamLinuxRuntime_sniper/`), prefer the client-managed copy (it
-   self-updates) and only fall back to SteamFlow-provisioned ones.
+1. **Depot-based acquisition (Phase 4.3 — RESOLVED)**: `steamflow
+   test-download-runtime <line>` now fetches the SLR app through the
+   `SteamClient::install_game` asset-fetcher pipeline (SLR appids verified
+   against SteamDB: scout 1070560, soldier 1391110, sniper 1628350,
+   **steamrt4 4183110**) and feeds `RuntimeManager::provision_from_archive`
+   via `provision_from_depot_dir` (tar the depot tree → verify → extract).
+   The direct-HTTP `provision_from_url` remains the interim source.
+2. **Launch wiring (Phase 4.3 — RESOLVED)**: `OnlineContainerized` now
+   dispatches to the pressure-vessel path (see
+   `docs/architecture/phase4-containerized-launch.md`).
+3. **Client-managed preference (Phase 4.3 — RESOLVED)**: `RuntimeManager::
+   resolve_runtime_root` prefers the client-managed
+   `steamapps/common/SteamLinuxRuntime_<line>/` copy (self-updating) and
+   falls back to the SteamFlow-provisioned one. Note the steamrt4 client
+   directory is `SteamLinuxRuntime_4` (SteamDB `installdir`), NOT
+   `SteamLinuxRuntime_steamrt4`.
 4. `AudioBackend` binds only the winning socket (pulse-compat first). A
    follow-up could bind both pulse and pipewire sockets when both exist.

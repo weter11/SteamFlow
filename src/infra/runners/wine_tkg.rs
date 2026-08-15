@@ -230,9 +230,15 @@ impl Runner for WineTkgRunner {
         // Phase 4.1: OfflineEmulated bypasses the Windows Steam client
         // entirely — no client-file deployment, no background Steam spawn, no
         // readiness polling. The emulator provisioning happens below where
-        // steam_appid.txt is handled. `OnlineContainerized` (reserved for
-        // Phase 4.2/4.3) keeps the current client-based behavior for now.
-        if use_steam_runtime && effective_steam_mode != crate::models::SteamMode::OfflineEmulated {
+        // steam_appid.txt is handled.
+        // Phase 4.3: OnlineContainerized ALSO bypasses the Windows Steam
+        // client — the game runs inside the Steam Linux Runtime container and
+        // talks to the NATIVE Steam client through Proton's lsteamclient.dll
+        // IPC bridge, so no secondary Windows steam.exe is ever spawned.
+        if use_steam_runtime
+            && effective_steam_mode != crate::models::SteamMode::OfflineEmulated
+            && effective_steam_mode != crate::models::SteamMode::OnlineContainerized
+        {
             let steam_cfg = crate::utils::get_master_steam_config();
             tracing::info!("Unified Master Steam resolution (Game Launch):");
             tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
@@ -683,7 +689,12 @@ impl Runner for WineTkgRunner {
         }
 
         // Phase 4.1: no client in OfflineEmulated mode → nothing to enforce.
-        if use_steam_runtime && effective_steam_mode != crate::models::SteamMode::OfflineEmulated {
+        // Phase 4.3: no client in OnlineContainerized mode either (the native
+        // Steam client owns its UI, not a Wine-prefix webhelper).
+        if use_steam_runtime
+            && effective_steam_mode != crate::models::SteamMode::OfflineEmulated
+            && effective_steam_mode != crate::models::SteamMode::OnlineContainerized
+        {
             // Enforce the user's disabled Steam features (webhelper/CEF, friends
             // UI, chat UI, overlay) as a background task, fully decoupled from
             // the game launch critical path — this does NOT block the game.
@@ -790,6 +801,20 @@ impl Runner for WineTkgRunner {
                     crate::infra::steam_emulator::emulator_source_dir().display()
                 );
             }
+        } else if effective_steam_mode == crate::models::SteamMode::OnlineContainerized {
+            // Phase 4.3: the native Steam client + lsteamclient bridge supply
+            // the app identity via SteamAppId / STEAM_COMPAT_APP_ID env. A
+            // steam_appid.txt would make Proton's own steam_api read a stale
+            // appid from disk (and it must NOT be present for the bridge), so
+            // remove any leftover.
+            let stale = game_working_dir.join("steam_appid.txt");
+            if stale.exists() {
+                let _ = std::fs::remove_file(&stale);
+                tracing::info!(
+                    "Removed stale steam_appid.txt from {} (OnlineContainerized: native Steam supplies identity)",
+                    stale.display()
+                );
+            }
         } else if runtime_active_for_appid {
             let app_id_str = ctx.app.app_id.to_string();
             let app_id_path = game_working_dir.join("steam_appid.txt");
@@ -876,9 +901,11 @@ impl Runner for WineTkgRunner {
 
         // Phase 4.1: in OfflineEmulated mode there is deliberately no Steam
         // client to check — the emulator replaces it, so the readiness
-        // warning would be noise.
+        // warning would be noise. Phase 4.3: OnlineContainerized has no
+        // Windows Steam client either (the native client is the bridge).
         if effective_steam_runtime_for_gate
             && effective_steam_mode != crate::models::SteamMode::OfflineEmulated
+            && effective_steam_mode != crate::models::SteamMode::OnlineContainerized
         {
             let master_steam_cfg = crate::utils::get_master_steam_config();
             let steam_wineprefix = master_steam_cfg.wine_prefix.clone();
@@ -957,8 +984,12 @@ impl Runner for WineTkgRunner {
         // Steam must be installed/running, rather than getting a silent "SteamAPI Initialization Failed".
         // Phase 4.1: skipped in OfflineEmulated mode — the emulator answers Steamworks
         // directly and no Windows Steam (hence no lsteamclient) is involved.
+        // Phase 4.3: skipped in OnlineContainerized mode too — the container
+        // uses Proton's OWN lsteamclient.dll to reach the native client, not a
+        // Wine-prefix Windows Steam install.
         if effective_steam_runtime_for_gate
             && effective_steam_mode != crate::models::SteamMode::OfflineEmulated
+            && effective_steam_mode != crate::models::SteamMode::OnlineContainerized
         {
             let master_steam_cfg = crate::utils::get_master_steam_config();
             let steam_wineprefix = master_steam_cfg.wine_prefix.clone();
@@ -1593,6 +1624,58 @@ impl Runner for WineTkgRunner {
             }
         }
 
+        // Phase 4.3 OnlineContainerized: the game runs inside the Steam Linux
+        // Runtime container and talks to the NATIVE Linux Steam client through
+        // Proton's lsteamclient.dll IPC bridge (no Windows Steam client).
+        // STEAM_COMPAT_CLIENT_INSTALL_PATH must point at the native client
+        // install root so lsteamclient can load steamclient.so from linux64/
+        // and ubuntu12_32/.
+        if effective_steam_mode == crate::models::SteamMode::OnlineContainerized {
+            let native_steam = crate::config::detect_steam_path().unwrap_or_else(|| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(".steam/steam"))
+                    .unwrap_or_else(|_| PathBuf::from("/usr/lib/steam"))
+            });
+            env.insert(
+                "STEAM_COMPAT_CLIENT_INSTALL_PATH".to_string(),
+                native_steam.to_string_lossy().to_string(),
+            );
+            // App identity reaches the container regardless of the Steam
+            // Runtime policy (the native client needs SteamAppId /
+            // STEAM_COMPAT_APP_ID to answer Steamworks ownership queries).
+            env.insert("SteamAppId".to_string(), app_id_str.clone());
+            env.insert("SteamGameId".to_string(), app_id_str.clone());
+            env.insert("STEAM_COMPAT_APP_ID".to_string(), app_id_str.clone());
+            // Force Proton's native lsteamclient.dll (n,b = native then builtin)
+            // so it intercepts the game's SteamAPI_Init() and routes it across
+            // the container namespace to the host Steam client.
+            let existing = env.get("WINEDLLOVERRIDES").cloned().unwrap_or_default();
+            let merged = if existing
+                .split(';')
+                .any(|s| s.trim().starts_with("lsteamclient="))
+            {
+                existing
+            } else if existing.is_empty() {
+                "lsteamclient=n,b".to_string()
+            } else {
+                format!("lsteamclient=n,b;{}", existing)
+            };
+            env.insert("WINEDLLOVERRIDES".to_string(), merged.clone());
+            tracing::info!(
+                "OnlineContainerized: STEAM_COMPAT_CLIENT_INSTALL_PATH={} WINEDLLOVERRIDES={}",
+                native_steam.display(),
+                merged
+            );
+            unsafe {
+                if !ctx.verification_ptr.is_null() {
+                    let v = &mut *ctx.verification_ptr;
+                    v.steam_client_install_path_exposed_to_game =
+                        Some(native_steam.to_string_lossy().to_string());
+                    v.steam_client_install_path_source = Some("native_lsteamclient".to_string());
+                }
+            }
+        }
+
         if let Ok(display) = std::env::var("DISPLAY") {
             env.insert("DISPLAY".to_string(), display);
         }
@@ -1746,7 +1829,7 @@ impl Runner for WineTkgRunner {
             .or_else(|| executable.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| install_dir.clone());
 
-        spec.cwd = Some(game_working_dir);
+        spec.cwd = Some(game_working_dir.clone());
 
         let launch_mode = ctx.user_config
             .as_ref()
@@ -1778,6 +1861,32 @@ impl Runner for WineTkgRunner {
                 .into_iter()
                 .filter(|a| a != "-mangohud" && a != "--mangohud"),
         );
+
+        // Phase 4.3: OnlineContainerized dispatches to the pressure-vessel
+        // container path (game inside the Steam Linux Runtime, bridged to the
+        // native Steam client via Proton's lsteamclient.dll) instead of a
+        // bare-wine or Steam-mediated launch.
+        let game_requires_steam_api = crate::infra::steam_emulator::game_requires_steam_api(
+            ctx.user_config.as_ref(),
+            ctx.app.install_path.as_deref().map(Path::new),
+        );
+        let effective_steam_mode = crate::infra::steam_emulator::resolve_effective_steam_mode(
+            ctx.user_config.as_ref(),
+            crate::infra::steam_emulator::native_steam_host_session_active(),
+            game_requires_steam_api,
+        );
+        if effective_steam_mode == crate::models::SteamMode::OnlineContainerized {
+            return self
+                .build_containerized_command(
+                    ctx,
+                    &active_runner,
+                    &install_dir,
+                    &executable,
+                    &game_working_dir,
+                    forwarded_args,
+                )
+                .await;
+        }
 
         let steam_mediated = !matches!(launch_mode, crate::models::LaunchMode::DirectWine);
         let mut steam_mode_args: Option<Vec<String>> = None;
@@ -1864,5 +1973,107 @@ impl Runner for WineTkgRunner {
         println!("-------------------------");
 
         cmd.spawn().map_err(|e| LaunchError::new(LaunchErrorKind::Process, "failed to spawn runner process").with_source(anyhow!(e)))
+    }
+}
+
+impl WineTkgRunner {
+    /// Phase 4.3: build the containerized (pressure-vessel) command for
+    /// `OnlineContainerized` mode. The game runs inside the Steam Linux
+    /// Runtime container under the resolved Proton runner, with the game
+    /// install + per-game prefix mounted read-write and the full game env
+    /// (incl. the lsteamclient.dll bridge) forced into the container.
+    async fn build_containerized_command(
+        &self,
+        ctx: &LaunchContext,
+        active_runner: &Path,
+        install_dir: &Path,
+        executable: &Path,
+        game_working_dir: &Path,
+        forwarded_args: Vec<String>,
+    ) -> std::result::Result<CommandSpec, LaunchError> {
+        let library_root = PathBuf::from(&ctx.launcher_config.steam_library_path);
+
+        // Require a Proton compatibility tool (the pure-PE Proton 11.0 is the
+        // intended runner) — a plain Wine runner cannot host the lsteamclient
+        // IPC bridge inside the container.
+        let runner_kind = crate::utils::classify_runner(active_runner);
+        let proton_runner_root = match &runner_kind {
+            crate::utils::RunnerKind::Proton { proton_script, .. } => proton_script
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| active_runner.to_path_buf()),
+            _ => {
+                return Err(LaunchError::new(
+                    LaunchErrorKind::Runner,
+                    format!(
+                        "OnlineContainerized requires a Proton compatibility tool (got {}). Set the game's Compatibility Layer to a Proton runner (e.g. the pure-PE Proton 11.0).",
+                        active_runner.display()
+                    ),
+                ));
+            }
+        };
+
+        // Runtime root: prefer the client-managed SteamLinuxRuntime_<line>
+        // (self-updating), then the SteamFlow-provisioned copy.
+        let mgr = crate::container::runtime::RuntimeManager::default();
+        let runtime_root = mgr.resolve_runtime_root(&library_root).ok_or_else(|| {
+            LaunchError::new(
+                LaunchErrorKind::Environment,
+                "OnlineContainerized requires a Steam Linux Runtime. Install it via the Steam client (SteamLinuxRuntime_sniper / SteamLinuxRuntime_4) or provision one with `steamflow test-download-runtime steamrt4`.",
+            )
+        })?;
+        let revision = crate::container::runtime::read_versions_txt(&runtime_root)
+            .into_iter()
+            .map(|v| v.version)
+            .max();
+        tracing::info!(
+            "OnlineContainerized: runtime root {} (revision {:?})",
+            runtime_root.display(),
+            revision
+        );
+
+        // Per-game compatdata prefix — containerized launches are always
+        // per-game (no shared Windows Steam prefix exists in the container).
+        let compat_pfx = library_root
+            .join("steamapps")
+            .join("compatdata")
+            .join(ctx.app.app_id.to_string())
+            .join("pfx");
+        std::fs::create_dir_all(&compat_pfx).map_err(|e| {
+            LaunchError::new(
+                LaunchErrorKind::Permission,
+                format!("failed creating container prefix {}", compat_pfx.display()),
+            )
+            .with_source(anyhow!(e))
+        })?;
+
+        let mut env = self.build_env(ctx).await?;
+        // Proton derives WINEPREFIX from STEAM_COMPAT_DATA_PATH, but keep it
+        // explicit (and correct) for preflight + diagnostics. STEAM_COMPAT_DATA_PATH
+        // is already the per-game compatdata dir (set by build_env).
+        env.insert(
+            "WINEPREFIX".to_string(),
+            compat_pfx.to_string_lossy().to_string(),
+        );
+
+        let launch = crate::container::launch::ContainerizedLaunch {
+            proton_runner: proton_runner_root,
+            game_exe: executable.to_path_buf(),
+            install_dir: install_dir.to_path_buf(),
+            prefix: compat_pfx,
+            launch_args: forwarded_args,
+            env,
+            working_dir: game_working_dir.to_path_buf(),
+        };
+
+        launch
+            .build_command_spec(&runtime_root)
+            .map_err(|e| {
+                LaunchError::new(
+                    LaunchErrorKind::Runner,
+                    format!("failed to build containerized launch: {e:#}"),
+                )
+                .with_source(e)
+            })
     }
 }
