@@ -1952,6 +1952,31 @@ impl SteamLauncher {
                     });
             }).response.on_hover_text("Required for DRM-protected games. Runs an official Steam client in the background.");
 
+            ui.horizontal(|ui| {
+                ui.label("Steam Client Mode:");
+                let selected = match config.steam_mode {
+                    crate::models::SteamMode::Auto => "Auto (Default)",
+                    crate::models::SteamMode::OfflineEmulated => "Offline Emulated (Clientless)",
+                    crate::models::SteamMode::OnlineContainerized => "Online Containerized (SteamRT4)",
+                };
+                egui::ComboBox::from_id_salt("steam_mode_selector")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        use crate::models::SteamMode;
+                        if ui.selectable_value(&mut config.steam_mode, SteamMode::Auto, "Auto (Default)").clicked() {
+                            changed = true;
+                        }
+                        if ui.selectable_value(&mut config.steam_mode, SteamMode::OfflineEmulated, "Offline Emulated (Clientless)").clicked() {
+                            changed = true;
+                        }
+                        if ui.selectable_value(&mut config.steam_mode, SteamMode::OnlineContainerized, "Online Containerized (SteamRT4)").clicked() {
+                            changed = true;
+                        }
+                    });
+            })
+            .response
+            .on_hover_text("How the game talks to Steam. Auto uses the Windows Steam client when a host session is active and falls back to the offline emulator; Offline Emulated launches fully clientless via a local steam_api emulator; Online Containerized is reserved for the SteamRT4 pressure-vessel launch (Phase 4.2/4.3). Persisted to user_apps.json.");
+
             let effective_runtime = match config.steam_runtime_policy {
                 crate::models::SteamRuntimePolicy::Enabled => true,
                 crate::models::SteamRuntimePolicy::Disabled => false,

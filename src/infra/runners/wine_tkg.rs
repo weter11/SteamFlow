@@ -118,6 +118,21 @@ impl Runner for WineTkgRunner {
         // WINEPREFIX). See `effective_prefix_mode_impl`.
         let steam_prefix_mode = effective_prefix_mode(ctx);
 
+        // Phase 4.1: effective Steam client mode. `Auto` falls back to the
+        // offline emulator when the game needs Steam API and no native Steam
+        // host session is active; `OfflineEmulated` bypasses the Windows
+        // Steam client entirely (no deployment, no background spawn).
+        let game_requires_steam_api = crate::infra::steam_emulator::game_requires_steam_api(
+            ctx.user_config.as_ref(),
+            ctx.app.install_path.as_deref().map(Path::new),
+        );
+        let effective_steam_mode = crate::infra::steam_emulator::resolve_effective_steam_mode(
+            ctx.user_config.as_ref(),
+            crate::infra::steam_emulator::native_steam_host_session_active(),
+            game_requires_steam_api,
+        );
+        tracing::info!("Effective Steam client mode: {:?}", effective_steam_mode);
+
         let user_config_store: crate::models::UserConfigStore = ctx.user_config.as_ref().map(|c| {
             let mut store = HashMap::new();
             store.insert(ctx.app.app_id, c.clone());
@@ -212,7 +227,12 @@ impl Runner for WineTkgRunner {
             ),
         }
 
-        if use_steam_runtime {
+        // Phase 4.1: OfflineEmulated bypasses the Windows Steam client
+        // entirely — no client-file deployment, no background Steam spawn, no
+        // readiness polling. The emulator provisioning happens below where
+        // steam_appid.txt is handled. `OnlineContainerized` (reserved for
+        // Phase 4.2/4.3) keeps the current client-based behavior for now.
+        if use_steam_runtime && effective_steam_mode != crate::models::SteamMode::OfflineEmulated {
             let steam_cfg = crate::utils::get_master_steam_config();
             tracing::info!("Unified Master Steam resolution (Game Launch):");
             tracing::info!("  - Root Dir: {}", steam_cfg.root_dir.display());
@@ -662,7 +682,8 @@ impl Runner for WineTkgRunner {
                     }
         }
 
-        if use_steam_runtime {
+        // Phase 4.1: no client in OfflineEmulated mode → nothing to enforce.
+        if use_steam_runtime && effective_steam_mode != crate::models::SteamMode::OfflineEmulated {
             // Enforce the user's disabled Steam features (webhelper/CEF, friends
             // UI, chat UI, overlay) as a background task, fully decoupled from
             // the game launch critical path — this does NOT block the game.
@@ -733,7 +754,43 @@ impl Runner for WineTkgRunner {
                 ctx.user_config.as_ref().map(|c| c.use_steam_runtime).unwrap_or(false)
             }
         };
-        if runtime_active_for_appid {
+        // Phase 4.1: OfflineEmulated — provision the steam_api emulator
+        // contract (steam_appid.txt into game root + exe dir + staging,
+        // emulator DLL staging, steam_settings/ identity files) instead of
+        // the client-based steam_appid.txt handling below. Runs regardless
+        // of the Steam Runtime policy: in emulated mode the emulator IS the
+        // Steam API, and no Steam client will be running to answer
+        // Steamworks queries.
+        if effective_steam_mode == crate::models::SteamMode::OfflineEmulated {
+            let offline_settings = ctx.user_config
+                .as_ref()
+                .map(|c| c.offline_settings.clone())
+                .unwrap_or_default();
+            let executable_dir = executable
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| install_dir.clone());
+            let report = crate::infra::steam_emulator::SteamEmulatorManager::provision(
+                &install_dir,
+                &executable_dir,
+                ctx.app.app_id,
+                &offline_settings,
+                &effective_game_prefix,
+            )
+            .map_err(|e| {
+                LaunchError::new(
+                    LaunchErrorKind::Environment,
+                    format!("OfflineEmulated emulator provisioning failed: {e}"),
+                )
+            })?;
+            if report.dlls_staged.is_empty() {
+                tracing::warn!(
+                    "OfflineEmulated: no emulator DLLs staged ({}). SteamAPI_Init will fail without a Steam client unless steam_api.dll/steam_api64.dll emulator binaries are supplied in {}.",
+                    report.dlls_missing.join(", "),
+                    crate::infra::steam_emulator::emulator_source_dir().display()
+                );
+            }
+        } else if runtime_active_for_appid {
             let app_id_str = ctx.app.app_id.to_string();
             let app_id_path = game_working_dir.join("steam_appid.txt");
             let _ = std::fs::write(&app_id_path, &app_id_str);
@@ -787,9 +844,21 @@ impl Runner for WineTkgRunner {
         // (either already running or needs to be started). This gate runs BEFORE the game
         // spawns so the user gets a clear warning rather than a silent crash with
         // "SteamAPI Initialization Failed" in the logs.
-        let game_requires_steam_api = ctx.user_config.as_ref()
-            .map(|c| c.requires_steam_api)
-            .unwrap_or(false);
+        // Phase 4.1: effective Steam client mode — same resolution as the
+        // dispatch path: `Auto` falls back to the offline emulator when the
+        // game needs Steam API and no native Steam host session is active.
+        // `game_requires_steam_api` mirrors the UI badge (per-game flag OR
+        // steam_api*.dll on disk) so the readiness gate below and the
+        // emulator decision agree.
+        let game_requires_steam_api = crate::infra::steam_emulator::game_requires_steam_api(
+            ctx.user_config.as_ref(),
+            ctx.app.install_path.as_deref().map(Path::new),
+        );
+        let effective_steam_mode = crate::infra::steam_emulator::resolve_effective_steam_mode(
+            ctx.user_config.as_ref(),
+            crate::infra::steam_emulator::native_steam_host_session_active(),
+            game_requires_steam_api,
+        );
 
         let steam_runtime_policy = ctx.user_config.as_ref()
             .map(|c| c.steam_runtime_policy.clone())
@@ -805,7 +874,12 @@ impl Runner for WineTkgRunner {
             }
         };
 
-        if effective_steam_runtime_for_gate {
+        // Phase 4.1: in OfflineEmulated mode there is deliberately no Steam
+        // client to check — the emulator replaces it, so the readiness
+        // warning would be noise.
+        if effective_steam_runtime_for_gate
+            && effective_steam_mode != crate::models::SteamMode::OfflineEmulated
+        {
             let master_steam_cfg = crate::utils::get_master_steam_config();
             let steam_wineprefix = master_steam_cfg.wine_prefix.clone();
             let steam_is_running = SteamClient::is_steam_running_in_prefix(&steam_wineprefix);
@@ -881,7 +955,11 @@ impl Runner for WineTkgRunner {
         // Steamworks games such as An Arcade Full of Cats (AppID 2368470). It does NOT block
         // the launch \u2014 it surfaces a clear, actionable warning so the user knows Windows
         // Steam must be installed/running, rather than getting a silent "SteamAPI Initialization Failed".
-        if effective_steam_runtime_for_gate {
+        // Phase 4.1: skipped in OfflineEmulated mode — the emulator answers Steamworks
+        // directly and no Windows Steam (hence no lsteamclient) is involved.
+        if effective_steam_runtime_for_gate
+            && effective_steam_mode != crate::models::SteamMode::OfflineEmulated
+        {
             let master_steam_cfg = crate::utils::get_master_steam_config();
             let steam_wineprefix = master_steam_cfg.wine_prefix.clone();
 
@@ -1291,6 +1369,25 @@ impl Runner for WineTkgRunner {
             }
         }
 
+        // Phase 4.1: OfflineEmulated — force the emulator's steam_api DLLs
+        // native-first. Appended LAST so it wins over any earlier steam_api
+        // entry (WINEDLLOVERRIDES: the last occurrence for a DLL takes
+        // effect). The emulator DLL itself is resolved via WINEDLLPATH below.
+        if effective_steam_mode == crate::models::SteamMode::OfflineEmulated {
+            let existing = env.get("WINEDLLOVERRIDES").cloned().unwrap_or_default();
+            let merged = if existing.is_empty() {
+                crate::infra::steam_emulator::WINEDLL_OVERRIDES_FRAGMENT.to_string()
+            } else {
+                format!(
+                    "{};{}",
+                    existing,
+                    crate::infra::steam_emulator::WINEDLL_OVERRIDES_FRAGMENT
+                )
+            };
+            env.insert("WINEDLLOVERRIDES".to_string(), merged.clone());
+            tracing::info!("OfflineEmulated: WINEDLLOVERRIDES={}", merged);
+        }
+
         // NOTE: `steam_prefix_mode` is the EFFECTIVE mode, resolved at the top
         // of this fn via `effective_prefix_mode(ctx)` (runner-mismatch guard).
         if steam_prefix_mode == crate::models::SteamPrefixMode::Shared && SteamClient::is_steam_running_in_prefix(&effective_game_prefix) {
@@ -1389,6 +1486,22 @@ impl Runner for WineTkgRunner {
                         }
                     }
                 }
+            }
+        }
+
+        // Phase 4.1: OfflineEmulated — the emulator staging dir inside the
+        // prefix shadows the game's own steam_api*.dll: Wine searches
+        // WINEDLLPATH BEFORE the executable's directory for native DLLs, so
+        // the staged emulator wins over the game's original steam_api. Must
+        // be FIRST in the list (WINEDLLPATH is order-sensitive).
+        if effective_steam_mode == crate::models::SteamMode::OfflineEmulated {
+            let staging =
+                crate::infra::steam_emulator::SteamEmulatorManager::winedllpath_fragment(
+                    &effective_game_prefix,
+                    ctx.app.app_id,
+                );
+            if !wine_dll_dirs.contains(&staging) {
+                wine_dll_dirs.insert(0, staging);
             }
         }
 
