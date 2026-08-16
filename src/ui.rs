@@ -301,6 +301,14 @@ pub struct SteamLauncher {
     /// 404). Skipped on retry within the session; cleared by Refresh Library so
     /// nothing is permanently negative-cached.
     cover_fetch_failures: HashSet<(AppId, CoverVariant)>,
+    /// Per-appid unix-seconds of the last `ensure_image_requested` spawn.
+    /// Gates the per-frame spawn in the game detail view: the spawned task
+    /// completes within the same frame and `pending_images` is cleared, so
+    /// without this the selected game's cover task respawns EVERY frame —
+    /// re-decoding the cached JPEG + re-uploading the texture at full repaint
+    /// rate (~165 Hz = a pegged core). Refresh Library clears it to force a
+    /// full recheck.
+    last_cover_request: HashMap<AppId, u64>,
     image_tx: Sender<(AppId, CoverVariant, Option<String>)>,
     image_rx: Receiver<(AppId, CoverVariant, Option<String>)>,
     selected_app: Option<AppId>,
@@ -394,6 +402,7 @@ impl SteamLauncher {
             pending_images: HashSet::new(),
             pending_metadata: HashSet::new(),
             cover_fetch_failures: HashSet::new(),
+            last_cover_request: HashMap::new(),
             image_tx,
             image_rx,
             selected_app: None,
@@ -532,6 +541,30 @@ impl SteamLauncher {
         if self.pending_images.contains(&appid) {
             return;
         }
+
+        // Cover fetch cadence gate: only (re)spawn the fetch task once per
+        // COVER_RECHECK_INTERVAL_SECS per appid. Without this gate the task
+        // completes within the same frame it is spawned (state file says the
+        // 24h window is still fresh → cached path sent back → pending_images
+        // cleared in poll_image_results), so the selected game's cover task
+        // respawns EVERY UI frame — re-decoding the cached JPEG in the tokio
+        // worker and re-uploading the texture on the UI thread at full repaint
+        // rate (165 Hz on a high-refresh display ≈ one pegged core). The
+        // once-per-day availability recheck still runs: when the interval
+        // elapses, the next spawn re-validates via HEAD. Refresh Library
+        // clears the map to force an immediate full recheck.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        if self
+            .last_cover_request
+            .get(&appid)
+            .is_some_and(|t| now.saturating_sub(*t) < COVER_RECHECK_INTERVAL_SECS)
+        {
+            return;
+        }
+        self.last_cover_request.insert(appid, now);
 
         let best = self.image_variant.get(&appid).copied();
         // The top variant still needs a once-per-day availability check.
@@ -1279,6 +1312,9 @@ impl SteamLauncher {
     fn recheck_missing_covers(&mut self) {
         self.pending_images.clear();
         self.cover_fetch_failures.clear();
+        // Clear the cadence gate so Refresh Library forces an immediate
+        // recheck of every game (bypasses the 24 h last_cover_request window).
+        self.last_cover_request.clear();
         let appids: Vec<AppId> = self.library.iter().map(|g| g.app_id).collect();
         for appid in appids {
             self.ensure_image_requested(appid);
