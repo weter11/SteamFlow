@@ -155,4 +155,60 @@ mod tests {
         let warnings = check_environment_sanity(&env, "Proton 8.0", None);
         assert!(warnings.iter().any(|w| w.code == "SANITY_MISSING_PROTON_DATA_PATH"));
     }
+
+    #[test]
+    fn test_install_manifest_resolution_event() {
+        use crate::infra::logging::event_log::log_install_manifest_resolution_to;
+
+        let dir = tempdir().expect("Failed to create temp dir");
+        let mut manifests = HashMap::new();
+        manifests.insert(883711u64, 1276883776777242280u64);
+        manifests.insert(883715u64, 1048038669598412361u64);
+
+        log_install_manifest_resolution_to(dir.path(), 883710, "public", Some(37581365), &manifests)
+            .expect("Failed to log install event");
+
+        let content = std::fs::read_to_string(dir.path().join("install_events.jsonl")).unwrap();
+        let event: LogEvent = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(event.event_type, "install_manifest_resolution");
+        assert_eq!(event.metadata.get("appid").unwrap(), "883710");
+        assert_eq!(event.metadata.get("active_branch").unwrap(), "public");
+        assert_eq!(
+            event.metadata.get("appinfo_changenumber").unwrap(),
+            "37581365"
+        );
+        let manifests_str = event.metadata.get("resolved_manifests").unwrap();
+        // HashMap iteration order is unspecified — assert per-pair presence.
+        assert!(manifests_str.contains("883711:1276883776777242280"));
+        assert!(manifests_str.contains("883715:1048038669598412361"));
+        assert_eq!(manifests_str.split(',').count(), 2);
+        assert_eq!(event.stage.as_deref(), Some("manifest_resolution"));
+    }
+
+    #[test]
+    fn test_install_manifest_resolution_append_and_no_changenumber() {
+        use crate::infra::logging::event_log::log_install_manifest_resolution_to;
+
+        let dir = tempdir().expect("Failed to create temp dir");
+        let mut manifests = HashMap::new();
+        manifests.insert(1u64, 2u64);
+
+        // First event: with changenumber.
+        log_install_manifest_resolution_to(dir.path(), 10, "public", Some(7), &manifests).unwrap();
+        // Second event: no changenumber (verify mode) — must append, not overwrite.
+        log_install_manifest_resolution_to(dir.path(), 10, "public", None, &manifests).unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join("install_events.jsonl")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "events must append as JSON lines");
+
+        let first: LogEvent = serde_json::from_str(lines[0]).unwrap();
+        let second: LogEvent = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(
+            first.metadata.get("appinfo_changenumber").unwrap(),
+            "7"
+        );
+        assert!(!second.metadata.contains_key("appinfo_changenumber"));
+    }
 }

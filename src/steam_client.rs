@@ -1603,7 +1603,9 @@ impl SteamClient {
             .connection
             .as_ref()
             .context("steam connection not initialized")?;
-        SteamClient::remote_manifest_ids_static(connection, appid, branch).await
+        let (manifests, _) =
+            SteamClient::remote_manifest_ids_static(connection, appid, branch).await?;
+        Ok(manifests)
     }
 
     pub async fn get_user_profile(&self, current_library_len: usize) -> Result<UserProfile> {
@@ -1910,13 +1912,32 @@ impl SteamClient {
 })
                 .await;
 
-            let remote_manifests = if verify_mode {
-                local_manifests.clone()
+            let (remote_manifests, changenumber) = if verify_mode {
+                (local_manifests.clone(), None)
             } else {
                 SteamClient::remote_manifest_ids_static(&connection, appid, &active_branch)
                     .await
                     .unwrap_or_default()
             };
+
+            // Durable record of exactly what this operation resolved: the
+            // branch requested, the appinfo change number the manifests came
+            // from, and the depot→manifest map. Without this, a later
+            // diagnosis cannot distinguish a wrong-branch request from a
+            // wrong manifest picked out of the right appinfo.
+            tracing::info!(
+                appid,
+                branch = %active_branch,
+                changenumber = ?changenumber,
+                manifests = ?remote_manifests,
+                "resolved remote depot manifests for install/update"
+            );
+            let _ = crate::infra::logging::log_install_manifest_resolution(
+                appid,
+                &active_branch,
+                changenumber,
+                &remote_manifests,
+            );
 
             let mut selections = Vec::new();
             for (depot_id, manifest_id) in &remote_manifests {
@@ -2266,7 +2287,7 @@ impl SteamClient {
         connection: &Connection,
         appid: u32,
         branch: &str,
-    ) -> Result<HashMap<u64, u64>> {
+    ) -> Result<(HashMap<u64, u64>, Option<u32>)> {
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
             .apps
@@ -2285,6 +2306,15 @@ impl SteamClient {
             .iter()
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
+
+        // The appinfo change number fingerprints the exact PICS payload these
+        // manifests came from — record it so an install log can later tell a
+        // stale appinfo from a wrong-branch request.
+        let changenumber = if app.has_change_number() {
+            Some(app.change_number())
+        } else {
+            None
+        };
 
         let mut manifests = HashMap::new();
         if let Ok(vdf) = find_vdf_in_pics(app.buffer()) {
@@ -2314,7 +2344,7 @@ impl SteamClient {
                 }
             }
         }
-        Ok(manifests)
+        Ok((manifests, changenumber))
     }
 
 
