@@ -1352,6 +1352,15 @@ impl Runner for WineTkgRunner {
         // by SteamFlow. See docs/architecture/valve-stack-replication.md.
         {
             let mut compat = crate::runner::proton_abi::default_compat_config(ctx.app.app_id);
+            // dxvk_enabled=false contract: DXVK must not be provisioned into the
+            // prefix. The proton script installs DXVK by default; the "wined3d"
+            // compat option (→ PROTON_USE_WINED3D=1) makes it install WineD3D
+            // builtins instead, overwriting any DXVK DLLs left in syswow64 by
+            // an earlier launch. Same mechanism RE2 (883710) uses via its
+            // per-game proton_compat_options: ["wined3d"].
+            if !effective_dxvk && is_proton_game {
+                compat.insert("wined3d".into());
+            }
             if let Some(user_config) = &ctx.user_config {
                 for opt in &user_config.proton_compat_options {
                     compat.insert(opt.clone());
