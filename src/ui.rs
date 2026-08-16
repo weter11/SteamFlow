@@ -476,8 +476,10 @@ impl SteamLauncher {
         self.library.iter().find(|g| g.app_id == appid)
     }
 
-    fn poll_image_results(&mut self, ctx: &egui::Context) {
+    fn poll_image_results(&mut self, ctx: &egui::Context) -> bool {
+        let mut drained = false;
         while let Ok((appid, variant, result)) = self.image_rx.try_recv() {
+            drained = true;
             match result {
                 Some(path) => {
                     self.cover_fetch_failures.remove(&(appid, variant));
@@ -512,6 +514,7 @@ impl SteamLauncher {
             }
             self.pending_images.remove(&appid);
         }
+        drained
     }
 
     fn ensure_metadata_requested(&mut self, appid: AppId) {
@@ -731,13 +734,15 @@ impl SteamLauncher {
         self.status = "Logged out".to_string();
     }
 
-    fn poll_download_progress(&mut self) {
+    fn poll_download_progress(&mut self) -> bool {
         let mut finished: Vec<u32> = Vec::new();
+        let mut drained = false;
 
         // Drain every active task's channel independently — each task is
         // strictly bound to its own AppID + game title.
         for (appid, task) in self.download_tasks.iter_mut() {
             while let Ok(progress) = task.rx.try_recv() {
+                drained = true;
                 task.progress = Some(progress.clone());
                 let game_name = task.game_name.clone();
                 match progress.state {
@@ -829,13 +834,16 @@ impl SteamLauncher {
         for appid in finished {
             self.download_tasks.remove(&appid);
         }
+        drained
     }
 
 
-    fn poll_play_result(&mut self) {
+    fn poll_play_result(&mut self) -> bool {
+        let mut drained = false;
         if let Some(rx) = &self.play_result_rx {
             match rx.try_recv() {
                 Ok(message) => {
+                    drained = true;
                     let mut finished = true;
                     if let Some(value) = message.strip_prefix("__RUNNING__") {
                         finished = false;
@@ -874,6 +882,7 @@ impl SteamLauncher {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
+        drained
     }
 
     fn start_install(&mut self, app_id: u32, platform: DepotPlatform, cached_vdf: Option<Vec<u8>>, filter_depots: Option<Vec<u64>>) {
@@ -921,8 +930,10 @@ impl SteamLauncher {
         });
     }
 
-    fn poll_async_ops(&mut self) {
+    fn poll_async_ops(&mut self) -> bool {
+        let mut drained = false;
         while let Ok(op) = self.operation_rx.try_recv() {
+            drained = true;
             match op {
                 AsyncOp::DownloadStarted(appid, rx, state) => {
                     // Register a new per-AppID task. If one already exists for
@@ -1228,7 +1239,7 @@ impl SteamLauncher {
                         if let Some(preferred_id) = self.launcher_config.preferred_launch_options.get(&appid) {
                             if let Some(option) = options.iter().find(|o| &o.id == preferred_id) {
                                 self.start_launch_task(&game, option.clone(), proton_path);
-                                return;
+                                return drained;
                             }
                         }
 
@@ -1260,6 +1271,7 @@ impl SteamLauncher {
             }
             }
         }
+        drained
     }
 
     fn confirmation_validation_message(&self) -> Option<String> {
@@ -3616,10 +3628,10 @@ fn scan_proton_runtimes(config: &LauncherConfig) -> (Vec<String>, Vec<String>) {
 
 impl eframe::App for SteamLauncher {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_image_results(ctx);
-        self.poll_download_progress();
-        self.poll_play_result();
-        self.poll_async_ops();
+        let drained_images = self.poll_image_results(ctx);
+        let drained_progress = self.poll_download_progress();
+        let drained_play = self.poll_play_result();
+        let drained_ops = self.poll_async_ops();
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -4703,6 +4715,33 @@ impl eframe::App for SteamLauncher {
         self.draw_depot_install_selection_modal(ctx);
         self.draw_launch_selector_modal(ctx);
         self.draw_proton_remove_confirm_modal(ctx);
-        ctx.request_repaint();
+
+        // Scoped repaint policy — replaces the old unconditional
+        // `ctx.request_repaint()` that forced a full frame every vsync
+        // (~165 fps on a high-refresh display ≈ one pegged core even when
+        // the window sat idle). egui already repaints on input events, so
+        // idle frames are only needed when something async changed:
+        //
+        // 1. A channel was drained this frame (cover art landed, progress
+        //    message, play result, async op) → render the new state now.
+        // 2. Active downloads → tick progress bars + the Instant-based ETA
+        //    countdown (which changes by wall-clock even between messages).
+        //    egui::Spinner (cover loading, account/proton/steamguard) is
+        //    animated and self-requests repaint while visible, so those
+        //    cover themselves and stop when they disappear.
+        // 3. A launch/play result is pending → poll its channel at 1 Hz so
+        //    a game exit or login-required event is picked up promptly.
+        //
+        // With nothing pending the UI schedules no repaint and the main
+        // thread goes fully idle (~0% CPU) until the next input event.
+        if drained_images || drained_progress || drained_play || drained_ops {
+            ctx.request_repaint();
+        }
+        if !self.download_tasks.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if self.play_result_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
     }
 }
