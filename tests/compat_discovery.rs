@@ -164,12 +164,12 @@ fn test_architecture_aware_discovery() {
     let game_dir = Path::new("/tmp/game");
 
     // Case 1: 64-bit architecture
-    let (res_64, _) = resolver.resolve(game_dir, &runner_root, &components, &steamflow::models::D3D12ProviderPolicy::Auto, &ExecutableArchitecture::X86_64, None, None, None);
+    let (res_64, _) = resolver.resolve(game_dir, &runner_root, &components, &steamflow::models::D3D12ProviderPolicy::Auto, &ExecutableArchitecture::X86_64, None, None, None, true);
     let d3d11_res_64 = res_64.iter().find(|r| r.name == "d3d11").unwrap();
     assert_eq!(d3d11_res_64.chosen_path.as_ref().unwrap(), &d3d11_64);
 
     // Case 2: 32-bit architecture
-    let (res_32, _) = resolver.resolve(game_dir, &runner_root, &components, &steamflow::models::D3D12ProviderPolicy::Auto, &ExecutableArchitecture::X86, None, None, None);
+    let (res_32, _) = resolver.resolve(game_dir, &runner_root, &components, &steamflow::models::D3D12ProviderPolicy::Auto, &ExecutableArchitecture::X86, None, None, None, true);
     let d3d11_res_32 = res_32.iter().find(|r| r.name == "d3d11").unwrap();
     assert_eq!(d3d11_res_32.chosen_path.as_ref().unwrap(), &d3d11_32);
 }

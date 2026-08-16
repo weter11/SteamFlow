@@ -34,16 +34,33 @@ fn test_build_dll_overrides_dxvk_active() {
 
 #[test]
 fn test_build_dll_overrides_vkd3d_active() {
+    // dxvk_enabled=false + VKD3D-Proton: D3D12 pairing only. The
+    // d3d8/d3d9/d3d10core/d3d11 "=n,b" entries are DXVK pairings — emitting
+    // them without DXVK would hand the game the runner's DXVK DLLs and defeat
+    // dxvk_enabled=false (with WineD3D active the proton script installs the
+    // wined3d dxgi, so native dxgi == wined3d builtin — no null-import crash).
     let overrides = build_dll_overrides(false, true, false, true, false, None, false, None);
 
     // VKD3D keys should be present
     assert!(overrides.contains("d3d12=n,b"));
+    assert!(overrides.contains("d3d12core=n,b"));
     // vkd3d-proton requires native dxgi for its swapchain
     assert!(overrides.contains("dxgi=n,b"));
 
-    // Wine's builtin d3d11/d3d10core must be paired native with dxgi:
-    // builtin d3d11 imports Wine-internal symbols (DXGID3D10CreateDevice)
-    // that native DXVK dxgi does not export -> null imports -> crash.
+    // WineD3D D3D9/D3D11 must NOT be forced native when DXVK is off.
+    assert!(!overrides.contains("d3d11=n,b"));
+    assert!(!overrides.contains("d3d10core=n,b"));
+    assert!(!overrides.contains("d3d9=n,b"));
+    assert!(!overrides.contains("d3d8=n,b"));
+}
+
+#[test]
+fn test_build_dll_overrides_vkd3d_active_with_dxvk() {
+    // dxvk_enabled=true + VKD3D-Proton: full DXVK pairing applies (native
+    // dxgi is DXVK's, so every D3D8-11 DLL must pair native with it).
+    let overrides = build_dll_overrides(true, true, false, true, false, None, false, None);
+    assert!(overrides.contains("d3d12=n,b"));
+    assert!(overrides.contains("dxgi=n,b"));
     assert!(overrides.contains("d3d11=n,b"));
     assert!(overrides.contains("d3d10core=n,b"));
     assert!(overrides.contains("d3d9=n,b"));
