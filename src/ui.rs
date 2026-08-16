@@ -2114,6 +2114,28 @@ impl SteamLauncher {
 
             ui.add_space(8.0);
             ui.heading("Beta Branches");
+            // Always-visible installed-branch label — parsed from the installed
+            // appmanifest (UserConfig.betakey, "public" = default branch). No
+            // network call; independent of "Check for Beta Branches", which
+            // only fetches the switchable branch list.
+            ui.horizontal(|ui| {
+                ui.label("Installed branch:");
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_gray(46))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 220, 170),
+                            &game.active_branch,
+                        )
+                        .on_hover_text(
+                            "Branch the game is installed/updated on, read from the installed \
+                             appmanifest (UserConfig.betakey; \"public\" is the default branch). \
+                             Use \"Check for Beta Branches\" to fetch the switchable branch list.",
+                        );
+                    });
+            });
             if let Some(branches) = self.available_branches.get(&game.app_id) {
                 let mut active_branch = game.active_branch.clone();
                 egui::ComboBox::from_id_salt("branch_selector_tab")
