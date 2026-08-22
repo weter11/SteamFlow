@@ -33,6 +33,18 @@ struct UninstallModalState {
     delete_prefix: bool,
 }
 
+/// Pre-launch VRAM guard: a launch deferred because the GPU is nearly out of
+/// memory. "Launch anyway" re-dispatches through [`Self::begin_launch_task`]
+/// without re-running the probe.
+#[derive(Debug, Clone)]
+struct VramWarningModalState {
+    game: LibraryGame,
+    launch_info: crate::steam_client::LaunchInfo,
+    proton_path: Option<String>,
+    snapshot: crate::vram_guard::VramSnapshot,
+    threshold_pct: u32,
+}
+
 #[derive(Debug, Clone)]
 struct DepotBrowserState {
     app_id: u32,
@@ -332,6 +344,8 @@ pub struct SteamLauncher {
     user_profile: Option<UserProfile>,
     refreshing_account_data: bool,
     uninstall_modal: Option<UninstallModalState>,
+    vram_warning_modal: Option<VramWarningModalState>,
+    vram_warning_suppressed: bool,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     depot_install_selection: Option<DepotInstallSelectionState>,
@@ -428,6 +442,8 @@ impl SteamLauncher {
             user_profile,
             refreshing_account_data: false,
             uninstall_modal: None,
+            vram_warning_modal: None,
+            vram_warning_suppressed: false,
             depot_browser: None,
             platform_selection: None,
             depot_install_selection: None,
@@ -1489,6 +1505,46 @@ impl SteamLauncher {
     }
 
     fn start_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
+        // Pre-launch VRAM guard: a local LLM / AI server (e.g. TabbyAPI) can
+        // occupy nearly all GPU memory, making the game's DXVK/vulkan device
+        // creation fail later with an opaque error. Probe once, warn once.
+        let threshold = self.launcher_config.vram_warn_threshold_pct;
+        if self.vram_warning_suppressed || threshold == 0 {
+            self.begin_launch_task(game, launch_info, proton_path);
+            return;
+        }
+        match crate::vram_guard::probe_vram() {
+            Ok(snapshot) => {
+                let pct = f64::from(snapshot.used_fraction()) * 100.0;
+                if pct >= f64::from(threshold) {
+                    tracing::info!(
+                        "vram_guard: {:.0}% used (>= {}%): deferring launch of {}",
+                        pct,
+                        threshold,
+                        game.name
+                    );
+                    self.vram_warning_modal = Some(VramWarningModalState {
+                        game: game.clone(),
+                        launch_info,
+                        proton_path,
+                        snapshot,
+                        threshold_pct: threshold,
+                    });
+                    return;
+                }
+            }
+            Err(err) => {
+                // No usable GPU telemetry (laptop hybrid graphics, headless,
+                // unknown vendor): never block a launch because of it.
+                tracing::debug!("vram_guard: probe unavailable, launching anyway: {err}");
+            }
+        }
+        self.begin_launch_task(game, launch_info, proton_path);
+    }
+
+    /// Actual launch dispatch. Called by [`Self::start_launch_task`] (guard
+    /// passed or suppressed) and by the VRAM warning modal ("Launch anyway").
+    fn begin_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
         // Phase 4 Task 3: remember the launch so it can be auto-retried after
         // the one-time Windows Steam login completes (cleared on success).
         self.pending_login_launch = Some(PendingLoginLaunch {
@@ -1606,7 +1662,7 @@ impl SteamLauncher {
         });
     }
 
-    fn draw_launch_selector_modal(&mut self, ctx: &egui::Context) {
+    fn draw_launch_selector_modal(&mut self, ui: &mut egui::Ui) {
         let mut selection = None;
         let mut close = false;
 
@@ -1614,7 +1670,7 @@ impl SteamLauncher {
             egui::Window::new("Launch Configuration")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.label(format!("Select version of {} to launch:", state.game_name));
                     ui.add_space(8.0);
 
@@ -1656,7 +1712,7 @@ impl SteamLauncher {
         }
     }
 
-    fn draw_platform_selection_modal(&mut self, ctx: &egui::Context) {
+    fn draw_platform_selection_modal(&mut self, ui: &mut egui::Ui) {
         let mut selection = None;
         let mut close = false;
 
@@ -1664,7 +1720,7 @@ impl SteamLauncher {
             egui::Window::new("Select Version to Install")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.label(format!("Select version of {} to install:", state.game_name));
                     ui.add_space(8.0);
 
@@ -1709,14 +1765,14 @@ impl SteamLauncher {
         }
     }
 
-    fn draw_depot_install_selection_modal(&mut self, ctx: &egui::Context) {
+    fn draw_depot_install_selection_modal(&mut self, ui: &mut egui::Ui) {
             let mut proceed = None;
             let mut close = false;
             if let Some(state) = &self.depot_install_selection {
                 egui::Window::new("Select Depots to Install")
                     .collapsible(false)
                     .resizable(true)
-                    .show(ctx, |ui| {
+                    .show(ui, |ui| {
                         ui.label(format!("Select depots for {}:", state.game_name));
                         ui.small("Locked depots are not owned or have no available decryption key.");
                         ui.add_space(8.0);
@@ -2114,6 +2170,28 @@ impl SteamLauncher {
 
             ui.add_space(8.0);
             ui.heading("Beta Branches");
+            // Always-visible installed-branch label — parsed from the installed
+            // appmanifest (UserConfig.betakey, "public" = default branch). No
+            // network call; independent of "Check for Beta Branches", which
+            // only fetches the switchable branch list.
+            ui.horizontal(|ui| {
+                ui.label("Installed branch:");
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_gray(46))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(8, 3))
+                    .show(ui, |ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 220, 170),
+                            &game.active_branch,
+                        )
+                        .on_hover_text(
+                            "Branch the game is installed/updated on, read from the installed \
+                             appmanifest (UserConfig.betakey; \"public\" is the default branch). \
+                             Use \"Check for Beta Branches\" to fetch the switchable branch list.",
+                        );
+                    });
+            });
             if let Some(branches) = self.available_branches.get(&game.app_id) {
                 let mut active_branch = game.active_branch.clone();
                 egui::ComboBox::from_id_salt("branch_selector_tab")
@@ -3077,14 +3155,14 @@ impl SteamLauncher {
         self.runner_components = Some(components);
     }
 
-    fn draw_uninstall_modal(&mut self, ctx: &egui::Context) {
+    fn draw_uninstall_modal(&mut self, ui: &mut egui::Ui) {
         let mut do_uninstall = None;
         let mut close = false;
         if let Some(modal) = &mut self.uninstall_modal {
             egui::Window::new(format!("Uninstall {}?", modal.game_name))
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.label(format!("Uninstall {}?", modal.game_name));
                     ui.checkbox(
                         &mut modal.delete_prefix,
@@ -3142,7 +3220,68 @@ impl SteamLauncher {
         }
     }
 
-    fn draw_depot_browser_window(&mut self, ctx: &egui::Context) {
+    fn draw_vram_warning_modal(&mut self, ui: &mut egui::Ui) {
+        let mut launch_anyway = false;
+        let mut close = false;
+        if let Some(modal) = &mut self.vram_warning_modal {
+            let used_pct = (modal.snapshot.used_fraction() * 100.0).round() as u32;
+            egui::Window::new(format!("Launch {}?", modal.game.name))
+                .collapsible(false)
+                .resizable(false)
+                .show(ui, |ui| {
+                    ui.label(format!(
+                        "GPU memory is {}% full ({} / {} MiB) — above your {}% warning \
+                         threshold, so the game may fail to start or crash.",
+                        used_pct,
+                        modal.snapshot.used_mib,
+                        modal.snapshot.total_mib,
+                        modal.threshold_pct
+                    ));
+                    if !modal.snapshot.processes.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label("Processes holding GPU memory:");
+                        for proc in modal.snapshot.processes.iter().take(5) {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "• {} (pid {}) — {} MiB",
+                                    proc.name, proc.pid, proc.mem_mib
+                                ))
+                                .monospace(),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.small(
+                            "Local AI / LLM servers are the usual cause. Stop them (or lower \
+                             their GPU memory reserve) before launching.",
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut self.vram_warning_suppressed,
+                        "Don't check again this session",
+                    );
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Launch anyway").clicked() {
+                            launch_anyway = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+        }
+
+        if launch_anyway {
+            if let Some(modal) = self.vram_warning_modal.take() {
+                self.begin_launch_task(&modal.game, modal.launch_info, modal.proton_path);
+            }
+        } else if close {
+            self.vram_warning_modal = None;
+        }
+    }
+
+    fn draw_depot_browser_window(&mut self, ui: &mut egui::Ui) {
         let mut close = false;
         let mut request_refresh: Option<(u32, u32, String)> = None;
         let mut request_download: Option<(u32, u32, String, String)> = None;
@@ -3153,7 +3292,7 @@ impl SteamLauncher {
                 state.game_name, state.app_id
             ))
             .resizable(true)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Manifest ID:");
                     ui.add(
@@ -3461,14 +3600,14 @@ impl SteamLauncher {
         });
     }
 
-    fn draw_proton_remove_confirm_modal(&mut self, ctx: &egui::Context) {
+    fn draw_proton_remove_confirm_modal(&mut self, ui: &mut egui::Ui) {
         let mut confirm = false;
         let mut close = false;
         if let Some(state) = &self.proton_remove_confirm {
             egui::Window::new("Confirm Removal")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.label(format!("Are you sure you want to remove {}?", state.name));
                     if state.is_default {
                         ui.colored_label(egui::Color32::YELLOW, "This is currently set as the global default Proton version.");
@@ -3627,13 +3766,13 @@ fn scan_proton_runtimes(config: &LauncherConfig) -> (Vec<String>, Vec<String>) {
 }
 
 impl eframe::App for SteamLauncher {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let drained_images = self.poll_image_results(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let drained_images = self.poll_image_results(ui.ctx());
         let drained_progress = self.poll_download_progress();
         let drained_play = self.poll_play_result();
         let drained_ops = self.poll_async_ops();
 
-        egui::TopBottomPanel::top("status").show(ctx, |ui| {
+        egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Refresh Library").clicked() {
                     self.refresh_library();
@@ -3651,10 +3790,10 @@ impl eframe::App for SteamLauncher {
             }
         });
 
-        egui::SidePanel::left("sidebar")
+        egui::Panel::left("sidebar")
             .resizable(true)
-            .default_width(280.0)
-            .show(ctx, |ui| {
+            .default_size(280.0)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.main_tab, MainTab::Library, "Library");
                     ui.selectable_value(&mut self.main_tab, MainTab::Account, "Account");
@@ -3784,7 +3923,7 @@ impl eframe::App for SteamLauncher {
                 .resizable(true)
                 .default_size([420.0, 600.0])
                 .min_width(320.0)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.heading("Library");
@@ -4272,7 +4411,7 @@ impl eframe::App for SteamLauncher {
             self.show_settings = show_settings;
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.needs_reauth {
                 ui.heading("Authentication required");
                 ui.label("Login from the left panel to restore your Steam session.");
@@ -4288,7 +4427,7 @@ impl eframe::App for SteamLauncher {
                 self.ensure_image_requested(game.app_id);
 
                 ui.vertical(|ui| {
-                    egui::TopBottomPanel::bottom("game_status_bar").show_inside(ui, |ui| {
+                    egui::Panel::bottom("game_status_bar").show(ui, |ui| {
                         egui::ScrollArea::horizontal()
                             .id_salt("game_status_scroll")
                             .show(ui, |ui| {
@@ -4296,7 +4435,7 @@ impl eframe::App for SteamLauncher {
                             });
                     });
 
-                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("game_view_scroll")
                             .show(ui, |ui| {
@@ -4709,12 +4848,13 @@ impl eframe::App for SteamLauncher {
             }
         });
 
-        self.draw_uninstall_modal(ctx);
-        self.draw_depot_browser_window(ctx);
-        self.draw_platform_selection_modal(ctx);
-        self.draw_depot_install_selection_modal(ctx);
-        self.draw_launch_selector_modal(ctx);
-        self.draw_proton_remove_confirm_modal(ctx);
+        self.draw_uninstall_modal(ui);
+        self.draw_vram_warning_modal(ui);
+        self.draw_depot_browser_window(ui);
+        self.draw_platform_selection_modal(ui);
+        self.draw_depot_install_selection_modal(ui);
+        self.draw_launch_selector_modal(ui);
+        self.draw_proton_remove_confirm_modal(ui);
 
         // Scoped repaint policy — replaces the old unconditional
         // `ctx.request_repaint()` that forced a full frame every vsync
@@ -4735,13 +4875,13 @@ impl eframe::App for SteamLauncher {
         // With nothing pending the UI schedules no repaint and the main
         // thread goes fully idle (~0% CPU) until the next input event.
         if drained_images || drained_progress || drained_play || drained_ops {
-            ctx.request_repaint();
+            ui.request_repaint();
         }
         if !self.download_tasks.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            ui.request_repaint_after(std::time::Duration::from_millis(250));
         }
         if self.play_result_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            ui.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 }

@@ -1603,7 +1603,9 @@ impl SteamClient {
             .connection
             .as_ref()
             .context("steam connection not initialized")?;
-        SteamClient::remote_manifest_ids_static(connection, appid, branch).await
+        let (manifests, _) =
+            SteamClient::remote_manifest_ids_static(connection, appid, branch).await?;
+        Ok(manifests)
     }
 
     pub async fn get_user_profile(&self, current_library_len: usize) -> Result<UserProfile> {
@@ -1910,13 +1912,32 @@ impl SteamClient {
 })
                 .await;
 
-            let remote_manifests = if verify_mode {
-                local_manifests.clone()
+            let (remote_manifests, changenumber) = if verify_mode {
+                (local_manifests.clone(), None)
             } else {
                 SteamClient::remote_manifest_ids_static(&connection, appid, &active_branch)
                     .await
                     .unwrap_or_default()
             };
+
+            // Durable record of exactly what this operation resolved: the
+            // branch requested, the appinfo change number the manifests came
+            // from, and the depot→manifest map. Without this, a later
+            // diagnosis cannot distinguish a wrong-branch request from a
+            // wrong manifest picked out of the right appinfo.
+            tracing::info!(
+                appid,
+                branch = %active_branch,
+                changenumber = ?changenumber,
+                manifests = ?remote_manifests,
+                "resolved remote depot manifests for install/update"
+            );
+            let _ = crate::infra::logging::log_install_manifest_resolution(
+                appid,
+                &active_branch,
+                changenumber,
+                &remote_manifests,
+            );
 
             let mut selections = Vec::new();
             for (depot_id, manifest_id) in &remote_manifests {
@@ -2266,7 +2287,7 @@ impl SteamClient {
         connection: &Connection,
         appid: u32,
         branch: &str,
-    ) -> Result<HashMap<u64, u64>> {
+    ) -> Result<(HashMap<u64, u64>, Option<u32>)> {
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
             .apps
@@ -2285,6 +2306,15 @@ impl SteamClient {
             .iter()
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
+
+        // The appinfo change number fingerprints the exact PICS payload these
+        // manifests came from — record it so an install log can later tell a
+        // stale appinfo from a wrong-branch request.
+        let changenumber = if app.has_change_number() {
+            Some(app.change_number())
+        } else {
+            None
+        };
 
         let mut manifests = HashMap::new();
         if let Ok(vdf) = find_vdf_in_pics(app.buffer()) {
@@ -2314,7 +2344,7 @@ impl SteamClient {
                 }
             }
         }
-        Ok(manifests)
+        Ok((manifests, changenumber))
     }
 
 
@@ -2464,6 +2494,13 @@ impl SteamClient {
                 .with_context(|| format!("failed creating {}", parent.display()))?;
         }
 
+        // Preserve an existing UserConfig section (which holds the active
+        // BetaKey) so a rewrite after install/update does NOT silently drop a
+        // beta branch and revert the game to public on the next update.
+        let preserved_user_config = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| extract_user_config_block(&raw));
+
         let game_name = game_name.replace('"', "");
 
         let mut content = format!(
@@ -2478,6 +2515,10 @@ impl SteamClient {
                 ));
             }
             content.push_str("\t}\n");
+        }
+
+        if let Some(block) = preserved_user_config {
+            content.push_str(&block);
         }
 
         content.push_str("}\n");
@@ -4258,6 +4299,57 @@ fn parse_installed_depots_from_acf(raw: &str) -> HashMap<u64, u64> {
     manifests
 }
 
+/// Extract the existing `UserConfig` section (holds `BetaKey`, `language`,
+/// …) from a raw ACF so a manifest rewrite can preserve it instead of silently
+/// dropping the active beta branch. Returns the section re-emitted at the
+/// standard two-tab indent, ready to be appended inside `AppState`:
+///
+/// ```text
+/// "UserConfig"
+/// {
+///     "language"   "english"
+///     "BetaKey"    "dx11_non-rt"
+/// }
+/// ```
+fn extract_user_config_block(raw: &str) -> Option<String> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim().eq_ignore_ascii_case("\"UserConfig\"") {
+            let mut depth = 0i32;
+            let mut inner: Vec<&str> = Vec::new();
+            let mut closed = false;
+            for line in lines[(i + 1)..].iter().copied() {
+                let t = line.trim();
+                if t == "{" {
+                    depth += 1;
+                } else if t == "}" {
+                    depth -= 1;
+                    if depth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                inner.push(line);
+            }
+            if !closed {
+                return None;
+            }
+            let mut out = String::new();
+            out.push_str("\t\"UserConfig\"\n\t{\n");
+            for line in inner {
+                out.push_str("\t\t");
+                out.push_str(line.trim_start());
+                out.push('\n');
+            }
+            out.push_str("\t}\n");
+            return Some(out);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn parse_active_branch_from_acf(raw: &str) -> String {
     let mut in_user_config = false;
     for line in raw.lines() {
@@ -4506,7 +4598,7 @@ impl SteamClient {
 }
 
 /// Extracts the first quoted string from a VDF line fragment like
-/// `"path"		"C:\Program Files (x86)\Steam"`.
+/// `"path"  "C:\Program Files (x86)\Steam"`.
 fn extract_vdf_quoted(s: &str) -> Option<String> {
     let s = s.trim();
     let first = s.find('"')?;
@@ -5220,5 +5312,58 @@ mod steamwebhelper_management_tests {
         );
 
         let _ = std::fs::remove_dir_all(&prefix);
+    }
+}
+
+#[cfg(test)]
+mod acf_betakey_preservation_tests {
+    use super::*;
+
+    /// Regression test for the branch-loss bug: `write_appmanifest` used to
+    /// regenerate the ACF from scratch, silently dropping the `UserConfig`
+    /// block (and with it the active `BetaKey`). A game on a beta branch that
+    /// received an update would therefore be rewritten as `public`.
+    #[test]
+    fn write_appmanifest_preserves_user_config_betakey() {
+        let dir = std::env::temp_dir().join("sf-acf-preserve-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appmanifest_883710.acf");
+
+        // Steam-client-written ACF shape for a game on the dx11_non-rt beta.
+        let original = "\"AppState\"\n{\n\t\"appid\"\t\t\"883710\"\n\t\"name\"\t\t\"Resident Evil 2\"\n\t\"StateFlags\"\t\t\"4\"\n\t\"installdir\"\t\t\"Resident Evil 2\"\n\t\"InstalledDepots\"\n\t{\n\t\t\"883711\"\n\t\t{\n\t\t\t\"manifest\"\t\t\"1276883776777242280\"\n\t\t\t\"size\"\t\t\"27213723651\"\n\t\t}\n\t}\n\t\"UserConfig\"\n\t{\n\t\t\"language\"\t\t\"english\"\n\t\t\"BetaKey\"\t\t\"dx11_non-rt\"\n\t}\n}\n";
+        std::fs::write(&path, original).unwrap();
+
+        // A subsequent install/update rewrites the ACF with fresh depot data.
+        SteamClient::write_appmanifest(
+            &path,
+            883710,
+            "Resident Evil 2",
+            "Resident Evil 2",
+            vec![(883711, 1276883776777242280, 27213723651)],
+        )
+        .unwrap();
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        // The beta branch survives the rewrite.
+        assert_eq!(parse_active_branch_from_acf(&rewritten), "dx11_non-rt");
+        // Fresh depot data is present, and no section got duplicated.
+        assert!(rewritten.contains("\"manifest\"\t\t\"1276883776777242280\""));
+        assert_eq!(rewritten.matches("\"InstalledDepots\"").count(), 1);
+        assert_eq!(rewritten.matches("\"UserConfig\"").count(), 1);
+    }
+
+    #[test]
+    fn write_appmanifest_fresh_install_has_no_user_config() {
+        // Fresh install (no pre-existing ACF): no UserConfig is fabricated.
+        let dir = std::env::temp_dir().join("sf-acf-fresh-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appmanifest_999999.acf");
+
+        SteamClient::write_appmanifest(&path, 999999, "Test Game", "testgame", vec![(1, 2, 3)])
+            .unwrap();
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("UserConfig"));
+        assert_eq!(parse_active_branch_from_acf(&rewritten), "public");
     }
 }
