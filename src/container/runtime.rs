@@ -648,8 +648,8 @@ pub fn find_runtime_root(root: &Path) -> PathBuf {
 /// 3. Valve's **current** tab-separated table (the real SLR 3.0/4.0 layout):
 ///
 ///    ```text
-///    #Name	Version		Runtime	Runtime_Version	Comment
-///    steamrt4	4.0.20260805.254769	steamrt4	4.0.20260805.254769	# …
+///    #Name    Version        Runtime    Runtime_Version    Comment
+///    steamrt4    4.0.20260805.254769    steamrt4    4.0.20260805.254769    # …
 ///    ```
 ///
 /// Comments (`#`) and blank lines are skipped; unrecognized lines are
