@@ -4598,7 +4598,7 @@ impl SteamClient {
 }
 
 /// Extracts the first quoted string from a VDF line fragment like
-/// `"path"		"C:\Program Files (x86)\Steam"`.
+/// `"path"  "C:\Program Files (x86)\Steam"`.
 fn extract_vdf_quoted(s: &str) -> Option<String> {
     let s = s.trim();
     let first = s.find('"')?;
