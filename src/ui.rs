@@ -1606,7 +1606,7 @@ impl SteamLauncher {
         });
     }
 
-    fn draw_launch_selector_modal(&mut self, ctx: &egui::Context) {
+    fn draw_launch_selector_modal(&mut self, ui: &mut egui::Ui) {
         let mut selection = None;
         let mut close = false;
 
@@ -1614,7 +1614,7 @@ impl SteamLauncher {
             egui::Window::new("Launch Configuration")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.label(format!("Select version of {} to launch:", state.game_name));
                     ui.add_space(8.0);
 
@@ -1656,7 +1656,7 @@ impl SteamLauncher {
         }
     }
 
-    fn draw_platform_selection_modal(&mut self, ctx: &egui::Context) {
+    fn draw_platform_selection_modal(&mut self, ui: &mut egui::Ui) {
         let mut selection = None;
         let mut close = false;
 
@@ -1664,7 +1664,7 @@ impl SteamLauncher {
             egui::Window::new("Select Version to Install")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.label(format!("Select version of {} to install:", state.game_name));
                     ui.add_space(8.0);
 
@@ -1709,14 +1709,14 @@ impl SteamLauncher {
         }
     }
 
-    fn draw_depot_install_selection_modal(&mut self, ctx: &egui::Context) {
+    fn draw_depot_install_selection_modal(&mut self, ui: &mut egui::Ui) {
             let mut proceed = None;
             let mut close = false;
             if let Some(state) = &self.depot_install_selection {
                 egui::Window::new("Select Depots to Install")
                     .collapsible(false)
                     .resizable(true)
-                    .show(ctx, |ui| {
+                    .show(ui, |ui| {
                         ui.label(format!("Select depots for {}:", state.game_name));
                         ui.small("Locked depots are not owned or have no available decryption key.");
                         ui.add_space(8.0);
@@ -3099,14 +3099,14 @@ impl SteamLauncher {
         self.runner_components = Some(components);
     }
 
-    fn draw_uninstall_modal(&mut self, ctx: &egui::Context) {
+    fn draw_uninstall_modal(&mut self, ui: &mut egui::Ui) {
         let mut do_uninstall = None;
         let mut close = false;
         if let Some(modal) = &mut self.uninstall_modal {
             egui::Window::new(format!("Uninstall {}?", modal.game_name))
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.label(format!("Uninstall {}?", modal.game_name));
                     ui.checkbox(
                         &mut modal.delete_prefix,
@@ -3164,7 +3164,7 @@ impl SteamLauncher {
         }
     }
 
-    fn draw_depot_browser_window(&mut self, ctx: &egui::Context) {
+    fn draw_depot_browser_window(&mut self, ui: &mut egui::Ui) {
         let mut close = false;
         let mut request_refresh: Option<(u32, u32, String)> = None;
         let mut request_download: Option<(u32, u32, String, String)> = None;
@@ -3175,7 +3175,7 @@ impl SteamLauncher {
                 state.game_name, state.app_id
             ))
             .resizable(true)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Manifest ID:");
                     ui.add(
@@ -3483,14 +3483,14 @@ impl SteamLauncher {
         });
     }
 
-    fn draw_proton_remove_confirm_modal(&mut self, ctx: &egui::Context) {
+    fn draw_proton_remove_confirm_modal(&mut self, ui: &mut egui::Ui) {
         let mut confirm = false;
         let mut close = false;
         if let Some(state) = &self.proton_remove_confirm {
             egui::Window::new("Confirm Removal")
                 .collapsible(false)
                 .resizable(false)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.label(format!("Are you sure you want to remove {}?", state.name));
                     if state.is_default {
                         ui.colored_label(egui::Color32::YELLOW, "This is currently set as the global default Proton version.");
@@ -3649,13 +3649,13 @@ fn scan_proton_runtimes(config: &LauncherConfig) -> (Vec<String>, Vec<String>) {
 }
 
 impl eframe::App for SteamLauncher {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let drained_images = self.poll_image_results(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let drained_images = self.poll_image_results(ui.ctx());
         let drained_progress = self.poll_download_progress();
         let drained_play = self.poll_play_result();
         let drained_ops = self.poll_async_ops();
 
-        egui::TopBottomPanel::top("status").show(ctx, |ui| {
+        egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Refresh Library").clicked() {
                     self.refresh_library();
@@ -3673,10 +3673,10 @@ impl eframe::App for SteamLauncher {
             }
         });
 
-        egui::SidePanel::left("sidebar")
+        egui::Panel::left("sidebar")
             .resizable(true)
-            .default_width(280.0)
-            .show(ctx, |ui| {
+            .default_size(280.0)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.main_tab, MainTab::Library, "Library");
                     ui.selectable_value(&mut self.main_tab, MainTab::Account, "Account");
@@ -3806,7 +3806,7 @@ impl eframe::App for SteamLauncher {
                 .resizable(true)
                 .default_size([420.0, 600.0])
                 .min_width(320.0)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.heading("Library");
@@ -4294,7 +4294,7 @@ impl eframe::App for SteamLauncher {
             self.show_settings = show_settings;
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.needs_reauth {
                 ui.heading("Authentication required");
                 ui.label("Login from the left panel to restore your Steam session.");
@@ -4310,7 +4310,7 @@ impl eframe::App for SteamLauncher {
                 self.ensure_image_requested(game.app_id);
 
                 ui.vertical(|ui| {
-                    egui::TopBottomPanel::bottom("game_status_bar").show_inside(ui, |ui| {
+                    egui::Panel::bottom("game_status_bar").show(ui, |ui| {
                         egui::ScrollArea::horizontal()
                             .id_salt("game_status_scroll")
                             .show(ui, |ui| {
@@ -4318,7 +4318,7 @@ impl eframe::App for SteamLauncher {
                             });
                     });
 
-                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("game_view_scroll")
                             .show(ui, |ui| {
@@ -4731,12 +4731,12 @@ impl eframe::App for SteamLauncher {
             }
         });
 
-        self.draw_uninstall_modal(ctx);
-        self.draw_depot_browser_window(ctx);
-        self.draw_platform_selection_modal(ctx);
-        self.draw_depot_install_selection_modal(ctx);
-        self.draw_launch_selector_modal(ctx);
-        self.draw_proton_remove_confirm_modal(ctx);
+        self.draw_uninstall_modal(ui);
+        self.draw_depot_browser_window(ui);
+        self.draw_platform_selection_modal(ui);
+        self.draw_depot_install_selection_modal(ui);
+        self.draw_launch_selector_modal(ui);
+        self.draw_proton_remove_confirm_modal(ui);
 
         // Scoped repaint policy — replaces the old unconditional
         // `ctx.request_repaint()` that forced a full frame every vsync
@@ -4757,13 +4757,13 @@ impl eframe::App for SteamLauncher {
         // With nothing pending the UI schedules no repaint and the main
         // thread goes fully idle (~0% CPU) until the next input event.
         if drained_images || drained_progress || drained_play || drained_ops {
-            ctx.request_repaint();
+            ui.request_repaint();
         }
         if !self.download_tasks.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            ui.request_repaint_after(std::time::Duration::from_millis(250));
         }
         if self.play_result_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            ui.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 }
