@@ -13,4 +13,5 @@ pub mod runner;
 pub mod steam_client;
 pub mod ui;
 pub mod utils;
+pub mod vram_guard;
 pub mod infra;

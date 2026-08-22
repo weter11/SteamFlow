@@ -33,6 +33,18 @@ struct UninstallModalState {
     delete_prefix: bool,
 }
 
+/// Pre-launch VRAM guard: a launch deferred because the GPU is nearly out of
+/// memory. "Launch anyway" re-dispatches through [`Self::begin_launch_task`]
+/// without re-running the probe.
+#[derive(Debug, Clone)]
+struct VramWarningModalState {
+    game: LibraryGame,
+    launch_info: crate::steam_client::LaunchInfo,
+    proton_path: Option<String>,
+    snapshot: crate::vram_guard::VramSnapshot,
+    threshold_pct: u32,
+}
+
 #[derive(Debug, Clone)]
 struct DepotBrowserState {
     app_id: u32,
@@ -332,6 +344,8 @@ pub struct SteamLauncher {
     user_profile: Option<UserProfile>,
     refreshing_account_data: bool,
     uninstall_modal: Option<UninstallModalState>,
+    vram_warning_modal: Option<VramWarningModalState>,
+    vram_warning_suppressed: bool,
     depot_browser: Option<DepotBrowserState>,
     platform_selection: Option<PlatformSelectionState>,
     depot_install_selection: Option<DepotInstallSelectionState>,
@@ -428,6 +442,8 @@ impl SteamLauncher {
             user_profile,
             refreshing_account_data: false,
             uninstall_modal: None,
+            vram_warning_modal: None,
+            vram_warning_suppressed: false,
             depot_browser: None,
             platform_selection: None,
             depot_install_selection: None,
@@ -1489,6 +1505,46 @@ impl SteamLauncher {
     }
 
     fn start_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
+        // Pre-launch VRAM guard: a local LLM / AI server (e.g. TabbyAPI) can
+        // occupy nearly all GPU memory, making the game's DXVK/vulkan device
+        // creation fail later with an opaque error. Probe once, warn once.
+        let threshold = self.launcher_config.vram_warn_threshold_pct;
+        if self.vram_warning_suppressed || threshold == 0 {
+            self.begin_launch_task(game, launch_info, proton_path);
+            return;
+        }
+        match crate::vram_guard::probe_vram() {
+            Ok(snapshot) => {
+                let pct = f64::from(snapshot.used_fraction()) * 100.0;
+                if pct >= f64::from(threshold) {
+                    tracing::info!(
+                        "vram_guard: {:.0}% used (>= {}%): deferring launch of {}",
+                        pct,
+                        threshold,
+                        game.name
+                    );
+                    self.vram_warning_modal = Some(VramWarningModalState {
+                        game: game.clone(),
+                        launch_info,
+                        proton_path,
+                        snapshot,
+                        threshold_pct: threshold,
+                    });
+                    return;
+                }
+            }
+            Err(err) => {
+                // No usable GPU telemetry (laptop hybrid graphics, headless,
+                // unknown vendor): never block a launch because of it.
+                tracing::debug!("vram_guard: probe unavailable, launching anyway: {err}");
+            }
+        }
+        self.begin_launch_task(game, launch_info, proton_path);
+    }
+
+    /// Actual launch dispatch. Called by [`Self::start_launch_task`] (guard
+    /// passed or suppressed) and by the VRAM warning modal ("Launch anyway").
+    fn begin_launch_task(&mut self, game: &LibraryGame, launch_info: crate::steam_client::LaunchInfo, proton_path: Option<String>) {
         // Phase 4 Task 3: remember the launch so it can be auto-retried after
         // the one-time Windows Steam login completes (cleared on success).
         self.pending_login_launch = Some(PendingLoginLaunch {
@@ -3164,6 +3220,67 @@ impl SteamLauncher {
         }
     }
 
+    fn draw_vram_warning_modal(&mut self, ui: &mut egui::Ui) {
+        let mut launch_anyway = false;
+        let mut close = false;
+        if let Some(modal) = &mut self.vram_warning_modal {
+            let used_pct = (modal.snapshot.used_fraction() * 100.0).round() as u32;
+            egui::Window::new(format!("Launch {}?", modal.game.name))
+                .collapsible(false)
+                .resizable(false)
+                .show(ui, |ui| {
+                    ui.label(format!(
+                        "GPU memory is {}% full ({} / {} MiB) — above your {}% warning \
+                         threshold, so the game may fail to start or crash.",
+                        used_pct,
+                        modal.snapshot.used_mib,
+                        modal.snapshot.total_mib,
+                        modal.threshold_pct
+                    ));
+                    if !modal.snapshot.processes.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label("Processes holding GPU memory:");
+                        for proc in modal.snapshot.processes.iter().take(5) {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "• {} (pid {}) — {} MiB",
+                                    proc.name, proc.pid, proc.mem_mib
+                                ))
+                                .monospace(),
+                            );
+                        }
+                        ui.add_space(4.0);
+                        ui.small(
+                            "Local AI / LLM servers are the usual cause. Stop them (or lower \
+                             their GPU memory reserve) before launching.",
+                        );
+                    }
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut self.vram_warning_suppressed,
+                        "Don't check again this session",
+                    );
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Launch anyway").clicked() {
+                            launch_anyway = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+        }
+
+        if launch_anyway {
+            if let Some(modal) = self.vram_warning_modal.take() {
+                self.begin_launch_task(&modal.game, modal.launch_info, modal.proton_path);
+            }
+        } else if close {
+            self.vram_warning_modal = None;
+        }
+    }
+
     fn draw_depot_browser_window(&mut self, ui: &mut egui::Ui) {
         let mut close = false;
         let mut request_refresh: Option<(u32, u32, String)> = None;
@@ -4732,6 +4849,7 @@ impl eframe::App for SteamLauncher {
         });
 
         self.draw_uninstall_modal(ui);
+        self.draw_vram_warning_modal(ui);
         self.draw_depot_browser_window(ui);
         self.draw_platform_selection_modal(ui);
         self.draw_depot_install_selection_modal(ui);
