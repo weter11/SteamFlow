@@ -145,7 +145,7 @@ impl Default for LauncherConfig {
             steam_launch_config: crate::models::SteamLaunchConfig::all_alive(),
             preferred_launch_options: HashMap::new(),
             game_configs: HashMap::new(),
-            vram_warn_threshold_pct: 90,
+            vram_warn_threshold_pct: 75,
         }
     }
 }
