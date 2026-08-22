@@ -81,6 +81,7 @@ impl DllProviderResolver {
         custom_dxvk_path: Option<&Path>,
         custom_vkd3d_path: Option<&Path>,
         custom_vkd3d_proton_path: Option<&Path>,
+        dxvk_enabled: bool,
     ) -> (Vec<DllResolution>, ComponentScanReport) {
         tracing::debug!("Resolving DLL providers. ExeDir: {}, Runner: {}", game_exe_dir.display(), runner_path.display());
         let runner_root = crate::utils::derive_runner_root(runner_path);
@@ -137,6 +138,7 @@ impl DllProviderResolver {
                 custom_dxvk_path,
                 custom_vkd3d_path,
                 custom_vkd3d_proton_path,
+                dxvk_enabled,
             ))
             .collect();
 
@@ -224,6 +226,7 @@ impl DllProviderResolver {
         custom_dxvk_path: Option<&Path>,
         custom_vkd3d_path: Option<&Path>,
         custom_vkd3d_proton_path: Option<&Path>,
+        dxvk_enabled: bool,
     ) -> DllResolution {
         let mut candidates = Vec::new();
         let dll_filename = format!("{}.dll", dll_name);
@@ -251,6 +254,7 @@ impl DllProviderResolver {
             custom_dxvk_path,
             custom_vkd3d_path,
             custom_vkd3d_proton_path,
+            dxvk_enabled,
         ) {
             candidates.push(DllCandidate {
                 provider: DllProvider::Custom,
@@ -260,7 +264,14 @@ impl DllProviderResolver {
         }
 
         // 3. Runner Priority
-        if let Some(path) = self.get_runner_dll_path(dll_name, runner_path, runner_components, d3d12_policy, target_arch) {
+        if let Some(path) = self.get_runner_dll_path(
+            dll_name,
+            runner_path,
+            runner_components,
+            d3d12_policy,
+            target_arch,
+            dxvk_enabled,
+        ) {
             candidates.push(DllCandidate {
                 provider: DllProvider::Runner,
                 path: path.clone(),
@@ -269,12 +280,16 @@ impl DllProviderResolver {
         }
 
         // 3. System Priority
-        // For now, we use a simplified check for system paths
+        // For now, we use a simplified check for system paths.
+        // dxvk_enabled=false contract: system DXVK paths must not be listed
+        // either — otherwise a runner lacking a builtin would fall back to
+        // system DXVK, defeating the WineD3D selection.
         let system_paths = match dll_name {
-            "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi" => vec![
+            "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi" if dxvk_enabled => vec![
                 "/usr/lib/dxvk/x64",
                 "/usr/lib/x86_64-linux-gnu/dxvk",
             ],
+            "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi" => vec![],
             "d3d12" | "d3d12core" | "libvkd3d-1" | "libvkd3d-shader-1" => vec![
                 "/usr/lib/vkd3d-proton/x64",
                 "/usr/lib/x86_64-linux-gnu/vkd3d-proton",
@@ -320,11 +335,18 @@ impl DllProviderResolver {
         custom_dxvk_path: Option<&Path>,
         custom_vkd3d_path: Option<&Path>,
         custom_vkd3d_proton_path: Option<&Path>,
+        dxvk_enabled: bool,
     ) -> Option<PathBuf> {
         let dll_filename = format!("{}.dll", dll_name);
         let is_dxvk = matches!(dll_name, "d3d8" | "d3d9" | "d3d10core" | "d3d11" | "dxgi");
         let is_vkd3d_proton = matches!(dll_name, "d3d12" | "d3d12core");
         let is_vkd3d = matches!(dll_name, "libvkd3d-1" | "libvkd3d-shader-1");
+
+        // dxvk_enabled=false contract: a custom DXVK path must NOT be used —
+        // the user asked for WineD3D/builtin, not for a custom DXVK build.
+        if is_dxvk && !dxvk_enabled {
+            return None;
+        }
 
         let custom_root = if is_dxvk {
             custom_dxvk_path
@@ -374,6 +396,7 @@ impl DllProviderResolver {
         components: &crate::utils::RunnerComponents,
         d3d12_policy: &crate::models::D3D12ProviderPolicy,
         target_arch: &crate::models::ExecutableArchitecture,
+        dxvk_enabled: bool,
     ) -> Option<PathBuf> {
         let runner_root = crate::utils::derive_runner_root(runner_path);
 
@@ -415,9 +438,16 @@ impl DllProviderResolver {
         if is_dxvk && components.dxvk.is_some() {
             let mut relative_paths = Vec::new();
             for lib_subdir in crate::proton::COMPONENT_LIB_SUBDIRS {
-                relative_paths.push(format!("{}/dxvk", lib_subdir));
+                if dxvk_enabled {
+                    relative_paths.push(format!("{}/dxvk", lib_subdir));
+                }
                 for (_, arch_dir) in crate::proton::ARCH_SUBDIRS {
-                    relative_paths.push(format!("{}/dxvk/{}", lib_subdir, arch_dir));
+                    if dxvk_enabled {
+                        relative_paths.push(format!("{}/dxvk/{}", lib_subdir, arch_dir));
+                    }
+                    // Plain builtin dirs (WineD3D). When dxvk_enabled=false these
+                    // are the ONLY runner paths that qualify: the DXVK subdirs
+                    // must never be resolved or provisioned for such a game.
                     relative_paths.push(format!("{}/{}", lib_subdir, arch_dir));
                 }
             }
@@ -574,7 +604,7 @@ mod tests {
         let components = crate::utils::RunnerComponents::default();
         let d3d12_policy = crate::models::D3D12ProviderPolicy::Auto;
         let arch = crate::models::ExecutableArchitecture::X86_64;
-        let (resolutions, _) = resolver.resolve(&game_dir, runner_path, &components, &d3d12_policy, &arch, None, None, None);
+        let (resolutions, _) = resolver.resolve(&game_dir, runner_path, &components, &d3d12_policy, &arch, None, None, None, true);
 
         let d3d9_res = resolutions.iter().find(|r| r.name == "d3d9").unwrap();
         assert_eq!(d3d9_res.chosen_provider, DllProvider::GameLocal);
@@ -593,7 +623,7 @@ mod tests {
         let components = crate::utils::RunnerComponents::default();
         let d3d12_policy = crate::models::D3D12ProviderPolicy::Auto;
         let arch = crate::models::ExecutableArchitecture::X86_64;
-        let (resolutions, _) = resolver.resolve(&game_dir, runner_path, &components, &d3d12_policy, &arch, None, None, None);
+        let (resolutions, _) = resolver.resolve(&game_dir, runner_path, &components, &d3d12_policy, &arch, None, None, None, true);
 
         for res in resolutions {
             if res.chosen_provider == DllProvider::System {
@@ -635,17 +665,17 @@ mod tests {
         let arch = crate::models::ExecutableArchitecture::X86_64;
 
         // Case 1: Auto (Prefer Proton)
-        let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Auto, &arch, None, None, None);
+        let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Auto, &arch, None, None, None, true);
         let d3d12 = res.iter().find(|r| r.name == "d3d12").unwrap();
         assert_eq!(d3d12.chosen_path.as_ref().unwrap(), &proton_dll);
 
         // Case 2: Explicit Wine
-        let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Vkd3dWine, &arch, None, None, None);
+        let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Vkd3dWine, &arch, None, None, None, true);
         let d3d12 = res.iter().find(|r| r.name == "d3d12").unwrap();
         assert_eq!(d3d12.chosen_path.as_ref().unwrap(), &wine_dll);
 
         // Case 3: Explicit Proton
-        let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Vkd3dProton, &arch, None, None, None);
+        let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Vkd3dProton, &arch, None, None, None, true);
         let d3d12 = res.iter().find(|r| r.name == "d3d12").unwrap();
         assert_eq!(d3d12.chosen_path.as_ref().unwrap(), &proton_dll);
     }
@@ -661,7 +691,7 @@ mod tests {
         let resolver = DllProviderResolver::new();
         let tmp = tempdir().unwrap();
         let arch = crate::models::ExecutableArchitecture::X86_64;
-        let (res, _) = resolver.resolve(tmp.path(), tmp.path(), &crate::utils::RunnerComponents::default(), &crate::models::D3D12ProviderPolicy::Auto, &arch, None, None, None);
+        let (res, _) = resolver.resolve(tmp.path(), tmp.path(), &crate::utils::RunnerComponents::default(), &crate::models::D3D12ProviderPolicy::Auto, &arch, None, None, None, true);
         let d3d11 = res.iter().find(|r| r.name == "d3d11").unwrap();
         assert_eq!(d3d11.chosen_provider, DllProvider::None);
         assert!(d3d11.fallback_reason.is_some());
@@ -693,7 +723,7 @@ mod tests {
         let game_dir = Path::new("/tmp/game");
         let arch = crate::models::ExecutableArchitecture::X86_64;
 
-        let (res, report) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Auto, &arch, None, None, None);
+        let (res, report) = resolver.resolve(game_dir, &runner_root, &components, &crate::models::D3D12ProviderPolicy::Auto, &arch, None, None, None, true);
 
         let d3d11_res = res.iter().find(|r| r.name == "d3d11").unwrap();
         assert_eq!(d3d11_res.chosen_provider, DllProvider::Runner);
@@ -705,5 +735,80 @@ mod tests {
 
         // Check if report scan roots include the new unified path
         assert!(report.scan_roots.iter().any(|p| p.to_string_lossy().contains("files/lib/wine/x86_64-windows")));
+    }
+
+    #[test]
+    fn test_dxvk_disabled_resolves_builtin_not_dxvk() {
+        // Classic layout: runner ships BOTH the DXVK build (dxvk/ subdir) and
+        // the plain WineD3D builtin. dxvk_enabled=false must resolve to the
+        // builtin; dxvk_enabled=true must resolve to the DXVK build.
+        let tmp = tempdir().unwrap();
+        let runner_root = tmp.path().to_path_buf();
+        let dxvk_dir = runner_root.join("files/lib/wine/dxvk/i386-windows");
+        let builtin_dir = runner_root.join("files/lib/wine/i386-windows");
+        fs::create_dir_all(&dxvk_dir).unwrap();
+        fs::create_dir_all(&builtin_dir).unwrap();
+        let dxvk_dll = dxvk_dir.join("d3d9.dll");
+        let builtin_dll = builtin_dir.join("d3d9.dll");
+        fs::write(&dxvk_dll, "dxvk build").unwrap();
+        fs::write(&builtin_dll, "wined3d builtin").unwrap();
+
+        let mut components = crate::utils::RunnerComponents::default();
+        components.dxvk = Some(crate::utils::ComponentInfo {
+            version: "2.3".into(),
+            source: crate::utils::ComponentSource::BundledWithRunner,
+            path: None,
+        });
+
+        let resolver = DllProviderResolver::new();
+        let game_dir = Path::new("/tmp/game");
+        let arch = crate::models::ExecutableArchitecture::X86;
+        let policy = crate::models::D3D12ProviderPolicy::Auto;
+
+        // DXVK disabled → builtin WineD3D DLL, never the dxvk/ subdir.
+        let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &policy, &arch, None, None, None, false);
+        let d3d9 = res.iter().find(|r| r.name == "d3d9").unwrap();
+        assert_eq!(d3d9.chosen_provider, DllProvider::Runner);
+        let chosen = d3d9.chosen_path.as_ref().unwrap().to_string_lossy().to_string();
+        assert!(chosen.ends_with("files/lib/wine/i386-windows/d3d9.dll"), "expected builtin path, got {chosen}");
+        assert!(!chosen.contains("/dxvk/"), "dxvk_enabled=false must not resolve the dxvk subdir: {chosen}");
+        assert!(d3d9.candidates.iter().all(|c| !c.path.to_string_lossy().contains("/dxvk/")),
+            "dxvk_enabled=false must not even list dxvk candidates");
+
+        // DXVK enabled → DXVK build wins (regression guard).
+        let (res, _) = resolver.resolve(game_dir, &runner_root, &components, &policy, &arch, None, None, None, true);
+        let d3d9 = res.iter().find(|r| r.name == "d3d9").unwrap();
+        let chosen = d3d9.chosen_path.as_ref().unwrap().to_string_lossy().to_string();
+        assert!(chosen.contains("/dxvk/"), "dxvk_enabled=true should resolve the dxvk subdir, got {chosen}");
+    }
+
+    #[test]
+    fn test_dxvk_disabled_ignores_custom_dxvk_path() {
+        let tmp = tempdir().unwrap();
+        // get_custom_dll_path expects arch subdirs directly under the custom
+        // dxvk root (i386-windows / x86_64-windows / x64 / x32 / "").
+        let custom = tmp.path().join("i386-windows");
+        fs::create_dir_all(&custom).unwrap();
+        let custom_dll = custom.join("d3d9.dll");
+        fs::write(&custom_dll, "custom dxvk").unwrap();
+
+        let resolver = DllProviderResolver::new();
+        let game_dir = Path::new("/tmp/game");
+        let runner_root = Path::new("/tmp/fake_runner");
+        let arch = crate::models::ExecutableArchitecture::X86;
+        let policy = crate::models::D3D12ProviderPolicy::Auto;
+        let components = crate::utils::RunnerComponents::default();
+
+        // dxvk_enabled=false: the custom DXVK path must be ignored entirely.
+        let (res, _) = resolver.resolve(game_dir, runner_root, &components, &policy, &arch, Some(tmp.path()), None, None, false);
+        let d3d9 = res.iter().find(|r| r.name == "d3d9").unwrap();
+        assert_ne!(d3d9.chosen_provider, DllProvider::Custom, "custom dxvk path must be ignored when dxvk_enabled=false");
+        assert!(d3d9.candidates.iter().all(|c| c.provider != DllProvider::Custom));
+
+        // dxvk_enabled=true: custom path is honored as before.
+        let (res, _) = resolver.resolve(game_dir, runner_root, &components, &policy, &arch, Some(tmp.path()), None, None, true);
+        let d3d9 = res.iter().find(|r| r.name == "d3d9").unwrap();
+        assert_eq!(d3d9.chosen_provider, DllProvider::Custom);
+        assert_eq!(d3d9.chosen_path.as_ref().unwrap(), &custom_dll);
     }
 }

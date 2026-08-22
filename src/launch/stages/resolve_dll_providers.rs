@@ -113,6 +113,10 @@ impl PipelineStage for ResolveDllProvidersStage {
             custom_dxvk,
             custom_vkd3d,
             custom_vkd3d_proton,
+            ctx.user_config
+                .as_ref()
+                .map(|c| c.graphics_layers.dxvk_enabled)
+                .unwrap_or(false),
         );
 
         if !nvapi_enabled {

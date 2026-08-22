@@ -33,6 +33,7 @@ fn test_dll_resolution_report_includes_runner_candidates() {
         None,
         None,
         None,
+        true,
     );
 
     let d3d11 = resolutions.iter().find(|r| r.name == "d3d11").unwrap();

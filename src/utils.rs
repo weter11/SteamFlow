@@ -1751,14 +1751,22 @@ pub fn build_dll_overrides(
             // does not export. Loading builtin d3d11 against native dxgi yields
             // null imports -> broken D3D11 device -> crash (Portal 2, RE2).
             // Only push when the DXVK branch (above) hasn't already done so.
-            for stem in &["d3d8", "d3d9", "d3d10core", "d3d11"] {
-                if game_has(&format!("{stem}.dll")) {
-                    // Game ships its own copy — keep game-local priority.
-                    continue;
-                }
-                let entry = format!("{stem}=n,b");
-                if !overrides.iter().any(|o| o.starts_with(&format!("{stem}="))) {
-                    overrides.push(entry);
+            //
+            // CRITICAL (dxvk_enabled=false contract): the d3d8/d3d9/d3d10core/
+            // d3d11 "=n,b" entries hand the game the runner's DXVK DLLs (the
+            // proton script installs them into the prefix by default). When
+            // DXVK is disabled they must NOT be emitted — Wine then loads its
+            // builtin WineD3D DLLs, which is what dxvk_enabled=false promises.
+            if dxvk_active {
+                for stem in &["d3d8", "d3d9", "d3d10core", "d3d11"] {
+                    if game_has(&format!("{stem}.dll")) {
+                        // Game ships its own copy — keep game-local priority.
+                        continue;
+                    }
+                    let entry = format!("{stem}=n,b");
+                    if !overrides.iter().any(|o| o.starts_with(&format!("{stem}="))) {
+                        overrides.push(entry);
+                    }
                 }
             }
         }
@@ -2485,5 +2493,35 @@ mod versions_txt_tests {
         // Nothing harvestable → no VERSIONS.txt written.
         assert!(!write_runner_versions_txt(root, ""));
         assert!(!root.join("VERSIONS.txt").exists());
+    }
+
+    #[test]
+    fn test_build_dll_overrides_dxvk_disabled_no_d3d9_native_override() {
+        use crate::utils::build_dll_overrides;
+
+        // dxvk_enabled=false + runner ships VKD3D-Proton (the purepe case that
+        // used to leak d3d9=n,b and activate DXVK against the user's explicit
+        // dxvk_enabled=false): d3d9/d3d11 must NOT get native overrides.
+        let off = build_dll_overrides(false, true, false, false, false, None, false, None);
+        assert!(!off.contains("d3d9=n"), "dxvk disabled must not emit d3d9=n,b: {off}");
+        assert!(!off.contains("d3d11=n"), "dxvk disabled must not emit d3d11=n,b: {off}");
+        assert!(!off.contains("d3d8=n"), "dxvk disabled must not emit d3d8=n,b: {off}");
+        assert!(!off.contains("d3d10core=n"), "dxvk disabled must not emit d3d10core=n,b: {off}");
+        // VKD3D-Proton pairing (d3d12 + dxgi) stays — needed for D3D12 games.
+        assert!(off.contains("d3d12=n,b"), "d3d12 pairing must stay: {off}");
+        assert!(off.contains("dxgi=n,b"), "dxgi pairing must stay: {off}");
+
+        // dxvk_enabled=true + VKD3D-Proton: full DXVK pairing (regression guard).
+        let on = build_dll_overrides(true, true, false, false, false, None, false, None);
+        assert!(on.contains("d3d9=n,b"), "dxvk enabled must emit d3d9=n,b: {on}");
+        assert!(on.contains("d3d11=n,b"), "dxvk enabled must emit d3d11=n,b: {on}");
+        assert!(on.contains("dxgi=n,b"), "dxvk enabled must emit dxgi=n,b: {on}");
+
+        // Game-local d3d9 (e.g. Portal 2 RTX Remix bin/d3d9.dll) must still win.
+        let game = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(game.path().join("bin")).unwrap();
+        std::fs::write(game.path().join("bin/d3d9.dll"), "remix runtime").unwrap();
+        let local = build_dll_overrides(true, true, false, false, false, Some(game.path()), false, None);
+        assert!(!local.contains("d3d9=n,b"), "game-local d3d9 must not be overridden: {local}");
     }
 }
