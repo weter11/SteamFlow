@@ -106,6 +106,10 @@ pub struct LauncherConfig {
     pub preferred_launch_options: HashMap<u32, String>,
     #[serde(default)]
     pub game_configs: HashMap<u32, GameConfig>,
+    /// Pre-launch VRAM guard: warn when GPU memory usage exceeds this
+    /// percentage of total VRAM. Set to 0 to disable the warning entirely.
+    #[serde(default)]
+    pub vram_warn_threshold_pct: u32,
 }
 
 impl LauncherConfig {
@@ -141,6 +145,7 @@ impl Default for LauncherConfig {
             steam_launch_config: crate::models::SteamLaunchConfig::all_alive(),
             preferred_launch_options: HashMap::new(),
             game_configs: HashMap::new(),
+            vram_warn_threshold_pct: 90,
         }
     }
 }
