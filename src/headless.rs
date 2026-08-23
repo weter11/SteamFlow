@@ -276,8 +276,8 @@ pub async fn test_download_proton(args: &[String]) -> Result<()> {
         }
     }
     let connection = client
-        .connection()
-        .cloned()
+        .get_active_connection()
+        .await
         .context("no steam connection — is a session saved?")?;
 
     println!("== stage 1: PICS appinfo for appid {appid}");
