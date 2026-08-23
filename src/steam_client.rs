@@ -13,6 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,17 +49,6 @@ use steam_vent::proto::steammessages_player_steamclient::{
 use steam_vent::{ConnectionError, ConnectionTrait, ServerList};
 use tokio::io::{duplex, sink, AsyncWriteExt};
 use tokio::sync::mpsc::Receiver;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginState {
-    Connected,
-    AwaitingCredentialSession,
-    AwaitingGuardConfirmation,
-    AwaitingPollResult,
-    AwaitingAccessTokenLogon,
-    Complete,
-    Offline,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchTarget {
@@ -127,83 +117,214 @@ pub struct AccountData {
     pub vac_banned_apps: Vec<u32>,
 }
 
+/// Mutable CM-session state shared behind a mutex so any caller holding only
+/// `&SteamClient` (UI task, background download task, headless CLI) can obtain
+/// or repair the connection. `Connection` is cheaply clonable (shared socket +
+/// message filter), so handing out clones is safe.
+#[derive(Default)]
+struct ConnectionState {
+    connection: Option<Connection>,
+    /// Set when we observe the CM transport die (WebSocket reset without
+    /// closing handshake, heartbeat AlreadyClosed, job EOF). A set flag makes
+    /// the held `connection` a zombie: the next `get_active_connection()`
+    /// drops it and transparently re-authenticates.
+    dead: bool,
+    dead_since: Option<Instant>,
+}
+
 #[derive(Clone)]
 pub struct SteamClient {
-    connection: Option<Connection>,
-    state: LoginState,
-    connected_at: Option<Instant>,
-    active_cm: Option<SocketAddr>,
-    server_list: Option<ServerList>,
-    pending_confirmations: Vec<ConfirmationPrompt>,
-    /// Set the moment we observe the CM connection drop (Steam resets the
-    /// WebSocket, or a heartbeat send fails with AlreadyClosed). A set value
-    /// means the held `connection` is a zombie and must be dropped + reconnected
-    /// before the next CM call, instead of being reused (which would otherwise
-    /// keep erroring with "Failed to send heartbeat: AlreadyClosed").
-    connection_dead_since: Option<Instant>,
+    /// Live CM session state; see [`ConnectionState`].
+    inner: Arc<tokio::sync::Mutex<ConnectionState>>,
+    server_list: Arc<std::sync::Mutex<Option<ServerList>>>,
+    /// True once a usable Steam session exists (post login/restore/reconnect).
+    has_session: Arc<AtomicBool>,
+    /// True when SteamFlow entered offline mode (cached library only).
+    offline: Arc<AtomicBool>,
+    connected_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    active_cm: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    pending_confirmations: Arc<std::sync::Mutex<Vec<ConfirmationPrompt>>>,
 }
 
 impl SteamClient {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            connection: None,
-            state: LoginState::Connected,
-            connected_at: None,
-            active_cm: None,
-            server_list: None,
-            pending_confirmations: Vec::new(),
-            connection_dead_since: None,
+            inner: Arc::new(tokio::sync::Mutex::new(ConnectionState::default())),
+            server_list: Arc::new(std::sync::Mutex::new(None)),
+            has_session: Arc::new(AtomicBool::new(false)),
+            offline: Arc::new(AtomicBool::new(false)),
+            connected_at: Arc::new(std::sync::Mutex::new(None)),
+            active_cm: Arc::new(std::sync::Mutex::new(None)),
+            pending_confirmations: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
     pub fn is_authenticated(&self) -> bool {
-        // A connection marked dead (Steam reset the WebSocket / heartbeat failed with
-        // AlreadyClosed) is a zombie and must not be treated as usable; callers that
-        // hold &mut self should call connection_or_reconnect() to transparently recover.
-        self.connection.is_some() && self.connection_dead_since.is_none()
+        // With the self-healing accessor (`get_active_connection`) a dropped
+        // CM socket no longer means permanent log-out: the next guarded call
+        // re-authenticates from the persisted refresh token. What matters here
+        // is whether we HAVE a usable session credential and are not in
+        // offline mode.
+        self.has_session.load(Ordering::Relaxed) && !self.is_offline()
     }
 
     pub fn is_offline(&self) -> bool {
-        self.state == LoginState::Offline
+        self.offline.load(Ordering::Relaxed)
     }
 
-    pub fn connection(&self) -> Option<&Connection> {
-        self.connection.as_ref()
+    /// Legacy peek at the live connection. Prefer [`Self::get_active_connection`].
+    pub fn connection(&self) -> Option<Connection> {
+        self.inner.try_lock().ok()?.connection.clone()
+    }
+
+    /// True when the last observed CM socket state was "reset" and no
+    /// successful re-authentication has happened since. Used by the sync
+    /// (non-async) download path to fail fast instead of hanging.
+    pub fn is_connection_dead(&self) -> bool {
+        self.inner.try_lock().map(|guard| guard.dead).unwrap_or(false)
     }
 
     /// Mark the held CM connection as dead. Called when we observe a transport
-    /// reset (Steam rotates connection managers, or the WebSocket is closed with
-    /// ResetWithoutClosingHandshake / AlreadyClosed). The next guarded CM call
-    /// will drop the zombie handle and transparently reconnect.
-    pub fn mark_connection_dead(&mut self) {
-        if self.connection_dead_since.is_none() {
-            self.connection_dead_since = Some(Instant::now());
+    /// reset (Steam rotates connection managers, or the WebSocket is closed
+    /// with ResetWithoutClosingHandshake / AlreadyClosed). Uses `try_lock`
+    /// because callers are frequently inside error-handling paths; if the
+    /// state mutex is contended, the next `get_active_connection()` will
+    /// observe and repair the zombie anyway.
+    pub fn mark_connection_dead(&self) {
+        if let Ok(mut guard) = self.inner.try_lock() {
+            if !guard.dead {
+                guard.dead = true;
+                guard.dead_since = Some(Instant::now());
+            }
+            guard.connection = None;
         }
-        self.connection = None;
     }
 
-    /// Return a live connection, transparently reconnecting if the previous one
-    /// was marked dead (Steam reset it). This prevents callers from reusing a
-    /// closed socket and stops the repeated "Failed to send heartbeat" spam.
-    pub async fn connection_or_reconnect(&mut self) -> Result<&Connection> {
-        if self.connection.is_none() {
-            self.connect().await?;
-        }
-        self.connection
-            .as_ref()
-            .context("steam connection not initialized")
+    fn is_transport_error(err: &anyhow::Error) -> bool {
+        Self::is_transport_error_public(err)
     }
 
+    /// Public mirror of [`Self::is_transport_error`] for tests.
+    #[doc(hidden)]
+    pub fn is_transport_error_public(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            let text = cause.to_string();
+            // ResetWithoutClosingHandshake: WebSocket torn down by the CM.
+            // AlreadyClosed: heartbeat/sender hitting the closed socket.
+            // EOF: job waiter whose read-loop died with the connection.
+            text.contains("ResetWithoutClosingHandshake")
+                || text.contains("AlreadyClosed")
+                || text.contains("EOF")
+        })
+    }
+
+    /// Return a live, logged-in connection — re-authenticating from the
+    /// persisted refresh token if the previous one died. This is the ONE
+    /// accessor all CM-touching code paths should use.
+    pub async fn get_active_connection(&self) -> Result<Connection> {
+        let mut guard = self.inner.lock().await;
+        self.active_connection_locked(&mut guard).await
+    }
+
+    /// Compatibility alias for [`Self::get_active_connection`].
+    pub async fn connection_or_reconnect(&self) -> Result<Connection> {
+        self.get_active_connection().await
+    }
+
+    /// Core of `get_active_connection`; caller must hold the state mutex.
+    async fn active_connection_locked(&self, guard: &mut ConnectionState) -> Result<Connection> {
+        if let Some(connection) = &guard.connection {
+            if !guard.dead {
+                return Ok(connection.clone());
+            }
+            tracing::info!(
+                idle_secs = guard
+                    .dead_since
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0),
+                "CM connection marked dead; re-authenticating from refresh token"
+            );
+        }
+
+        let persisted = load_session()
+            .await
+            .context("failed loading persisted Steam session")?;
+        let account_name = persisted
+            .account_name
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("no persisted account_name found"))?;
+        let refresh_token = persisted
+            .refresh_token
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("no persisted refresh_token found"))?;
+
+        let server_list = self.resolve_server_list().await?;
+        let connection = Connection::access(&server_list, &account_name, &refresh_token)
+            .await
+            .map_err(|e| anyhow!(e))
+            .context("refresh token re-authentication failed")?;
+
+        // Persist the rotated token pair so restarts never replay a consumed
+        // refresh token.
+        if let Some(session) =
+            Self::session_state_from(&connection, account_name.clone())
+        {
+            save_session(&session).await.ok();
+        }
+
+        guard.connection = Some(connection.clone());
+        guard.dead = false;
+        guard.dead_since = None;
+        *self.connected_at.lock().unwrap() = Some(Instant::now());
+        self.has_session.store(true, Ordering::Relaxed);
+
+        tracing::info!("CM connection restored via refresh-token re-authentication");
+        Ok(connection)
+    }
+
+    /// Run `op` on a healthy connection. If the operation fails with a CM
+    /// transport error (reset WebSocket, closed socket, EOF on the job
+    /// waiter), mark the connection dead, transparently re-authenticate, and
+    /// retry the operation ONCE on the fresh connection.
+    pub(crate) async fn with_healthy_connection<T, F, Fut>(&self, op: F) -> Result<T>
+    where
+        F: Fn(Connection) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let connection = self.get_active_connection().await?;
+        match op(connection.clone()).await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if !Self::is_transport_error(&err) {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    error = %err,
+                    "CM transport failure on job call; marking connection dead and retrying once"
+                );
+                self.mark_connection_dead();
+                let fresh = self.get_active_connection().await?;
+                op(fresh).await
+            }
+        }
+    }
     pub async fn logout(&mut self) -> Result<()> {
-        self.connection = None;
-        self.connection_dead_since = None;
-        self.state = LoginState::Connected;
+        {
+            let mut guard = self.inner.lock().await;
+            guard.connection = None;
+            guard.dead = false;
+            guard.dead_since = None;
+        }
+        self.has_session.store(false, Ordering::Relaxed);
+        self.offline.store(false, Ordering::Relaxed);
         delete_session().await?;
         Ok(())
     }
 
     pub async fn get_app_ticket(&self, appid: u32) -> Result<Vec<u8>> {
-        let connection = self.connection.as_ref().context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
 
         let mut request = CMsgClientGetAppOwnershipTicket::new();
         request.set_app_id(appid);
@@ -219,7 +340,7 @@ impl SteamClient {
     }
 
     pub async fn get_account_data(&self) -> AccountData {
-        let Some(connection) = self.connection.as_ref() else {
+        let Some(connection) = self.connection() else {
             return AccountData::default();
         };
 
@@ -246,12 +367,12 @@ impl SteamClient {
         data
     }
 
-    pub fn pending_confirmations(&self) -> &[ConfirmationPrompt] {
-        &self.pending_confirmations
+    pub fn pending_confirmations(&self) -> Vec<ConfirmationPrompt> {
+        self.pending_confirmations.lock().unwrap().clone()
     }
 
     pub fn clear_pending_confirmations(&mut self) {
-        self.pending_confirmations.clear();
+        self.pending_confirmations.lock().unwrap().clear();
     }
 
     pub fn is_auth_error_text(message: &str) -> bool {
@@ -266,9 +387,8 @@ impl SteamClient {
     pub async fn connect(&mut self) -> Result<()> {
         match self.resolve_server_list().await {
             Ok(server_list) => {
-                self.active_cm = Some(server_list.pick());
-                self.connected_at = Some(Instant::now());
-                self.state = LoginState::Connected;
+                *self.active_cm.lock().unwrap() = Some(server_list.pick());
+                *self.connected_at.lock().unwrap() = Some(Instant::now());
                 Ok(())
             }
             Err(err) => {
@@ -281,14 +401,14 @@ impl SteamClient {
         }
     }
 
-    async fn resolve_server_list(&mut self) -> Result<ServerList> {
-        if let Some(existing) = &self.server_list {
-            return Ok(existing.clone());
+    async fn resolve_server_list(&self) -> Result<ServerList> {
+        if let Some(existing) = self.server_list.lock().unwrap().clone() {
+            return Ok(existing);
         }
 
         match ServerList::discover().await {
             Ok(list) => {
-                self.server_list = Some(list.clone());
+                *self.server_list.lock().unwrap() = Some(list.clone());
                 Ok(list)
             }
             Err(_) => {
@@ -304,34 +424,40 @@ impl SteamClient {
 
                 let list = ServerList::new(tcp_servers, ws_servers)
                     .context("failed constructing fallback server list")?;
-                self.server_list = Some(list.clone());
+                *self.server_list.lock().unwrap() = Some(list.clone());
                 Ok(list)
             }
         }
     }
 
-    async fn try_enter_offline_mode(&mut self) -> Result<bool> {
+    async fn try_enter_offline_mode(&self) -> Result<bool> {
         let cache_path = library_cache_path()?;
         if cache_path.exists() {
-            self.state = LoginState::Offline;
-            self.connection = None;
+            self.offline.store(true, Ordering::Relaxed);
+            self.inner.lock().await.connection = None;
             return Ok(true);
         }
         Ok(false)
     }
 
     pub fn invalidate_session(&mut self) {
-        self.connection = None;
-        self.connection_dead_since = None;
-        self.state = LoginState::Connected;
+        // Synchronous best-effort: clears the zombie flag and drops the
+        // connection handle; the next get_active_connection() re-authenticates.
+        if let Ok(mut guard) = self.inner.try_lock() {
+            guard.connection = None;
+            guard.dead = false;
+            guard.dead_since = None;
+        }
+        self.has_session.store(false, Ordering::Relaxed);
+        self.offline.store(false, Ordering::Relaxed);
     }
 
     pub fn connected_seconds(&self) -> Option<u64> {
-        self.connected_at.map(|v| v.elapsed().as_secs())
+        self.connected_at.lock().unwrap().map(|v| v.elapsed().as_secs())
     }
 
     pub fn active_cm(&self) -> Option<SocketAddr> {
-        self.active_cm
+        *self.active_cm.lock().unwrap()
     }
 
     pub async fn restore_session(&mut self) -> Result<SessionState> {
@@ -351,20 +477,26 @@ impl SteamClient {
         if self.is_offline() {
             bail!("offline mode: using cached library");
         }
-        self.state = LoginState::AwaitingAccessTokenLogon;
 
         let server_list = self.resolve_server_list().await?;
         let connection = Connection::access(&server_list, &account_name, &refresh_token)
             .await
+            .map_err(|e| anyhow!(e))
             .context("refresh token login failed")?;
 
-        self.connection = Some(connection);
-        let session = self
-            .session_from_connection(account_name)
-            .context("refresh token login succeeded but no token was available for persistence")?;
+        {
+            let mut guard = self.inner.lock().await;
+            guard.connection = Some(connection.clone());
+            guard.dead = false;
+            guard.dead_since = None;
+        }
+        self.has_session.store(true, Ordering::Relaxed);
+
+        let session =
+            Self::session_state_from(&connection, account_name).context(
+                "refresh token login succeeded but no token was available for persistence",
+            )?;
         save_session(&session).await?;
-        self.state = LoginState::Complete;
-        self.pending_confirmations.clear();
         Ok(session)
     }
 
@@ -379,12 +511,7 @@ impl SteamClient {
             bail!("offline mode: using cached library");
         }
 
-        self.state = LoginState::AwaitingCredentialSession;
         let server_list = self.resolve_server_list().await?;
-
-        self.state = LoginState::AwaitingGuardConfirmation;
-        self.state = LoginState::AwaitingPollResult;
-        self.state = LoginState::AwaitingAccessTokenLogon;
 
         let login_result = if let Some(code) = guard_code.filter(|v| !v.trim().is_empty()) {
             let (mut writer, reader) = duplex(64);
@@ -419,25 +546,29 @@ impl SteamClient {
         let connection = match login_result {
             Ok(connection) => connection,
             Err(ConnectionError::UnsupportedConfirmationAction(methods)) => {
-                self.pending_confirmations =
+                *self.pending_confirmations.lock().unwrap() =
                     methods.iter().map(map_confirmation).collect::<Vec<_>>();
                 bail!("Steam Guard confirmation required")
             }
             Err(other) => return Err(anyhow!(other)).context("steam-vent login flow failed"),
         };
 
-        self.connection = Some(connection);
-        let session = self
-            .session_from_connection(account_name)
+        {
+            let mut guard = self.inner.lock().await;
+            guard.connection = Some(connection.clone());
+            guard.dead = false;
+            guard.dead_since = None;
+        }
+        self.has_session.store(true, Ordering::Relaxed);
+
+        let session = Self::session_state_from(&connection, account_name)
             .context("login succeeded but no token was available for persistence")?;
         save_session(&session).await?;
-        self.state = LoginState::Complete;
-        self.pending_confirmations.clear();
+        self.pending_confirmations.lock().unwrap().clear();
         Ok(session)
     }
 
-    fn session_from_connection(&self, account_name: String) -> Option<SessionState> {
-        let connection = self.connection.as_ref()?;
+    fn session_state_from(connection: &Connection, account_name: String) -> Option<SessionState> {
         let steam_id = u64::from(connection.steam_id());
         Some(SessionState {
             account_name: Some(account_name),
@@ -448,61 +579,56 @@ impl SteamClient {
     }
 
     pub async fn fetch_branches(&self, appid: u32) -> Result<Vec<String>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        self.with_healthy_connection(move |connection| async move {
+            let mut request = CMsgClientPICSProductInfoRequest::new();
+            request
+                .apps
+                .push(cmsg_client_picsproduct_info_request::AppInfo {
+                    appid: Some(appid),
+                    ..Default::default()
+                });
 
-        let mut request = CMsgClientPICSProductInfoRequest::new();
-        request
-            .apps
-            .push(cmsg_client_picsproduct_info_request::AppInfo {
-                appid: Some(appid),
-                ..Default::default()
-            });
+            let response: CMsgClientPICSProductInfoResponse = connection
+                .job(request)
+                .await
+                .context("failed requesting appinfo product info for branches")?;
 
-        let response: CMsgClientPICSProductInfoResponse = connection
-            .job(request)
-            .await
-            .context("failed requesting appinfo product info for branches")?;
+            let app = response
+                .apps
+                .iter()
+                .find(|entry| entry.appid() == appid)
+                .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
 
-        let app = response
-            .apps
-            .iter()
-            .find(|entry| entry.appid() == appid)
-            .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
+            let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+            let parsed: AppInfoRoot =
+                parse_appinfo(&appinfo_vdf).context("failed parsing appinfo VDF")?;
 
-        let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        let parsed: AppInfoRoot =
-            parse_appinfo(&appinfo_vdf).context("failed parsing appinfo VDF")?;
+            let branches = parsed
+                .appinfo
+                .map(|node| node.branches)
+                .unwrap_or(parsed.branches);
 
-        let branches = parsed
-            .appinfo
-            .map(|node| node.branches)
-            .unwrap_or(parsed.branches);
+            let mut names: Vec<String> = branches
+                .into_iter()
+                .filter(|(_, node)| node.pwdrequired.is_none()) // Ignore private
+                .map(|(name, _)| name)
+                .collect();
 
-        let mut names: Vec<String> = branches
-            .into_iter()
-            .filter(|(_, node)| node.pwdrequired.is_none()) // Ignore private
-            .map(|(name, _)| name)
-            .collect();
+            if !names.contains(&"public".to_string()) {
+                names.push("public".to_string());
+            }
 
-        if !names.contains(&"public".to_string()) {
-            names.push("public".to_string());
-        }
-
-        names.sort();
-        Ok(names)
+            names.sort();
+            Ok(names)
+        })
+        .await
     }
 
     pub async fn get_available_platforms(
         &mut self,
         appid: u32,
     ) -> Result<(Vec<DepotPlatform>, Vec<u8>)> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
 
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
@@ -592,11 +718,7 @@ impl SteamClient {
         filter_depots: Option<Vec<u64>>,
         shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
     ) -> Result<Receiver<DownloadProgress>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .cloned()
-            .context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
 
         let cfg = load_launcher_config().await?;
         let library_root = cfg.steam_library_path.clone();
@@ -1169,7 +1291,7 @@ impl SteamClient {
     }
 
     pub async fn get_content_servers(&self, cell_id: u32) -> Result<Vec<String>> {
-        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let connection = self.get_active_connection().await?;
         let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
         request.set_cell_id(cell_id);
         request.set_max_servers(20);
@@ -1200,7 +1322,7 @@ impl SteamClient {
         depot_id: u32,
         manifest_id: u64,
     ) -> Result<u64> {
-        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let connection = self.get_active_connection().await?;
         let mut request = CContentServerDirectory_GetManifestRequestCode_Request::new();
         request.set_app_id(app_id);
         request.set_depot_id(depot_id);
@@ -1220,7 +1342,7 @@ impl SteamClient {
         depot_id: u32,
         host_name: &str,
     ) -> Result<String> {
-        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
+        let connection = self.get_active_connection().await?;
         let mut request = CMsgClientGetCDNAuthToken::new();
         request.set_depot_id(depot_id);
         request.set_host_name(host_name.to_string());
@@ -1246,10 +1368,7 @@ impl SteamClient {
     }
 
     pub async fn get_depot_list(&self, app_id: u32) -> Result<Vec<DepotInfo>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
 
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
@@ -1346,10 +1465,7 @@ impl SteamClient {
     }
 
     pub async fn get_depot_key(&self, app_id: u32, depot_id: u32) -> Result<Vec<u8>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
         let mut request = CMsgClientGetDepotDecryptionKey::new();
         request.set_depot_id(depot_id);
         request.set_app_id(app_id);
@@ -1369,13 +1485,17 @@ impl SteamClient {
         tracing::info!("Verifying ownership for {} depots...", depot_ids.len());
         let mut results = HashMap::new();
 
-        let connection = match self.connection.as_ref() {
-            Some(c) => c,
-            None => {
-                for id in depot_ids { results.insert(id, false); }
+        let connection = match self.get_active_connection().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(app_id, error = %e, "depot ownership check skipped: no CM connection");
+                for id in depot_ids {
+                    results.insert(id, false);
+                }
                 return results;
             }
         };
+        let connection = &connection;
 
         // 1. Ensure we have an App Ticket (Warm up session)
         let _ = self.get_app_ticket(app_id).await;
@@ -1403,11 +1523,8 @@ impl SteamClient {
     }
 
     pub async fn fetch_depots(&self, appid: u32) -> Result<Vec<BrowserDepotInfo>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
-        depot_browser::fetch_depots(connection, appid).await
+        let connection = self.get_active_connection().await?;
+        depot_browser::fetch_depots(&connection, appid).await
     }
 
     pub async fn fetch_manifest_files(
@@ -1416,13 +1533,18 @@ impl SteamClient {
         depot_id: u32,
         manifest_ref: &str,
     ) -> Result<Vec<ManifestFileEntry>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
-        depot_browser::fetch_manifest_files(connection, appid, depot_id, manifest_ref).await
+        let connection = self.get_active_connection().await?;
+        depot_browser::fetch_manifest_files(&connection, appid, depot_id, manifest_ref).await
     }
 
+    /// Synchronous single-file download for the depot browser UI.
+    ///
+    /// NOTE: this path cannot transparently re-authenticate — it peeks at the
+    /// current connection without blocking on the reconnect mutex (the caller
+    /// runs on the sync side of the UI). If no connection exists, or the
+    /// socket was marked dead after a CM reset, the download fails fast with
+    /// a clear message instead of hanging; the user retries after the client
+    /// has reconnected.
     pub fn download_single_file(
         &self,
         appid: u32,
@@ -1432,11 +1554,13 @@ impl SteamClient {
         output_dir: &Path,
     ) -> Result<()> {
         let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+            .connection()
+            .context("no active steam connection — wait for reconnection and retry")?;
+        if self.is_connection_dead() {
+            bail!("steam connection was reset — wait for reconnection and retry");
+        }
         depot_browser::download_single_file(
-            connection,
+            &connection,
             appid,
             depot_id,
             manifest_ref,
@@ -1446,10 +1570,7 @@ impl SteamClient {
     }
 
     pub async fn fetch_owned_games(&mut self) -> Result<Vec<OwnedGame>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
 
         let request = CPlayer_GetOwnedGames_Request {
             steamid: Some(u64::from(connection.steam_id())),
@@ -1555,7 +1676,7 @@ impl SteamClient {
             game.local_manifest_ids = local.clone();
             game.active_branch = branch;
 
-            if self.is_offline() || self.connection.is_none() {
+            if self.is_offline() {
                 continue;
             }
 
@@ -1599,11 +1720,16 @@ impl SteamClient {
     }
 
     async fn remote_manifest_ids(&self, appid: u32, branch: &str) -> Result<HashMap<u64, u64>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
-        SteamClient::remote_manifest_ids_static(connection, appid, branch).await
+        let branch = branch.to_string();
+        let (manifests, _) = self
+            .with_healthy_connection(move |connection| {
+                let branch = branch.clone();
+                async move {
+                    SteamClient::remote_manifest_ids_static(&connection, appid, &branch).await
+                }
+            })
+            .await?;
+        Ok(manifests)
     }
 
     pub async fn get_user_profile(&self, current_library_len: usize) -> Result<UserProfile> {
@@ -1623,8 +1749,7 @@ impl SteamClient {
         }
 
         let steam_id = self
-            .connection
-            .as_ref()
+            .connection()
             .map(|connection| u64::from(connection.steam_id()))
             .or(persisted.steam_id)
             .unwrap_or_default();
@@ -1638,10 +1763,7 @@ impl SteamClient {
     }
 
     pub async fn get_extended_app_info(&self, appid: u32) -> Result<ExtendedAppInfo> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
 
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
@@ -1737,10 +1859,7 @@ impl SteamClient {
     }
 
     pub async fn get_product_info(&mut self, appid: u32, prefer_proton: bool) -> Result<Vec<LaunchInfo>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
 
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
@@ -1798,12 +1917,8 @@ impl SteamClient {
         let mut local_root = None;
 
         if cloud_enabled {
-            let client = CloudClient::new(
-                self.connection
-                    .as_ref()
-                    .cloned()
-                    .context("steam connection not initialized")?,
-            );
+            let connection = self.get_active_connection().await?;
+            let client = CloudClient::new(connection);
             let root = default_cloud_root(client.steam_id(), app.app_id)?;
             tracing::info!(appid = app.app_id, path = %root.display(), "Syncing Cloud...");
             let _ = client.sync_down(app.app_id, &root).await;
@@ -1863,11 +1978,7 @@ impl SteamClient {
         verify_mode: bool,
         shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
     ) -> Result<Receiver<DownloadProgress>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .cloned()
-            .context("steam connection not initialized")?;
+        let connection = self.get_active_connection().await?;
 
         let install_root = self.install_root_for_app(appid).await?;
         let manifest_path = self.appmanifest_path(appid).await?;
@@ -1910,13 +2021,32 @@ impl SteamClient {
 })
                 .await;
 
-            let remote_manifests = if verify_mode {
-                local_manifests.clone()
+            let (remote_manifests, changenumber) = if verify_mode {
+                (local_manifests.clone(), None)
             } else {
                 SteamClient::remote_manifest_ids_static(&connection, appid, &active_branch)
                     .await
                     .unwrap_or_default()
             };
+
+            // Durable record of exactly what this operation resolved: the
+            // branch requested, the appinfo change number the manifests came
+            // from, and the depot→manifest map. Without this, a later
+            // diagnosis cannot distinguish a wrong-branch request from a
+            // wrong manifest picked out of the right appinfo.
+            tracing::info!(
+                appid,
+                branch = %active_branch,
+                changenumber = ?changenumber,
+                manifests = ?remote_manifests,
+                "resolved remote depot manifests for install/update"
+            );
+            let _ = crate::infra::logging::log_install_manifest_resolution(
+                appid,
+                &active_branch,
+                changenumber,
+                &remote_manifests,
+            );
 
             let mut selections = Vec::new();
             for (depot_id, manifest_id) in &remote_manifests {
@@ -2266,7 +2396,7 @@ impl SteamClient {
         connection: &Connection,
         appid: u32,
         branch: &str,
-    ) -> Result<HashMap<u64, u64>> {
+    ) -> Result<(HashMap<u64, u64>, Option<u32>)> {
         let mut request = CMsgClientPICSProductInfoRequest::new();
         request
             .apps
@@ -2285,6 +2415,15 @@ impl SteamClient {
             .iter()
             .find(|entry| entry.appid() == appid)
             .ok_or_else(|| anyhow!("missing appinfo payload for app {appid}"))?;
+
+        // The appinfo change number fingerprints the exact PICS payload these
+        // manifests came from — record it so an install log can later tell a
+        // stale appinfo from a wrong-branch request.
+        let changenumber = if app.has_change_number() {
+            Some(app.change_number())
+        } else {
+            None
+        };
 
         let mut manifests = HashMap::new();
         if let Ok(vdf) = find_vdf_in_pics(app.buffer()) {
@@ -2314,7 +2453,7 @@ impl SteamClient {
                 }
             }
         }
-        Ok(manifests)
+        Ok((manifests, changenumber))
     }
 
 
@@ -2342,7 +2481,8 @@ impl SteamClient {
         // public_only=1 with no installdir unless the request carries the
         // per-app access token — fetch and attach it so the runtime app
         // resolves to its real SteamDB installdir (e.g. "SteamLinuxRuntime_4").
-        if let Some(conn) = self.connection.as_ref() {
+        let conn = self.get_active_connection().await.ok();
+        if let Some(conn) = conn.as_ref() {
             let app_token: Option<u64> = conn
                 .job(CMsgClientPICSAccessTokenRequest {
                     appids: vec![appid],
@@ -2464,6 +2604,13 @@ impl SteamClient {
                 .with_context(|| format!("failed creating {}", parent.display()))?;
         }
 
+        // Preserve an existing UserConfig section (which holds the active
+        // BetaKey) so a rewrite after install/update does NOT silently drop a
+        // beta branch and revert the game to public on the next update.
+        let preserved_user_config = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| extract_user_config_block(&raw));
+
         let game_name = game_name.replace('"', "");
 
         let mut content = format!(
@@ -2478,6 +2625,10 @@ impl SteamClient {
                 ));
             }
             content.push_str("\t}\n");
+        }
+
+        if let Some(block) = preserved_user_config {
+            content.push_str(&block);
         }
 
         content.push_str("}\n");
@@ -3414,7 +3565,7 @@ impl SteamClient {
                     if actual.starts_with(expected) {
                         if let Ok(metadata) = std::fs::metadata(&actual) {
                             let mut permissions = metadata.permissions();
-                            permissions.set_mode(0);
+                            permissions.set_mode(0o0);
                             let _ = std::fs::set_permissions(&actual, permissions);
                         }
                     }
@@ -4258,6 +4409,57 @@ fn parse_installed_depots_from_acf(raw: &str) -> HashMap<u64, u64> {
     manifests
 }
 
+/// Extract the existing `UserConfig` section (holds `BetaKey`, `language`,
+/// …) from a raw ACF so a manifest rewrite can preserve it instead of silently
+/// dropping the active beta branch. Returns the section re-emitted at the
+/// standard two-tab indent, ready to be appended inside `AppState`:
+///
+/// ```text
+/// "UserConfig"
+/// {
+///     "language"   "english"
+///     "BetaKey"    "dx11_non-rt"
+/// }
+/// ```
+fn extract_user_config_block(raw: &str) -> Option<String> {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim().eq_ignore_ascii_case("\"UserConfig\"") {
+            let mut depth = 0i32;
+            let mut inner: Vec<&str> = Vec::new();
+            let mut closed = false;
+            for line in lines[(i + 1)..].iter().copied() {
+                let t = line.trim();
+                if t == "{" {
+                    depth += 1;
+                } else if t == "}" {
+                    depth -= 1;
+                    if depth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                inner.push(line);
+            }
+            if !closed {
+                return None;
+            }
+            let mut out = String::new();
+            out.push_str("\t\"UserConfig\"\n\t{\n");
+            for line in inner {
+                out.push_str("\t\t");
+                out.push_str(line.trim_start());
+                out.push('\n');
+            }
+            out.push_str("\t}\n");
+            return Some(out);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn parse_active_branch_from_acf(raw: &str) -> String {
     let mut in_user_config = false;
     for line in raw.lines() {
@@ -4506,7 +4708,7 @@ impl SteamClient {
 }
 
 /// Extracts the first quoted string from a VDF line fragment like
-/// `"path"		"C:\Program Files (x86)\Steam"`.
+/// `"path"  "C:\Program Files (x86)\Steam"`.
 fn extract_vdf_quoted(s: &str) -> Option<String> {
     let s = s.trim();
     let first = s.find('"')?;
@@ -5036,7 +5238,7 @@ mod steamwebhelper_management_tests {
         std::fs::write(&helper, b"MZ fake webhelper").unwrap();
         // Simulate the per-game "Disable CEF" enforcement lock (chmod 000).
         let mut perms = std::fs::metadata(&helper).unwrap().permissions();
-        perms.set_mode(0);
+        perms.set_mode(0o0);
         std::fs::set_permissions(&helper, perms).unwrap();
         assert_eq!(std::fs::metadata(&helper).unwrap().permissions().mode() & 0o111, 0);
 
@@ -5220,5 +5422,58 @@ mod steamwebhelper_management_tests {
         );
 
         let _ = std::fs::remove_dir_all(&prefix);
+    }
+}
+
+#[cfg(test)]
+mod acf_betakey_preservation_tests {
+    use super::*;
+
+    /// Regression test for the branch-loss bug: `write_appmanifest` used to
+    /// regenerate the ACF from scratch, silently dropping the `UserConfig`
+    /// block (and with it the active `BetaKey`). A game on a beta branch that
+    /// received an update would therefore be rewritten as `public`.
+    #[test]
+    fn write_appmanifest_preserves_user_config_betakey() {
+        let dir = std::env::temp_dir().join("sf-acf-preserve-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appmanifest_883710.acf");
+
+        // Steam-client-written ACF shape for a game on the dx11_non-rt beta.
+        let original = "\"AppState\"\n{\n\t\"appid\"\t\t\"883710\"\n\t\"name\"\t\t\"Resident Evil 2\"\n\t\"StateFlags\"\t\t\"4\"\n\t\"installdir\"\t\t\"Resident Evil 2\"\n\t\"InstalledDepots\"\n\t{\n\t\t\"883711\"\n\t\t{\n\t\t\t\"manifest\"\t\t\"1276883776777242280\"\n\t\t\t\"size\"\t\t\"27213723651\"\n\t\t}\n\t}\n\t\"UserConfig\"\n\t{\n\t\t\"language\"\t\t\"english\"\n\t\t\"BetaKey\"\t\t\"dx11_non-rt\"\n\t}\n}\n";
+        std::fs::write(&path, original).unwrap();
+
+        // A subsequent install/update rewrites the ACF with fresh depot data.
+        SteamClient::write_appmanifest(
+            &path,
+            883710,
+            "Resident Evil 2",
+            "Resident Evil 2",
+            vec![(883711, 1276883776777242280, 27213723651)],
+        )
+        .unwrap();
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        // The beta branch survives the rewrite.
+        assert_eq!(parse_active_branch_from_acf(&rewritten), "dx11_non-rt");
+        // Fresh depot data is present, and no section got duplicated.
+        assert!(rewritten.contains("\"manifest\"\t\t\"1276883776777242280\""));
+        assert_eq!(rewritten.matches("\"InstalledDepots\"").count(), 1);
+        assert_eq!(rewritten.matches("\"UserConfig\"").count(), 1);
+    }
+
+    #[test]
+    fn write_appmanifest_fresh_install_has_no_user_config() {
+        // Fresh install (no pre-existing ACF): no UserConfig is fabricated.
+        let dir = std::env::temp_dir().join("sf-acf-fresh-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("appmanifest_999999.acf");
+
+        SteamClient::write_appmanifest(&path, 999999, "Test Game", "testgame", vec![(1, 2, 3)])
+            .unwrap();
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("UserConfig"));
+        assert_eq!(parse_active_branch_from_acf(&rewritten), "public");
     }
 }

@@ -6,7 +6,6 @@ use crate::models::{
     SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
-use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1474,17 +1473,31 @@ impl SteamLauncher {
             let mut local_root = None;
 
             if cloud_enabled {
-                let c = crate::cloud_sync::CloudClient::new(
-                    client.connection()
-                        .cloned()
-                        .ok_or_else(|| anyhow!("steam connection not initialized"))
-                        .unwrap()
-                );
-                let root = crate::cloud_sync::default_cloud_root(c.steam_id(), game.app_id).unwrap();
-                tracing::info!(appid = game.app_id, path = %root.display(), "Syncing Cloud...");
-                let _ = c.sync_down(game.app_id, &root).await;
-                cloud_client = Some(c);
-                local_root = Some(root);
+                // A dead CM socket must not block game launch: skip the cloud
+                // round-trip (get_active_connection transparently re-auths when
+                // it can; if it can't, launch proceeds without sync).
+                match client.get_active_connection().await {
+                    Ok(connection) => {
+                        let c = crate::cloud_sync::CloudClient::new(connection);
+                        let root =
+                            crate::cloud_sync::default_cloud_root(c.steam_id(), game.app_id).unwrap();
+                        tracing::info!(appid = game.app_id, path = %root.display(), "Syncing Cloud...");
+                        let _ = c.sync_down(game.app_id, &root).await;
+                        cloud_client = Some(c);
+                        local_root = Some(root);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            appid = game.app_id,
+                            error = %e,
+                            "cloud sync skipped: no usable steam connection"
+                        );
+                        let _ = tx.send(format!(
+                            "Cloud sync skipped for {}: {e}",
+                            game.name
+                        ));
+                    }
+                }
             }
 
             let mut child: std::process::Child =
