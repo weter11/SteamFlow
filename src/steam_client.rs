@@ -1291,29 +1291,31 @@ impl SteamClient {
     }
 
     pub async fn get_content_servers(&self, cell_id: u32) -> Result<Vec<String>> {
-        let connection = self.get_active_connection().await?;
-        let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
-        request.set_cell_id(cell_id);
-        request.set_max_servers(20);
+        self.with_healthy_connection(move |connection| async move {
+            let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
+            request.set_cell_id(cell_id);
+            request.set_max_servers(20);
 
-        let response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
-            .service_method(request)
-            .await
-            .context("failed calling ContentServerDirectory.GetServersForSteamPipe")?;
+            let response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
+                .service_method(request)
+                .await
+                .context("failed calling ContentServerDirectory.GetServersForSteamPipe")?;
 
-        let mut hosts = Vec::new();
-        for server in &response.servers {
-            if server.type_() == "SteamCache" || server.type_() == "CDN" {
-                let host = server.host().to_string();
-                hosts.push(host);
+            let mut hosts = Vec::new();
+            for server in &response.servers {
+                if server.type_() == "SteamCache" || server.type_() == "CDN" {
+                    let host = server.host().to_string();
+                    hosts.push(host);
+                }
             }
-        }
 
-        if hosts.is_empty() {
-            println!("ERROR: Service returned 0 valid CDN servers!");
-        }
+            if hosts.is_empty() {
+                println!("ERROR: Service returned 0 valid CDN servers!");
+            }
 
-        Ok(hosts)
+            Ok(hosts)
+        })
+        .await
     }
 
     pub async fn get_manifest_request_code(
@@ -1322,18 +1324,20 @@ impl SteamClient {
         depot_id: u32,
         manifest_id: u64,
     ) -> Result<u64> {
-        let connection = self.get_active_connection().await?;
-        let mut request = CContentServerDirectory_GetManifestRequestCode_Request::new();
-        request.set_app_id(app_id);
-        request.set_depot_id(depot_id);
-        request.set_manifest_id(manifest_id);
+        self.with_healthy_connection(move |connection| async move {
+            let mut request = CContentServerDirectory_GetManifestRequestCode_Request::new();
+            request.set_app_id(app_id);
+            request.set_depot_id(depot_id);
+            request.set_manifest_id(manifest_id);
 
-        let response: CContentServerDirectory_GetManifestRequestCode_Response = connection
-            .service_method(request)
-            .await
-            .context("failed calling ContentServerDirectory.GetManifestRequestCode")?;
+            let response: CContentServerDirectory_GetManifestRequestCode_Response = connection
+                .service_method(request)
+                .await
+                .context("failed calling ContentServerDirectory.GetManifestRequestCode")?;
 
-        Ok(response.manifest_request_code())
+            Ok(response.manifest_request_code())
+        })
+        .await
     }
 
     pub async fn get_cdn_auth_token(
@@ -1570,86 +1574,95 @@ impl SteamClient {
     }
 
     pub async fn fetch_owned_games(&mut self) -> Result<Vec<OwnedGame>> {
-        let connection = self.get_active_connection().await?;
+        // Both passes run inside `with_healthy_connection` so a CM transport
+        // failure mid-refresh (the post-game-launch reset window) marks the
+        // connection dead, re-authenticates, and retries ONCE transparently.
+        // Before this, the two `service_method` calls here ran directly on the
+        // possibly-zombie handle and surfaced as
+        // "Failed to refresh library: failed calling Player.GetOwnedGames".
+        let owned = self
+            .with_healthy_connection(move |connection| async move {
+                let request = CPlayer_GetOwnedGames_Request {
+                    steamid: Some(u64::from(connection.steam_id())),
+                    include_appinfo: Some(true),
+                    include_played_free_games: Some(true),
+                    // Standalone Steam mods (e.g. Portal: Revolution, AppID 601300)
+                    // and free community mods are classified by Steam as "unvetted
+                    // apps" and are dropped from GetOwnedGames unless explicitly
+                    // requested. include_free_sub pulls in free subscriptions held on
+                    // the account; skip_unvetted_apps=false keeps mod-type entries in
+                    // the result so they appear in the library alongside native titles.
+                    include_free_sub: Some(true),
+                    skip_unvetted_apps: Some(false),
+                    ..Default::default()
+                };
 
-        let request = CPlayer_GetOwnedGames_Request {
-            steamid: Some(u64::from(connection.steam_id())),
-            include_appinfo: Some(true),
-            include_played_free_games: Some(true),
-            // Standalone Steam mods (e.g. Portal: Revolution, AppID 601300)
-            // and free community mods are classified by Steam as "unvetted
-            // apps" and are dropped from GetOwnedGames unless explicitly
-            // requested. include_free_sub pulls in free subscriptions held on
-            // the account; skip_unvetted_apps=false keeps mod-type entries in
-            // the result so they appear in the library alongside native titles.
-            include_free_sub: Some(true),
-            skip_unvetted_apps: Some(false),
-            ..Default::default()
-        };
+                let response: CPlayer_GetOwnedGames_Response = connection
+                    .service_method(request)
+                    .await
+                    .context("failed calling Player.GetOwnedGames")?;
 
-        let response: CPlayer_GetOwnedGames_Response = connection
-            .service_method(request)
-            .await
-            .context("failed calling Player.GetOwnedGames")?;
+                let mut owned = Vec::new();
+                for game in response.games {
+                    owned.push(OwnedGame {
+                        app_id: game.appid() as u32,
+                        name: if game.name().is_empty() {
+                            format!("App {}", game.appid())
+                        } else {
+                            game.name().to_string()
+                        },
+                        playtime_forever_minutes: game.playtime_forever() as u32,
+                        local_manifest_ids: HashMap::new(),
+                        update_available: false,
+                    });
+                }
 
-        let mut owned = Vec::new();
-        for game in response.games {
-            owned.push(OwnedGame {
-                app_id: game.appid() as u32,
-                name: if game.name().is_empty() {
-                    format!("App {}", game.appid())
-                } else {
-                    game.name().to_string()
-                },
-                playtime_forever_minutes: game.playtime_forever() as u32,
-                local_manifest_ids: HashMap::new(),
-                update_available: false,
-            });
-        }
+                // SECOND PASS (no appinfo): GetOwnedGames with include_appinfo=true can
+                // silently DROP entries whose appinfo the service cannot attach — the
+                // typical case for standalone Steam mods such as Portal: Revolution
+                // (AppID 601300), which the user sees in the Steam web library but
+                // never arrives here. Without appinfo the raw appids come through
+                // (empty names); they are merged in as "App <id>" and hydrated later by
+                // ensure_metadata_requested / fetch_app_metadata when selected.
+                let bare_request = CPlayer_GetOwnedGames_Request {
+                    steamid: Some(u64::from(connection.steam_id())),
+                    include_appinfo: Some(false),
+                    include_played_free_games: Some(true),
+                    include_free_sub: Some(true),
+                    skip_unvetted_apps: Some(false),
+                    ..Default::default()
+                };
+                let bare_response: CPlayer_GetOwnedGames_Response = connection
+                    .service_method(bare_request)
+                    .await
+                    .context("failed calling Player.GetOwnedGames (appinfo-less pass)")?;
 
-        // SECOND PASS (no appinfo): GetOwnedGames with include_appinfo=true can
-        // silently DROP entries whose appinfo the service cannot attach — the
-        // typical case for standalone Steam mods such as Portal: Revolution
-        // (AppID 601300), which the user sees in the Steam web library but
-        // never arrives here. Without appinfo the raw appids come through
-        // (empty names); they are merged in as "App <id>" and hydrated later by
-        // ensure_metadata_requested / fetch_app_metadata when selected.
-        let bare_request = CPlayer_GetOwnedGames_Request {
-            steamid: Some(u64::from(connection.steam_id())),
-            include_appinfo: Some(false),
-            include_played_free_games: Some(true),
-            include_free_sub: Some(true),
-            skip_unvetted_apps: Some(false),
-            ..Default::default()
-        };
-        let bare_response: CPlayer_GetOwnedGames_Response = connection
-            .service_method(bare_request)
-            .await
-            .context("failed calling Player.GetOwnedGames (appinfo-less pass)")?;
+                let mut known: std::collections::HashSet<u32> =
+                    owned.iter().map(|g| g.app_id).collect();
+                let mut merged = 0usize;
+                for game in bare_response.games {
+                    let app_id = game.appid() as u32;
+                    if known.insert(app_id) {
+                        owned.push(OwnedGame {
+                            app_id,
+                            name: format!("App {app_id}"),
+                            playtime_forever_minutes: game.playtime_forever() as u32,
+                            local_manifest_ids: HashMap::new(),
+                            update_available: false,
+                        });
+                        merged += 1;
+                    }
+                }
+                tracing::info!(
+                    total = owned.len(),
+                    merged_from_bare_pass = merged,
+                    portal_revolution_present = owned.iter().any(|g| g.app_id == 601300),
+                    "fetch_owned_games: appinfo pass + appinfo-less merge complete"
+                );
 
-        let mut known: std::collections::HashSet<u32> =
-            owned.iter().map(|g| g.app_id).collect();
-        let mut merged = 0usize;
-        for game in bare_response.games {
-            let app_id = game.appid() as u32;
-            if known.insert(app_id) {
-                owned.push(OwnedGame {
-                    app_id,
-                    name: format!("App {app_id}"),
-                    playtime_forever_minutes: game.playtime_forever() as u32,
-                    local_manifest_ids: HashMap::new(),
-                    update_available: false,
-                });
-                merged += 1;
-            }
-        }
-        tracing::info!(
-            total = owned.len(),
-            merged_from_bare_pass = merged,
-            portal_revolution_present =
-                owned.iter().any(|g| g.app_id == 601300),
-            "fetch_owned_games: appinfo pass + appinfo-less merge complete"
-        );
+                Ok(owned)
+            })
+            .await?;
 
         save_library_cache(&owned).await.ok();
         Ok(owned)
