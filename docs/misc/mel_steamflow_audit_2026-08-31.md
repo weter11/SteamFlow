@@ -23,7 +23,7 @@ Steam Prefix Mode: Shared
 Graphics: dxvk_enabled = true, nvapi_enabled = false, backend_policy = DXVK
 Launch Options: -game portal_stories -steam -insecure -novid -disable_d3d9_hacks -limitvsconst -softparticlesdefaultoff -disallowhwmorph -no_compressed_verts -nogamepadui +mat_phong 1
 Env Variables: {"DXVK_HUD": "full"}
-Custom Exec Path: /home/wer/.local/share/Steam/steamapps/common/Portal Stories: Mel/portal2.exe
+Custom Exec Path: ~.local/share/Steam/steamapps/common/Portal Stories: Mel/portal2.exe
 ```
 
 Note: `DirectWine` + `OnlineContainerized` + `Shared` prefix + `Enabled` runtime = Mel runs through the Steam runtime with a shared Wine prefix, not via `DirectWine` standalone (the config value says `DirectWine` but `steam_mode` is `OnlineContainerized` and `use_steam_runtime` is true — the actual runtime path is Steam-mediated). The `-nogamepadui` flag suppresses the Steam Input overlay; the Source engine's internal joystick (`joystick 1`) still works independently.
@@ -36,7 +36,7 @@ The user's Mel install has original Mel DLLs replaced with Portal 2 (`P2`) versi
 
 Mel runs on top of xoxor4d's `p2-rtx` RTX Remix mod (github.com/xoxor4d/p2-rtx), not the stock `portal2rtx` mod. Evidence from the install root:
 
-**Top-level layout** (`/home/wer/.local/share/Steam/steamapps/common/Portal Stories: Mel/`):
+**Top-level layout** (`~.local/share/Steam/steamapps/common/Portal Stories: Mel/`):
 - `bin` → symlink to `Portal 2/bin` (P2 binaries, including the replaced `client.dll` etc.)
 - `portal2.exe` → symlink to `Portal 2/portal2.exe` (P2 executable)
 - `portal2-rtx/` — xoxor4d's base RTX Remix mod directory (contains `map_settings.toml`, `textures/`, `mods/`, etc.)
