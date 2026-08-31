@@ -50,8 +50,6 @@ Mel runs on top of xoxor4d's `p2-rtx` RTX Remix mod (github.com/xoxor4d/p2-rtx),
 - `imgui.ini` (53 bytes) — DearImgui UI state
 - `metrics.txt` (0 bytes) — Steam metrics
 - `Digital.mods-off` →  the Digital texture pack (see below)
-- `portal2.exe.mel.bak` (217,600 bytes) — backup of original Mel executable
-- `bin.mel.bak/` — backup of original Mel binaries
 
 **xoxor4d base mod** (`portal2-rtx/`):
 - Source: `github.com/xoxor4d/p2-rtx` — the community RTX Remix mod for Portal 2
