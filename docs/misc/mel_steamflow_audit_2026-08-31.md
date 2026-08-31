@@ -70,7 +70,7 @@ Mel runs on top of xoxor4d's `p2-rtx` RTX Remix mod (github.com/xoxor4d/p2-rtx),
 | xoxor4d `p2-rtx` mod | **2.4.0** | `portal2-rtx/game_settings.toml` line 6 (`Ver: 2.4.0`); `p2-rtx.dll` strings (`2.4.0`) |
 | `portal2rtx` mod definition (inside `rtx-remix/mods/portal2rtx/mod.usda`) | **2.0.0** | `mod.usda` line 9 (`lightspeed_mod_version = "2.0.0"`) |
 | Digital Additions texture pack | **1.4.2** | Portal 2 Digital Additions PBR PACK |
-| RTX Remix Bridge Server | `remix-main+8fc13a51` | `rtx-remix/logs/bridge64.log` line 10 |
+| RTX Remix Bridge Server | `remix-main+8fc13a51` | part of xoxor4d archive |
 | NVIDIA RTX Remix runtime | `dxvk-remix-nv` (build path in `NvRemixLauncher32.exe`) | `NvRemixLauncher32.exe` strings |
 | DXVK (D3D9 layer) | bundled with Remix runtime | `bridge64.log` line 21 (`Version of d3d9 loaded is DXVK`) |
 
