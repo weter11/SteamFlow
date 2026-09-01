@@ -8,7 +8,7 @@ SteamFlow is the modern successor to the OpenSteamClient project, leveraging Rus
 
 # Current status
 
-SteamFlow is in active development and has reached a beta-level state. Authentication, library management, install/update/verify, Steam Cloud, and the native Rhai game-fixup engine are implemented. Multi-task downloads, the launch pipeline (with both launch mode and Steam client/API mode), and the Windows Steam client lifecycle (Install / Manage / Repair / Backup / Restore) are also implemented; see [Implemented](#implemented) below.
+SteamFlow is in active development and has reached a functional alpha-level state. Authentication, library management, install/update/verify, Steam Cloud, and the native Rhai game-fixup engine are implemented. Multi-task downloads, the launch pipeline (with both launch mode and Steam client/API mode), and the Windows Steam client lifecycle (Install / Manage / Repair / Backup / Restore) are partially implemented; see [Implemented](#implemented) below.
 
 SteamFlow is **not affiliated with, endorsed by, or sponsored by Valve**. "Steam" and "Valve" are trademarks of Valve Corporation.
 
@@ -47,6 +47,7 @@ The following are present in the current code base. Phase status and design rati
 - Friends list & Chat
 - Workshop management (browse / subscribe / install — distinct from the current per-game **Mods** tab, which is a custom mod launcher/executable/script mechanism)
 - Depot browser GUI refinements
+- Replication of Steam input but based on other principals
 
 # Getting started
 
