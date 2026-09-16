@@ -74,6 +74,64 @@ impl EventLogger {
     }
 }
 
+/// Durable record of exactly what an install/update resolved: the requested
+/// branch, the appinfo change number the manifests came from, and the
+/// depot→manifest map. Without this, a later diagnosis cannot distinguish a
+/// wrong-branch request from a wrong manifest picked out of the right appinfo.
+pub fn log_install_manifest_resolution(
+    appid: u32,
+    branch: &str,
+    changenumber: Option<u32>,
+    manifests: &HashMap<u64, u64>,
+) -> Result<()> {
+    let dir = crate::config::config_dir()?.join("logs");
+    log_install_manifest_resolution_to(&dir, appid, branch, changenumber, manifests)
+}
+
+/// Path-taking variant of [`log_install_manifest_resolution`], separated out
+/// so tests can write to a temp dir without touching `$HOME`.
+pub(crate) fn log_install_manifest_resolution_to(
+    dir: &std::path::Path,
+    appid: u32,
+    branch: &str,
+    changenumber: Option<u32>,
+    manifests: &HashMap<u64, u64>,
+) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("install_events.jsonl");
+
+    let mut metadata = HashMap::new();
+    metadata.insert("appid".to_string(), appid.to_string());
+    metadata.insert("active_branch".to_string(), branch.to_string());
+    if let Some(change) = changenumber {
+        metadata.insert("appinfo_changenumber".to_string(), change.to_string());
+    }
+    let manifests_str = manifests
+        .iter()
+        .map(|(depot, gid)| format!("{depot}:{gid}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    metadata.insert("resolved_manifests".to_string(), manifests_str);
+
+    let event = LogEvent {
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        level: LogLevel::Info,
+        event_type: "install_manifest_resolution".to_string(),
+        message: format!(
+            "resolved {} depot manifests for app {appid} on branch {branch}",
+            manifests.len()
+        ),
+        stage: Some("manifest_resolution".to_string()),
+        metadata: redact_metadata(metadata),
+    };
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut line = serde_json::to_string(&event)?;
+    line.push('\n');
+    file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
 fn redact_metadata(mut metadata: HashMap<String, String>) -> HashMap<String, String> {
     let sensitive_keys = ["STEAM_TOKEN", "STEAM_PASSWORD", "TOKEN", "PASSWORD", "REFRESH_TOKEN"];
     for (key, value) in metadata.iter_mut() {
