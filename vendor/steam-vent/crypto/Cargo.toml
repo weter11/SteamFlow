@@ -1,0 +1,22 @@
+[package]
+name = "steam-vent-crypto"
+version = "0.2.1"
+authors = ["Robin Appelman <robin@icewind.nl>"]
+description = "Rust implementation of Steam crypto"
+edition = "2018"
+license = "MIT"
+repository = "https://codeberg.org/steam-vent/steam-vent"
+
+[dependencies]
+rand = "0.8.5"
+rsa = "0.9.8"
+once_cell = "1"
+aes = "0.8.4"
+thiserror = "2.0.17"
+cbc = "0.1.2"
+sha-1 = "0.10.1"
+hmac = "0.12.1"
+bytes = "1.10.1"
+
+[build-dependencies]
+rsa = { version = "0.9.8", features = ["pem"] }

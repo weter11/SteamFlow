@@ -19,10 +19,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 steam-vdf-parser = "0.1.2" # Used for text and binary VDF parsing
-steam-vent = "0.4.2"
-steam-vent-proto = "=0.5.2"
+steam-vent = { path = "vendor/steam-vent" }
+steam-vent-proto-steam = "=0.5.2"
 # Match steam-vent's WebSocket error types without enabling extra features.
-tungstenite = { version = "0.27", default-features = false }
+tungstenite = { version = "0.29", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

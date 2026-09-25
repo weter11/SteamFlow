@@ -1,5 +1,6 @@
 pub mod cloud_sync;
 pub mod cm_list;
+pub mod auth_login;
 pub mod config;
 pub mod container;
 pub mod proton;

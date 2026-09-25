@@ -1,3 +1,4 @@
+use crate::auth_login::{AuthLoginState, AuthLoginTask};
 use crate::config::{load_launcher_config, opensteam_image_cache_dir, LauncherConfig};
 use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::library::{build_game_library, scan_installed_app_paths};
@@ -153,7 +154,7 @@ pub enum AsyncOp {
     PlatformsFetched(u32, Vec<DepotPlatform>, Vec<u8>),
     ExtendedInfoFetched(u32, crate::steam_client::ExtendedAppInfo),
     LibraryFetched(Vec<LibraryGame>),
-    Authenticated(crate::models::SessionState),
+    Authenticated(u64, crate::models::SessionState),
     BranchesFetched(u32, Vec<String>),
     DepotsFetched(u32, Vec<BrowserDepotInfo>),
     DepotListFetched(u32, Vec<crate::steam_client::DepotInfo>),
@@ -166,7 +167,7 @@ pub enum AsyncOp {
     DepotOwnershipVerified(HashMap<u64, Option<bool>>),
     ManifestFilesFetched(Vec<ManifestFileEntry>),
     LaunchOptionsFetched(u32, Vec<crate::steam_client::LaunchInfo>, Option<String>),
-    AuthFailed(String),
+    AuthFailed(u64, String),
     UserProfileFetched(crate::models::UserProfile),
     SettingsSaved(bool),
     WineControlPanelLaunched,
@@ -377,6 +378,14 @@ pub struct SteamLauncher {
     pending_login_launch: Option<PendingLoginLaunch>,
     /// The prefix the auto-onboarding login must target (master or per-game).
     pending_login_prefix: Option<PathBuf>,
+    /// Monotonic password-login attempt IDs. Results carrying a superseded
+    /// attempt ID are discarded so a cancelled login can never mutate account
+    /// or session state.
+    auth_login_state: AuthLoginState,
+    /// In-flight password-login worker. Lives on a dedicated OS thread with
+    /// its own current-thread runtime because steam-vent 0.6's confirmation
+    /// handler future is not `Send`.
+    auth_login_task: Option<AuthLoginTask>,
 }
 
 impl SteamLauncher {
@@ -470,6 +479,8 @@ impl SteamLauncher {
             operation_tx,
             operation_rx,
             game_processes: HashMap::new(),
+            auth_login_state: AuthLoginState::new(),
+            auth_login_task: None,
         }
     }
 
@@ -739,6 +750,9 @@ impl SteamLauncher {
     }
 
     fn logout(&mut self) {
+        // Stop any in-flight password login before the account state changes,
+        // and retire its attempt ID so a delayed result cannot re-authenticate.
+        self.cancel_auth_login();
         let mut client = self.client.clone();
         let _ = self.runtime.block_on(client.logout());
         self.client = client;
@@ -1036,7 +1050,16 @@ impl SteamLauncher {
                     self.status = format!("Library refreshed ({})", self.library.len());
                     self.refresh_user_profile();
                 }
-                AsyncOp::Authenticated(_session) => {
+                AsyncOp::Authenticated(attempt, _session) => {
+                    // A superseded or cancelled attempt must never be able to
+                    // reopen/alter the account.
+                    if !self.auth_login_state.is_current(attempt) {
+                        tracing::debug!(
+                            attempt,
+                            "discarding stale login result from a superseded attempt"
+                        );
+                        continue;
+                    }
                     self.needs_reauth = false;
                     self.auth_guard_code.clear();
                     self.client.clear_pending_confirmations();
@@ -1071,7 +1094,14 @@ impl SteamLauncher {
                         }
                     }
                 }
-                AsyncOp::AuthFailed(err) => {
+                AsyncOp::AuthFailed(attempt, err) => {
+                    if !self.auth_login_state.is_current(attempt) {
+                        tracing::debug!(
+                            attempt,
+                            "discarding stale login failure from a superseded attempt"
+                        );
+                        continue;
+                    }
                     if self.client.is_offline() {
                         self.needs_reauth = false;
                         self.status = "OFFLINE MODE".to_string();
@@ -1393,6 +1423,31 @@ impl SteamLauncher {
         });
     }
 
+    /// Stop the in-flight password-login worker and retire its attempt ID.
+    ///
+    /// Dropping the result receiver is NOT enough: the send would fail, but
+    /// the worker would keep polling Steam's network/auth work. The oneshot
+    /// signal makes the worker drop the login future through `select!`.
+    fn cancel_auth_login(&mut self) {
+        if let Some(mut task) = self.auth_login_task.take() {
+            task.cancel();
+        }
+        self.auth_login_state.invalidate_current();
+    }
+
+    /// Reap a finished login worker during a normal UI update. Never blocks:
+    /// `AuthLoginTask::reap` only joins a handle that already reports finished.
+    fn reap_auth_login(&mut self) {
+        let mut finished = false;
+        if let Some(task) = self.auth_login_task.as_mut() {
+            task.reap();
+            finished = task.is_finished();
+        }
+        if finished {
+            self.auth_login_task = None;
+        }
+    }
+
     fn handle_auth_submit(&mut self) {
         if self.auth_username.trim().is_empty() || self.auth_password.trim().is_empty() {
             self.status = "Enter username and password".to_string();
@@ -1404,7 +1459,11 @@ impl SteamLauncher {
             return;
         }
 
-        let mut client = self.client.clone();
+        // A replacement attempt supersedes any in-flight one.
+        self.cancel_auth_login();
+        let attempt = self.auth_login_state.begin_attempt();
+
+        let client = self.client.clone();
         let tx = self.operation_tx.clone();
         let username = self.auth_username.trim().to_string();
         let password = self.auth_password.clone();
@@ -1414,16 +1473,27 @@ impl SteamLauncher {
             Some(self.auth_guard_code.trim().to_string())
         };
 
-        self.runtime.spawn(async move {
-            match client.login(username, password, guard_code).await {
-                Ok(session) => {
-                    let _ = tx.send(AsyncOp::Authenticated(session));
-                }
-                Err(err) => {
-                    let _ = tx.send(AsyncOp::AuthFailed(err.to_string()));
-                }
-            }
-        });
+        // steam-vent 0.6's confirmation handler future is not `Send`, so this
+        // cannot go through self.runtime.spawn. The future is built and polled
+        // on a dedicated OS thread's current-thread runtime.
+        self.auth_login_task = Some(crate::auth_login::spawn_local_task(
+            attempt,
+            move || async move {
+                // `client` is moved INTO the future, so the future owns it and
+                // may borrow it across awaits. Moving the non-Send future is
+                // still impossible — which is the whole reason for this path.
+                let mut client = client;
+                client.login(username, password, guard_code).await
+            },
+            move |result| {
+                let op = match result {
+                    Ok(session) => AsyncOp::Authenticated(attempt, session),
+                    Err(err) => AsyncOp::AuthFailed(attempt, err.to_string()),
+                };
+                let _ = tx.send(op);
+            },
+        ));
+        self.status = "Logging in…".to_string();
     }
 
     fn handle_windows_client_login(&mut self) {
@@ -3742,6 +3812,10 @@ impl SteamLauncher {
         if ui.button("Login / Re-authenticate").clicked() {
             self.handle_auth_submit();
         }
+        if self.auth_login_task.is_some() && ui.button("Cancel login").clicked() {
+            self.cancel_auth_login();
+            self.status = "Login cancelled".to_string();
+        }
 
         ui.add_space(4.0);
         let master_prefix = crate::utils::resolve_master_wineprefix();
@@ -3814,6 +3888,11 @@ impl eframe::App for SteamLauncher {
         let drained_progress = self.poll_download_progress();
         let drained_play = self.poll_play_result();
         let drained_ops = self.poll_async_ops();
+        // Reap the login worker outside the op channel: it reports completion
+        // by thread exit, not by a message. `reap` only joins a finished
+        // handle, so this never blocks the egui thread.
+        self.reap_auth_login();
+        let auth_login_pending = self.auth_login_task.is_some();
 
         egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -4926,6 +5005,20 @@ impl eframe::App for SteamLauncher {
         if self.play_result_rx.is_some() {
             ui.request_repaint_after(std::time::Duration::from_secs(1));
         }
+        if auth_login_pending {
+            // The worker completes by thread exit rather than by draining a
+            // channel, so keep ticking while it is alive.
+            ui.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+}
+
+impl Drop for SteamLauncher {
+    fn drop(&mut self) {
+        // App shutdown: signal the worker and retire its attempt ID. Drop of
+        // AuthLoginTask detaches instead of joining, so shutdown cannot block
+        // on in-flight network/auth work.
+        self.cancel_auth_login();
     }
 }
 

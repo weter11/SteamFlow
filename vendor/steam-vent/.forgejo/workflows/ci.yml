@@ -1,0 +1,46 @@
+name: "CI"
+on:
+  pull_request:
+  push:
+
+jobs:
+  checks:
+    runs-on: nix
+    steps:
+      - uses: actions/checkout@v4
+      - uses: https://codeberg.org/icewind/attic-action@v1
+        with:
+          name: link
+          instance: https://cache.icewind.link
+          authToken: "${{ secrets.ATTIC_TOKEN }}"
+      - run: nix flake check --keep-going
+
+  semver-checks:
+    runs-on: nix
+    needs: [checks]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: https://codeberg.org/icewind/attic-action@v1
+        with:
+          name: ci
+          instance: https://cache.icewind.me
+          authToken: "${{ secrets.ATTIC_TOKEN }}"
+      - run: nix run .#semver-checks
+
+  tests:
+    runs-on: nix
+    needs: [checks]
+    env:
+      HAS_LOGIN_SECRET: ${{ secrets.STEAM_USERNAME != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: https://codeberg.org/icewind/attic-action@v1
+        with:
+          name: ci
+          instance: https://cache.icewind.me
+          authToken: "${{ secrets.ATTIC_TOKEN }}"
+      - run: nix build .#checks.x86_64-linux.examples
+      - name: Login
+        if: ${{ env.HAS_LOGIN_SECRET == 'true' }}
+        run: |
+          ./result/bin/login ${{ secrets.STEAM_USERNAME }} "${{ secrets.STEAM_PASSWORD }}" "${{ secrets.STEAM_GUARD_SECRET }}"
