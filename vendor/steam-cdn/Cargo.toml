@@ -77,7 +77,14 @@ features = ["derive"]
 version = "0.10"
 
 [dependencies.steam-vent]
-version = "0.4"
+git = "https://codeberg.org/steam-vent/steam-vent.git"
+rev = "54ecd10ebd385c6879a536725fd77cdb846fc9a3"
+
+[dependencies.steam-vent-proto-common]
+version = "0.5.1"
+
+[dependencies.steam-vent-proto-steam]
+version = "0.5.2"
 
 [dependencies.thiserror]
 version = "2.0"
