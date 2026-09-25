@@ -19,7 +19,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 steam-vdf-parser = "0.1.2" # Used for text and binary VDF parsing
-steam-vent = { git = "https://codeberg.org/steam-vent/steam-vent.git", rev = "54ecd10ebd385c6879a536725fd77cdb846fc9a3" }
+steam-vent = { path = "vendor/steam-vent" }
 steam-vent-proto-steam = "=0.5.2"
 # Match steam-vent's WebSocket error types without enabling extra features.
 tungstenite = { version = "0.29", default-features = false }

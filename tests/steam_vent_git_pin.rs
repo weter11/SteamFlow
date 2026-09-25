@@ -1,13 +1,29 @@
-//! Offline regression coverage for the pinned steam-vent Git dependency.
+//! Offline regression coverage for the vendored steam-vent revision.
 //!
-//! The tuple-struct visibility assertion deliberately constructs
-//! `SteamGuardToken` by field instead of calling `SteamGuardToken::new(...)`:
-//! the public constructor already exists on upstream main, so only direct
-//! tuple construction compiles if PR #19's `pub` field change is present.
+//! steam-vent is vendored as a path dependency because Cargo cannot resolve an
+//! unadvertised `refs/pull/NN/head` commit from a `rev = "<sha>"` git
+//! dependency: its fetcher asks for `refs/heads/<sha>`, which does not exist
+//! while the pull request is open. Vendoring the exact commit keeps CI and a
+//! fresh clone deterministic without publishing a mirror.
+//!
+//! Two things must therefore be asserted offline instead of by package source:
+//!   1. the recorded upstream revision, and
+//!   2. the PR #19 structural change itself.
+//!
+//! The tuple-struct assertion deliberately constructs `SteamGuardToken` by field
+//! rather than calling `SteamGuardToken::new(...)`: the public constructor
+//! already exists upstream, so only direct tuple construction compiles if the
+//! `pub` field change is present.
 
 use steam_vent::auth::SteamGuardToken;
 
 const PINNED_STEAM_VENT_REV: &str = "54ecd10ebd385c6879a536725fd77cdb846fc9a3";
+
+fn vendored_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("vendor")
+        .join("steam-vent")
+}
 
 #[test]
 fn test_steam_guard_token_tuple_field_is_public() {
@@ -16,24 +32,47 @@ fn test_steam_guard_token_tuple_field_is_public() {
 }
 
 #[test]
-fn test_resolved_steam_vent_is_pinned_to_expected_git_revision() {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let lock_path = manifest_dir.join("Cargo.lock");
+fn test_vendored_steam_vent_records_the_expected_upstream_revision() {
+    let rev_path = vendored_root().join("STEAMVENT_REV");
+    let recorded = std::fs::read_to_string(&rev_path)
+        .unwrap_or_else(|e| panic!("failed reading {}: {e}", rev_path.display()));
+    assert_eq!(
+        recorded.trim(),
+        PINNED_STEAM_VENT_REV,
+        "vendor/steam-vent/STEAMVENT_REV does not match the pinned revision; \
+         re-vendor with `git archive {PINNED_STEAM_VENT_REV}`"
+    );
+}
+
+#[test]
+fn test_vendored_steam_vent_source_contains_the_pr_19_change() {
+    let auth_path = vendored_root().join("src").join("auth").join("mod.rs");
+    let source = std::fs::read_to_string(&auth_path)
+        .unwrap_or_else(|e| panic!("failed reading {}: {e}", auth_path.display()));
+    assert!(
+        source.contains("pub struct SteamGuardToken(pub String);"),
+        "vendored steam-vent is missing PR #19's public tuple field; the recorded \
+         revision and the actual source disagree"
+    );
+}
+
+#[test]
+fn test_resolved_steam_vent_is_the_vendored_path_package() {
+    // The root lockfile must resolve steam-vent as a local path package, not as
+    // a git or registry package: a git entry would reintroduce the unadvertised
+    // refspec problem, and a registry entry would silently drop PR #19.
+    let lock_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
     let lock = std::fs::read_to_string(&lock_path)
         .unwrap_or_else(|e| panic!("failed reading {}: {e}", lock_path.display()));
 
-    let expected_source =
-        format!("git+https://codeberg.org/steam-vent/steam-vent.git?rev={PINNED_STEAM_VENT_REV}#");
-    let mut steam_vent_packages: Vec<&str> = Vec::new();
     let mut current_name: Option<&str> = None;
     let mut current_source: Option<&str> = None;
-
+    let mut sources: Vec<&str> = Vec::new();
     for line in lock.lines() {
         let trimmed = line.trim();
         if trimmed == "[[package]]" {
-            // Flush the previous package before starting the next one.
             if current_name == Some("steam-vent") {
-                steam_vent_packages.push(current_source.unwrap_or("<no source>"));
+                sources.push(current_source.unwrap_or("<no source>"));
             }
             current_name = None;
             current_source = None;
@@ -44,17 +83,17 @@ fn test_resolved_steam_vent_is_pinned_to_expected_git_revision() {
         }
     }
     if current_name == Some("steam-vent") {
-        steam_vent_packages.push(current_source.unwrap_or("<no source>"));
+        sources.push(current_source.unwrap_or("<no source>"));
     }
 
     assert_eq!(
-        steam_vent_packages.len(),
+        sources.len(),
         1,
-        "expected exactly one steam-vent package, found {steam_vent_packages:?}"
+        "expected exactly one steam-vent package, found {sources:?}"
     );
     assert!(
-        steam_vent_packages[0].starts_with(&expected_source),
-        "steam-vent source is not bound to pinned revision {PINNED_STEAM_VENT_REV}: {}",
-        steam_vent_packages[0]
+        !sources[0].starts_with("git+") && !sources[0].starts_with("registry+"),
+        "steam-vent must resolve to the vendored path package, found: {}",
+        sources[0]
     );
 }

@@ -5020,7 +5020,6 @@ dependencies = [
 [[package]]
 name = "steam-vent"
 version = "0.6.0"
-source = "git+https://codeberg.org/steam-vent/steam-vent.git?rev=54ecd10ebd385c6879a536725fd77cdb846fc9a3#54ecd10ebd385c6879a536725fd77cdb846fc9a3"
 dependencies = [
  "another-steam-totp",
  "async-stream",
@@ -5062,7 +5061,6 @@ dependencies = [
 [[package]]
 name = "steam-vent-core"
 version = "0.1.0"
-source = "git+https://codeberg.org/steam-vent/steam-vent.git?rev=54ecd10ebd385c6879a536725fd77cdb846fc9a3#54ecd10ebd385c6879a536725fd77cdb846fc9a3"
 dependencies = [
  "bytes",
  "steam-vent-proto-common",
@@ -5074,7 +5072,6 @@ dependencies = [
 [[package]]
 name = "steam-vent-crypto"
 version = "0.2.1"
-source = "git+https://codeberg.org/steam-vent/steam-vent.git?rev=54ecd10ebd385c6879a536725fd77cdb846fc9a3#54ecd10ebd385c6879a536725fd77cdb846fc9a3"
 dependencies = [
  "aes",
  "bytes",
@@ -6969,18 +6966,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.58"
+version = "0.8.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c17e8fafad82b542ff3717217ecdc736231b59e387768c9630123b4ce4d2db44"
+checksum = "6df92bf3d9227be3d53173901ddbffac2babc27ae50f397776ffd6dc33f800cb"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.58"
+version = "0.8.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "595f56e044df4f46a0c9a626f65c3d99eb8488f7e8a8baa12dd76326d9710bf2"
+checksum = "ac4f328cf2f05d084e496c3e9c3f33ed0a183656a16e1fcec4d464d8373aec82"
 dependencies = [
  "proc-macro2",
  "quote",
