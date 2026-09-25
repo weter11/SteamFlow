@@ -6,10 +6,8 @@ use std::{
     io::{Cursor, Read},
     str,
 };
-use steam_vent::proto::{
-    content_manifest::{ContentManifestMetadata, ContentManifestPayload},
-    protobuf::Message,
-};
+use steam_vent_proto_common::protobuf::Message;
+use steam_vent_proto_steam::content_manifest::{ContentManifestMetadata, ContentManifestPayload};
 use zip::ZipArchive;
 
 use super::inner::InnerClient;
