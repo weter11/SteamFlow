@@ -53,6 +53,9 @@ pub async fn run(args: &[String]) -> Result<()> {
         "list" => list_games().await,
         "test-download-proton" => test_download_proton(args).await,
         "test-download-runtime" => test_download_runtime(args).await,
+        "test-update" => test_update(args).await,
+        "test-verify" => test_verify(args).await,
+        "test-install" => test_install(args).await,
         "test-diff" => crate::parity::test_diff(args).await,
         "runtime" => runtime_cmd(args).await,
         "help" | "-h" | "--help" => {
@@ -76,6 +79,11 @@ fn print_help() {
          steamflow test-launch <appid>        launch game via the UI Play pipeline\n  \
          steamflow test-mod <appid>           launch custom mod executable (Play Mod)\n  \
          steamflow list                       list installed games\n  \
+         steamflow test-update <appid> [--reset-window N] [--max-secs N]   update an installed game (cheap: exercises the start_manifest_download spawned-task fence)\n  \
+         steamflow test-verify <appid> [--reset-window N] [--max-secs N]   verify installed chunks (does NOT reach that fence)\n  \
+         steamflow test-install <appid> [--reset-window N] [--max-secs N]  install a game (exercises the install_game appinfo fence)\n  \
+         --reset-window N  print READY_FOR_CM_RESET and sleep N secs, so the operator can `sudo ss -K` the CM socket first\n  \
+         --max-secs N  raise the shared abort signal after N secs, so a download stops instead of pulling everything down\n  \
          steamflow test-diff <appid>          env-parity: native proton log vs effective_env.json\n  \
          steamflow test-download-runtime <line>  fetch + provision a Steam Linux Runtime (scout/soldier/sniper/steamrt4)\n  \
          steamflow runtime status [<line>]    show a Steam Linux Runtime's deployment state\n  \
@@ -276,8 +284,8 @@ pub async fn test_download_proton(args: &[String]) -> Result<()> {
         }
     }
     let connection = client
-        .connection()
-        .cloned()
+        .get_active_connection()
+        .await
         .context("no steam connection — is a session saved?")?;
 
     println!("== stage 1: PICS appinfo for appid {appid}");
@@ -805,4 +813,184 @@ pub async fn runtime_cmd(args: &[String]) -> Result<()> {
         }
         _ => bail!("usage: runtime <status [<line>] | repair <line> [--force]>"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// CM-recovery test commands
+//
+// These exist so the recovery work can be driven headlessly instead of through
+// the Depot Manager GUI. Each one restores the session, proves the connection
+// is healthy with a read-only wrapped call, optionally opens a window for the
+// operator to reset the CM socket, then runs the operation under test while
+// echoing every progress event.
+// ---------------------------------------------------------------------------
+
+/// `--reset-window <secs>` / `--max-secs <secs>` for the CM test commands.
+fn parse_test_args(args: &[String], default_max_secs: u64) -> Result<(u32, u64, u64)> {
+    let appid = parse_appid(args.get(1))?;
+    let mut reset_window = 0u64;
+    let mut max_secs = default_max_secs;
+    let mut i = 2;
+    while i < args.len() {
+        let value = args
+            .get(i + 1)
+            .ok_or_else(|| anyhow!("{} needs a value", args[i]))?;
+        match args[i].as_str() {
+            "--reset-window" => reset_window = value.parse()?,
+            "--max-secs" => max_secs = value.parse()?,
+            other => bail!("unknown option: {other}"),
+        }
+        i += 2;
+    }
+    Ok((appid, reset_window, max_secs))
+}
+
+/// Config dirs, session restore, a baseline read-only CM call, then an
+/// optional window for resetting the CM socket. The baseline matters: if the
+/// library refresh does not succeed first, nothing about the later run proves
+/// anything about recovery.
+async fn prepare_cm_test(appid: u32, reset_window_secs: u64) -> Result<crate::steam_client::SteamClient> {
+    crate::config::ensure_config_dirs().await?;
+    let mut client = crate::steam_client::SteamClient::new()?;
+    let saved = crate::config::load_session().await.unwrap_or_default();
+    if saved.refresh_token.is_some() && saved.account_name.is_some() {
+        client
+            .restore_session()
+            .await
+            .context("session restore failed")?;
+    }
+
+    client
+        .fetch_owned_games()
+        .await
+        .context("baseline library refresh failed — cannot establish a healthy starting state")?;
+    println!("BASELINE_OK appid={appid} library_refresh=ok");
+
+    if reset_window_secs > 0 {
+        println!("READY_FOR_CM_RESET window_secs={reset_window_secs}");
+        println!("  reset now with: sudo ss -K dst <cm-ip> dport = <cm-port>");
+        println!("  (find the socket with: ss -tnp | grep <this process pid>)");
+        tokio::time::sleep(std::time::Duration::from_secs(reset_window_secs)).await;
+        println!("RESET_WINDOW_CLOSED");
+    }
+    Ok(client)
+}
+
+/// Echo a download/verify progress stream. Once `max_secs` elapses the shared
+/// abort signal is raised so the spawned task stops instead of pulling an
+/// entire game down; the stream is then drained for up to a further 60s.
+async fn drain_progress(
+    mut rx: tokio::sync::mpsc::Receiver<crate::models::DownloadProgress>,
+    shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
+    max_secs: u64,
+) {
+    use std::sync::atomic::Ordering;
+    let started = std::time::Instant::now();
+    let mut aborted = false;
+
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(p)) => println!(
+                "PROGRESS state={:?} file_bytes={}/{} total={}/{} {}",
+                p.state,
+                p.file_bytes_downloaded,
+                p.file_total_bytes,
+                p.bytes_downloaded,
+                p.total_bytes,
+                p.current_file
+            ),
+            Ok(None) => {
+                println!("STREAM_CLOSED");
+                break;
+            }
+            Err(_) => {}
+        }
+
+        let elapsed = started.elapsed().as_secs();
+        if !aborted && elapsed >= max_secs {
+            aborted = true;
+            println!("MAX_SECS={max_secs} reached -> abort_signal=true");
+            // Read lock is enough: AtomicBool::store needs only &self, and a
+            // write lock could contend with the download task's own reads.
+            if let Ok(state) = shared_state.read() {
+                state.abort_signal.store(true, Ordering::Release);
+            }
+        }
+        if aborted && started.elapsed().as_secs() >= max_secs + 60 {
+            println!("ABORT_TIMEOUT: stream did not close, giving up");
+            break;
+        }
+    }
+
+    if let Ok(state) = shared_state.read() {
+        println!(
+            "FINAL is_downloading={} downloaded_bytes={}/{} status={:?}",
+            state.is_downloading, state.downloaded_bytes, state.total_bytes, state.status_text
+        );
+    }
+}
+
+fn shared_download_state() -> Arc<std::sync::RwLock<crate::models::DownloadState>> {
+    Arc::new(std::sync::RwLock::new(crate::models::DownloadState::default()))
+}
+
+/// `steamflow test-update <appid> [--reset-window N] [--max-secs N]`
+///
+/// Runs `update_game`, i.e. `start_manifest_download` with `verify_mode=false`.
+/// That is the path whose spawned task resolves remote manifests over a raw
+/// `Connection` and must fence a transport failure. For an already-current
+/// installed game the file download is ~0 bytes, which makes this the cheap
+/// probe for that fence.
+pub async fn test_update(args: &[String]) -> Result<()> {
+    let (appid, reset_window, max_secs) = parse_test_args(args, 90)?;
+    let client = prepare_cm_test(appid, reset_window).await?;
+    let shared_state = shared_download_state();
+
+    println!("== update_game({appid})");
+    println!("   target fence: start_manifest_download spawned task (remote_manifest_ids_static)");
+    let rx = client.update_game(appid, shared_state.clone()).await?;
+    drain_progress(rx, shared_state, max_secs).await;
+    Ok(())
+}
+
+/// `steamflow test-verify <appid> [--reset-window N] [--max-secs N]`
+///
+/// Runs `verify_game`, i.e. `start_manifest_download` with `verify_mode=true`.
+/// NOTE: verify mode skips remote-manifest resolution entirely, so this does
+/// NOT reach the spawned-task fence — use `test-update` for that.
+pub async fn test_verify(args: &[String]) -> Result<()> {
+    let (appid, reset_window, max_secs) = parse_test_args(args, 120)?;
+    let client = prepare_cm_test(appid, reset_window).await?;
+    let shared_state = shared_download_state();
+
+    println!("== verify_game({appid})");
+    println!("   NOTE: verify_mode skips remote-manifest resolution — this does NOT");
+    println!("         exercise the start_manifest_download CM fence (use test-update).");
+    let rx = client.verify_game(appid, shared_state.clone()).await?;
+    drain_progress(rx, shared_state, max_secs).await;
+    Ok(())
+}
+
+/// `steamflow test-install <appid> [--reset-window N] [--max-secs N]`
+///
+/// Runs `install_game`. Its spawned task issues a PICS product-info job on the
+/// captured connection — the fence under test. The download itself can be
+/// large, so `--max-secs` matters here more than anywhere else.
+pub async fn test_install(args: &[String]) -> Result<()> {
+    let (appid, reset_window, max_secs) = parse_test_args(args, 60)?;
+    let client = prepare_cm_test(appid, reset_window).await?;
+    let shared_state = shared_download_state();
+    let platform = if cfg!(target_os = "linux") {
+        DepotPlatform::Linux
+    } else {
+        DepotPlatform::Windows
+    };
+
+    println!("== install_game({appid}) platform={platform:?}");
+    println!("   target fence: install_game spawned task (PICS product-info job)");
+    let rx = client
+        .install_game(appid, platform, None, None, shared_state.clone())
+        .await?;
+    drain_progress(rx, shared_state, max_secs).await;
+    Ok(())
 }

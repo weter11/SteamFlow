@@ -13,6 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,17 +49,6 @@ use steam_vent::proto::steammessages_player_steamclient::{
 use steam_vent::{ConnectionError, ConnectionTrait, ServerList};
 use tokio::io::{duplex, sink, AsyncWriteExt};
 use tokio::sync::mpsc::Receiver;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginState {
-    Connected,
-    AwaitingCredentialSession,
-    AwaitingGuardConfirmation,
-    AwaitingPollResult,
-    AwaitingAccessTokenLogon,
-    Complete,
-    Offline,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchTarget {
@@ -127,99 +117,1164 @@ pub struct AccountData {
     pub vac_banned_apps: Vec<u32>,
 }
 
+/// Mutable CM-session state shared behind a mutex so any caller holding only
+/// `&SteamClient` (UI task, background download task, headless CLI) can obtain
+/// or repair the connection. `Connection` is cheaply clonable (shared socket +
+/// message filter), so handing out clones is safe.
+#[derive(Default)]
+struct ConnectionState {
+    connection: Option<Connection>,
+    /// Set when we observe the CM transport die (WebSocket reset without
+    /// closing handshake, heartbeat AlreadyClosed, job EOF). A set flag makes
+    /// the held `connection` a zombie: the next `get_active_connection()`
+    /// drops it and transparently re-authenticates.
+    dead: bool,
+    dead_since: Option<Instant>,
+    /// Bumped on every connection replacement/teardown so stale operation
+    /// failures can prove the connection they used is still the live one.
+    generation: u64,
+    /// Backoff for failed re-authentication attempts. Only `Background`
+    /// intents consult it; a user-initiated call clears it first.
+    reauth: ReauthBackoff,
+}
+
+/// How urgently a caller wants a live CM session. Decides whether the
+/// re-auth cooldown may refuse the attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReauthIntent {
+    /// The user is waiting on this call — login, manual refresh, launch,
+    /// install. Clears any cooldown and gets exactly one attempt.
+    UserInitiated,
+    /// Bulk / background sweeps (`check_for_updates`). May be refused while a
+    /// cooldown is armed, so N games can never serialise N reconnect attempts.
+    Background,
+}
+
+/// "Re-authentication is on cooldown". Typed so callers detect it by
+/// downcast, never by matching Display text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReauthCooldown {
+    pub failures: u32,
+    pub retry_after_secs: u64,
+}
+
+impl std::fmt::Display for ReauthCooldown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "steam reconnection on cooldown after {} consecutive failures (retry in {}s)",
+            self.failures, self.retry_after_secs
+        )
+    }
+}
+impl std::error::Error for ReauthCooldown {}
+
+/// "Re-authentication exceeded its time budget". Typed, and counted as a
+/// failed attempt by the cooldown because it is a connect failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReauthTimeout {
+    pub secs: u64,
+}
+
+impl std::fmt::Display for ReauthTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "steam re-authentication timed out after {}s", self.secs)
+    }
+}
+impl std::error::Error for ReauthTimeout {}
+
+/// Pure backoff arithmetic for failed re-authentication attempts.
+///
+/// `now` is always a parameter rather than read inside: tests drive the clock
+/// directly instead of sleeping, and no `tokio` `test-util` feature is needed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReauthBackoff {
+    /// Consecutive attempts that failed for network/connect reasons.
+    pub failures: u32,
+    /// Background attempts are refused until this instant.
+    pub until: Option<Instant>,
+}
+
+impl ReauthBackoff {
+    /// Backoff ladder: 1, 2, 4, 8, 16, 32, then capped.
+    const MAX_SECS: u64 = 60;
+
+    pub fn on_cooldown(&self, now: Instant) -> bool {
+        self.until.map(|until| now < until).unwrap_or(false)
+    }
+
+    /// Seconds remaining, 0 once expired or if never armed.
+    pub fn retry_after_secs(&self, now: Instant) -> u64 {
+        self.until
+            .map(|until| until.saturating_duration_since(now).as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Record one network-attributable failure and arm the backoff.
+    pub fn record_failure(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        let step = 1u64 << self.failures.saturating_sub(1).min(6);
+        let secs = step.min(Self::MAX_SECS);
+        self.until = Some(now + std::time::Duration::from_secs(secs));
+    }
+
+    /// A successful re-auth, or a user-initiated attempt, clears everything.
+    pub fn clear(&mut self) {
+        self.failures = 0;
+        self.until = None;
+    }
+
+    pub fn to_error(&self, now: Instant) -> ReauthCooldown {
+        ReauthCooldown {
+            failures: self.failures,
+            retry_after_secs: self.retry_after_secs(now),
+        }
+    }
+}
+
+/// Bounds a bulk background sweep to one *failing* CM attempt per run.
+///
+/// `check_for_updates` walks every installed game and asks each one for its
+/// remote manifests. Against a dead CM that became N sequential
+/// re-authentication attempts — exactly the case the re-auth cooldown exists
+/// to prevent. Spending the budget on the first failure stops the sweep from
+/// even asking; the cooldown independently refuses anything that does.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BulkCmBudget {
+    spent: bool,
+}
+
+impl BulkCmBudget {
+    /// May this iteration talk to CM?
+    pub fn allow_attempt(&self) -> bool {
+        !self.spent
+    }
+
+    /// The attempt failed — every later iteration is skipped.
+    pub fn spend(&mut self) {
+        self.spent = true;
+    }
+}
+
+/// Time budget for a single re-authentication attempt.
+///
+/// This is the bound on how long the **state mutex** can stay held: the
+/// attempt runs while `active_connection_locked` owns the guard, so without
+/// this a hung `Connection::access` (unreachable CM, wedged TCP connect)
+/// would block every caller of `get_active_connection` indefinitely. With it,
+/// a second caller waits at most this long before it gets an error back.
+const REAUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The bypass rule, in one place so it is directly testable: only a
+/// `Background` attempt may be refused by an armed cooldown. A user-initiated
+/// call is never refused — it clears the cooldown instead and gets exactly one
+/// attempt, so acting in the UI is always enough to try again immediately.
+fn intent_refused(reauth: &ReauthBackoff, intent: ReauthIntent, now: Instant) -> bool {
+    match intent {
+        ReauthIntent::Background => reauth.on_cooldown(now),
+        ReauthIntent::UserInitiated => false,
+    }
+}
+
+/// Run a re-authentication attempt under [`REAUTH_TIMEOUT`]. Expiry becomes a
+/// typed [`ReauthTimeout`] so it is distinguishable from an auth rejection —
+/// and so the cooldown can count it as a failed connect attempt.
+async fn bounded_reauth<F, T>(budget: std::time::Duration, attempt: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(budget, attempt).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(anyhow::Error::new(ReauthTimeout {
+            secs: budget.as_secs(),
+        })),
+    }
+}
+
+/// Attribute a re-authentication failure to network/connect trouble.
+///
+/// This answers a *different* question from `is_transport_error`, which asks
+/// whether a CM operation may be safely replayed. Here we ask whether the
+/// network — as opposed to Steam rejecting our credentials — caused the
+/// failure, because only that should arm the cooldown.
+///
+/// Classified by what the error chain *contains*, never by its text:
+/// `ConnectionError` uses `#[from]`, so `NetworkError` is always reachable as
+/// a source. A rejected refresh token (`ConnectionError::AccessToken`) or bad
+/// credentials (`ConnectionError::LoginError`) carry `AccessTokenError` /
+/// `LoginError` payloads, neither of which can hold a network error, so they
+/// are never counted — they must surface immediately instead of hiding behind
+/// a backoff.
+///
+/// Note `NetworkError::Timeout` *is* counted here even though
+/// `is_transport_error` deliberately rejects it: for a replayed operation a
+/// timeout leaves the outcome unknown, but for `Connection::access` it plainly
+/// means we could not connect.
+fn is_network_failure(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if cause.downcast_ref::<ReauthTimeout>().is_some() {
+            return true;
+        }
+        matches!(
+            cause.downcast_ref::<steam_vent::NetworkError>(),
+            Some(
+                steam_vent::NetworkError::IO(_)
+                    | steam_vent::NetworkError::Ws(_)
+                    | steam_vent::NetworkError::EOF
+                    | steam_vent::NetworkError::Timeout
+            )
+        )
+    })
+}
+
 #[derive(Clone)]
 pub struct SteamClient {
-    connection: Option<Connection>,
-    state: LoginState,
-    connected_at: Option<Instant>,
-    active_cm: Option<SocketAddr>,
-    server_list: Option<ServerList>,
-    pending_confirmations: Vec<ConfirmationPrompt>,
-    /// Set the moment we observe the CM connection drop (Steam resets the
-    /// WebSocket, or a heartbeat send fails with AlreadyClosed). A set value
-    /// means the held `connection` is a zombie and must be dropped + reconnected
-    /// before the next CM call, instead of being reused (which would otherwise
-    /// keep erroring with "Failed to send heartbeat: AlreadyClosed").
-    connection_dead_since: Option<Instant>,
+    /// Live CM session state; see [`ConnectionState`].
+    inner: Arc<tokio::sync::Mutex<ConnectionState>>,
+    server_list: Arc<std::sync::Mutex<Option<ServerList>>>,
+    /// True once a usable Steam session exists (post login/restore/reconnect).
+    has_session: Arc<AtomicBool>,
+    /// True when SteamFlow entered offline mode (cached library only).
+    offline: Arc<AtomicBool>,
+    connected_at: Arc<std::sync::Mutex<Option<Instant>>>,
+    active_cm: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    pending_confirmations: Arc<std::sync::Mutex<Vec<ConfirmationPrompt>>>,
+}
+
+#[cfg(test)]
+mod cm_generation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalidation_waits_for_contended_state_lock() {
+        let client = SteamClient::new().unwrap();
+        let guard = client.inner.lock().await;
+        let pending = client.mark_connection_dead();
+        tokio::pin!(pending);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending)
+            .await.is_err());
+        drop(guard);
+        pending.await;
+        assert!(client.is_connection_dead());
+    }
+
+    #[tokio::test]
+    async fn stale_generation_cannot_invalidate_replacement() {
+        let client = SteamClient::new().unwrap();
+        client.inner.lock().await.generation = 2;
+        client.mark_generation_dead(1).await;
+        assert!(!client.is_connection_dead());
+        client.mark_generation_dead(2).await;
+        assert!(client.is_connection_dead());
+    }
+}
+
+/// `observe_transport_failure` is the no-retry invalidation path: it must act
+/// on typed transport errors only, and only for the generation it was handed.
+/// No live `Connection` is involved, so these run offline.
+#[cfg(test)]
+mod observe_transport_failure_tests {
+    use super::*;
+    use steam_vent::NetworkError;
+
+    /// Build an error shaped like production: a typed `NetworkError` carrying
+    /// an anyhow context, reached through `err.chain()`.
+    fn wrapped(err: NetworkError) -> anyhow::Error {
+        let failed: Result<(), NetworkError> = Err(err);
+        failed
+            .context("failed calling Player.GetOwnedGames")
+            .unwrap_err()
+    }
+
+    fn typed_reset() -> anyhow::Error {
+        wrapped(NetworkError::Ws(tungstenite::Error::Protocol(
+            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        )))
+    }
+
+    #[tokio::test]
+    async fn observe_transport_failure_marks_dead_on_typed_reset() {
+        let client = SteamClient::new().unwrap();
+        assert!(!client.is_connection_dead(), "precondition: fresh client");
+
+        client.observe_transport_failure(0, &typed_reset()).await;
+
+        assert!(
+            client.is_connection_dead(),
+            "a typed WebSocket reset must mark the connection dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_transport_failure_ignores_stale_generation() {
+        let client = SteamClient::new().unwrap();
+        client.inner.lock().await.generation = 2;
+
+        // Failure observed on generation 1, long since replaced.
+        client.observe_transport_failure(1, &typed_reset()).await;
+
+        assert!(
+            !client.is_connection_dead(),
+            "a stale failure must not tear down the replacement connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_transport_failure_ignores_timeout() {
+        let client = SteamClient::new().unwrap();
+
+        client
+            .observe_transport_failure(0, &wrapped(NetworkError::Timeout))
+            .await;
+
+        assert!(
+            !client.is_connection_dead(),
+            "a timeout is not proof the transport died and must not force re-auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_transport_failure_ignores_tls_error() {
+        let client = SteamClient::new().unwrap();
+        let err = anyhow::Error::new(NetworkError::Ws(tungstenite::Error::Tls(
+            tungstenite::error::TlsError::InvalidDnsName,
+        )));
+
+        client.observe_transport_failure(0, &err).await;
+
+        assert!(
+            !client.is_connection_dead(),
+            "a TLS failure is not a CM transport reset"
+        );
+    }
+}
+
+/// Structural guards for the no-retry work: compound flows must not sit behind
+/// the retrying wrapper, spawned CM tasks must carry a generation they can
+/// fence, and no production path may take the bare accessor (which cannot see
+/// a pre-call zombie). Source scans only — no `Connection`, no network, no
+/// `$HOME`, so they are deterministic offline.
+#[cfg(test)]
+mod no_retry_fence_structure_tests {
+    /// Needles are assembled at runtime: if this module contained the text it
+    /// searches for, every count would include the test itself.
+    fn needle(head: &str, tail: &str) -> String {
+        [head, tail].concat()
+    }
+
+    fn source() -> String {
+        let mut dir = std::env::current_dir().expect("cwd");
+        let text = loop {
+            let candidate = dir.join("src/steam_client.rs");
+            if candidate.exists() {
+                break std::fs::read_to_string(&candidate).expect("read src/steam_client.rs");
+            }
+            if !dir.pop() {
+                panic!("could not locate src/steam_client.rs walking up from the cwd");
+            }
+        };
+        // All whitespace removed, so the needles survive rustfmt re-wrapping a
+        // call across lines (which is how both spawned-task fences are written).
+        text.split_whitespace().collect()
+    }
+
+    #[test]
+    fn no_bare_accessor_calls_remain_outside_the_alias() {
+        let src = source();
+        let probe = needle("self.get_active_connection", "().await");
+        let count = src.matches(&probe).count();
+        assert_eq!(
+            count,
+            1,
+            "only the connection_or_reconnect alias may call get_active_connection, but it appears {count} times. Every other site must either lease a generation or sit inside a recovery boundary - the bare accessor hands back a zombie it cannot detect."
+        );
+    }
+
+    #[test]
+    fn spawned_cm_tasks_lease_a_generation_then_fence_it() {
+        let src = source();
+        // run_guarded (behind both replay-safe wrappers), with_connection_no_retry,
+        // install_game and start_manifest_download each capture
+        // `(Connection, generation)` up front. The needle stops at
+        // `connection_lease` so it counts both the plain and the
+        // intent-carrying `connection_lease_with` form.
+        let lease = needle("let(connection,generation)=self.", "connection_lease");
+        assert_eq!(
+            src.matches(&lease).count(),
+            4,
+            "expected the recovery boundaries plus the two spawned-task sites to take a lease"
+        );
+        // Called through `client_clone` by the spawned tasks; the boundary's own
+        // call goes through `self` and is counted separately.
+        let fence = needle("client_clone.observe_transport_failure", "(generation,");
+        assert_eq!(
+            src.matches(&fence).count(),
+            2,
+            "install_game and start_manifest_download must fence the raw CM call              they make inside tokio::task::spawn"
+        );
+    }
+
+    #[test]
+    fn compound_sites_use_the_no_retry_boundary() {
+        let src = source();
+        let no_retry = needle(".with_connection_no_retry", "(");
+        assert_eq!(
+            src.matches(&no_retry).count(),
+            2,
+            "play_game's sync_down and sync_up must repair the connection without replaying their effects"
+        );
+        // The replay-safe wrapper was split by (d) into a user-initiated and a
+        // background form; pin their TOTAL so a compound flow gaining a call
+        // site shows up here as a bump, which is exactly when a reviewer
+        // should look.
+        let retrying = needle(".with_healthy_connection", "(");
+        let background = needle(".with_healthy_connection_bg", "(");
+        assert_eq!(
+            src.matches(&retrying).count() + src.matches(&background).count(),
+            14,
+            "read-only call-site count changed — confirm no compound flow joined it"
+        );
+    }
+}
+
+/// Clear the shared download flag when a spawned download task exits early.
+///
+/// Each download task sets `is_downloading = true` on entry and clears it only
+/// on its end-of-body paths, so every early `return` in between used to leave
+/// the flag stuck at true and the UI kept showing an operation in flight.
+/// Guarded on the flag still being set, so a normal completion — which has
+/// already written its own status text — is left untouched.
+fn mark_download_ended(
+    shared_state: &std::sync::RwLock<crate::models::DownloadState>,
+    status: &str,
+) {
+    if let Ok(mut state) = shared_state.write() {
+        if state.is_downloading {
+            state.is_downloading = false;
+            state.status_text = status.to_string();
+        }
+    }
+}
+
+#[cfg(test)]
+mod download_state_cleanup_tests {
+    use super::mark_download_ended;
+    use crate::models::DownloadState;
+    use std::sync::RwLock;
+
+    fn running_state() -> RwLock<DownloadState> {
+        let state = RwLock::new(DownloadState::default());
+        {
+            let mut s = state.write().unwrap();
+            s.is_downloading = true;
+            s.status_text = "Preparing operation for Some Game...".to_string();
+        }
+        state
+    }
+
+    #[test]
+    fn mark_download_ended_clears_a_flag_left_by_an_early_return() {
+        let state = running_state();
+        assert!(
+            state.read().unwrap().is_downloading,
+            "precondition: task is in flight"
+        );
+
+        mark_download_ended(&state, "Operation failed or paused");
+
+        assert!(
+            !state.read().unwrap().is_downloading,
+            "an early return must not leave the flag stuck"
+        );
+        assert_eq!(
+            state.read().unwrap().status_text,
+            "Operation failed or paused"
+        );
+    }
+
+    #[test]
+    fn mark_download_ended_leaves_a_normal_completion_alone() {
+        let state = running_state();
+        // Simulate the end-of-body path having already run.
+        {
+            let mut s = state.write().unwrap();
+            s.is_downloading = false;
+            s.status_text = "Operation complete".to_string();
+        }
+
+        mark_download_ended(&state, "Operation failed or paused");
+
+        let s = state.read().unwrap();
+        assert!(!s.is_downloading);
+        assert_eq!(
+            s.status_text, "Operation complete",
+            "a completed run must keep its own status"
+        );
+    }
+
+    #[test]
+    fn mark_download_ended_is_a_noop_when_nothing_started() {
+        let state = RwLock::new(DownloadState::default());
+        mark_download_ended(&state, "Operation failed or paused");
+        let s = state.read().unwrap();
+        assert!(!s.is_downloading);
+        assert_eq!(
+            s.status_text, "",
+            "a task that never started must not report a status"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reauth_cooldown_tests {
+    use super::{
+        bounded_reauth, intent_refused, is_network_failure, BulkCmBudget, ReauthBackoff,
+        ReauthIntent, ReauthTimeout, SteamClient,
+    };
+    use anyhow::Context;
+    use std::time::{Duration, Instant};
+    use steam_vent::{ConnectionError, EResult, LoginError, NetworkError};
+
+    fn wrap(err: ConnectionError) -> anyhow::Error {
+        let failed: Result<(), ConnectionError> = Err(err);
+        failed
+            .context("refresh token re-authentication failed")
+            .unwrap_err()
+    }
+
+    // ---- pure backoff arithmetic: `now` is always passed in ----
+
+    #[test]
+    fn backoff_starts_disarmed() {
+        let now = Instant::now();
+        let backoff = ReauthBackoff::default();
+        assert!(!backoff.on_cooldown(now));
+        assert_eq!(backoff.retry_after_secs(now), 0);
+        assert_eq!(backoff.failures, 0);
+    }
+
+    #[test]
+    fn backoff_ladder_doubles_until_the_cap() {
+        let start = Instant::now();
+        let expected = [1u64, 2, 4, 8, 16, 32, 60, 60, 60];
+        let mut backoff = ReauthBackoff::default();
+        for (i, want) in expected.iter().enumerate() {
+            backoff.record_failure(start);
+            assert_eq!(backoff.failures as usize, i + 1, "failure count");
+            assert_eq!(
+                backoff.retry_after_secs(start),
+                *want,
+                "backoff after {} failures",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_expires_exactly_at_its_deadline() {
+        let start = Instant::now();
+        let mut backoff = ReauthBackoff::default();
+        backoff.record_failure(start); // 1s
+        assert!(backoff.on_cooldown(start));
+        assert!(backoff.on_cooldown(start + Duration::from_millis(999)));
+        assert!(
+            !backoff.on_cooldown(start + Duration::from_secs(1)),
+            "the deadline must pass into a usable state"
+        );
+        assert_eq!(backoff.retry_after_secs(start + Duration::from_secs(1)), 0);
+    }
+
+    #[test]
+    fn user_initiated_action_clears_the_cooldown() {
+        let now = Instant::now();
+        let mut backoff = ReauthBackoff::default();
+        backoff.record_failure(now);
+        backoff.record_failure(now);
+        assert!(backoff.on_cooldown(now), "precondition: armed");
+
+        backoff.clear();
+
+        assert!(
+            !backoff.on_cooldown(now),
+            "acting in the UI must clear the backoff"
+        );
+        assert_eq!(backoff.failures, 0);
+        assert_eq!(backoff.retry_after_secs(now), 0);
+    }
+
+    // ---- the bypass rule itself ----
+
+    #[test]
+    fn cooldown_refuses_background_attempts_but_never_user_initiated_ones() {
+        let now = Instant::now();
+        let mut backoff = ReauthBackoff::default();
+        backoff.record_failure(now);
+        assert!(backoff.on_cooldown(now), "precondition: cooldown armed");
+
+        assert!(intent_refused(&backoff, ReauthIntent::Background, now));
+        assert!(
+            !intent_refused(&backoff, ReauthIntent::UserInitiated, now),
+            "a user-initiated action must never be refused by the cooldown"
+        );
+    }
+
+    // ---- attribution: only connect trouble arms the backoff ----
+
+    #[test]
+    fn rejected_credentials_do_not_arm_the_cooldown() {
+        // Steam answered us. These must surface immediately instead of hiding
+        // behind a backoff the user cannot clear by acting.
+        assert!(!is_network_failure(&wrap(ConnectionError::LoginError(
+            LoginError::InvalidCredentials
+        ))));
+        assert!(!is_network_failure(&wrap(ConnectionError::LoginError(
+            LoginError::SteamGuardRequired
+        ))));
+        assert!(!is_network_failure(&wrap(ConnectionError::LoginError(
+            LoginError::RateLimited
+        ))));
+        assert!(!is_network_failure(&wrap(ConnectionError::Aborted)));
+    }
+
+    #[test]
+    fn network_failures_arm_the_cooldown_but_api_rejections_do_not() {
+        assert!(is_network_failure(&wrap(ConnectionError::Network(
+            NetworkError::EOF
+        ))));
+        assert!(is_network_failure(&wrap(ConnectionError::Network(
+            NetworkError::Timeout
+        ))));
+        assert!(is_network_failure(&wrap(ConnectionError::Network(
+            NetworkError::IO(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+        ))));
+        assert!(!is_network_failure(&wrap(ConnectionError::Network(
+            NetworkError::ApiError(EResult::Busy)
+        ))));
+        assert!(!is_network_failure(&wrap(ConnectionError::Network(
+            NetworkError::CryptoHandshakeFailed
+        ))));
+    }
+
+    #[test]
+    fn reauth_timeout_counts_as_a_connect_failure() {
+        let err = anyhow::Error::new(ReauthTimeout { secs: 15 });
+        assert!(
+            is_network_failure(&err),
+            "a re-auth that timed out plainly could not connect"
+        );
+        // ...and is still distinguishable from an auth rejection by type.
+        assert!(err.downcast_ref::<ReauthTimeout>().is_some());
+    }
+
+    // ---- the state lock must not be pinned by a hung attempt ----
+
+    #[tokio::test]
+    async fn reauth_attempt_is_bounded_so_waiters_are_not_blocked_forever() {
+        let client = SteamClient::new().unwrap();
+
+        // Hold the state mutex exactly as active_connection_locked does while
+        // its attempt runs, with an attempt that never completes on its own.
+        let guard = client.inner.lock().await;
+        let hung = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok::<_, anyhow::Error>(())
+        };
+
+        let started = Instant::now();
+        let outcome = bounded_reauth(Duration::from_millis(50), hung).await;
+        let elapsed = started.elapsed();
+
+        let err = outcome.expect_err("a hung attempt must not report success");
+        assert!(
+            err.downcast_ref::<ReauthTimeout>().is_some(),
+            "expiry must surface as the typed ReauthTimeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the attempt must return at its budget, not after the hour-long sleep (took {elapsed:?})"
+        );
+
+        drop(guard);
+
+        // `Mutex::lock()` yields a future; wrapping the already-awaited guard
+        // would time out nothing.
+        let second = tokio::time::timeout(Duration::from_secs(2), client.inner.lock()).await;
+        assert!(
+            second.is_ok(),
+            "a waiter must get the state lock once the attempt is bounded"
+        );
+    }
+
+    // ---- the bulk loop that motivated the cooldown ----
+
+    #[test]
+    fn bulk_sweep_stops_after_one_failing_attempt() {
+        let mut budget = BulkCmBudget::default();
+        let mut attempts = 0;
+        for _game in 0..50u32 {
+            if !budget.allow_attempt() {
+                continue;
+            }
+            attempts += 1;
+            budget.spend(); // that attempt failed
+        }
+        assert_eq!(attempts, 1, "50 games must not become 50 CM attempts");
+    }
+
+    #[test]
+    fn cooldown_starves_the_rest_of_a_bulk_loop() {
+        let start = Instant::now();
+        let mut backoff = ReauthBackoff::default();
+        backoff.record_failure(start);
+
+        let mut reached_network = 0;
+        for _game in 0..50u32 {
+            if intent_refused(
+                &backoff,
+                ReauthIntent::Background,
+                start + Duration::from_millis(1),
+            ) {
+                continue;
+            }
+            reached_network += 1;
+        }
+        assert_eq!(
+            reached_network, 0,
+            "inside the backoff window no later game may reach the network"
+        );
+    }
+
+    fn read_source() -> String {
+        let mut dir = std::env::current_dir().expect("cwd");
+        loop {
+            let candidate = dir.join("src/steam_client.rs");
+            if candidate.exists() {
+                return std::fs::read_to_string(&candidate).expect("read src/steam_client.rs");
+            }
+            if !dir.pop() {
+                panic!("could not locate src/steam_client.rs walking up from the cwd");
+            }
+        }
+    }
+
+    #[test]
+    fn check_for_updates_wires_in_the_background_wrapper_and_budget() {
+        // Assembled at runtime so this module's own source cannot match itself.
+        let text = read_source();
+        let wrapper = ["remote_manifest_", "ids_bg("].concat();
+        let budget = ["BulkCmBudget::", "default()"].concat();
+        assert!(
+            text.contains(&wrapper),
+            "the sweep must use the background wrapper"
+        );
+        assert!(
+            text.contains(&budget),
+            "the sweep must spend a BulkCmBudget"
+        );
+        let stale = ["remote_manifest_ids(", "game.app_id"].concat();
+        assert!(
+            !text.contains(&stale),
+            "the sweep must no longer call the user-initiated wrapper"
+        );
+    }
 }
 
 impl SteamClient {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            connection: None,
-            state: LoginState::Connected,
-            connected_at: None,
-            active_cm: None,
-            server_list: None,
-            pending_confirmations: Vec::new(),
-            connection_dead_since: None,
+            inner: Arc::new(tokio::sync::Mutex::new(ConnectionState::default())),
+            server_list: Arc::new(std::sync::Mutex::new(None)),
+            has_session: Arc::new(AtomicBool::new(false)),
+            offline: Arc::new(AtomicBool::new(false)),
+            connected_at: Arc::new(std::sync::Mutex::new(None)),
+            active_cm: Arc::new(std::sync::Mutex::new(None)),
+            pending_confirmations: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
     pub fn is_authenticated(&self) -> bool {
-        // A connection marked dead (Steam reset the WebSocket / heartbeat failed with
-        // AlreadyClosed) is a zombie and must not be treated as usable; callers that
-        // hold &mut self should call connection_or_reconnect() to transparently recover.
-        self.connection.is_some() && self.connection_dead_since.is_none()
+        // With the self-healing accessor (`get_active_connection`) a dropped
+        // CM socket no longer means permanent log-out: the next guarded call
+        // re-authenticates from the persisted refresh token. What matters here
+        // is whether we HAVE a usable session credential and are not in
+        // offline mode.
+        self.has_session.load(Ordering::Relaxed) && !self.is_offline()
     }
 
     pub fn is_offline(&self) -> bool {
-        self.state == LoginState::Offline
+        self.offline.load(Ordering::Relaxed)
     }
 
-    pub fn connection(&self) -> Option<&Connection> {
-        self.connection.as_ref()
+    /// Legacy peek at the live connection. Prefer [`Self::get_active_connection`].
+    pub fn connection(&self) -> Option<Connection> {
+        self.inner.try_lock().ok()?.connection.clone()
+    }
+
+    /// True when the last observed CM socket state was "reset" and no
+    /// successful re-authentication has happened since. Used by the sync
+    /// (non-async) download path to fail fast instead of hanging.
+    pub fn is_connection_dead(&self) -> bool {
+        self.inner.try_lock().map(|guard| guard.dead).unwrap_or(false)
     }
 
     /// Mark the held CM connection as dead. Called when we observe a transport
-    /// reset (Steam rotates connection managers, or the WebSocket is closed with
-    /// ResetWithoutClosingHandshake / AlreadyClosed). The next guarded CM call
-    /// will drop the zombie handle and transparently reconnect.
-    pub fn mark_connection_dead(&mut self) {
-        if self.connection_dead_since.is_none() {
-            self.connection_dead_since = Some(Instant::now());
-        }
-        self.connection = None;
+    /// reset (Steam rotates connection managers, or the WebSocket is closed
+    /// with ResetWithoutClosingHandshake / AlreadyClosed). Waits for the state
+    /// mutex so an invalidation is never silently lost to contention; error
+    /// paths that captured a generation should prefer
+    /// [`Self::mark_generation_dead`] instead.
+    pub async fn mark_connection_dead(&self) {
+        let mut guard = self.inner.lock().await;
+        Self::invalidate_connection_locked(&mut guard);
     }
 
-    /// Return a live connection, transparently reconnecting if the previous one
-    /// was marked dead (Steam reset it). This prevents callers from reusing a
-    /// closed socket and stops the repeated "Failed to send heartbeat" spam.
-    pub async fn connection_or_reconnect(&mut self) -> Result<&Connection> {
-        if self.connection.is_none() {
-            self.connect().await?;
+    /// Invalidate the connection only if it is still the generation the
+    /// caller observed. A stale failure (from a zombie replaced by a fresh
+    /// login in the meantime) must not tear down the newer connection.
+    async fn mark_generation_dead(&self, generation: u64) {
+        let mut guard = self.inner.lock().await;
+        if guard.generation == generation {
+            Self::invalidate_connection_locked(&mut guard);
         }
-        self.connection
-            .as_ref()
-            .context("steam connection not initialized")
+    }
+
+    fn invalidate_connection_locked(guard: &mut ConnectionState) {
+        if !guard.dead {
+            guard.dead = true;
+            guard.dead_since = Some(Instant::now());
+        }
+        guard.connection = None;
+    }
+
+    /// Health-checked accessor that also reports the connection generation.
+    /// Callers that replay operations on transport failure must capture it and
+    /// fence their invalidation through [`Self::mark_generation_dead`].
+    /// Lease a connection for a user-initiated operation: clears any cooldown
+    /// and gets exactly one re-auth attempt.
+    async fn connection_lease(&self) -> Result<(Connection, u64)> {
+        self.connection_lease_with(ReauthIntent::UserInitiated)
+            .await
+    }
+
+    /// Lease a connection, letting `intent` decide whether an armed cooldown
+    /// may refuse the attempt.
+    async fn connection_lease_with(&self, intent: ReauthIntent) -> Result<(Connection, u64)> {
+        let mut guard = self.inner.lock().await;
+        let connection = self.active_connection_locked(&mut guard, intent).await?;
+        Ok((connection, guard.generation))
+    }
+
+    fn is_transport_error(err: &anyhow::Error) -> bool {
+        Self::is_transport_error_public(err)
+    }
+
+    fn is_reset_io_error(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    }
+
+    /// Public mirror of [`Self::is_transport_error`] for tests.
+    #[doc(hidden)]
+    pub fn is_transport_error_public(err: &anyhow::Error) -> bool {
+        // Error values, not Display/Debug strings or context prose, determine
+        // whether replay is safe. Timeouts/API failures are not death evidence.
+        err.chain().any(|cause| {
+            if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+                // A future wrapped operation with local disk I/O could expose a
+                // bare io::Error here; only the four reset/pipe/EOF kinds qualify.
+                return Self::is_reset_io_error(io_error);
+            }
+            match cause.downcast_ref::<steam_vent::NetworkError>() {
+                Some(steam_vent::NetworkError::IO(io_error)) => {
+                    Self::is_reset_io_error(io_error)
+                }
+                Some(steam_vent::NetworkError::EOF) => true,
+                Some(steam_vent::NetworkError::Ws(tungstenite::Error::Io(io_error))) => {
+                    Self::is_reset_io_error(io_error)
+                }
+                Some(steam_vent::NetworkError::Ws(
+                    tungstenite::Error::AlreadyClosed
+                        | tungstenite::Error::ConnectionClosed
+                        | tungstenite::Error::Protocol(
+                            tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                        ),
+                )) => true,
+                _ => false,
+            }
+        })
+    }
+
+    /// Return a live, logged-in connection — re-authenticating from the
+    /// persisted refresh token if the previous one died. This is the ONE
+    /// accessor all CM-touching code paths should use.
+    pub async fn get_active_connection(&self) -> Result<Connection> {
+        let mut guard = self.inner.lock().await;
+        self.active_connection_locked(&mut guard, ReauthIntent::UserInitiated)
+            .await
+    }
+
+    /// Compatibility alias for [`Self::get_active_connection`].
+    pub async fn connection_or_reconnect(&self) -> Result<Connection> {
+        self.get_active_connection().await
+    }
+
+    /// Core of `get_active_connection`; caller must hold the state mutex.
+    /// Core of `get_active_connection`; caller must hold the state mutex.
+    ///
+    /// `intent` decides whether an armed cooldown may refuse the attempt. The
+    /// attempt itself runs under [`REAUTH_TIMEOUT`] *while this guard is
+    /// held*, which is what bounds how long a concurrent caller can block —
+    /// without it a hung `Connection::access` would pin the mutex forever.
+    async fn active_connection_locked(
+        &self,
+        guard: &mut ConnectionState,
+        intent: ReauthIntent,
+    ) -> Result<Connection> {
+        if let Some(connection) = &guard.connection {
+            if !guard.dead {
+                return Ok(connection.clone());
+            }
+            tracing::info!(
+                idle_secs = guard
+                    .dead_since
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0),
+                "CM connection marked dead; re-authenticating from refresh token"
+            );
+        }
+
+        let now = Instant::now();
+        if intent_refused(&guard.reauth, intent, now) {
+            let cooldown = guard.reauth.to_error(now);
+            tracing::debug!(
+                failures = cooldown.failures,
+                retry_after_secs = cooldown.retry_after_secs,
+                "background re-authentication refused: on cooldown"
+            );
+            return Err(anyhow::Error::new(cooldown));
+        }
+        if intent == ReauthIntent::UserInitiated {
+            // The user is waiting: drop any cooldown so this call gets exactly
+            // one attempt. A failure re-arms it for background paths.
+            guard.reauth.clear();
+        }
+
+        let attempt = async {
+            let persisted = load_session()
+                .await
+                .context("failed loading persisted Steam session")?;
+            let account_name = persisted
+                .account_name
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("no persisted account_name found"))?;
+            let refresh_token = persisted
+                .refresh_token
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow!("no persisted refresh_token found"))?;
+
+            let server_list = self.resolve_server_list().await?;
+            let connection = Connection::access(&server_list, &account_name, &refresh_token)
+                .await
+                .map_err(|e| anyhow!(e))
+                .context("refresh token re-authentication failed")?;
+            Ok::<_, anyhow::Error>((connection, account_name))
+        };
+
+        let (connection, account_name) = match bounded_reauth(REAUTH_TIMEOUT, attempt).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                // Only connect trouble arms the backoff. A rejected refresh
+                // token must surface straight away rather than hide behind a
+                // cooldown the user cannot clear by acting.
+                if is_network_failure(&err) {
+                    guard.reauth.record_failure(Instant::now());
+                    tracing::warn!(
+                        error = %err,
+                        failures = guard.reauth.failures,
+                        retry_after_secs = guard.reauth.retry_after_secs(Instant::now()),
+                        "re-authentication failed with a connect error; arming backoff"
+                    );
+                } else {
+                    tracing::warn!(
+                        error = %err,
+                        "re-authentication failed without a connect error; not backing off"
+                    );
+                }
+                return Err(err);
+            }
+        };
+
+        // Persist the rotated token pair so restarts never replay a consumed
+        // refresh token.
+        if let Some(session) =
+            Self::session_state_from(&connection, account_name.clone())
+        {
+            save_session(&session).await.ok();
+        }
+
+        guard.reauth.clear();
+        guard.generation += 1;
+        guard.connection = Some(connection.clone());
+        guard.dead = false;
+        guard.dead_since = None;
+        *self.connected_at.lock().unwrap() = Some(Instant::now());
+        self.has_session.store(true, Ordering::Relaxed);
+
+        tracing::info!("CM connection restored via refresh-token re-authentication");
+        Ok(connection)
+    }
+
+    /// Run `op` on a healthy connection. If the operation fails with a CM
+    /// transport error (reset WebSocket, closed socket, EOF on the job
+    /// waiter), mark the connection dead, transparently re-authenticate, and
+    /// retry the operation ONCE on the fresh connection.
+    /// Read-only, replay-safe operation the user is waiting on: lease, run,
+    /// and on a typed transport failure repair the connection and retry ONCE.
+    pub(crate) async fn with_healthy_connection<T, F, Fut>(&self, op: F) -> Result<T>
+    where
+        F: Fn(Connection) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.run_guarded(ReauthIntent::UserInitiated, op).await
+    }
+
+    /// Same guard, but for bulk/background sweeps where the re-auth cooldown
+    /// is allowed to refuse a lease instead of hammering a dead CM.
+    pub(crate) async fn with_healthy_connection_bg<T, F, Fut>(&self, op: F) -> Result<T>
+    where
+        F: Fn(Connection) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.run_guarded(ReauthIntent::Background, op).await
+    }
+
+    async fn run_guarded<T, F, Fut>(&self, intent: ReauthIntent, op: F) -> Result<T>
+    where
+        F: Fn(Connection) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let (connection, generation) = self.connection_lease_with(intent).await?;
+        match op(connection).await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if !Self::is_transport_error(&err) {
+                    tracing::warn!(
+                        error = %err,
+                        error_chain = ?err.chain().collect::<Vec<_>>(),
+                        "CM operation failed without a reconnectable transport error"
+                    );
+                    return Err(err);
+                }
+                tracing::warn!(
+                    error = %err,
+                    error_chain = ?err.chain().collect::<Vec<_>>(),
+                    "CM transport failure on job call; marking connection dead and retrying once"
+                );
+                self.mark_generation_dead(generation).await;
+                let (fresh, generation) = self.connection_lease().await?;
+                let result = op(fresh).await;
+                // Fence the retry's own failure the same way: only mark dead
+                // if the replacement is still current.
+                if let Err(err) = &result {
+                    if Self::is_transport_error(err) {
+                        self.mark_generation_dead(generation).await;
+                    }
+                }
+                result
+            }
+        }
+    }
+
+    /// Run `op` on a leased connection exactly once. On failure, classify with
+    /// the typed transport classifier and fence the invalidation against the
+    /// lease's generation — but never retry.
+    ///
+    /// For compound / non-idempotent flows (install, verify, launch, cloud
+    /// writes) where replaying would duplicate effects: this still repairs the
+    /// connection for the *next* caller while letting this operation's error
+    /// surface unchanged.
+    pub(crate) async fn with_connection_no_retry<T, F, Fut>(&self, op: F) -> Result<T>
+    where
+        F: Fn(Connection) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let (connection, generation) = self.connection_lease().await?;
+        let result = op(connection).await;
+        if let Err(err) = &result {
+            self.observe_transport_failure(generation, err).await;
+        }
+        result
+    }
+
+    /// Classify `err` and, only when it is a typed CM transport failure, mark
+    /// the connection dead — fenced so a stale failure cannot tear down a
+    /// replacement. Never leases, never retries.
+    ///
+    /// Entry point for CM calls made from spawned tasks that captured a
+    /// `(Connection, generation)` lease before `tokio::task::spawn`: those
+    /// cannot re-lease from inside the task, but they can still invalidate.
+    pub(crate) async fn observe_transport_failure(&self, generation: u64, err: &anyhow::Error) {
+        if !Self::is_transport_error(err) {
+            tracing::warn!(
+                error = %err,
+                error_chain = ?err.chain().collect::<Vec<_>>(),
+                "CM operation failed without a reconnectable transport error"
+            );
+            return;
+        }
+        tracing::warn!(
+            error = %err,
+            error_chain = ?err.chain().collect::<Vec<_>>(),
+            generation,
+            "CM transport failure; marking connection dead (no retry)"
+        );
+        self.mark_generation_dead(generation).await;
     }
 
     pub async fn logout(&mut self) -> Result<()> {
-        self.connection = None;
-        self.connection_dead_since = None;
-        self.state = LoginState::Connected;
+        {
+            let mut guard = self.inner.lock().await;
+            guard.generation += 1;
+            guard.connection = None;
+            guard.dead = false;
+            guard.dead_since = None;
+        }
+        self.has_session.store(false, Ordering::Relaxed);
+        self.offline.store(false, Ordering::Relaxed);
         delete_session().await?;
         Ok(())
     }
 
     pub async fn get_app_ticket(&self, appid: u32) -> Result<Vec<u8>> {
-        let connection = self.connection.as_ref().context("steam connection not initialized")?;
+        // Read-only: a single GetAppOwnershipTicket job, safe to replay once
+        // on a fresh connection after a CM transport failure.
+        self.with_healthy_connection(move |connection| async move {
+            let mut request = CMsgClientGetAppOwnershipTicket::new();
+            request.set_app_id(appid);
 
-        let mut request = CMsgClientGetAppOwnershipTicket::new();
-        request.set_app_id(appid);
+            let response: steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse = connection
+                .job(request)
+                .await
+                .context("failed requesting app ownership ticket")?;
 
-        let response: steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse =
-            connection.job(request).await.context("failed requesting app ownership ticket")?;
-
-        let ticket = response.ticket().to_vec();
-        if ticket.is_empty() {
-            bail!("Steam returned an empty app ownership ticket for app {appid}");
-        }
-        Ok(ticket)
+            let ticket = response.ticket().to_vec();
+            if ticket.is_empty() {
+                bail!("Steam returned an empty app ownership ticket for app {appid}");
+            }
+            Ok(ticket)
+        })
+        .await
     }
 
     pub async fn get_account_data(&self) -> AccountData {
-        let Some(connection) = self.connection.as_ref() else {
+        let Some(connection) = self.connection() else {
             return AccountData::default();
         };
 
@@ -246,12 +1301,12 @@ impl SteamClient {
         data
     }
 
-    pub fn pending_confirmations(&self) -> &[ConfirmationPrompt] {
-        &self.pending_confirmations
+    pub fn pending_confirmations(&self) -> Vec<ConfirmationPrompt> {
+        self.pending_confirmations.lock().unwrap().clone()
     }
 
     pub fn clear_pending_confirmations(&mut self) {
-        self.pending_confirmations.clear();
+        self.pending_confirmations.lock().unwrap().clear();
     }
 
     pub fn is_auth_error_text(message: &str) -> bool {
@@ -266,9 +1321,8 @@ impl SteamClient {
     pub async fn connect(&mut self) -> Result<()> {
         match self.resolve_server_list().await {
             Ok(server_list) => {
-                self.active_cm = Some(server_list.pick());
-                self.connected_at = Some(Instant::now());
-                self.state = LoginState::Connected;
+                *self.active_cm.lock().unwrap() = Some(server_list.pick());
+                *self.connected_at.lock().unwrap() = Some(Instant::now());
                 Ok(())
             }
             Err(err) => {
@@ -281,14 +1335,14 @@ impl SteamClient {
         }
     }
 
-    async fn resolve_server_list(&mut self) -> Result<ServerList> {
-        if let Some(existing) = &self.server_list {
-            return Ok(existing.clone());
+    async fn resolve_server_list(&self) -> Result<ServerList> {
+        if let Some(existing) = self.server_list.lock().unwrap().clone() {
+            return Ok(existing);
         }
 
         match ServerList::discover().await {
             Ok(list) => {
-                self.server_list = Some(list.clone());
+                *self.server_list.lock().unwrap() = Some(list.clone());
                 Ok(list)
             }
             Err(_) => {
@@ -304,34 +1358,43 @@ impl SteamClient {
 
                 let list = ServerList::new(tcp_servers, ws_servers)
                     .context("failed constructing fallback server list")?;
-                self.server_list = Some(list.clone());
+                *self.server_list.lock().unwrap() = Some(list.clone());
                 Ok(list)
             }
         }
     }
 
-    async fn try_enter_offline_mode(&mut self) -> Result<bool> {
+    async fn try_enter_offline_mode(&self) -> Result<bool> {
         let cache_path = library_cache_path()?;
         if cache_path.exists() {
-            self.state = LoginState::Offline;
-            self.connection = None;
+            self.offline.store(true, Ordering::Relaxed);
+            let mut guard = self.inner.lock().await;
+            guard.generation += 1;
+            guard.connection = None;
             return Ok(true);
         }
         Ok(false)
     }
 
     pub fn invalidate_session(&mut self) {
-        self.connection = None;
-        self.connection_dead_since = None;
-        self.state = LoginState::Connected;
+        // Synchronous best-effort: clears the zombie flag and drops the
+        // connection handle; the next get_active_connection() re-authenticates.
+        if let Ok(mut guard) = self.inner.try_lock() {
+            guard.generation += 1;
+            guard.connection = None;
+            guard.dead = false;
+            guard.dead_since = None;
+        }
+        self.has_session.store(false, Ordering::Relaxed);
+        self.offline.store(false, Ordering::Relaxed);
     }
 
     pub fn connected_seconds(&self) -> Option<u64> {
-        self.connected_at.map(|v| v.elapsed().as_secs())
+        self.connected_at.lock().unwrap().map(|v| v.elapsed().as_secs())
     }
 
     pub fn active_cm(&self) -> Option<SocketAddr> {
-        self.active_cm
+        *self.active_cm.lock().unwrap()
     }
 
     pub async fn restore_session(&mut self) -> Result<SessionState> {
@@ -351,20 +1414,27 @@ impl SteamClient {
         if self.is_offline() {
             bail!("offline mode: using cached library");
         }
-        self.state = LoginState::AwaitingAccessTokenLogon;
 
         let server_list = self.resolve_server_list().await?;
         let connection = Connection::access(&server_list, &account_name, &refresh_token)
             .await
+            .map_err(|e| anyhow!(e))
             .context("refresh token login failed")?;
 
-        self.connection = Some(connection);
-        let session = self
-            .session_from_connection(account_name)
-            .context("refresh token login succeeded but no token was available for persistence")?;
+        {
+            let mut guard = self.inner.lock().await;
+            guard.generation += 1;
+            guard.connection = Some(connection.clone());
+            guard.dead = false;
+            guard.dead_since = None;
+        }
+        self.has_session.store(true, Ordering::Relaxed);
+
+        let session =
+            Self::session_state_from(&connection, account_name).context(
+                "refresh token login succeeded but no token was available for persistence",
+            )?;
         save_session(&session).await?;
-        self.state = LoginState::Complete;
-        self.pending_confirmations.clear();
         Ok(session)
     }
 
@@ -379,12 +1449,7 @@ impl SteamClient {
             bail!("offline mode: using cached library");
         }
 
-        self.state = LoginState::AwaitingCredentialSession;
         let server_list = self.resolve_server_list().await?;
-
-        self.state = LoginState::AwaitingGuardConfirmation;
-        self.state = LoginState::AwaitingPollResult;
-        self.state = LoginState::AwaitingAccessTokenLogon;
 
         let login_result = if let Some(code) = guard_code.filter(|v| !v.trim().is_empty()) {
             let (mut writer, reader) = duplex(64);
@@ -419,25 +1484,30 @@ impl SteamClient {
         let connection = match login_result {
             Ok(connection) => connection,
             Err(ConnectionError::UnsupportedConfirmationAction(methods)) => {
-                self.pending_confirmations =
+                *self.pending_confirmations.lock().unwrap() =
                     methods.iter().map(map_confirmation).collect::<Vec<_>>();
                 bail!("Steam Guard confirmation required")
             }
             Err(other) => return Err(anyhow!(other)).context("steam-vent login flow failed"),
         };
 
-        self.connection = Some(connection);
-        let session = self
-            .session_from_connection(account_name)
+        {
+            let mut guard = self.inner.lock().await;
+            guard.generation += 1;
+            guard.connection = Some(connection.clone());
+            guard.dead = false;
+            guard.dead_since = None;
+        }
+        self.has_session.store(true, Ordering::Relaxed);
+
+        let session = Self::session_state_from(&connection, account_name)
             .context("login succeeded but no token was available for persistence")?;
         save_session(&session).await?;
-        self.state = LoginState::Complete;
-        self.pending_confirmations.clear();
+        self.pending_confirmations.lock().unwrap().clear();
         Ok(session)
     }
 
-    fn session_from_connection(&self, account_name: String) -> Option<SessionState> {
-        let connection = self.connection.as_ref()?;
+    fn session_state_from(connection: &Connection, account_name: String) -> Option<SessionState> {
         let steam_id = u64::from(connection.steam_id());
         Some(SessionState {
             account_name: Some(account_name),
@@ -448,74 +1518,73 @@ impl SteamClient {
     }
 
     pub async fn fetch_branches(&self, appid: u32) -> Result<Vec<String>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        self.with_healthy_connection(move |connection| async move {
+            let mut request = CMsgClientPICSProductInfoRequest::new();
+            request
+                .apps
+                .push(cmsg_client_picsproduct_info_request::AppInfo {
+                    appid: Some(appid),
+                    ..Default::default()
+                });
 
-        let mut request = CMsgClientPICSProductInfoRequest::new();
-        request
-            .apps
-            .push(cmsg_client_picsproduct_info_request::AppInfo {
-                appid: Some(appid),
-                ..Default::default()
-            });
+            let response: CMsgClientPICSProductInfoResponse = connection
+                .job(request)
+                .await
+                .context("failed requesting appinfo product info for branches")?;
 
-        let response: CMsgClientPICSProductInfoResponse = connection
-            .job(request)
-            .await
-            .context("failed requesting appinfo product info for branches")?;
+            let app = response
+                .apps
+                .iter()
+                .find(|entry| entry.appid() == appid)
+                .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
 
-        let app = response
-            .apps
-            .iter()
-            .find(|entry| entry.appid() == appid)
-            .ok_or_else(|| anyhow!("missing app info payload for app {appid}"))?;
+            let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
+            let parsed: AppInfoRoot =
+                parse_appinfo(&appinfo_vdf).context("failed parsing appinfo VDF")?;
 
-        let appinfo_vdf = String::from_utf8_lossy(app.buffer()).to_string();
-        let parsed: AppInfoRoot =
-            parse_appinfo(&appinfo_vdf).context("failed parsing appinfo VDF")?;
+            let branches = parsed
+                .appinfo
+                .map(|node| node.branches)
+                .unwrap_or(parsed.branches);
 
-        let branches = parsed
-            .appinfo
-            .map(|node| node.branches)
-            .unwrap_or(parsed.branches);
+            let mut names: Vec<String> = branches
+                .into_iter()
+                .filter(|(_, node)| node.pwdrequired.is_none()) // Ignore private
+                .map(|(name, _)| name)
+                .collect();
 
-        let mut names: Vec<String> = branches
-            .into_iter()
-            .filter(|(_, node)| node.pwdrequired.is_none()) // Ignore private
-            .map(|(name, _)| name)
-            .collect();
+            if !names.contains(&"public".to_string()) {
+                names.push("public".to_string());
+            }
 
-        if !names.contains(&"public".to_string()) {
-            names.push("public".to_string());
-        }
-
-        names.sort();
-        Ok(names)
+            names.sort();
+            Ok(names)
+        })
+        .await
     }
 
     pub async fn get_available_platforms(
         &mut self,
         appid: u32,
     ) -> Result<(Vec<DepotPlatform>, Vec<u8>)> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        // Read-only PICS product-info job. Only the round-trip sits inside the
+        // recovery wrapper; the VDF parsing below is local and replay-free.
+        let response: CMsgClientPICSProductInfoResponse = self
+            .with_healthy_connection(move |connection| async move {
+                let mut request = CMsgClientPICSProductInfoRequest::new();
+                request
+                    .apps
+                    .push(cmsg_client_picsproduct_info_request::AppInfo {
+                        appid: Some(appid),
+                        ..Default::default()
+                    });
 
-        let mut request = CMsgClientPICSProductInfoRequest::new();
-        request
-            .apps
-            .push(cmsg_client_picsproduct_info_request::AppInfo {
-                appid: Some(appid),
-                ..Default::default()
-            });
-
-        let response: CMsgClientPICSProductInfoResponse = connection
-            .job(request)
-            .await
-            .context("failed requesting appinfo product info")?;
+                connection
+                    .job(request)
+                    .await
+                    .context("failed requesting appinfo product info")
+            })
+            .await?;
 
         let app = response
             .apps
@@ -592,11 +1661,9 @@ impl SteamClient {
         filter_depots: Option<Vec<u64>>,
         shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
     ) -> Result<Receiver<DownloadProgress>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .cloned()
-            .context("steam connection not initialized")?;
+        // Lease, not bare accessor: the spawned task inherits a generation it
+        // can fence against, since a CM call made inside the task cannot re-lease.
+        let (connection, generation) = self.connection_lease().await?;
 
         let cfg = load_launcher_config().await?;
         let library_root = cfg.steam_library_path.clone();
@@ -677,18 +1744,23 @@ impl SteamClient {
                 {
                     Ok(res) => res,
                     Err(e) => {
+                        let err = anyhow::Error::new(e);
+                        client_clone
+                            .observe_transport_failure(generation, &err)
+                            .await;
                         let _ = tx
                             .send(DownloadProgress {
                                 state: DownloadProgressState::Failed,
                                 bytes_downloaded: 0,
                                 total_bytes: 0,
-                                current_file: format!("failed requesting appinfo: {e}"),
+                                current_file: format!("failed requesting appinfo: {err}"),
                             
             file_path: String::new(),
             file_bytes_downloaded: 0,
             file_total_bytes: 0,
 })
                             .await;
+                        mark_download_ended(&shared_state_clone, "Operation failed or paused");
                         return;
                     }
                 };
@@ -707,6 +1779,7 @@ impl SteamClient {
             file_total_bytes: 0,
 })
                         .await;
+                    mark_download_ended(&shared_state_clone, "Operation failed or paused");
                     return;
                 };
                 appinfo_vdf_bytes_owned = app.buffer().to_vec();
@@ -811,6 +1884,7 @@ impl SteamClient {
             file_total_bytes: 0,
 })
                     .await;
+                mark_download_ended(&shared_state_clone, "Operation failed or paused");
                 return;
             }
 
@@ -855,6 +1929,7 @@ impl SteamClient {
             file_total_bytes: 0,
 })
                         .await;
+                    mark_download_ended(&shared_state_clone, "Operation failed or paused");
                     return;
                 }
             };
@@ -1169,29 +2244,31 @@ impl SteamClient {
     }
 
     pub async fn get_content_servers(&self, cell_id: u32) -> Result<Vec<String>> {
-        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
-        let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
-        request.set_cell_id(cell_id);
-        request.set_max_servers(20);
+        self.with_healthy_connection(move |connection| async move {
+            let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
+            request.set_cell_id(cell_id);
+            request.set_max_servers(20);
 
-        let response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
-            .service_method(request)
-            .await
-            .context("failed calling ContentServerDirectory.GetServersForSteamPipe")?;
+            let response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
+                .service_method(request)
+                .await
+                .context("failed calling ContentServerDirectory.GetServersForSteamPipe")?;
 
-        let mut hosts = Vec::new();
-        for server in &response.servers {
-            if server.type_() == "SteamCache" || server.type_() == "CDN" {
-                let host = server.host().to_string();
-                hosts.push(host);
+            let mut hosts = Vec::new();
+            for server in &response.servers {
+                if server.type_() == "SteamCache" || server.type_() == "CDN" {
+                    let host = server.host().to_string();
+                    hosts.push(host);
+                }
             }
-        }
 
-        if hosts.is_empty() {
-            println!("ERROR: Service returned 0 valid CDN servers!");
-        }
+            if hosts.is_empty() {
+                println!("ERROR: Service returned 0 valid CDN servers!");
+            }
 
-        Ok(hosts)
+            Ok(hosts)
+        })
+        .await
     }
 
     pub async fn get_manifest_request_code(
@@ -1200,18 +2277,20 @@ impl SteamClient {
         depot_id: u32,
         manifest_id: u64,
     ) -> Result<u64> {
-        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
-        let mut request = CContentServerDirectory_GetManifestRequestCode_Request::new();
-        request.set_app_id(app_id);
-        request.set_depot_id(depot_id);
-        request.set_manifest_id(manifest_id);
+        self.with_healthy_connection(move |connection| async move {
+            let mut request = CContentServerDirectory_GetManifestRequestCode_Request::new();
+            request.set_app_id(app_id);
+            request.set_depot_id(depot_id);
+            request.set_manifest_id(manifest_id);
 
-        let response: CContentServerDirectory_GetManifestRequestCode_Response = connection
-            .service_method(request)
-            .await
-            .context("failed calling ContentServerDirectory.GetManifestRequestCode")?;
+            let response: CContentServerDirectory_GetManifestRequestCode_Response = connection
+                .service_method(request)
+                .await
+                .context("failed calling ContentServerDirectory.GetManifestRequestCode")?;
 
-        Ok(response.manifest_request_code())
+            Ok(response.manifest_request_code())
+        })
+        .await
     }
 
     pub async fn get_cdn_auth_token(
@@ -1220,19 +2299,24 @@ impl SteamClient {
         depot_id: u32,
         host_name: &str,
     ) -> Result<String> {
-        let connection = self.connection.as_ref().ok_or_else(|| anyhow!("No connection"))?;
-        let mut request = CMsgClientGetCDNAuthToken::new();
-        request.set_depot_id(depot_id);
-        request.set_host_name(host_name.to_string());
-        request.set_app_id(app_id);
+        // Read-only CDN auth-token job. Commit 436738f claimed to route CDN
+        // lookups through the reconnect wrapper but never touched this call.
+        let response: CMsgClientGetCDNAuthTokenResponse = self
+            .with_healthy_connection(move |connection| async move {
+                let mut request = CMsgClientGetCDNAuthToken::new();
+                request.set_depot_id(depot_id);
+                request.set_host_name(host_name.to_string());
+                request.set_app_id(app_id);
 
-        // NOTE: the ContentServerDirectory.GetCDNAuthToken SERVICE variant returns
-        // ERESULT Fail server-side; the real client uses the job-based
-        // CMsgClientGetCDNAuthToken (same shape as GetDepotDecryptionKey).
-        let response: CMsgClientGetCDNAuthTokenResponse = connection
-            .job(request)
-            .await
-            .context("failed calling GetCDNAuthToken job")?;
+                // NOTE: the ContentServerDirectory.GetCDNAuthToken SERVICE variant returns
+                // ERESULT Fail server-side; the real client uses the job-based
+                // CMsgClientGetCDNAuthToken (same shape as GetDepotDecryptionKey).
+                connection
+                    .job(request)
+                    .await
+                    .context("failed calling GetCDNAuthToken job")
+            })
+            .await?;
 
         if response.eresult() != 1 {
             return Err(anyhow!("GetCDNAuthToken returned eresult {}", response.eresult()));
@@ -1246,23 +2330,23 @@ impl SteamClient {
     }
 
     pub async fn get_depot_list(&self, app_id: u32) -> Result<Vec<DepotInfo>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        // Read-only PICS product-info job; round-trip only inside the wrapper.
+        let response: CMsgClientPICSProductInfoResponse = self
+            .with_healthy_connection(move |connection| async move {
+                let mut request = CMsgClientPICSProductInfoRequest::new();
+                request
+                    .apps
+                    .push(cmsg_client_picsproduct_info_request::AppInfo {
+                        appid: Some(app_id),
+                        ..Default::default()
+                    });
 
-        let mut request = CMsgClientPICSProductInfoRequest::new();
-        request
-            .apps
-            .push(cmsg_client_picsproduct_info_request::AppInfo {
-                appid: Some(app_id),
-                ..Default::default()
-            });
-
-        let response: CMsgClientPICSProductInfoResponse = connection
-            .job(request)
-            .await
-            .context("failed requesting appinfo product info for depot list")?;
+                connection
+                    .job(request)
+                    .await
+                    .context("failed requesting appinfo product info for depot list")
+            })
+            .await?;
 
         let app = response
             .apps
@@ -1346,39 +2430,57 @@ impl SteamClient {
     }
 
     pub async fn get_depot_key(&self, app_id: u32, depot_id: u32) -> Result<Vec<u8>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
-        let mut request = CMsgClientGetDepotDecryptionKey::new();
-        request.set_depot_id(depot_id);
-        request.set_app_id(app_id);
+        // Read-only: a single GetDepotDecryptionKey job, safe to replay once.
+        self.with_healthy_connection(move |connection| async move {
+            let mut request = CMsgClientGetDepotDecryptionKey::new();
+            request.set_depot_id(depot_id);
+            request.set_app_id(app_id);
 
-        let response: CMsgClientGetDepotDecryptionKeyResponse = connection.job(request).await?;
-        if response.eresult() != 1 {
-            bail!(
-                "failed to get depot key for depot {depot_id}: eresult {}",
-                response.eresult()
-            );
-        }
+            let response: CMsgClientGetDepotDecryptionKeyResponse = connection.job(request).await?;
+            if response.eresult() != 1 {
+                bail!(
+                    "failed to get depot key for depot {depot_id}: eresult {}",
+                    response.eresult()
+                );
+            }
 
-        Ok(response.depot_encryption_key().to_vec())
+            Ok(response.depot_encryption_key().to_vec())
+        })
+        .await
     }
 
-    pub async fn verify_depot_ownership(&self, app_id: u32, depot_ids: Vec<u64>) -> HashMap<u64, bool> {
+    /// Returns `Some(true)` only when Steam answered with a usable decryption
+    /// key, `Some(false)` only when it explicitly refused one, and omits any
+    /// depot that could not be asked (transport failure, non-transport job
+    /// error). Omission means *unknown* — callers must not read it as "not
+    /// owned", because the UI renders `Some(false)` as a hard "Locked".
+    pub async fn verify_depot_ownership(
+        &self,
+        app_id: u32,
+        depot_ids: Vec<u64>,
+    ) -> HashMap<u64, Option<bool>> {
         tracing::info!("Verifying ownership for {} depots...", depot_ids.len());
-        let mut results = HashMap::new();
-
-        let connection = match self.connection.as_ref() {
-            Some(c) => c,
-            None => {
-                for id in depot_ids { results.insert(id, false); }
-                return results;
+        // Compound: one warm-up ticket job plus one key job per depot. Take a
+        // lease directly rather than using with_connection_no_retry, because a
+        // transport failure must abort the sweep WITHOUT discarding the depots
+        // already answered — those answers are real, and blanking them would
+        // turn "owned" into "locked" in the UI.
+        let all_ids = depot_ids.clone();
+        let (connection, generation) = match self.connection_lease().await {
+            Ok(lease) => lease,
+            Err(e) => {
+                // Could not ask at all: explicitly unknown, which also clears
+                // any stale Owned/Locked left from a previous run.
+                tracing::warn!(app_id, error = %e, "depot ownership check failed: no lease");
+                return all_ids.into_iter().map(|id| (id, None)).collect();
             }
         };
 
         // 1. Ensure we have an App Ticket (Warm up session)
         let _ = self.get_app_ticket(app_id).await;
+
+        let mut results: HashMap<u64, Option<bool>> = HashMap::new();
+        let mut transport_failure: Option<anyhow::Error> = None;
 
         for depot_id in depot_ids {
             let mut request = CMsgClientGetDepotDecryptionKey::new();
@@ -1388,26 +2490,41 @@ impl SteamClient {
             match connection.job(request).await {
                 Ok(response) => {
                     let response: CMsgClientGetDepotDecryptionKeyResponse = response;
-                    if response.eresult() == 1 { // EResult::OK
-                        results.insert(depot_id, true);
-                    } else {
-                        results.insert(depot_id, false);
-                    }
+                    // Only an explicit ERESULT answer becomes a definitive
+                    // true/false.
+                    results.insert(depot_id, Some(response.eresult() == 1));
                 }
-                Err(_) => {
-                    results.insert(depot_id, false);
+                Err(e) => {
+                    let err = anyhow::Error::new(e);
+                    if Self::is_transport_error(&err) {
+                        // Socket is gone; stop asking. Everything answered so
+                        // far stays valid, everything else is unknown.
+                        transport_failure = Some(err);
+                        break;
+                    }
+                    // Asked, but got no usable answer — unknown, not "not owned".
                 }
             }
+        }
+
+        if let Some(err) = transport_failure {
+            self.observe_transport_failure(generation, &err).await;
+            tracing::warn!(
+                app_id,
+                error = %err,
+                answered = results.len(),
+                "depot ownership sweep aborted on transport failure; remainder unknown"
+            );
         }
         results
     }
 
     pub async fn fetch_depots(&self, appid: u32) -> Result<Vec<BrowserDepotInfo>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
-        depot_browser::fetch_depots(connection, appid).await
+        // Read-only depot listing; replay-safe on a fresh connection.
+        self.with_healthy_connection(move |connection| async move {
+            depot_browser::fetch_depots(&connection, appid).await
+        })
+        .await
     }
 
     pub async fn fetch_manifest_files(
@@ -1416,13 +2533,21 @@ impl SteamClient {
         depot_id: u32,
         manifest_ref: &str,
     ) -> Result<Vec<ManifestFileEntry>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
-        depot_browser::fetch_manifest_files(connection, appid, depot_id, manifest_ref).await
+        // Read-only manifest listing; replay-safe on a fresh connection.
+        self.with_healthy_connection(move |connection| async move {
+            depot_browser::fetch_manifest_files(&connection, appid, depot_id, manifest_ref).await
+        })
+        .await
     }
 
+    /// Synchronous single-file download for the depot browser UI.
+    ///
+    /// NOTE: this path cannot transparently re-authenticate — it peeks at the
+    /// current connection without blocking on the reconnect mutex (the caller
+    /// runs on the sync side of the UI). If no connection exists, or the
+    /// socket was marked dead after a CM reset, the download fails fast with
+    /// a clear message instead of hanging; the user retries after the client
+    /// has reconnected.
     pub fn download_single_file(
         &self,
         appid: u32,
@@ -1432,11 +2557,13 @@ impl SteamClient {
         output_dir: &Path,
     ) -> Result<()> {
         let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+            .connection()
+            .context("no active steam connection — wait for reconnection and retry")?;
+        if self.is_connection_dead() {
+            bail!("steam connection was reset — wait for reconnection and retry");
+        }
         depot_browser::download_single_file(
-            connection,
+            &connection,
             appid,
             depot_id,
             manifest_ref,
@@ -1446,89 +2573,95 @@ impl SteamClient {
     }
 
     pub async fn fetch_owned_games(&mut self) -> Result<Vec<OwnedGame>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        // Both passes run inside `with_healthy_connection` so a CM transport
+        // failure mid-refresh (the post-game-launch reset window) marks the
+        // connection dead, re-authenticates, and retries ONCE transparently.
+        // Before this, the two `service_method` calls here ran directly on the
+        // possibly-zombie handle and surfaced as
+        // "Failed to refresh library: failed calling Player.GetOwnedGames".
+        let owned = self
+            .with_healthy_connection(move |connection| async move {
+                let request = CPlayer_GetOwnedGames_Request {
+                    steamid: Some(u64::from(connection.steam_id())),
+                    include_appinfo: Some(true),
+                    include_played_free_games: Some(true),
+                    // Standalone Steam mods (e.g. Portal: Revolution, AppID 601300)
+                    // and free community mods are classified by Steam as "unvetted
+                    // apps" and are dropped from GetOwnedGames unless explicitly
+                    // requested. include_free_sub pulls in free subscriptions held on
+                    // the account; skip_unvetted_apps=false keeps mod-type entries in
+                    // the result so they appear in the library alongside native titles.
+                    include_free_sub: Some(true),
+                    skip_unvetted_apps: Some(false),
+                    ..Default::default()
+                };
 
-        let request = CPlayer_GetOwnedGames_Request {
-            steamid: Some(u64::from(connection.steam_id())),
-            include_appinfo: Some(true),
-            include_played_free_games: Some(true),
-            // Standalone Steam mods (e.g. Portal: Revolution, AppID 601300)
-            // and free community mods are classified by Steam as "unvetted
-            // apps" and are dropped from GetOwnedGames unless explicitly
-            // requested. include_free_sub pulls in free subscriptions held on
-            // the account; skip_unvetted_apps=false keeps mod-type entries in
-            // the result so they appear in the library alongside native titles.
-            include_free_sub: Some(true),
-            skip_unvetted_apps: Some(false),
-            ..Default::default()
-        };
+                let response: CPlayer_GetOwnedGames_Response = connection
+                    .service_method(request)
+                    .await
+                    .context("failed calling Player.GetOwnedGames")?;
 
-        let response: CPlayer_GetOwnedGames_Response = connection
-            .service_method(request)
-            .await
-            .context("failed calling Player.GetOwnedGames")?;
+                let mut owned = Vec::new();
+                for game in response.games {
+                    owned.push(OwnedGame {
+                        app_id: game.appid() as u32,
+                        name: if game.name().is_empty() {
+                            format!("App {}", game.appid())
+                        } else {
+                            game.name().to_string()
+                        },
+                        playtime_forever_minutes: game.playtime_forever() as u32,
+                        local_manifest_ids: HashMap::new(),
+                        update_available: false,
+                    });
+                }
 
-        let mut owned = Vec::new();
-        for game in response.games {
-            owned.push(OwnedGame {
-                app_id: game.appid() as u32,
-                name: if game.name().is_empty() {
-                    format!("App {}", game.appid())
-                } else {
-                    game.name().to_string()
-                },
-                playtime_forever_minutes: game.playtime_forever() as u32,
-                local_manifest_ids: HashMap::new(),
-                update_available: false,
-            });
-        }
+                // SECOND PASS (no appinfo): GetOwnedGames with include_appinfo=true can
+                // silently DROP entries whose appinfo the service cannot attach — the
+                // typical case for standalone Steam mods such as Portal: Revolution
+                // (AppID 601300), which the user sees in the Steam web library but
+                // never arrives here. Without appinfo the raw appids come through
+                // (empty names); they are merged in as "App <id>" and hydrated later by
+                // ensure_metadata_requested / fetch_app_metadata when selected.
+                let bare_request = CPlayer_GetOwnedGames_Request {
+                    steamid: Some(u64::from(connection.steam_id())),
+                    include_appinfo: Some(false),
+                    include_played_free_games: Some(true),
+                    include_free_sub: Some(true),
+                    skip_unvetted_apps: Some(false),
+                    ..Default::default()
+                };
+                let bare_response: CPlayer_GetOwnedGames_Response = connection
+                    .service_method(bare_request)
+                    .await
+                    .context("failed calling Player.GetOwnedGames (appinfo-less pass)")?;
 
-        // SECOND PASS (no appinfo): GetOwnedGames with include_appinfo=true can
-        // silently DROP entries whose appinfo the service cannot attach — the
-        // typical case for standalone Steam mods such as Portal: Revolution
-        // (AppID 601300), which the user sees in the Steam web library but
-        // never arrives here. Without appinfo the raw appids come through
-        // (empty names); they are merged in as "App <id>" and hydrated later by
-        // ensure_metadata_requested / fetch_app_metadata when selected.
-        let bare_request = CPlayer_GetOwnedGames_Request {
-            steamid: Some(u64::from(connection.steam_id())),
-            include_appinfo: Some(false),
-            include_played_free_games: Some(true),
-            include_free_sub: Some(true),
-            skip_unvetted_apps: Some(false),
-            ..Default::default()
-        };
-        let bare_response: CPlayer_GetOwnedGames_Response = connection
-            .service_method(bare_request)
-            .await
-            .context("failed calling Player.GetOwnedGames (appinfo-less pass)")?;
+                let mut known: std::collections::HashSet<u32> =
+                    owned.iter().map(|g| g.app_id).collect();
+                let mut merged = 0usize;
+                for game in bare_response.games {
+                    let app_id = game.appid() as u32;
+                    if known.insert(app_id) {
+                        owned.push(OwnedGame {
+                            app_id,
+                            name: format!("App {app_id}"),
+                            playtime_forever_minutes: game.playtime_forever() as u32,
+                            local_manifest_ids: HashMap::new(),
+                            update_available: false,
+                        });
+                        merged += 1;
+                    }
+                }
+                tracing::info!(
+                    total = owned.len(),
+                    merged_from_bare_pass = merged,
+                    portal_revolution_present = owned.iter().any(|g| g.app_id == 601300),
+                    "fetch_owned_games: appinfo pass + appinfo-less merge complete"
+                );
 
-        let mut known: std::collections::HashSet<u32> =
-            owned.iter().map(|g| g.app_id).collect();
-        let mut merged = 0usize;
-        for game in bare_response.games {
-            let app_id = game.appid() as u32;
-            if known.insert(app_id) {
-                owned.push(OwnedGame {
-                    app_id,
-                    name: format!("App {app_id}"),
-                    playtime_forever_minutes: game.playtime_forever() as u32,
-                    local_manifest_ids: HashMap::new(),
-                    update_available: false,
-                });
-                merged += 1;
-            }
-        }
-        tracing::info!(
-            total = owned.len(),
-            merged_from_bare_pass = merged,
-            portal_revolution_present =
-                owned.iter().any(|g| g.app_id == 601300),
-            "fetch_owned_games: appinfo pass + appinfo-less merge complete"
-        );
+                Ok(owned)
+            })
+            .await?;
 
         save_library_cache(&owned).await.ok();
         Ok(owned)
@@ -1543,6 +2676,11 @@ impl SteamClient {
     }
 
     pub async fn check_for_updates(&self, games: &mut [LibraryGame]) -> Result<()> {
+        // Bound the whole sweep: with a dead CM this loop used to visit every
+        // installed game and pay a full re-authentication for each one. The
+        // budget stops us after the first failure, and the cooldown (via the
+        // Background intent) independently refuses while backoff is armed.
+        let mut budget = BulkCmBudget::default();
         for game in games.iter_mut() {
             game.update_available = false;
             game.local_manifest_ids.clear();
@@ -1555,14 +2693,29 @@ impl SteamClient {
             game.local_manifest_ids = local.clone();
             game.active_branch = branch;
 
-            if self.is_offline() || self.connection.is_none() {
+            if self.is_offline() {
                 continue;
             }
 
-            let remote = self
-                .remote_manifest_ids(game.app_id, &game.active_branch)
+            if !budget.allow_attempt() {
+                continue;
+            }
+
+            let remote = match self
+                .remote_manifest_ids_bg(game.app_id, &game.active_branch)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(remote) => remote,
+                Err(err) => {
+                    tracing::warn!(
+                        app_id = game.app_id,
+                        error = %err,
+                        "remote manifest check failed; skipping the remainder of this sweep"
+                    );
+                    budget.spend();
+                    continue;
+                }
+            };
             if remote.is_empty() {
                 continue;
             }
@@ -1598,13 +2751,18 @@ impl SteamClient {
         Ok((manifests, branch))
     }
 
-    async fn remote_manifest_ids(&self, appid: u32, branch: &str) -> Result<HashMap<u64, u64>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
-        let (manifests, _) =
-            SteamClient::remote_manifest_ids_static(connection, appid, branch).await?;
+    /// Background variant: `check_for_updates` sweeps installed games, so
+    /// this is the one CM call allowed to be refused by the re-auth cooldown.
+    async fn remote_manifest_ids_bg(&self, appid: u32, branch: &str) -> Result<HashMap<u64, u64>> {
+        let branch = branch.to_string();
+        let (manifests, _) = self
+            .with_healthy_connection_bg(move |connection| {
+                let branch = branch.clone();
+                async move {
+                    SteamClient::remote_manifest_ids_static(&connection, appid, &branch).await
+                }
+            })
+            .await?;
         Ok(manifests)
     }
 
@@ -1625,8 +2783,7 @@ impl SteamClient {
         }
 
         let steam_id = self
-            .connection
-            .as_ref()
+            .connection()
             .map(|connection| u64::from(connection.steam_id()))
             .or(persisted.steam_id)
             .unwrap_or_default();
@@ -1640,23 +2797,23 @@ impl SteamClient {
     }
 
     pub async fn get_extended_app_info(&self, appid: u32) -> Result<ExtendedAppInfo> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        // Read-only PICS product-info job; round-trip only inside the wrapper.
+        let response: CMsgClientPICSProductInfoResponse = self
+            .with_healthy_connection(move |connection| async move {
+                let mut request = CMsgClientPICSProductInfoRequest::new();
+                request
+                    .apps
+                    .push(cmsg_client_picsproduct_info_request::AppInfo {
+                        appid: Some(appid),
+                        ..Default::default()
+                    });
 
-        let mut request = CMsgClientPICSProductInfoRequest::new();
-        request
-            .apps
-            .push(cmsg_client_picsproduct_info_request::AppInfo {
-                appid: Some(appid),
-                ..Default::default()
-            });
-
-        let response: CMsgClientPICSProductInfoResponse = connection
-            .job(request)
-            .await
-            .context("failed requesting appinfo product info for extended metadata")?;
+                connection
+                    .job(request)
+                    .await
+                    .context("failed requesting appinfo product info for extended metadata")
+            })
+            .await?;
 
         let app = response
             .apps
@@ -1739,23 +2896,23 @@ impl SteamClient {
     }
 
     pub async fn get_product_info(&mut self, appid: u32, prefer_proton: bool) -> Result<Vec<LaunchInfo>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .context("steam connection not initialized")?;
+        // Read-only PICS product-info job; round-trip only inside the wrapper.
+        let response: CMsgClientPICSProductInfoResponse = self
+            .with_healthy_connection(move |connection| async move {
+                let mut request = CMsgClientPICSProductInfoRequest::new();
+                request
+                    .apps
+                    .push(cmsg_client_picsproduct_info_request::AppInfo {
+                        appid: Some(appid),
+                        ..Default::default()
+                    });
 
-        let mut request = CMsgClientPICSProductInfoRequest::new();
-        request
-            .apps
-            .push(cmsg_client_picsproduct_info_request::AppInfo {
-                appid: Some(appid),
-                ..Default::default()
-            });
-
-        let response: CMsgClientPICSProductInfoResponse = connection
-            .job(request)
-            .await
-            .context("failed requesting appinfo product info for launch metadata")?;
+                connection
+                    .job(request)
+                    .await
+                    .context("failed requesting appinfo product info for launch metadata")
+            })
+            .await?;
 
         let app = response
             .apps
@@ -1796,20 +2953,23 @@ impl SteamClient {
         };
 
         let cloud_enabled = launcher_config.enable_cloud_sync && !self.is_offline();
-        let mut cloud_client = None;
         let mut local_root = None;
 
         if cloud_enabled {
-            let client = CloudClient::new(
-                self.connection
-                    .as_ref()
-                    .cloned()
-                    .context("steam connection not initialized")?,
-            );
-            let root = default_cloud_root(client.steam_id(), app.app_id)?;
-            tracing::info!(appid = app.app_id, path = %root.display(), "Syncing Cloud...");
-            let _ = client.sync_down(app.app_id, &root).await;
-            cloud_client = Some(client);
+            // Cloud writes are non-idempotent: no automatic replay, but a
+            // transport failure must still repair the connection for whoever
+            // comes next.
+            let root = self
+                .with_connection_no_retry(move |connection| async move {
+                    let client = CloudClient::new(connection);
+                    let root = default_cloud_root(client.steam_id(), app.app_id)?;
+                    tracing::info!(appid = app.app_id, path = %root.display(), "Syncing Cloud...");
+                    if let Err(e) = client.sync_down(app.app_id, &root).await {
+                        tracing::warn!(appid = app.app_id, error = %e, "cloud sync_down failed");
+                    }
+                    Ok::<_, anyhow::Error>(root)
+                })
+                .await?;
             local_root = Some(root);
         }
 
@@ -1820,8 +2980,21 @@ impl SteamClient {
             .context("failed waiting for game process exit")?;
 
         if cloud_enabled {
-            if let (Some(client), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
-                client.sync_up(app.app_id, root).await?;
+            // Re-acquire: the handle used for sync_down was taken before the
+            // game ran and may be a zombie if the CM reset mid-session. Same
+            // correction as the ui.rs launch path.
+            if let Some(root) = local_root.as_ref() {
+                self.with_connection_no_retry(move |connection| {
+                    // Clone inside the body: `Fn` forbids moving the captured
+                    // PathBuf out on each call (E0507).
+                    let root = root.clone();
+                    async move {
+                        let client = CloudClient::new(connection);
+                        client.sync_up(app.app_id, &root).await?;
+                        Ok(())
+                    }
+                })
+                .await?;
                 tracing::info!(appid = app.app_id, "Upload Complete");
             }
         }
@@ -1865,11 +3038,9 @@ impl SteamClient {
         verify_mode: bool,
         shared_state: Arc<std::sync::RwLock<crate::models::DownloadState>>,
     ) -> Result<Receiver<DownloadProgress>> {
-        let connection = self
-            .connection
-            .as_ref()
-            .cloned()
-            .context("steam connection not initialized")?;
+        // Lease, not bare accessor: the spawned task needs a generation to
+        // fence the raw manifest lookup against.
+        let (connection, generation) = self.connection_lease().await?;
 
         let install_root = self.install_root_for_app(appid).await?;
         let manifest_path = self.appmanifest_path(appid).await?;
@@ -1915,9 +3086,24 @@ impl SteamClient {
             let (remote_manifests, changenumber) = if verify_mode {
                 (local_manifests.clone(), None)
             } else {
-                SteamClient::remote_manifest_ids_static(&connection, appid, &active_branch)
+                match SteamClient::remote_manifest_ids_static(&connection, appid, &active_branch)
                     .await
-                    .unwrap_or_default()
+                {
+                    Ok(resolved) => resolved,
+                    Err(e) => {
+                        // Previously swallowed by unwrap_or_default(): a dead
+                        // socket looked identical to "this app has no remote
+                        // manifests", and nothing repaired the connection.
+                        client_clone.observe_transport_failure(generation, &e).await;
+                        tracing::warn!(
+                            appid,
+                            error = %e,
+                            branch = %active_branch,
+                            "remote manifest lookup failed; continuing with an empty set"
+                        );
+                        Default::default()
+                    }
+                }
             };
 
             // Durable record of exactly what this operation resolved: the
@@ -1962,6 +3148,7 @@ impl SteamClient {
             file_total_bytes: 0,
 })
                     .await;
+                mark_download_ended(&shared_state_clone, "Operation failed or paused");
                 return;
             };
 
@@ -1980,6 +3167,7 @@ impl SteamClient {
             file_total_bytes: 0,
 })
                         .await;
+                    mark_download_ended(&shared_state_clone, "Operation failed or paused");
                     return;
                 }
             };
@@ -2372,20 +3560,29 @@ impl SteamClient {
         // public_only=1 with no installdir unless the request carries the
         // per-app access token — fetch and attach it so the runtime app
         // resolves to its real SteamDB installdir (e.g. "SteamLinuxRuntime_4").
-        if let Some(conn) = self.connection.as_ref() {
-            let app_token: Option<u64> = conn
+        // Read-only, and its contract is "always return a usable name /
+        // installdir" — so failures are still swallowed here, but each swallow
+        // now fences a transport failure instead of hiding it.
+        let leased = self.connection_lease().await.ok();
+        if let Some((conn, generation)) = leased.as_ref() {
+            let token_res: Result<CMsgClientPICSAccessTokenResponse, _> = conn
                 .job(CMsgClientPICSAccessTokenRequest {
                     appids: vec![appid],
                     ..Default::default()
                 })
-                .await
-                .ok()
-                .and_then(|resp: CMsgClientPICSAccessTokenResponse| {
-                    resp.app_access_tokens
-                        .iter()
-                        .find(|t| t.appid() == appid)
-                        .and_then(|t| t.access_token.clone())
-                });
+                .await;
+            let app_token: Option<u64> = match token_res {
+                Ok(resp) => resp
+                    .app_access_tokens
+                    .iter()
+                    .find(|t| t.appid() == appid)
+                    .and_then(|t| t.access_token.clone()),
+                Err(e) => {
+                    self.observe_transport_failure(*generation, &anyhow::Error::new(e))
+                        .await;
+                    None
+                }
+            };
 
             let mut request = CMsgClientPICSProductInfoRequest::new();
             request
@@ -2396,7 +3593,14 @@ impl SteamClient {
                     ..Default::default()
                 });
 
-            let res: Result<CMsgClientPICSProductInfoResponse, _> = conn.job(request).await;
+            let res: Result<CMsgClientPICSProductInfoResponse, _> = match conn.job(request).await {
+                Ok(response) => Ok(response),
+                Err(e) => {
+                    let err = anyhow::Error::new(e);
+                    self.observe_transport_failure(*generation, &err).await;
+                    Err(err)
+                }
+            };
             if let Ok(response) = res {
                 if let Some(app) = response.apps.iter().find(|entry| entry.appid() == appid) {
                     if let Ok(raw_vdf) = String::from_utf8(app.buffer().to_vec()) {

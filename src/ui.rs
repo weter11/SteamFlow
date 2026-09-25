@@ -6,7 +6,6 @@ use crate::models::{
     SteamGuardReq, UserProfile,
 };
 use crate::steam_client::SteamClient;
-use anyhow::anyhow;
 use eframe::egui;
 use egui::{ColorImage, TextureHandle};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -164,7 +163,7 @@ pub enum AsyncOp {
         Vec<u8>,
         Vec<crate::steam_client::DepotInfo>,
     ),
-    DepotOwnershipVerified(HashMap<u64, bool>),
+    DepotOwnershipVerified(HashMap<u64, Option<bool>>),
     ManifestFilesFetched(Vec<ManifestFileEntry>),
     LaunchOptionsFetched(u32, Vec<crate::steam_client::LaunchInfo>, Option<String>),
     AuthFailed(String),
@@ -1220,9 +1219,10 @@ impl SteamLauncher {
                 }
                 AsyncOp::DepotOwnershipVerified(results) => {
                     for depot in &mut self.depot_list {
-                        if let Some(owned) = results.get(&depot.id) {
-                            depot.is_owned = Some(*owned);
-                        }
+                        // `None` (unknown) must land as `None`, not be skipped:
+                        // leaving a stale Owned/Locked behind after we could
+                        // not ask would be exactly as misleading as before.
+                        depot.is_owned = results.get(&depot.id).copied().flatten();
                     }
                     self.is_verifying = false;
                 }
@@ -1574,21 +1574,33 @@ impl SteamLauncher {
             };
 
             let cloud_enabled = launcher_config.enable_cloud_sync && !client.is_offline();
-            let mut cloud_client = None;
             let mut local_root = None;
 
             if cloud_enabled {
-                let c = crate::cloud_sync::CloudClient::new(
-                    client.connection()
-                        .cloned()
-                        .ok_or_else(|| anyhow!("steam connection not initialized"))
-                        .unwrap()
-                );
-                let root = crate::cloud_sync::default_cloud_root(c.steam_id(), game.app_id).unwrap();
-                tracing::info!(appid = game.app_id, path = %root.display(), "Syncing Cloud...");
-                let _ = c.sync_down(game.app_id, &root).await;
-                cloud_client = Some(c);
-                local_root = Some(root);
+                // A dead CM socket must not block game launch: skip the cloud
+                // round-trip (get_active_connection transparently re-auths when
+                // it can; if it can't, launch proceeds without sync).
+                match client.get_active_connection().await {
+                    Ok(connection) => {
+                        let c = crate::cloud_sync::CloudClient::new(connection);
+                        let root =
+                            crate::cloud_sync::default_cloud_root(c.steam_id(), game.app_id).unwrap();
+                        tracing::info!(appid = game.app_id, path = %root.display(), "Syncing Cloud...");
+                        let _ = c.sync_down(game.app_id, &root).await;
+                        local_root = Some(root);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            appid = game.app_id,
+                            error = %e,
+                            "cloud sync skipped: no usable steam connection"
+                        );
+                        let _ = tx.send(format!(
+                            "Cloud sync skipped for {}: {e}",
+                            game.name
+                        ));
+                    }
+                }
             }
 
             let mut child: std::process::Child =
@@ -1610,10 +1622,38 @@ impl SteamLauncher {
             let _ = tx.send(format!("__RUNNING__{}:{}", game.app_id, child.id()));
             let _ = child.wait();
 
-            if cloud_enabled {
-                if let (Some(c), Some(root)) = (cloud_client.as_ref(), local_root.as_ref()) {
-                    let _ = c.sync_up(game.app_id, root).await;
-                    tracing::info!(appid = game.app_id, "Upload Complete");
+            // Post-game upload. Re-acquire the CM handle instead of reusing the
+            // clone captured before launch: the game may run for hours, and a CM
+            // reset during play leaves that clone a zombie. A fresh handle from
+            // get_active_connection() transparently re-authenticates first.
+            //
+            // The sync_up result decides what gets logged. "Upload Complete" is
+            // emitted only when the upload actually returned Ok — the previous
+            // code discarded the result and logged success unconditionally.
+            let upload_outcome = if cloud_enabled {
+                match local_root.as_ref() {
+                    Some(root) => match client.get_active_connection().await {
+                        Ok(connection) => {
+                            let c = crate::cloud_sync::CloudClient::new(connection);
+                            CloudUploadOutcome::from_sync_up(c.sync_up(game.app_id, root).await)
+                        }
+                        Err(e) => CloudUploadOutcome::from_acquire_error(&e),
+                    },
+                    None => CloudUploadOutcome::NotRun,
+                }
+            } else {
+                CloudUploadOutcome::NotRun
+            };
+            if upload_outcome.is_success() {
+                tracing::info!(appid = game.app_id, "Upload Complete");
+            } else if !matches!(upload_outcome, CloudUploadOutcome::NotRun) {
+                tracing::warn!(
+                    appid = game.app_id,
+                    outcome = ?upload_outcome,
+                    "cloud upload did not complete"
+                );
+                if let Some(line) = upload_outcome.user_line(&game.name) {
+                    let _ = tx.send(line);
                 }
             }
 
@@ -4883,5 +4923,142 @@ impl eframe::App for SteamLauncher {
         if self.play_result_rx.is_some() {
             ui.request_repaint_after(std::time::Duration::from_secs(1));
         }
+    }
+}
+
+/// Outcome of the post-game cloud upload, and therefore of what gets logged.
+///
+/// Split out of the launch task so the rule "report success only when the
+/// upload actually succeeded" is unit-testable: a live `steam_vent::Connection`
+/// cannot be constructed offline, but the two constructors below only need
+/// `Result<T, E>` where `E: Display`, so a plain `&str` error stands in for a
+/// real transport failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CloudUploadOutcome {
+    /// `sync_up` returned `Ok`. The only state that may log "Upload Complete".
+    Uploaded,
+    /// A fresh handle was obtained but `sync_up` returned `Err`.
+    Failed { error: String },
+    /// No usable CM connection after the game exited, so upload never ran.
+    Skipped { reason: String },
+    /// Cloud sync disabled, or no local root was recorded at launch time.
+    NotRun,
+}
+
+impl CloudUploadOutcome {
+    /// Map `sync_up`'s result.
+    fn from_sync_up<T, E: std::fmt::Display>(uploaded: Result<T, E>) -> Self {
+        match uploaded {
+            Ok(_) => CloudUploadOutcome::Uploaded,
+            Err(e) => CloudUploadOutcome::Failed {
+                error: e.to_string(),
+            },
+        }
+    }
+
+    /// Map a failed post-game handle acquisition (`get_active_connection`).
+    fn from_acquire_error<E: std::fmt::Display>(error: &E) -> Self {
+        CloudUploadOutcome::Skipped {
+            reason: error.to_string(),
+        }
+    }
+
+    /// Success may be claimed for `Uploaded` and nothing else.
+    fn is_success(&self) -> bool {
+        matches!(self, CloudUploadOutcome::Uploaded)
+    }
+
+    /// Line to surface in the operation log. `None` when there is nothing
+    /// worth telling the user about.
+    fn user_line(&self, game: &str) -> Option<String> {
+        match self {
+            CloudUploadOutcome::Uploaded | CloudUploadOutcome::NotRun => None,
+            CloudUploadOutcome::Failed { error } => {
+                Some(format!("Cloud upload failed for {game}: {error}"))
+            }
+            CloudUploadOutcome::Skipped { reason } => {
+                Some(format!("Cloud upload skipped for {game}: {reason}"))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cloud_upload_tests {
+    use super::CloudUploadOutcome;
+
+    #[test]
+    fn cloud_upload_outcome_from_sync_up_err_is_failed_not_uploaded() {
+        let outcome = CloudUploadOutcome::from_sync_up(Err::<(), _>("upload rejected"));
+        assert_eq!(
+            outcome,
+            CloudUploadOutcome::Failed {
+                error: "upload rejected".to_string()
+            }
+        );
+        assert!(
+            !outcome.is_success(),
+            "a failed sync_up must never be reported as success"
+        );
+    }
+
+    #[test]
+    fn cloud_upload_outcome_from_sync_up_ok_is_uploaded() {
+        let outcome = CloudUploadOutcome::from_sync_up(Ok::<(), &str>(()));
+        assert_eq!(outcome, CloudUploadOutcome::Uploaded);
+        assert!(outcome.is_success());
+    }
+
+    #[test]
+    fn cloud_upload_outcome_from_acquire_error_is_skipped_not_uploaded() {
+        let outcome = CloudUploadOutcome::from_acquire_error(&"no persisted session");
+        assert_eq!(
+            outcome,
+            CloudUploadOutcome::Skipped {
+                reason: "no persisted session".to_string()
+            }
+        );
+        assert!(!outcome.is_success());
+    }
+
+    #[test]
+    fn cloud_upload_outcome_success_flag_only_for_uploaded() {
+        for outcome in [
+            CloudUploadOutcome::Uploaded,
+            CloudUploadOutcome::Failed {
+                error: "boom".to_string(),
+            },
+            CloudUploadOutcome::Skipped {
+                reason: "boom".to_string(),
+            },
+            CloudUploadOutcome::NotRun,
+        ] {
+            let expected = matches!(outcome, CloudUploadOutcome::Uploaded);
+            assert_eq!(
+                outcome.is_success(),
+                expected,
+                "wrong success flag for {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_upload_outcome_user_line_reported_for_failed_and_skipped_only() {
+        assert_eq!(
+            CloudUploadOutcome::Failed {
+                error: "boom".to_string()
+            }
+            .user_line("Half-Life"),
+            Some("Cloud upload failed for Half-Life: boom".to_string())
+        );
+        assert_eq!(
+            CloudUploadOutcome::Skipped {
+                reason: "no handle".to_string()
+            }
+            .user_line("Half-Life"),
+            Some("Cloud upload skipped for Half-Life: no handle".to_string())
+        );
+        assert_eq!(CloudUploadOutcome::Uploaded.user_line("Half-Life"), None);
+        assert_eq!(CloudUploadOutcome::NotRun.user_line("Half-Life"), None);
     }
 }
