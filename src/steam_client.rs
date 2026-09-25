@@ -21,8 +21,8 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use steam_vent::auth::{
-    AuthConfirmationHandler, ConfirmationMethod, DeviceConfirmationHandler, FileGuardDataStore,
-    UserProvidedAuthConfirmationHandler,
+    AuthConfirmationHandler, ClientInfo, ConfirmationMethod, DeviceConfirmationHandler,
+    FileGuardDataStore, RefreshToken, UserProvidedAuthConfirmationHandler,
 };
 use steam_vent::connection::Connection;
 use steam_vent_proto_steam::steammessages_clientserver::{
@@ -262,8 +262,9 @@ impl BulkCmBudget {
 ///
 /// This is the bound on how long the **state mutex** can stay held: the
 /// attempt runs while `active_connection_locked` owns the guard, so without
-/// this a hung `Connection::access` (unreachable CM, wedged TCP connect)
-/// would block every caller of `get_active_connection` indefinitely. With it,
+/// this a hung `Connection::login_with_refresh_token` (unreachable CM, wedged
+/// TCP connect) would block every caller of `get_active_connection`
+/// indefinitely. With it,
 /// a second caller waits at most this long before it gets an error back.
 const REAUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -302,16 +303,18 @@ where
 ///
 /// Classified by what the error chain *contains*, never by its text:
 /// `ConnectionError` uses `#[from]`, so `NetworkError` is always reachable as
-/// a source. A rejected refresh token (`ConnectionError::AccessToken`) or bad
-/// credentials (`ConnectionError::LoginError`) carry `AccessTokenError` /
-/// `LoginError` payloads, neither of which can hold a network error, so they
-/// are never counted — they must surface immediately instead of hiding behind
-/// a backoff.
+/// a source. A rejected refresh token
+/// (`ConnectionError::LoginError(LoginError::AccessToken(RefreshTokenError))`)
+/// or bad credentials (`ConnectionError::LoginError`) carry
+/// `RefreshTokenError` / `LoginError` payloads, neither of which can hold a
+/// network error, so they are never counted — they must surface immediately
+/// instead of hiding behind a backoff.
 ///
 /// Note `NetworkError::Timeout` *is* counted here even though
 /// `is_transport_error` deliberately rejects it: for a replayed operation a
-/// timeout leaves the outcome unknown, but for `Connection::access` it plainly
-/// means we could not connect.
+/// timeout leaves the outcome unknown, but for
+/// `Connection::login_with_refresh_token` it plainly means we could not
+/// connect.
 fn is_network_failure(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         if cause.downcast_ref::<ReauthTimeout>().is_some() {
@@ -1050,7 +1053,8 @@ impl SteamClient {
     /// `intent` decides whether an armed cooldown may refuse the attempt. The
     /// attempt itself runs under [`REAUTH_TIMEOUT`] *while this guard is
     /// held*, which is what bounds how long a concurrent caller can block —
-    /// without it a hung `Connection::access` would pin the mutex forever.
+    /// without it a hung `Connection::login_with_refresh_token` would pin the
+    /// mutex forever.
     async fn active_connection_locked(
         &self,
         guard: &mut ConnectionState,
@@ -1101,7 +1105,9 @@ impl SteamClient {
                 .ok_or_else(|| anyhow!("no persisted refresh_token found"))?;
 
             let server_list = self.resolve_server_list().await?;
-            let connection = Connection::access(&server_list, &account_name, &refresh_token)
+            let token = RefreshToken::new(refresh_token)
+                .context("invalid persisted refresh token")?;
+            let connection = Connection::login_with_refresh_token(&server_list, &token)
                 .await
                 .map_err(|e| anyhow!(e))
                 .context("refresh token re-authentication failed")?;
@@ -1301,7 +1307,7 @@ impl SteamClient {
 
         let mut data = AccountData {
             steam_id: u64::from(connection.steam_id()),
-            country: connection.ip_country_code().unwrap_or_default(),
+            country: connection.ip_country_code().to_string(),
             ..Default::default()
         };
 
@@ -1437,7 +1443,9 @@ impl SteamClient {
         }
 
         let server_list = self.resolve_server_list().await?;
-        let connection = Connection::access(&server_list, &account_name, &refresh_token)
+        let token =
+            RefreshToken::new(refresh_token).context("invalid persisted refresh token")?;
+        let connection = Connection::login_with_refresh_token(&server_list, &token)
             .await
             .map_err(|e| anyhow!(e))
             .context("refresh token login failed")?;
@@ -1533,7 +1541,7 @@ impl SteamClient {
         Some(SessionState {
             account_name: Some(account_name),
             steam_id: Some(steam_id),
-            refresh_token: connection.access_token().map(ToString::to_string),
+            refresh_token: Some(connection.refresh_token().token().to_string()),
             client_instance_id: None,
         })
     }
