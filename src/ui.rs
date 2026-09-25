@@ -1577,18 +1577,21 @@ impl SteamLauncher {
             let mut local_root = None;
 
             if cloud_enabled {
-                // A dead CM socket must not block game launch: skip the cloud
-                // round-trip (get_active_connection transparently re-auths when
-                // it can; if it can't, launch proceeds without sync).
-                match client.get_active_connection().await {
-                    Ok(connection) => {
+                // A dead CM socket must not block game launch. Keep the sync
+                // inside the no-retry boundary so transport failures fence
+                // the lease instead of being discarded.
+                match client
+                    .with_connection_no_retry(move |connection| async move {
                         let c = crate::cloud_sync::CloudClient::new(connection);
                         let root =
                             crate::cloud_sync::default_cloud_root(c.steam_id(), game.app_id).unwrap();
                         tracing::info!(appid = game.app_id, path = %root.display(), "Syncing Cloud...");
-                        let _ = c.sync_down(game.app_id, &root).await;
-                        local_root = Some(root);
-                    }
+                        c.sync_down(game.app_id, &root).await?;
+                        Ok::<_, anyhow::Error>(root)
+                    })
+                    .await
+                {
+                    Ok(root) => local_root = Some(root),
                     Err(e) => {
                         tracing::warn!(
                             appid = game.app_id,

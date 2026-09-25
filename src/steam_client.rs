@@ -25,7 +25,9 @@ use steam_vent::auth::{
     UserProvidedAuthConfirmationHandler,
 };
 use steam_vent::connection::Connection;
-use steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicket;
+use steam_vent::proto::steammessages_clientserver::{
+    CMsgClientGetAppOwnershipTicket, CMsgClientGetAppOwnershipTicketResponse,
+};
 use steam_vent::proto::steammessages_clientserver_2::{
     CMsgClientGetCDNAuthToken, CMsgClientGetCDNAuthTokenResponse, CMsgClientGetDepotDecryptionKey,
     CMsgClientGetDepotDecryptionKeyResponse,
@@ -819,6 +821,25 @@ mod reauth_cooldown_tests {
             budget.spend(); // that attempt failed
         }
         assert_eq!(attempts, 1, "50 games must not become 50 CM attempts");
+    }
+
+    #[test]
+    fn bulk_budget_is_spent_only_for_network_failures() {
+        let mut budget = BulkCmBudget::default();
+        let malformed = anyhow::anyhow!("malformed appinfo response");
+        assert!(!is_network_failure(&malformed));
+        assert!(
+            budget.allow_attempt(),
+            "a non-network failure must not stop later games"
+        );
+
+        let network = wrap(ConnectionError::Network(NetworkError::EOF));
+        assert!(is_network_failure(&network));
+        budget.spend();
+        assert!(
+            !budget.allow_attempt(),
+            "a network failure must stop later CM attempts"
+        );
     }
 
     #[test]
@@ -1914,7 +1935,7 @@ impl SteamClient {
 
             // 2. Fetch Content Servers via Service
             tracing::info!("Fetching Content Servers for AppID: {}...", appid);
-            let hosts = match client_clone.get_content_servers(connection.cell_id()).await {
+            let hosts = match client_clone.get_content_servers().await {
                 Ok(h) => h,
                 Err(e) => {
                     let _ = tx
@@ -1993,20 +2014,27 @@ impl SteamClient {
                         (host.as_str(), 80)
                     };
 
+                    let (cdn_connection, _) = match client_clone.connection_lease().await {
+                        Ok(lease) => lease,
+                        Err(e) => {
+                            tracing::warn!("Failed to re-lease CM connection for CDN: {}", e);
+                            continue;
+                        }
+                    };
                     let cdn_server = steam_cdn::web_api::content_service::CDNServer {
                         r#type: "CDN".to_string(),
                         https: port == 443,
                         host: host_name.to_string(),
                         vhost: host_name.to_string(),
                         port,
-                        cell_id: connection.cell_id(),
+                        cell_id: cdn_connection.cell_id(),
                         load: 0,
                         weighted_load: 0,
                         auth_token: token,
                     };
 
                     let cdn_client = steam_cdn::CDNClient::with_server(
-                        Arc::new(connection.clone()),
+                        Arc::new(cdn_connection.clone()),
                         cdn_server,
                     );
 
@@ -2243,10 +2271,10 @@ impl SteamClient {
         Ok(())
     }
 
-    pub async fn get_content_servers(&self, cell_id: u32) -> Result<Vec<String>> {
+    pub async fn get_content_servers(&self) -> Result<Vec<String>> {
         self.with_healthy_connection(move |connection| async move {
             let mut request = CContentServerDirectory_GetServersForSteamPipe_Request::new();
-            request.set_cell_id(cell_id);
+            request.set_cell_id(connection.cell_id());
             request.set_max_servers(20);
 
             let response: CContentServerDirectory_GetServersForSteamPipe_Response = connection
@@ -2419,12 +2447,10 @@ impl SteamClient {
     /// the account can actually download them.
     pub async fn get_depot_list_with_access(&self, app_id: u32) -> Result<Vec<DepotInfo>> {
         let mut depots = self.get_depot_list(app_id).await?;
+        let depot_ids = depots.iter().map(|depot| depot.id as u64).collect::<Vec<_>>();
+        let ownership = self.verify_depot_ownership(app_id, depot_ids).await;
         for depot in &mut depots {
-            depot.is_owned = Some(
-                self.get_depot_key(app_id, depot.id as u32)
-                    .await
-                    .is_ok(),
-            );
+            depot.is_owned = ownership.get(&(depot.id as u64)).copied().flatten();
         }
         Ok(depots)
     }
@@ -2476,8 +2502,24 @@ impl SteamClient {
             }
         };
 
-        // 1. Ensure we have an App Ticket (Warm up session)
-        let _ = self.get_app_ticket(app_id).await;
+        // 1. Ensure we have an App Ticket using the same leased connection as
+        // the ownership sweep. Do not call get_app_ticket here: its separate
+        // recovery boundary could replace the connection mid-sweep.
+        let mut ticket_request = CMsgClientGetAppOwnershipTicket::new();
+        ticket_request.set_app_id(app_id);
+        let ticket_response: CMsgClientGetAppOwnershipTicketResponse =
+            match connection.job(ticket_request).await {
+                Ok(response) => response,
+                Err(e) => {
+                    let err = anyhow::Error::new(e);
+                    if Self::is_transport_error(&err) {
+                        self.observe_transport_failure(generation, &err).await;
+                    }
+                    tracing::warn!(app_id, error = %err, "app-ticket warm-up failed");
+                    return all_ids.into_iter().map(|id| (id, None)).collect();
+                }
+            };
+        let _ = ticket_response;
 
         let mut results: HashMap<u64, Option<bool>> = HashMap::new();
         let mut transport_failure: Option<anyhow::Error> = None;
@@ -2712,7 +2754,9 @@ impl SteamClient {
                         error = %err,
                         "remote manifest check failed; skipping the remainder of this sweep"
                     );
-                    budget.spend();
+                    if is_network_failure(&err) {
+                        budget.spend();
+                    }
                     continue;
                 }
             };
@@ -3152,7 +3196,7 @@ impl SteamClient {
                 return;
             };
 
-            let hosts = match client_clone.get_content_servers(connection.cell_id()).await {
+            let hosts = match client_clone.get_content_servers().await {
                 Ok(h) => h,
                 Err(e) => {
                     let _ = tx
@@ -3209,20 +3253,27 @@ impl SteamClient {
                         (host.as_str(), 80)
                     };
 
+                    let (cdn_connection, _) = match client_clone.connection_lease().await {
+                        Ok(lease) => lease,
+                        Err(e) => {
+                            tracing::warn!("Failed to re-lease CM connection for CDN: {}", e);
+                            continue;
+                        }
+                    };
                     let cdn_server = steam_cdn::web_api::content_service::CDNServer {
                         r#type: "CDN".to_string(),
                         https: port == 443,
                         host: host_name.to_string(),
                         vhost: host_name.to_string(),
                         port,
-                        cell_id: connection.cell_id(),
+                        cell_id: cdn_connection.cell_id(),
                         load: 0,
                         weighted_load: 0,
                         auth_token: token,
                     };
 
                     let cdn_client = steam_cdn::CDNClient::with_server(
-                        Arc::new(connection.clone()),
+                        Arc::new(cdn_connection.clone()),
                         cdn_server,
                     );
 
@@ -6400,10 +6451,7 @@ mod steamwebhelper_management_tests {
     }
 
     fn process_alive(child: &mut std::process::Child) -> bool {
-        match child.try_wait() {
-            Ok(Some(_)) => false,
-            _ => true,
-        }
+        !matches!(child.try_wait(), Ok(Some(_)))
     }
 
     #[test]

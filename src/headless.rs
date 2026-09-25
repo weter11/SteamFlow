@@ -418,7 +418,7 @@ pub async fn test_download_proton(args: &[String]) -> Result<()> {
 
     println!("== stage 3: content servers (cell {})", connection.cell_id());
     let hosts = client
-        .get_content_servers(connection.cell_id())
+        .get_content_servers()
         .await
         .context("stage 3 FAILED: get_content_servers")?;
     println!("  {} hosts: {}", hosts.len(), hosts.join(", "));
