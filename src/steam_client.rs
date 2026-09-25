@@ -1488,8 +1488,10 @@ impl SteamClient {
                 .context("failed to prepare guard code input")?;
             drop(writer);
 
-            let handler = UserProvidedAuthConfirmationHandler::new(reader, sink())
-                .or(DeviceConfirmationHandler);
+            let handler = (
+                UserProvidedAuthConfirmationHandler::new(reader, sink()),
+                DeviceConfirmationHandler,
+            );
 
             Connection::login(
                 &server_list,
@@ -1497,6 +1499,7 @@ impl SteamClient {
                 &password,
                 FileGuardDataStore::user_cache(),
                 handler,
+                &ClientInfo::default(),
             )
             .await
         } else {
@@ -1506,6 +1509,7 @@ impl SteamClient {
                 &password,
                 FileGuardDataStore::user_cache(),
                 DeviceConfirmationHandler,
+                &ClientInfo::default(),
             )
             .await
         };
