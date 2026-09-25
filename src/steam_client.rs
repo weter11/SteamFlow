@@ -25,19 +25,19 @@ use steam_vent::auth::{
     UserProvidedAuthConfirmationHandler,
 };
 use steam_vent::connection::Connection;
-use steam_vent::proto::steammessages_clientserver::{
+use steam_vent_proto_steam::steammessages_clientserver::{
     CMsgClientGetAppOwnershipTicket, CMsgClientGetAppOwnershipTicketResponse,
 };
-use steam_vent::proto::steammessages_clientserver_2::{
+use steam_vent_proto_steam::steammessages_clientserver_2::{
     CMsgClientGetCDNAuthToken, CMsgClientGetCDNAuthTokenResponse, CMsgClientGetDepotDecryptionKey,
     CMsgClientGetDepotDecryptionKeyResponse,
 };
-use steam_vent::proto::steammessages_clientserver_appinfo::{
+use steam_vent_proto_steam::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSAccessTokenRequest,
     CMsgClientPICSAccessTokenResponse, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
 };
-use steam_vent::proto::steammessages_contentsystem_steamclient::{
+use steam_vent_proto_steam::steammessages_contentsystem_steamclient::{
     CContentServerDirectory_GetCDNAuthToken_Request,
     CContentServerDirectory_GetCDNAuthToken_Response,
     CContentServerDirectory_GetManifestRequestCode_Request,
@@ -45,7 +45,7 @@ use steam_vent::proto::steammessages_contentsystem_steamclient::{
     CContentServerDirectory_GetServersForSteamPipe_Request,
     CContentServerDirectory_GetServersForSteamPipe_Response,
 };
-use steam_vent::proto::steammessages_player_steamclient::{
+use steam_vent_proto_steam::steammessages_player_steamclient::{
     CPlayer_GetOwnedGames_Request, CPlayer_GetOwnedGames_Response,
 };
 use steam_vent::{ConnectionError, ConnectionTrait, ServerList};
@@ -1280,7 +1280,7 @@ impl SteamClient {
             let mut request = CMsgClientGetAppOwnershipTicket::new();
             request.set_app_id(appid);
 
-            let response: steam_vent::proto::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse = connection
+            let response: steam_vent_proto_steam::steammessages_clientserver::CMsgClientGetAppOwnershipTicketResponse = connection
                 .job(request)
                 .await
                 .context("failed requesting app ownership ticket")?;

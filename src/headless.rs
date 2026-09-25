@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use steam_cdn::web_api::content_service::CDNServer;
 use steam_cdn::CDNClient;
-use steam_vent::proto::steammessages_clientserver_appinfo::{
+use steam_vent_proto_steam::steammessages_clientserver_appinfo::{
     cmsg_client_picsproduct_info_request, CMsgClientPICSAccessTokenRequest,
     CMsgClientPICSAccessTokenResponse, CMsgClientPICSProductInfoRequest,
     CMsgClientPICSProductInfoResponse,
