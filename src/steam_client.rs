@@ -21,8 +21,8 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use steam_vent::auth::{
-    AuthConfirmationHandler, ClientInfo, ConfirmationMethod, DeviceConfirmationHandler,
-    FileGuardDataStore, RefreshToken, UserProvidedAuthConfirmationHandler,
+    ClientInfo, ConfirmationMethod, DeviceConfirmationHandler, FileGuardDataStore, RefreshToken,
+    UserProvidedAuthConfirmationHandler,
 };
 use steam_vent::connection::Connection;
 use steam_vent_proto_steam::steammessages_clientserver::{
