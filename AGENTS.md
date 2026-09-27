@@ -18,6 +18,7 @@ for the native UI, and Proton/Wine integration for game launching.
 - `tests/` — integration tests.
 - `docs/` — architecture decisions and reverse-engineering notes.
 - `vendor/steam-cdn/` — vendored and patched `steam-cdn` dependency.
+- `vendor/steam-vent/` — vendored `steam-vent` 0.6.0 dependency (see below).
 - `Assets/` and `assets/` — application artwork and other static assets.
 
 ## Development commands
@@ -76,10 +77,49 @@ development packages.
   dependencies.
 - Treat `vendor/steam-cdn` as a deliberate local patch; do not replace it with
   an upstream dependency without checking compatibility.
+- Treat `vendor/steam-vent` the same way: it is a deliberate local vendoring of
+  a third-party tree, not code we own.
 - Do not commit build output, local Steam configuration, session data, or
   credentials.
 - Avoid changing generated or vendored files unless the task specifically
   requires it.
+
+## Vendored `steam-vent`
+
+`vendor/steam-vent/` is upstream steam-vent 0.6.0 plus PR #19, committed as a
+`git archive` of revision `54ecd10ebd385c6879a536725fd77cdb846fc9a3`. The
+revision is recorded in `vendor/steam-vent/STEAMVENT_REV`.
+
+It is vendored rather than depended on because PR #19 is still open upstream, so
+that commit exists only as `refs/pull/19/head`. Cargo's git fetcher requests
+`refs/heads/<sha>`, which does not exist for an unadvertised pull-request ref,
+so a `rev = "<sha>"` git dependency fails to resolve. Publishing a mirror of a
+third-party project was the alternative and was rejected.
+
+Notes for anyone editing near this tree:
+
+- It is third-party code, including its own `examples/`, `.gitignore` and
+  `.forgejo/` CI config. Do not "fix" or tidy those files.
+- Because it ships its own `.gitignore`, a `git add` inside `vendor/steam-vent`
+  obeys *steam-vent's* rules, not this repository's.
+- `tests/steam_vent_git_pin.rs` asserts the recorded revision matches and that
+  the source contains PR #19's change. A re-vendor that drifts fails the build.
+
+To refresh to a newer revision, archive from a clone of upstream steam-vent
+(the vendored copy is not a git repository, so `git archive` cannot run here):
+
+```bash
+git clone https://codeberg.org/steam-vent/steam-vent /tmp/steam-vent
+git -C /tmp/steam-vent fetch origin 'refs/pull/19/head:refs/pr19'
+git -C /tmp/steam-vent archive <new-rev> | tar -x -C vendor/steam-vent
+echo <new-rev> > vendor/steam-vent/STEAMVENT_REV
+# update the expected revision in tests/steam_vent_git_pin.rs
+```
+
+`cargo test --test steam_vent_git_pin` then verifies the recorded revision and
+the vendored source agree.
+
+Once upstream merges PR #19 this can collapse back to a published version.
 
 ## Change workflow
 
