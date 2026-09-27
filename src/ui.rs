@@ -1475,9 +1475,13 @@ impl SteamLauncher {
 
         // steam-vent 0.6's confirmation handler future is not `Send`, so this
         // cannot go through self.runtime.spawn. The future is built and polled
-        // on a dedicated OS thread's current-thread runtime.
+        // on a dedicated OS thread — but driven by the app's PERSISTENT
+        // runtime via a cloned Handle, so the reader/heartbeat tasks steam-vent
+        // spawns during the login outlive this worker. A private runtime would
+        // abort them and leave a zombie connection.
         self.auth_login_task = Some(crate::auth_login::spawn_local_task(
             attempt,
+            self.runtime.handle().clone(),
             move || async move {
                 // `client` is moved INTO the future, so the future owns it and
                 // may borrow it across awaits. Moving the non-Send future is
