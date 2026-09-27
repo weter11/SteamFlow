@@ -1629,6 +1629,19 @@ impl SteamClient {
         // stop the result from being committed.
         let fence = self.connection_generation().await;
 
+        // One stable machine identity across logins. `ClientInfo::default()`
+        // mints a random machine ID per call, so calling it here on every
+        // attempt would present a different machine to Steam each time. Reuse
+        // the persisted one when present; otherwise generate and let the commit
+        // below persist it.
+        let client_info = match load_session().await.ok().and_then(|s| s.client_info) {
+            Some(info) => info,
+            None => {
+                tracing::debug!("no persisted machine identity; generating one");
+                ClientInfo::default()
+            }
+        };
+
         self.connect().await?;
         if self.is_offline() {
             bail!("offline mode: using cached library");
@@ -1655,7 +1668,7 @@ impl SteamClient {
                 &password,
                 FileGuardDataStore::user_cache(),
                 handler,
-                &ClientInfo::default(),
+                &client_info,
             )
             .await
         } else {
@@ -1665,7 +1678,7 @@ impl SteamClient {
                 &password,
                 FileGuardDataStore::user_cache(),
                 DeviceConfirmationHandler,
-                &ClientInfo::default(),
+                &client_info,
             )
             .await
         };
@@ -1689,8 +1702,13 @@ impl SteamClient {
         let committed = self.commit_generation_fenced(fence, connection.clone()).await?;
         self.has_session.store(true, Ordering::Relaxed);
 
-        let session = Self::session_state_from(&connection, account_name)
+        let mut session = Self::session_state_from(&connection, account_name)
             .context("login succeeded but no token was available for persistence")?;
+        // Persist the machine identity alongside the tokens so the NEXT password
+        // login presents the same machine. Set here rather than in
+        // `session_state_from` because the refresh-token paths never had a
+        // ClientInfo to carry, and must not silently start persisting one.
+        session.client_info = Some(client_info);
         tracing::debug!(
             fence,
             committed,
@@ -1708,6 +1726,11 @@ impl SteamClient {
             steam_id: Some(steam_id),
             refresh_token: Some(connection.refresh_token().token().to_string()),
             client_instance_id: None,
+            // Left None here on purpose. This helper is shared with the
+            // refresh-token paths, which have no ClientInfo to carry; the
+            // password path sets the field on the returned value so those paths
+            // neither invent nor clobber a persisted machine identity.
+            client_info: None,
         })
     }
 
