@@ -1,6 +1,7 @@
 use crate::models::{LaunchMode, OwnedGame, RunnerSource, SessionState, SteamPrefixMode, UserConfigStore};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use steam_vent::auth::ClientInfo;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::fs;
@@ -242,8 +243,68 @@ pub async fn save_session(session: &SessionState) -> Result<()> {
 pub async fn delete_session() -> Result<()> {
     let session_path = config_dir()?.join("session.json");
     if session_path.exists() {
-        fs::remove_file(session_path).await?;
+        fs::remove_file(&session_path).await?;
     }
+    Ok(())
+}
+
+/// Path of the persisted machine identity.
+///
+/// Deliberately NOT `session.json`. `delete_session` removes that file wholesale
+/// on logout, and the machine identity must outlive a logout: it describes the
+/// machine, not the account session. Keeping it here means a logout clears the
+/// refresh token without also making the next login look like a new machine.
+fn machine_id_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("machine_id.json"))
+}
+
+/// Load the persisted machine identity, if any.
+///
+/// Returns `Ok(None)` when none has been written yet, and on a corrupt file —
+/// a machine identity we cannot parse is not worth failing a login over, and
+/// the next login will simply mint a fresh one.
+pub async fn load_client_info() -> Result<Option<ClientInfo>> {
+    let path = machine_id_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = match fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "failed reading machine identity; will generate a new one"
+            );
+            return Ok(None);
+        }
+    };
+    match serde_json::from_str::<ClientInfo>(&raw) {
+        Ok(info) => Ok(Some(info)),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "machine identity is corrupt; will generate a new one"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Persist the machine identity. Written once and then left alone; no code path
+/// deletes this file, so the identity is stable across logouts and restarts.
+pub async fn save_client_info(info: &ClientInfo) -> Result<()> {
+    let path = machine_id_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed creating {}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(info)?;
+    fs::write(&path, body)
+        .await
+        .with_context(|| format!("failed writing {}", path.display()))?;
     Ok(())
 }
 
