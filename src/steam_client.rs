@@ -134,6 +134,12 @@ struct ConnectionState {
     dead_since: Option<Instant>,
     /// Bumped on every connection replacement/teardown so stale operation
     /// failures can prove the connection they used is still the live one.
+    ///
+    /// This is also the password-login fence: `login` records the generation it
+    /// started on and refuses to commit if anything bumped it in the meantime
+    /// (a CM reset, a re-authentication, `logout`). A `Connection` minted
+    /// against server-side state that has since been replaced must never be
+    /// installed or persisted.
     generation: u64,
     /// Backoff for failed re-authentication attempts. Only `Background`
     /// intents consult it; a user-initiated call clears it first.
@@ -371,6 +377,94 @@ mod cm_generation_tests {
         assert!(!client.is_connection_dead());
         client.mark_generation_dead(2).await;
         assert!(client.is_connection_dead());
+    }
+
+    /// Direction 1: a CM-reconnect-driven generation bump that lands WHILE a
+    /// password login is in flight must stop that login from committing.
+    ///
+    /// This is the cross-subsystem case the two fences share: the bump comes
+    /// from the CM-recovery path (`mark_connection_dead` /
+    /// `invalidate_session`), not from another login attempt. The `Connection`
+    /// a login was minting was negotiated against server-side state that this
+    /// bump has just torn down, so committing it would resurrect a zombie.
+    #[tokio::test]
+    async fn cm_reconnect_bump_during_login_blocks_the_commit() {
+        let mut client = SteamClient::new().unwrap();
+
+        // The login captures its fence here...
+        let fence = client.connection_generation().await;
+        assert!(client.generation_is_current(fence).await);
+
+        // ...and a CM reset happens before it can commit.
+        client.mark_connection_dead().await;
+        client.invalidate_session();
+
+        assert!(
+            !client.generation_is_current(fence).await,
+            "CM bump must retire the login's fence"
+        );
+        let mut guard = client.inner.lock().await;
+        let err = SteamClient::commit_fence_locked(&mut guard, fence)
+            .expect_err("stale login must not be allowed to commit");
+        let message = err.to_string();
+        assert!(
+            message.contains("login interrupted"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// Direction 2, the reverse: a login that started AFTER an unrelated
+    /// generation bump must still be allowed to commit.
+    ///
+    /// Guards against over-fencing. If the fence compared anything other than
+    /// "is this the generation I captured", a bump from before the attempt
+    /// began would reject a perfectly current login and password auth would
+    /// never work at all.
+    #[tokio::test]
+    async fn login_started_after_a_bump_is_not_spuriously_rejected() {
+        let mut client = SteamClient::new().unwrap();
+
+        // Unrelated earlier activity: a reset, then an explicit invalidation.
+        client.mark_connection_dead().await;
+        client.invalidate_session();
+        let after_bump = client.connection_generation().await;
+        assert!(after_bump > 0, "bumps must have advanced the generation");
+
+        // The login captures the fence only now, so the earlier bumps are
+        // already accounted for and must not reject it.
+        let fence = client.connection_generation().await;
+        assert_eq!(fence, after_bump);
+        assert!(client.generation_is_current(fence).await);
+
+        let mut guard = client.inner.lock().await;
+        let committed = SteamClient::commit_fence_locked(&mut guard, fence)
+            .expect("a current login must be allowed to commit");
+        assert_eq!(committed, fence + 1, "commit advances the generation");
+        assert_eq!(guard.generation, committed);
+
+        // And a second login on the now-stale fence is refused, proving the
+        // fence is a one-shot rather than a permanent exemption.
+        assert!(SteamClient::commit_fence_locked(&mut guard, fence).is_err());
+    }
+
+    /// A rejected commit must not mutate anything: no generation bump, no
+    /// `has_session`, so the login leaves no trace for a later reader to trust.
+    #[tokio::test]
+    async fn rejected_login_commit_leaves_state_untouched() {
+        let client = SteamClient::new().unwrap();
+        client.inner.lock().await.generation = 7;
+
+        let mut guard = client.inner.lock().await;
+        let before = guard.generation;
+        assert!(SteamClient::commit_fence_locked(&mut guard, 3).is_err());
+        assert_eq!(
+            guard.generation, before,
+            "a rejected commit must not advance the generation"
+        );
+        assert!(
+            guard.connection.is_none() && !guard.dead,
+            "a rejected commit must not install or mark any connection"
+        );
     }
 }
 
@@ -970,6 +1064,62 @@ impl SteamClient {
         guard.connection = None;
     }
 
+    /// The current connection generation, for callers that must fence a
+    /// long-running operation against any intervening replacement.
+    pub async fn connection_generation(&self) -> u64 {
+        self.inner.lock().await.generation
+    }
+
+    /// True only while `generation` is still the live one.
+    ///
+    /// This is the password-login fence. It shares the CM generation counter on
+    /// purpose: a login that started before a CM reset must not be able to
+    /// install a `Connection` minted against server-side state that has since
+    /// been torn down, and a login is exactly such a long-running operation.
+    pub async fn generation_is_current(&self, generation: u64) -> bool {
+        self.inner.lock().await.generation == generation
+    }
+
+    /// Install a freshly authenticated `Connection` only if `generation` is
+    /// still current, and return the new generation.
+    ///
+    /// The generation is re-checked *under the lock* rather than trusted from
+    /// the caller: between an operation's start and its commit, any number of
+    /// CM resets, re-authentications or logouts may have run. Committing
+    /// unconditionally is what let a superseded login overwrite both the live
+    /// connection and `session.json` after the UI had already decided the
+    /// attempt was stale.
+    pub(crate) async fn commit_generation_fenced(
+        &self,
+        generation: u64,
+        connection: Connection,
+    ) -> Result<u64> {
+        let mut guard = self.inner.lock().await;
+        let committed = Self::commit_fence_locked(&mut guard, generation)?;
+        guard.connection = Some(connection);
+        guard.dead = false;
+        guard.dead_since = None;
+        Ok(committed)
+    }
+
+    /// The fence decision itself, split out so it is testable without a live
+    /// `Connection` (which cannot be constructed offline).
+    ///
+    /// On success the generation is advanced and returned, so the caller holds
+    /// the generation its commit now owns. On failure nothing is mutated: a
+    /// stale login leaves no trace at all.
+    fn commit_fence_locked(guard: &mut ConnectionState, generation: u64) -> Result<u64> {
+        if guard.generation != generation {
+            bail!(
+                "login interrupted: connection was replaced while authenticating \
+                 (expected generation {generation}, found {})",
+                guard.generation
+            );
+        }
+        guard.generation += 1;
+        Ok(guard.generation)
+    }
+
     /// Health-checked accessor that also reports the connection generation.
     /// Callers that replay operations on transport failure must capture it and
     /// fence their invalidation through [`Self::mark_generation_dead`].
@@ -1473,6 +1623,12 @@ impl SteamClient {
         password: String,
         guard_code: Option<String>,
     ) -> Result<SessionState> {
+        // Fence value for this attempt. `Connection::login` is a multi-round
+        // trip to Steam, so anything that replaces the CM connection while it
+        // is in flight (a reset, a re-authentication, `logout`) must be able to
+        // stop the result from being committed.
+        let fence = self.connection_generation().await;
+
         self.connect().await?;
         if self.is_offline() {
             bail!("offline mode: using cached library");
@@ -1524,17 +1680,22 @@ impl SteamClient {
             Err(other) => return Err(anyhow!(other)).context("steam-vent login flow failed"),
         };
 
-        {
-            let mut guard = self.inner.lock().await;
-            guard.generation += 1;
-            guard.connection = Some(connection.clone());
-            guard.dead = false;
-            guard.dead_since = None;
-        }
+        // Fenced commit. Re-checked under the lock inside the helper: between
+        // capturing `fence` and here, a CM reset, re-authentication or logout
+        // may have replaced the connection this `Connection` was minted
+        // against. On a mismatch nothing is installed, `has_session` stays
+        // false, and `session.json` is never rewritten, so the UI shows
+        // "login interrupted" instead of a session that a newer event revoked.
+        let committed = self.commit_generation_fenced(fence, connection.clone()).await?;
         self.has_session.store(true, Ordering::Relaxed);
 
         let session = Self::session_state_from(&connection, account_name)
             .context("login succeeded but no token was available for persistence")?;
+        tracing::debug!(
+            fence,
+            committed,
+            "password login committed under the connection generation fence"
+        );
         save_session(&session).await?;
         self.pending_confirmations.lock().unwrap().clear();
         Ok(session)
