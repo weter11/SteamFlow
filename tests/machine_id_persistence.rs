@@ -150,10 +150,11 @@ async fn identity_round_trips_through_its_own_file() {
 /// A TRUNCATED identity file must converge on the same recovery path as a
 /// syntactically corrupt one: `Ok(None)`, so the next login regenerates.
 ///
-/// `save_client_info` uses a direct `fs::write`, not a temp-file-plus-rename,
-/// so a crash or a full disk mid-write can leave a partial file. This asserts
-/// that partial file is handled as "generate a new identity" rather than
-/// surfacing as a login error, and that the recovery actually completes.
+/// `save_client_info` now writes via temp-file-plus-rename, so a partial file
+/// should no longer be reachable in normal operation. This test still pins the
+/// recovery contract, because the file can predate the atomic writer, or be
+/// truncated by something outside SteamFlow, and an unparseable machine ID must
+/// never surface as a login error.
 #[tokio::test]
 async fn truncated_identity_file_converges_with_the_corrupt_path() {
     let _guard = scratch_home("truncated").await;
