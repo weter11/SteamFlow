@@ -277,18 +277,6 @@ pub struct SessionState {
     pub steam_id: Option<u64>,
     pub refresh_token: Option<String>,
     pub client_instance_id: Option<u64>,
-    /// The machine identity presented to Steam on password login.
-    ///
-    /// `ClientInfo::default()` mints a RANDOM machine ID on every call
-    /// (`MachineId::default` -> `MachineID::random`), so calling it per login
-    /// made every attempt look like a brand-new machine to Steam — the shape
-    /// that draws fresh-login / new-device challenges. Persisting it here and
-    /// reusing it keeps one stable identity across logins.
-    ///
-    /// `#[serde(default)]` so sessions written before this field existed still
-    /// parse; the first login after upgrading generates and persists one.
-    #[serde(default)]
-    pub client_info: Option<ClientInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,58 +526,44 @@ pub struct DepotManifests {
 }
 
 #[cfg(test)]
-mod session_client_info_tests {
+mod session_state_tests {
     use super::*;
 
-    /// `ClientInfo::default()` mints a RANDOM machine ID, so a session that
-    /// carried one must not silently lose it across a save/load cycle — that is
-    /// what would make every login look like a new machine again.
+    /// A session.json written by the revision that still mirrored the machine
+    /// identity into the session file carries a `client_info` key. That field
+    /// is gone from `SessionState` now, and the file must still parse: serde
+    /// ignores unknown fields, so an upgrading user's existing session keeps
+    /// working and the identity is simply read from its own file.
     #[test]
-    fn persisted_client_info_survives_a_json_round_trip() {
-        let session = SessionState {
-            account_name: Some("tester".to_string()),
-            refresh_token: Some("token".to_string()),
-            client_info: Some(ClientInfo::default()),
-            ..Default::default()
-        };
-
-        let encoded = serde_json::to_string(&session).expect("serialize");
-        let decoded: SessionState = serde_json::from_str(&encoded).expect("deserialize");
-
-        let original = session.client_info.expect("original has client_info");
-        let restored = decoded.client_info.expect("client_info must survive");
-        // Compare the encoded form: MachineId exposes no public accessor, but
-        // the three 20-byte components are what Steam actually sees.
-        assert_eq!(
-            serde_json::to_string(&original).unwrap(),
-            serde_json::to_string(&restored).unwrap(),
-            "machine identity must round-trip unchanged"
-        );
-    }
-
-    /// Sessions written before this field existed must still parse, and report
-    /// no machine identity so the next login generates one.
-    #[test]
-    fn a_pre_existing_session_without_the_field_still_parses() {
+    fn a_session_carrying_the_removed_client_info_key_still_parses() {
         let legacy = r#"{
             "account_name": "tester",
             "steam_id": 12345,
             "refresh_token": "token",
-            "client_instance_id": null
+            "client_instance_id": null,
+            "client_info": { "machine_id": "deadbeef" }
         }"#;
 
         let parsed: SessionState = serde_json::from_str(legacy).expect("legacy session must parse");
         assert_eq!(parsed.account_name.as_deref(), Some("tester"));
         assert_eq!(parsed.steam_id, Some(12345));
-        assert!(
-            parsed.client_info.is_none(),
-            "a legacy session has no machine identity yet"
-        );
+        assert_eq!(parsed.refresh_token.as_deref(), Some("token"));
     }
 
-    /// The default (no prior session) must also be representable and empty.
+    /// A round-trip must not reintroduce the key. Serializing a session now
+    /// produces no `client_info`, so the mirror cannot silently come back.
     #[test]
-    fn default_session_has_no_client_info() {
-        assert!(SessionState::default().client_info.is_none());
+    fn a_written_session_contains_no_client_info_key() {
+        let session = SessionState {
+            account_name: Some("tester".to_string()),
+            refresh_token: Some("token".to_string()),
+            ..Default::default()
+        };
+
+        let encoded = serde_json::to_string(&session).expect("serialize");
+        assert!(
+            !encoded.contains("client_info"),
+            "the machine identity must not be mirrored into session.json: {encoded}"
+        );
     }
 }

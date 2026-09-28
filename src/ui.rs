@@ -1433,6 +1433,12 @@ impl SteamLauncher {
             task.cancel();
         }
         self.auth_login_state.invalidate_current();
+        // The cancelled attempt can no longer raise or resolve a confirmation,
+        // so any prompt it left behind describes an attempt that will never
+        // finish. Without this the prompts stayed on screen and were rendered
+        // against the NEXT attempt, which never received them — a stale
+        // "Steam Guard code required" block on a login that needs no code.
+        self.client.clear_pending_confirmations();
     }
 
     /// Reap a finished login worker during a normal UI update. Never blocks:
