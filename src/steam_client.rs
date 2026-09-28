@@ -349,6 +349,15 @@ pub struct SteamClient {
     offline: Arc<AtomicBool>,
     connected_at: Arc<std::sync::Mutex<Option<Instant>>>,
     active_cm: Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    /// Steam Guard prompts raised by the most recent password-login attempt.
+    ///
+    /// Ownership: `login` is the only writer. It sets the list when Steam asks
+    /// for a confirmation, and it clears the list on EVERY other exit from the
+    /// function — success, a hard failure, and the replacement-login and
+    /// cancel paths in the UI. Without that, prompts raised by an attempt that
+    /// was then abandoned (cancelled, superseded, or failed for an unrelated
+    /// reason) stayed in the list and were rendered against the next attempt,
+    /// which never received them.
     pending_confirmations: Arc<std::sync::Mutex<Vec<ConfirmationPrompt>>>,
 }
 
@@ -472,6 +481,59 @@ mod cm_generation_tests {
 /// on typed transport errors only, and only for the generation it was handed.
 /// No live `Connection` is involved, so these run offline.
 #[cfg(test)]
+/// Ownership contract for `SteamClient::pending_confirmations`.
+///
+/// The UI reads this list on every frame, so a prompt that outlives the attempt
+/// that raised it is shown against a login that never received it.
+#[cfg(test)]
+mod pending_confirmation_tests {
+    use super::*;
+
+    /// A cancelled or superseded attempt must not leave prompts behind.
+    #[test]
+    fn clearing_confirmations_empties_a_raised_prompt_list() {
+        let mut client = SteamClient::new().unwrap();
+        assert!(client.pending_confirmations().is_empty());
+
+        *client.pending_confirmations.lock().unwrap() = vec![ConfirmationPrompt {
+            requirement: crate::models::SteamGuardReq::DeviceCode,
+            details: "stale prompt from a cancelled attempt".to_string(),
+        }];
+        assert_eq!(
+            client.pending_confirmations().len(),
+            1,
+            "precondition: a prompt is pending"
+        );
+
+        client.clear_pending_confirmations();
+        assert!(
+            client.pending_confirmations().is_empty(),
+            "a cancelled or superseded attempt must not leave prompts behind"
+        );
+    }
+
+    /// The guard list is shared across `SteamClient` clones, which is how the
+    /// UI observes a login running on a worker thread. Clearing through one
+    /// clone must therefore be visible to the other, not just to the writer.
+    #[test]
+    fn clearing_confirmations_is_visible_through_a_clone() {
+        let mut client = SteamClient::new().unwrap();
+        let observer = client.clone();
+
+        *client.pending_confirmations.lock().unwrap() = vec![ConfirmationPrompt {
+            requirement: crate::models::SteamGuardReq::DeviceConfirmation,
+            details: "prompt".to_string(),
+        }];
+        assert_eq!(observer.pending_confirmations().len(), 1);
+
+        client.clear_pending_confirmations();
+        assert!(
+            observer.pending_confirmations().is_empty(),
+            "the UI reads this list through its own clone, so the clear must be shared"
+        );
+    }
+}
+
 mod observe_transport_failure_tests {
     use super::*;
     use steam_vent::NetworkError;
@@ -1699,8 +1761,32 @@ impl SteamClient {
                     methods.iter().map(map_confirmation).collect::<Vec<_>>();
                 bail!("Steam Guard confirmation required")
             }
-            Err(other) => return Err(anyhow!(other)).context("steam-vent login flow failed"),
+            Err(other) => {
+                // This attempt produced no prompts of its own, so anything left
+                // over from a previous one must not be shown against it. See
+                // the note on the `pending_confirmations` field.
+                self.clear_pending_confirmations();
+                return Err(anyhow!(other)).context("steam-vent login flow failed");
+            }
         };
+
+        // Persist a freshly minted machine identity BEFORE the fenced commit.
+        //
+        // `Connection::login` has already told Steam about this machine by the
+        // time we get here, so if the fence then rejects the commit, the
+        // identity is not an unused draft — it is one Steam has seen. Saving it
+        // after the fence (as this did before) meant a fenced-out login
+        // presented a machine to Steam and then forgot it, so the next attempt
+        // presented yet another one.
+        //
+        // Written only when freshly generated, so a healthy identity is never
+        // rewritten. A write failure is not fatal: the login itself succeeded,
+        // and the next login simply mints another identity.
+        if generated {
+            if let Err(err) = save_client_info(&client_info).await {
+                tracing::warn!(error = %err, "failed persisting machine identity");
+            }
+        }
 
         // Fenced commit. Re-checked under the lock inside the helper: between
         // capturing `fence` and here, a CM reset, re-authentication or logout
@@ -1711,29 +1797,15 @@ impl SteamClient {
         let committed = self.commit_generation_fenced(fence, connection.clone()).await?;
         self.has_session.store(true, Ordering::Relaxed);
 
-        // Persist the machine identity to its OWN file, not session.json, so a
-        // logout (which deletes session.json) does not discard it. Written only
-        // when freshly generated, so a healthy identity is never rewritten.
-        if generated {
-            if let Err(err) = save_client_info(&client_info).await {
-                // Not fatal: the login itself succeeded, and the next login
-                // simply mints another identity.
-                tracing::warn!(error = %err, "failed persisting machine identity");
-            }
-        }
-
-        let mut session = Self::session_state_from(&connection, account_name)
+        let session = Self::session_state_from(&connection, account_name)
             .context("login succeeded but no token was available for persistence")?;
-        // Kept in session.json too, for round-trip compatibility with sessions
-        // written by the previous revision. `load_client_info` is the authority.
-        session.client_info = Some(client_info);
         tracing::debug!(
             fence,
             committed,
             "password login committed under the connection generation fence"
         );
         save_session(&session).await?;
-        self.pending_confirmations.lock().unwrap().clear();
+        self.clear_pending_confirmations();
         Ok(session)
     }
 
@@ -1744,11 +1816,6 @@ impl SteamClient {
             steam_id: Some(steam_id),
             refresh_token: Some(connection.refresh_token().token().to_string()),
             client_instance_id: None,
-            // Left None here on purpose. This helper is shared with the
-            // refresh-token paths, which have no ClientInfo to carry; the
-            // password path sets the field on the returned value so those paths
-            // neither invent nor clobber a persisted machine identity.
-            client_info: None,
         })
     }
 

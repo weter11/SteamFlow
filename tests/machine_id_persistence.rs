@@ -60,16 +60,22 @@ async fn machine_identity_survives_logout() {
         "the identity must be written to its own file"
     );
 
-    // The commit also writes session.json, which is what logout deletes.
+    // The commit also writes session.json, which is what logout deletes. The
+    // identity is deliberately NOT part of it: that mirror is gone, and
+    // session.json must not be able to carry the identity any more.
     steamflow::config::save_session(&steamflow::models::SessionState {
         account_name: Some("tester".to_string()),
         refresh_token: Some("token".to_string()),
-        client_info: Some(first.clone()),
         ..Default::default()
     })
     .await
     .unwrap();
     assert!(config_path("session.json").exists());
+    let written_session = std::fs::read_to_string(config_path("session.json")).unwrap();
+    assert!(
+        !written_session.contains("client_info"),
+        "session.json must not mirror the machine identity: {written_session}"
+    );
 
     // --- logout: deletes session.json wholesale.
     steamflow::config::delete_session().await.unwrap();
