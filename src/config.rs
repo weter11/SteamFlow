@@ -1,10 +1,15 @@
-use crate::models::{LaunchMode, OwnedGame, RunnerSource, SessionState, SteamPrefixMode, UserConfigStore};
+use crate::models::{
+    LaunchMode, OwnedGame, RunnerSource, SessionState, SteamPrefixMode, UserConfigStore,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use steam_vent::auth::ClientInfo;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs::Permissions;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use steam_vent::auth::ClientInfo;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct GameConfig {
@@ -208,7 +213,81 @@ pub fn opensteam_image_cache_dir() -> Result<PathBuf> {
 }
 
 pub fn data_dir() -> Result<PathBuf> {
-    config_dir()  // or use XDG_DATA_HOME if you want proper separation
+    config_dir() // or use XDG_DATA_HOME if you want proper separation
+}
+
+/// Mode for files that carry credentials: owner read/write only.
+const SECRET_MODE: u32 = 0o600;
+
+/// Write `body` to `path` as an owner-only file, atomically.
+///
+/// Two properties that a plain `fs::write` does not give:
+///
+/// - **Mode.** The file is created with `0o600` explicitly rather than
+///   inheriting the umask (typically `0644`), so the refresh token in
+///   `session.json` and the machine identity in `machine_id.json` are not
+///   readable by other local users. The mode is also re-applied on an
+///   existing file, which `fs::write` would leave at whatever mode it had.
+/// - **Atomicity.** The content goes to a temp file in the same directory and
+///   is then `rename`d over the target, so a crash or a full disk leaves the
+///   previous file intact instead of a truncated one. `rename` within a
+///   directory is atomic on POSIX; the temp file must share the directory so
+///   it cannot land on a different filesystem.
+///
+/// Both secret writers go through this function rather than each doing their
+/// own `fs::write`, so the two cannot drift apart on mode or atomicity again.
+pub(crate) async fn write_secret_file(path: &Path, body: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed creating {}", parent.display()))?;
+    }
+
+    // Unique-enough temp name in the SAME directory: same filesystem for the
+    // rename, and no `rand` dependency for what only has to avoid colliding
+    // with a concurrent write of the same file.
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("secret path has no file name")?;
+    let temp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+
+    let result = async {
+        let mut options = fs::OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(SECRET_MODE);
+        let mut file = options
+            .open(&temp_path)
+            .await
+            .with_context(|| format!("failed creating {}", temp_path.display()))?;
+
+        // An existing temp file from a crashed run would otherwise keep its
+        // old mode, because `OpenOptions::mode` only applies on creation.
+        file.set_permissions(Permissions::from_mode(SECRET_MODE))
+            .await
+            .with_context(|| format!("failed securing {}", temp_path.display()))?;
+
+        file.write_all(body)
+            .await
+            .with_context(|| format!("failed writing {}", temp_path.display()))?;
+        file.sync_all()
+            .await
+            .with_context(|| format!("failed flushing {}", temp_path.display()))?;
+
+        fs::rename(&temp_path, path)
+            .await
+            .with_context(|| format!("failed replacing {}", path.display()))
+    }
+    .await;
+
+    if result.is_err() {
+        // Never leave a stray temp file holding a token behind.
+        let _ = fs::remove_file(&temp_path).await;
+    }
+    result
 }
 
 pub async fn load_session() -> Result<SessionState> {
@@ -231,13 +310,8 @@ pub async fn save_session(session: &SessionState) -> Result<()> {
         .await
         .with_context(|| format!("failed creating {}", config.display()))?;
 
-    let session_path = config.join("session.json");
     let body = serde_json::to_string_pretty(session)?;
-    fs::write(&session_path, body)
-        .await
-        .with_context(|| format!("failed writing {}", session_path.display()))?;
-
-    Ok(())
+    write_secret_file(&config.join("session.json"), body.as_bytes()).await
 }
 
 pub async fn delete_session() -> Result<()> {
@@ -296,16 +370,8 @@ pub async fn load_client_info() -> Result<Option<ClientInfo>> {
 /// deletes this file, so the identity is stable across logouts and restarts.
 pub async fn save_client_info(info: &ClientInfo) -> Result<()> {
     let path = machine_id_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed creating {}", parent.display()))?;
-    }
     let body = serde_json::to_string_pretty(info)?;
-    fs::write(&path, body)
-        .await
-        .with_context(|| format!("failed writing {}", path.display()))?;
-    Ok(())
+    write_secret_file(&path, body.as_bytes()).await
 }
 
 pub async fn load_launcher_config() -> Result<LauncherConfig> {
