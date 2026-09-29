@@ -243,51 +243,111 @@ pub(crate) async fn write_secret_file(path: &Path, body: &[u8]) -> Result<()> {
             .with_context(|| format!("failed creating {}", parent.display()))?;
     }
 
-    // Unique-enough temp name in the SAME directory: same filesystem for the
-    // rename, and no `rand` dependency for what only has to avoid colliding
-    // with a concurrent write of the same file.
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .context("secret path has no file name")?;
-    let temp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    let (temp_path, mut file) = create_unique_temp_file(path, file_name).await?;
 
-    let result = async {
+    // Removes the temp file on ANY early return below, including the `?`s. A
+    // guard rather than a cleanup call at the end, so a new failure path cannot
+    // leak a token-bearing temp file by forgetting it.
+    let mut cleanup = TempFileGuard::armed(temp_path.clone());
+
+    // `create_new` means this process created the file, so the mode above
+    // already applied; re-asserting it keeps the guarantee independent of that
+    // detail (and of any platform that applies `mode` differently).
+    file.set_permissions(Permissions::from_mode(SECRET_MODE))
+        .await
+        .with_context(|| format!("failed securing {}", temp_path.display()))?;
+
+    file.write_all(body)
+        .await
+        .with_context(|| format!("failed writing {}", temp_path.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed flushing {}", temp_path.display()))?;
+    drop(file);
+
+    // Rename first, disarm second: afterwards the temp path no longer exists, so
+    // deleting it would only be a pointless failed syscall.
+    fs::rename(&temp_path, path)
+        .await
+        .with_context(|| format!("failed replacing {}", path.display()))?;
+    cleanup.disarm();
+    Ok(())
+}
+
+/// Creates and exclusively opens a temp file next to `path`.
+///
+/// The name is unique per WRITE, not per process, and the file is opened
+/// `create_new`. Deriving it from the target name and the PID alone was not
+/// enough: overlapping login workers in one process — a superseded attempt still
+/// writing while its replacement starts — opened the same `.<name>.<pid>.tmp`,
+/// truncated each other's partial content and raced the rename, which can leave
+/// a corrupt credential file. A per-process counter plus `create_new` is
+/// collision-free even then, and the counter also makes a crashed run's leftover
+/// harmless: the next write simply takes the next number.
+async fn create_unique_temp_file(path: &Path, file_name: &str) -> Result<(PathBuf, fs::File)> {
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let pid = std::process::id();
+    loop {
+        let seq = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = path.with_file_name(format!(".{file_name}.{pid}.{seq}.tmp"));
         let mut options = fs::OpenOptions::new();
         options
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true) // fails if the name is taken: never clobber
             .mode(SECRET_MODE);
-        let mut file = options
-            .open(&temp_path)
-            .await
-            .with_context(|| format!("failed creating {}", temp_path.display()))?;
-
-        // An existing temp file from a crashed run would otherwise keep its
-        // old mode, because `OpenOptions::mode` only applies on creation.
-        file.set_permissions(Permissions::from_mode(SECRET_MODE))
-            .await
-            .with_context(|| format!("failed securing {}", temp_path.display()))?;
-
-        file.write_all(body)
-            .await
-            .with_context(|| format!("failed writing {}", temp_path.display()))?;
-        file.sync_all()
-            .await
-            .with_context(|| format!("failed flushing {}", temp_path.display()))?;
-
-        fs::rename(&temp_path, path)
-            .await
-            .with_context(|| format!("failed replacing {}", path.display()))
+        match options.open(&candidate).await {
+            Ok(file) => return Ok((candidate, file)),
+            // Name already taken (a concurrent write, or a leftover from a
+            // crashed run): take the next counter value.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("failed creating {}", candidate.display())));
+            }
+        }
     }
-    .await;
+}
 
-    if result.is_err() {
-        // Never leave a stray temp file holding a token behind.
-        let _ = fs::remove_file(&temp_path).await;
+/// Deletes its temp file on drop unless disarmed. Synchronous on purpose:
+/// `Drop` cannot await, and unlinking a few-KB file in a config directory is not
+/// worth an async cleanup path.
+struct TempFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileGuard {
+    fn armed(path: PathBuf) -> Self {
+        Self { path, armed: true }
     }
-    result
+
+    /// Called once the temp file has been renamed onto its target, so Drop does
+    /// not try to delete a path that no longer exists.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Test-only re-export of [`write_secret_file`].
+///
+/// The concurrency property (no two writers sharing a temp file) belongs to the
+/// WRITER, not to any one credential file, so the test drives this directly at
+/// an arbitrary path rather than going through `save_session`.
+#[doc(hidden)]
+pub async fn write_secret_file_for_test(path: &Path, body: &[u8]) -> Result<()> {
+    write_secret_file(path, body).await
 }
 
 pub async fn load_session() -> Result<SessionState> {

@@ -87,9 +87,78 @@ async fn machine_id_file_is_owner_only() {
     assert_eq!(mode_of(&path), 0o600, "machine_id.json must be owner-only");
 }
 
+/// Concurrent writes to the SAME credential file must not share a temp file.
+///
+/// The temp name used to be derived from the target name and the PID alone, so
+/// two overlapping writers in one process opened the same
+/// `.session.json.<pid>.tmp`: one truncated the other's partial content and the
+/// two raced the rename. That is reachable in practice — a superseded login
+/// worker can still be writing `session.json` when its replacement starts — and
+/// the failure mode is a corrupt refresh token.
+///
+/// Every writer writes a complete, individually valid body, so the surviving
+/// file must be exactly one of them: never a blend, never a stale earlier round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writes_to_the_same_secret_file_do_not_collide() {
+    let (_guard, dir) = scratch_home("concurrent").await;
+    let path = dir.join(".config/SteamFlow/session.json");
+
+    const WRITERS: usize = 8;
+    const ROUNDS: usize = 12;
+
+    for round in 0..ROUNDS {
+        let mut tasks = Vec::with_capacity(WRITERS);
+        for index in 0..WRITERS {
+            let path = path.clone();
+            let body = format!(
+                r#"{{"account_name":"writer-{index}","refresh_token":"token-{index}-{round}"}}"#
+            );
+            tasks.push(tokio::spawn(async move {
+                steamflow::config::write_secret_file_for_test(&path, body.as_bytes()).await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("writer task must not panic")
+                .expect("concurrent write must succeed");
+        }
+
+        let written = std::fs::read_to_string(&path).expect("the target must exist");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&written).unwrap_or_else(|e| panic!("corrupt session file: {e}"));
+        assert_eq!(
+            parsed["refresh_token"]
+                .as_str()
+                .and_then(|token| token.rsplit('-').next())
+                .map(str::to_string),
+            Some(round.to_string()),
+            "a stale file survived, or two writers' content was blended: {written}"
+        );
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "concurrent writes must stay owner-only"
+        );
+    }
+
+    // No writer may leave its temp file behind.
+    let config = dir.join(".config/SteamFlow");
+    let leftovers: Vec<String> = std::fs::read_dir(&config)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().into_owned();
+            name.contains(".tmp").then_some(name)
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "concurrent writes must not leave temp files behind, found {leftovers:?}"
+    );
+}
+
 /// A write must not leave a temp file behind next to the target, whether it
 /// succeeded or not. The temp name is derived from the target, so a leftover
-/// `.session.json.<pid>.tmp` would both leak a token and confuse the next run.
+/// temp file would both leak a token and confuse the next run.
 #[tokio::test]
 async fn a_successful_write_leaves_no_temp_file() {
     let (_guard, dir) = scratch_home("no-temp").await;
