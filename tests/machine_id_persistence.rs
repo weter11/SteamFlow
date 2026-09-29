@@ -9,7 +9,9 @@
 //! These tests redirect `config_dir` at a scratch directory via `HOME`, so they
 //! never read or write the developer's real SteamFlow config.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use steam_vent::auth::ClientInfo;
 
@@ -100,6 +102,220 @@ async fn machine_identity_survives_logout() {
         serde_json::to_string(&reloaded).unwrap(),
         serde_json::to_string(&first).unwrap(),
         "the identity after logout must be byte-identical to the first login's"
+    );
+}
+
+/// FAIL CLOSED. If the identity cannot be persisted it must not be returned,
+/// because `login` would then send Steam a machine ID that is lost the moment
+/// the process exits — the next attempt would present a different machine,
+/// which is the whole failure this mechanism exists to prevent.
+///
+/// Made unwritable with a read-only config directory, which fails at the create
+/// step. Running as root defeats that, so the test skips rather than assert
+/// something untrue.
+#[tokio::test]
+async fn a_persistence_failure_is_reported_rather_than_returned() {
+    let _guard = scratch_home("fail-closed").await;
+    let config = std::env::temp_dir()
+        .join(std::env::var("HOME").expect("HOME"))
+        .join(".config/SteamFlow");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = steamflow::config::load_or_create_client_info().await;
+
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    if let Ok(info) = result {
+        // Root ignored the read-only directory, so the write succeeded and this
+        // run proves nothing either way.
+        let _ = info;
+        eprintln!("skipping: identity write succeeded despite a read-only config dir (root?)");
+        return;
+    }
+    assert!(
+        !config.join("machine_id.json").exists(),
+        "a failed identity write must not leave a partial file behind"
+    );
+}
+
+/// Concurrent TASKS in one process, starting with no identity, must all get the
+/// same one. `load_or_create_client_info` serializes them, so only the first
+/// generates and the rest reuse what it wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_tasks_share_one_generated_identity() {
+    let _guard = scratch_home("concurrent-tasks").await;
+    let existing = steamflow::config::load_client_info().await.unwrap();
+    assert!(existing.is_none(), "precondition: no identity exists yet");
+
+    const TASKS: usize = 8;
+    let mut handles = Vec::with_capacity(TASKS);
+    for _ in 0..TASKS {
+        handles.push(tokio::spawn(async {
+            steamflow::config::load_or_create_client_info()
+                .await
+                .expect("identity initialization must succeed")
+        }));
+    }
+
+    let mut identities = Vec::with_capacity(TASKS);
+    for handle in handles {
+        identities.push(handle.await.expect("task must not panic"));
+    }
+
+    let first = serde_json::to_string(&identities[0]).unwrap();
+    for (index, identity) in identities.iter().enumerate() {
+        assert_eq!(
+            serde_json::to_string(identity).unwrap(),
+            first,
+            "task {index} was handed a different machine identity"
+        );
+    }
+
+    // And the shared identity is the one actually on disk, so the next login
+    // presents the same machine.
+    let persisted = steamflow::config::load_client_info()
+        .await
+        .unwrap()
+        .expect("the identity must be persisted");
+    assert_eq!(serde_json::to_string(&persisted).unwrap(), first);
+}
+
+/// The child half of the cross-process test. A no-op unless the parent set the
+/// environment, so running the suite normally is unaffected.
+#[test]
+fn identity_subprocess_helper() {
+    let Ok(dir) = std::env::var("STEAMFLOW_IDENTITY_HELPER_DIR") else {
+        return;
+    };
+    let tag = std::env::var("STEAMFLOW_IDENTITY_HELPER_TAG").expect("helper tag");
+    let dir = PathBuf::from(dir);
+
+    // Readiness/start barrier: every child announces itself, then all of them
+    // block until the parent releases the start. Without it the children would
+    // run one after another and the race under test would never be exercised —
+    // and the test would pass for the wrong reason.
+    std::fs::write(dir.join(format!("ready-{tag}")), b"").expect("signal readiness");
+    let go = dir.join("go");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !go.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "start barrier was never released; refusing to hang"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("child runtime");
+    let identity = runtime
+        .block_on(steamflow::config::load_or_create_client_info())
+        .expect("child identity initialization");
+    println!(
+        "IDENTITY:{}",
+        serde_json::to_string(&identity).expect("serialize identity")
+    );
+}
+
+/// Concurrent PROCESSES starting with no identity must converge on one.
+///
+/// Two SteamFlow instances launched at once — the realistic case is a relaunch
+/// racing a still-exiting previous one — used to each see "no identity", each
+/// generate one, and each present a different machine to Steam. The lock in
+/// `load_or_create_client_info` serializes them, and the file is re-read after
+/// the lock is taken, so the second process reuses what the first persisted.
+#[test]
+fn concurrent_processes_share_one_generated_identity() {
+    // No HOME mutex here: this test redirects HOME for the whole process, like
+    // the sibling tests do, and `cargo test` runs the binary's tests on separate
+    // threads. The barrier below is what keeps the children (which inherit HOME
+    // explicitly) from racing each other.
+    let home = std::env::temp_dir().join("steamflow-machine-id-test-concurrent-processes");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".config/SteamFlow")).unwrap();
+    std::env::set_var("HOME", &home);
+    assert!(
+        !home.join(".config/SteamFlow/machine_id.json").exists(),
+        "precondition: no identity exists yet"
+    );
+
+    let barrier_dir = home.join("barrier");
+    std::fs::create_dir_all(&barrier_dir).unwrap();
+
+    const PROCESSES: usize = 4;
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut children = Vec::with_capacity(PROCESSES);
+    for index in 0..PROCESSES {
+        let output = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("identity_subprocess_helper")
+            .arg("--nocapture")
+            .env("HOME", &home)
+            .env("STEAMFLOW_IDENTITY_HELPER_DIR", &barrier_dir)
+            .env("STEAMFLOW_IDENTITY_HELPER_TAG", index.to_string())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn helper child");
+        children.push((index, output));
+    }
+
+    // Wait for every child to reach the barrier, with a bound.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ready = std::fs::read_dir(&barrier_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().starts_with("ready-"))
+                    .count()
+            })
+            .unwrap_or(0);
+        if ready == PROCESSES {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {ready}/{PROCESSES} children reached the barrier; refusing to hang"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(barrier_dir.join("go"), b"").expect("release barrier");
+
+    let mut identities = Vec::with_capacity(PROCESSES);
+    for (index, child) in children {
+        let output = child.wait_with_output().expect("wait for helper child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| line.starts_with("IDENTITY:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "child {index} produced no identity (status {:?})\nstdout:\n{stdout}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        identities.push(line.trim_start_matches("IDENTITY:").to_string());
+    }
+
+    let first = &identities[0];
+    for (index, identity) in identities.iter().enumerate() {
+        assert_eq!(
+            identity, first,
+            "process {index} generated a different machine identity"
+        );
+    }
+    let persisted = std::fs::read_to_string(home.join(".config/SteamFlow/machine_id.json"))
+        .expect("the identity must be on disk");
+    let persisted: ClientInfo =
+        serde_json::from_str(&persisted).expect("persisted identity parses");
+    let handed_out: ClientInfo = serde_json::from_str(first).expect("reported identity parses");
+    assert_eq!(
+        serde_json::to_value(&persisted).unwrap(),
+        serde_json::to_value(&handed_out).unwrap(),
+        "the persisted identity must be the one every process was handed"
     );
 }
 

@@ -55,6 +55,50 @@ impl AuthLoginState {
     pub fn is_current(&self, attempt: u64) -> bool {
         attempt == self.current_attempt
     }
+
+    /// Decide what to do with a SUCCESS arriving for `attempt`.
+    ///
+    /// This is the result-delivery half of the cancellation race, and the
+    /// generation/epoch fences cannot cover it: `SteamClient::login` installs
+    /// the connection and writes `session.json` *before* the result is ever
+    /// sent, so by the time a result is in hand the commit has already
+    /// happened. A pure attempt-ID check therefore has two failure modes, and
+    /// they are opposite:
+    ///
+    /// - always trust the attempt ID -> a cancel that lost the race leaves the
+    ///   user on a login form while their account is live behind it. The
+    ///   success was real and is thrown away.
+    /// - always distrust it -> a superseded attempt that had already committed
+    ///   has its success discarded, with the same stranded-session result.
+    ///
+    /// So the deciding fact is not "is this attempt current?" but "is there a
+    /// live session that this result is describing?". If the client is
+    /// authenticated, the commit landed and the result is the truth about the
+    /// client's state; adopting it keeps the UI consistent with the client. If
+    /// it is not, nothing was committed and the result must be ignored, or a
+    /// dead attempt would reopen the account.
+    pub fn classify_success(
+        &self,
+        attempt: u64,
+        client_authenticated: bool,
+    ) -> LoginResultDisposition {
+        if self.is_current(attempt) || client_authenticated {
+            LoginResultDisposition::Apply
+        } else {
+            LoginResultDisposition::Discard
+        }
+    }
+}
+
+/// What the UI must do with an arriving password-login result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginResultDisposition {
+    /// Apply it: it is the current attempt, or it committed before being
+    /// cancelled and therefore describes the client's real state.
+    Apply,
+    /// Ignore it: superseded or cancelled, and it never committed, so applying
+    /// it would resurrect an attempt the user abandoned.
+    Discard,
 }
 
 /// Owns the worker thread for one login attempt.
@@ -392,6 +436,73 @@ mod tests {
         assert!(
             !state.is_current(first),
             "superseded attempt result must be rejected"
+        );
+    }
+
+    /// The current attempt's success is always applied.
+    #[test]
+    fn a_current_attempts_success_is_applied() {
+        let mut state = AuthLoginState::new();
+        let attempt = state.begin_attempt();
+        assert_eq!(
+            state.classify_success(attempt, false),
+            LoginResultDisposition::Apply
+        );
+        assert_eq!(
+            state.classify_success(attempt, true),
+            LoginResultDisposition::Apply
+        );
+    }
+
+    /// CANCELLATION BEFORE COMMIT: a superseded attempt that never committed
+    /// must be discarded, or it would reopen the account the user abandoned.
+    #[test]
+    fn a_cancelled_attempt_that_never_committed_is_discarded() {
+        let mut state = AuthLoginState::new();
+        let cancelled = state.begin_attempt();
+        state.invalidate_current();
+
+        assert_eq!(
+            state.classify_success(cancelled, false),
+            LoginResultDisposition::Discard,
+            "nothing was committed, so there is no session for this result to describe"
+        );
+    }
+
+    /// COMMIT BEFORE CANCELLATION: the same result must be APPLIED when the
+    /// client is authenticated, because the commit already landed. This is the
+    /// case the attempt-ID check alone gets wrong in the opposite direction, and
+    /// the one that strands a live session behind a login form.
+    #[test]
+    fn a_cancelled_attempt_that_had_already_committed_is_adopted() {
+        let mut state = AuthLoginState::new();
+        let cancelled = state.begin_attempt();
+        state.invalidate_current();
+
+        assert_eq!(
+            state.classify_success(cancelled, true),
+            LoginResultDisposition::Apply,
+            "the commit landed, so the result is the truth about the client's state"
+        );
+    }
+
+    /// A superseded attempt racing a NEWER attempt that already committed is the
+    /// same situation: the client is authenticated, so the stale success is
+    /// describing a real session and must not be thrown away.
+    #[test]
+    fn a_superseded_result_is_discarded_while_the_newer_login_is_still_running() {
+        let mut state = AuthLoginState::new();
+        let first = state.begin_attempt();
+        let second = state.begin_attempt();
+
+        assert_eq!(
+            state.classify_success(first, false),
+            LoginResultDisposition::Discard,
+            "no session exists yet, so the older attempt must not apply"
+        );
+        assert_eq!(
+            state.classify_success(second, false),
+            LoginResultDisposition::Apply
         );
     }
 
