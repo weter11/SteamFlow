@@ -1052,13 +1052,29 @@ impl SteamLauncher {
                 }
                 AsyncOp::Authenticated(attempt, _session) => {
                     // A superseded or cancelled attempt must never be able to
-                    // reopen/alter the account.
+                    // reopen/alter the account — UNLESS it already committed.
+                    // `login` installs the connection and writes `session.json`
+                    // before the result reaches here, so a cancel or a
+                    // replacement that raced that commit leaves a real, live
+                    // session that simply has no UI state describing it. The
+                    // fence in `abandon_login_attempts` closes that window going
+                    // forward; this reconciliation is what makes an
+                    // already-committed result show up as the success it is,
+                    // instead of leaving the user on a login form while their
+                    // account is live.
                     if !self.auth_login_state.is_current(attempt) {
-                        tracing::debug!(
-                            attempt,
-                            "discarding stale login result from a superseded attempt"
-                        );
-                        continue;
+                        if self.client.is_authenticated() {
+                            tracing::debug!(
+                                attempt,
+                                "adopting a login result that committed before it was cancelled"
+                            );
+                        } else {
+                            tracing::debug!(
+                                attempt,
+                                "discarding stale login result from a superseded attempt"
+                            );
+                            continue;
+                        }
                     }
                     self.needs_reauth = false;
                     self.auth_guard_code.clear();
@@ -1429,10 +1445,30 @@ impl SteamLauncher {
     /// the worker would keep polling Steam's network/auth work. The oneshot
     /// signal makes the worker drop the login future through `select!`.
     fn cancel_auth_login(&mut self) {
-        if let Some(mut task) = self.auth_login_task.take() {
+        let mut worker_in_flight = self.auth_login_task.take();
+        let worker_was_running = worker_in_flight.is_some();
+        if let Some(task) = worker_in_flight.as_mut() {
             task.cancel();
         }
         self.auth_login_state.invalidate_current();
+        // Fence the CLIENT too, not just the UI. Cancelling the worker stops the
+        // login future, but a future already past `commit_generation_fenced` has
+        // installed its connection and written `session.json`: the UI then
+        // discarded the success as stale and the account stayed live behind a
+        // login form. Bumping the connection generation rejects any commit that
+        // has not landed yet, and leaves an already-usable session alone, so
+        // cancelling a re-authentication is not a logout.
+        //
+        // Only when a worker was actually running: there is no commit to fence
+        // otherwise, and bumping on every logout and panel close would be noise.
+        //
+        // Spawned rather than awaited — the client state lock is held across
+        // connection work, and the egui thread must not block on it.
+        if worker_was_running {
+            let client = self.client.clone();
+            self.runtime
+                .spawn(async move { client.abandon_login_attempts().await });
+        }
         // The cancelled attempt can no longer raise or resolve a confirmation,
         // so any prompt it left behind describes an attempt that will never
         // finish. Without this the prompts stayed on screen and were rendered

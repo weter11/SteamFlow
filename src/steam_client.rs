@@ -475,6 +475,49 @@ mod cm_generation_tests {
             "a rejected commit must not install or mark any connection"
         );
     }
+
+    /// Cancelling a login must be able to stop its COMMIT, not merely the
+    /// worker. The UI's attempt ID fences the UI; only the connection
+    /// generation fences the client, so a cancel that raced the commit used to
+    /// leave a live session behind a login form.
+    #[tokio::test]
+    async fn abandoning_a_login_retires_its_fence() {
+        let client = SteamClient::new().unwrap();
+        let fence = client.connection_generation().await;
+
+        client.abandon_login_attempts().await;
+
+        assert!(
+            !client.generation_is_current(fence).await,
+            "a cancelled login must not be able to commit afterwards"
+        );
+        let mut guard = client.inner.lock().await;
+        assert!(
+            SteamClient::commit_fence_locked(&mut guard, fence).is_err(),
+            "the fenced commit must be rejected after a cancel"
+        );
+    }
+
+    /// ...and the fence must be narrow. Cancelling a RE-authentication must not
+    /// log out an account that is already usable, which is what clearing
+    /// `connection` / `has_session` here would do.
+    #[tokio::test]
+    async fn abandoning_a_login_preserves_an_existing_session() {
+        let client = SteamClient::new().unwrap();
+        client.has_session.store(true, Ordering::Relaxed);
+
+        client.abandon_login_attempts().await;
+
+        assert!(
+            client.is_authenticated(),
+            "cancelling a login attempt must not log out a live session"
+        );
+        let guard = client.inner.lock().await;
+        assert!(
+            !guard.dead && guard.dead_since.is_none(),
+            "abandoning a login must not mark the connection dead"
+        );
+    }
 }
 
 /// `observe_transport_failure` is the no-retry invalidation path: it must act
@@ -1142,6 +1185,30 @@ impl SteamClient {
         self.inner.lock().await.generation == generation
     }
 
+    /// Abandon every password-login attempt currently in flight, without
+    /// touching the session that is already live.
+    ///
+    /// The UI's attempt ID fences only the UI: `login` installs its `Connection`
+    /// and writes `session.json` before the UI ever sees a result. Cancelling
+    /// therefore has to be able to stop the COMMIT, or a cancel that arrived
+    /// just after it left a live session behind a login form — the UI discarded
+    /// the success as stale while the client stayed authenticated.
+    ///
+    /// Bumping the generation is exactly that fence: `commit_generation_fenced`
+    /// re-checks it under the lock, so an attempt that has not committed yet is
+    /// rejected, and the rejection path leaves `session.json` untouched. Unlike
+    /// [`Self::invalidate_session`] this clears neither `connection` nor
+    /// `has_session`, so cancelling a RE-authentication does not log out an
+    /// account that is already usable.
+    ///
+    /// Takes the lock rather than `try_lock`, so it must be called off the UI
+    /// thread: the state lock is held across connection work elsewhere, and
+    /// blocking egui on it would stall a frame. The UI spawns it instead.
+    pub async fn abandon_login_attempts(&self) {
+        let mut guard = self.inner.lock().await;
+        guard.generation += 1;
+    }
+
     /// Install a freshly authenticated `Connection` only if `generation` is
     /// still current, and return the new generation.
     ///
@@ -1713,6 +1780,27 @@ impl SteamClient {
             }
         };
 
+        // Persist a freshly minted machine identity BEFORE it is sent to Steam.
+        //
+        // `Connection::login` puts `client_info.machine_id` into the
+        // `device_details` of `BeginAuthSessionViaCredentials`
+        // (vendor/steam-vent/src/auth/mod.rs), so the moment the request is on
+        // the wire Steam knows this machine ID. Saving it only on the success
+        // path -- or only after the fenced commit -- meant every attempt that
+        // did not reach that point (a Steam Guard challenge, a fenced-out
+        // login, a dropped transport) presented a machine to Steam and then
+        // forgot it, so the retry presented yet another one. Persisting first
+        // makes the identity stable from the very first request onwards.
+        //
+        // Written only when freshly generated, so a healthy identity is never
+        // rewritten. A write failure is not fatal: the login still proceeds,
+        // and it is the one case where the next attempt mints another identity.
+        if generated {
+            if let Err(err) = save_client_info(&client_info).await {
+                tracing::warn!(error = %err, "failed persisting machine identity");
+            }
+        }
+
         self.connect().await?;
         if self.is_offline() {
             bail!("offline mode: using cached library");
@@ -1770,24 +1858,9 @@ impl SteamClient {
             }
         };
 
-        // Persist a freshly minted machine identity BEFORE the fenced commit.
+        // The machine identity was persisted above, before the first byte went
+        // to Steam, so there is nothing left to write here.
         //
-        // `Connection::login` has already told Steam about this machine by the
-        // time we get here, so if the fence then rejects the commit, the
-        // identity is not an unused draft — it is one Steam has seen. Saving it
-        // after the fence (as this did before) meant a fenced-out login
-        // presented a machine to Steam and then forgot it, so the next attempt
-        // presented yet another one.
-        //
-        // Written only when freshly generated, so a healthy identity is never
-        // rewritten. A write failure is not fatal: the login itself succeeded,
-        // and the next login simply mints another identity.
-        if generated {
-            if let Err(err) = save_client_info(&client_info).await {
-                tracing::warn!(error = %err, "failed persisting machine identity");
-            }
-        }
-
         // Fenced commit. Re-checked under the lock inside the helper: between
         // capturing `fence` and here, a CM reset, re-authentication or logout
         // may have replaced the connection this `Connection` was minted

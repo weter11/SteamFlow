@@ -143,6 +143,11 @@ SteamFlow builds on the reverse-engineering work of many projects. Special thank
 
 This project is licensed under the **MIT License** — see [`LICENSE`](LICENSE) for the full text.
 
+Code vendored inside the repository is covered separately by
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md), which carries the MIT notice
+for `vendor/steam-vent` (upstream ships no `LICENSE` file, so `git archive`
+cannot include one) and points at `vendor/steam-cdn/LICENSE` (Apache-2.0).
+
 # Q&A
 
 ## Is this a full replacement for Steam?
