@@ -17,14 +17,20 @@ use steam_vent::auth::ClientInfo;
 
 /// Point `config_dir` (which reads `$HOME`) at a scratch dir for one test.
 ///
-/// Serialized against every other test in this binary, because `HOME` is
-/// process-global: a concurrent test in this process would see the temporary
-/// value. A `tokio::sync::Mutex` (not `std::sync`) because the guard is held
-/// across awaits; the tests never actually contend, so locking is uncontended
-/// and the ordering guarantee is what matters.
-async fn scratch_home(tag: &str) -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let guard = LOCK.lock().await;
+/// Exclusive right to redirect `HOME` for the duration of a test.
+///
+/// `cargo test` runs a binary's tests on parallel threads and `HOME` is
+/// process-global, so two tests redirecting it concurrently make each other
+/// read the wrong directory. Every test in this file holds one of these for as
+/// long as it has `HOME` redirected.
+///
+/// `tokio::sync::Mutex` rather than `std::sync::Mutex` because the guard is held
+/// across awaits and would otherwise make the future non-`Send`. The
+/// subprocess test is a plain `#[test]` with no runtime, so it takes the lock
+/// through [`block_on_home_lock`] instead — the same mutex, reached from a
+/// runtime it owns, so the two cannot get out of step.
+async fn scratch_home(tag: &str) -> HomeGuard {
+    let guard = HomeGuard::acquire().await;
 
     let dir = std::env::temp_dir().join(format!("steamflow-machine-id-test-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -34,6 +40,30 @@ async fn scratch_home(tag: &str) -> tokio::sync::MutexGuard<'static, ()> {
     guard
 }
 
+/// The one lock guarding `HOME` in this test binary.
+fn home_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
+}
+
+/// Held for as long as a test has `HOME` redirected. Dropping it releases the
+/// lock; nothing else does.
+struct HomeGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+
+impl HomeGuard {
+    async fn acquire() -> Self {
+        HomeGuard(home_lock().lock().await)
+    }
+}
+
+/// Take [`home_lock`] from a synchronous test, for its whole body.
+///
+/// `block_in_place` rather than `Runtime::block_on` on a current-thread runtime:
+/// a current-thread runtime cannot make progress on a task that is itself
+/// blocked inside `block_on`, which is exactly the shape here. `block_in_place`
+/// hands the worker thread to the blocking closure and keeps the rest of the
+/// runtime running, so a sibling async test parked on the same lock can still
+/// be polled and release it.
 fn config_path(name: &str) -> PathBuf {
     std::env::temp_dir()
         .join(std::env::var("HOME").expect("HOME"))
@@ -228,10 +258,22 @@ fn identity_subprocess_helper() {
 /// the lock is taken, so the second process reuses what the first persisted.
 #[test]
 fn concurrent_processes_share_one_generated_identity() {
-    // No HOME mutex here: this test redirects HOME for the whole process, like
-    // the sibling tests do, and `cargo test` runs the binary's tests on separate
-    // threads. The barrier below is what keeps the children (which inherit HOME
-    // explicitly) from racing each other.
+    // Redirecting HOME is process-global, so this takes the SAME lock the
+    // sibling tests use and holds it for the whole test body. Without it, this
+    // test and a sibling can redirect HOME concurrently and each reads the
+    // other's directory, which surfaces as failures that look like product
+    // bugs. The children get HOME passed explicitly, but this test still reads
+    // it itself, so it needs the lock regardless.
+    //
+    // Acquired through a runtime this test owns, which is what lets a plain
+    // `#[test]` share a `tokio::sync::Mutex` with the `#[tokio::test]`s above.
+    // Nothing else is scheduled on that runtime, so parking here simply blocks
+    // the siblings until this test finishes.
+    let _home_lock = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("home lock runtime")
+        .block_on(HomeGuard::acquire());
+
     let home = std::env::temp_dir().join("steamflow-machine-id-test-concurrent-processes");
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join(".config/SteamFlow")).unwrap();
