@@ -428,10 +428,121 @@ pub async fn load_client_info() -> Result<Option<ClientInfo>> {
 
 /// Persist the machine identity. Written once and then left alone; no code path
 /// deletes this file, so the identity is stable across logouts and restarts.
+///
+/// Callers that need "read or create" as one step want
+/// [`load_or_create_client_info`] instead: this half does no locking, so two
+/// processes calling it concurrently can each write a different identity.
 pub async fn save_client_info(info: &ClientInfo) -> Result<()> {
     let path = machine_id_path()?;
     let body = serde_json::to_string_pretty(info)?;
     write_secret_file(&path, body.as_bytes()).await
+}
+
+/// Path of the cross-process machine-identity lock file.
+fn identity_lock_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("machine_id.lock"))
+}
+
+/// An exclusive, crash-safe lock over first-time identity initialization.
+///
+/// `flock(2)`, not a lock file whose mere existence means "locked": the kernel
+/// releases an `flock` when the holding process exits for any reason, including
+/// `SIGKILL` and power loss. A presence-based lock file would survive a crash
+/// and then block every later login permanently — precisely the failure this
+/// has to not have, since the identity is required before a login can proceed.
+///
+/// The file itself is only a handle for the lock. It is created `0600` and is
+/// never read for meaning; it may outlive any process.
+struct IdentityLock(std::fs::File);
+
+impl IdentityLock {
+    /// Acquire the lock without blocking a runtime worker.
+    ///
+    /// `flock` is a blocking syscall, and it can block for as long as another
+    /// process holds the lock — unbounded and unpredictable. Calling it
+    /// directly from an async task is therefore wrong in a way that deadlocks:
+    /// concurrent identity initializations on a multi-thread runtime all block
+    /// their workers in `flock`, including the one that would release the lock
+    /// and let the others proceed, and the runtime never schedules anyone to
+    /// make progress. `spawn_blocking` moves the wait to the blocking pool,
+    /// which is sized for exactly this.
+    async fn acquire(path: PathBuf) -> Result<Self> {
+        let display = path.display().to_string();
+        tokio::task::spawn_blocking(move || Self::acquire_blocking(&path))
+            .await
+            .with_context(|| format!("failed locking {display}"))?
+    }
+
+    fn acquire_blocking(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(SECRET_MODE)
+            .open(path)
+            .with_context(|| format!("failed opening {}", path.display()))?;
+        // SAFETY: `file` owns a valid fd for the whole call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed locking {}", path.display()));
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for IdentityLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: the fd is still open; a failed unlock is not actionable and
+        // the kernel releases it on close regardless.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Load the machine identity, creating and persisting one on first use.
+///
+/// The single entry point `login` uses, because the interesting part is not
+/// "read a file" but "make sure exactly one identity exists".
+///
+/// The lock is held across the whole load/create/save sequence, and the file is
+/// RE-READ after it is taken. Both parts are necessary:
+///
+/// - Without re-reading, two processes that both saw "no identity" would each
+///   generate one, and the loser's identity would be the one Steam saw. The
+///   winner's would be on disk, so the next login would present yet another.
+/// - Without holding the lock across the save, the same race happens even with
+///   re-reading, because the window between "read" and "write" is where the
+///   second process slips in.
+///
+/// Errors are propagated, not degraded. The caller uses this identity to
+/// authenticate, and an identity that could not be persisted is one that cannot
+/// be reused next time; sending it anyway would present a machine to Steam and
+/// then forget it. Failing closed here is what makes the identity stable.
+pub async fn load_or_create_client_info() -> Result<ClientInfo> {
+    // The `File` holds the `flock` and is carried across the awaits below, so
+    // the lock is held across the whole load/create/save without any async task
+    // ever blocking on it.
+    let _lock = IdentityLock::acquire(identity_lock_path()?).await?;
+
+    if let Some(existing) = load_client_info().await? {
+        tracing::debug!("reusing persisted machine identity");
+        return Ok(existing);
+    }
+
+    let generated = ClientInfo::default();
+    tracing::debug!("no persisted machine identity; generating one");
+    save_client_info(&generated).await?;
+    Ok(generated)
 }
 
 pub async fn load_launcher_config() -> Result<LauncherConfig> {

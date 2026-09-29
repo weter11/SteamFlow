@@ -1,4 +1,4 @@
-use crate::auth_login::{AuthLoginState, AuthLoginTask};
+use crate::auth_login::{AuthLoginState, AuthLoginTask, LoginResultDisposition};
 use crate::config::{load_launcher_config, opensteam_image_cache_dir, LauncherConfig};
 use crate::depot_browser::{DepotInfo as BrowserDepotInfo, ManifestFileEntry};
 use crate::library::{build_game_library, scan_installed_app_paths};
@@ -1051,30 +1051,23 @@ impl SteamLauncher {
                     self.refresh_user_profile();
                 }
                 AsyncOp::Authenticated(attempt, _session) => {
-                    // A superseded or cancelled attempt must never be able to
-                    // reopen/alter the account — UNLESS it already committed.
-                    // `login` installs the connection and writes `session.json`
-                    // before the result reaches here, so a cancel or a
-                    // replacement that raced that commit leaves a real, live
-                    // session that simply has no UI state describing it. The
-                    // fence in `abandon_login_attempts` closes that window going
-                    // forward; this reconciliation is what makes an
-                    // already-committed result show up as the success it is,
-                    // instead of leaving the user on a login form while their
-                    // account is live.
-                    if !self.auth_login_state.is_current(attempt) {
-                        if self.client.is_authenticated() {
-                            tracing::debug!(
-                                attempt,
-                                "adopting a login result that committed before it was cancelled"
-                            );
-                        } else {
-                            tracing::debug!(
-                                attempt,
-                                "discarding stale login result from a superseded attempt"
-                            );
-                            continue;
-                        }
+                    // A superseded or cancelled attempt must never reopen or
+                    // alter the account — unless it already committed, in which
+                    // case the session is real and discarding the result would
+                    // strand the user on a login form with a live account.
+                    // `AuthLoginState::classify_success` owns that decision and
+                    // is unit-tested; see it for why the attempt ID alone is not
+                    // the right test.
+                    let authenticated = self.client.is_authenticated();
+                    let disposition = self
+                        .auth_login_state
+                        .classify_success(attempt, authenticated);
+                    if disposition == LoginResultDisposition::Discard {
+                        tracing::debug!(
+                            attempt,
+                            "discarding stale login result from a superseded attempt"
+                        );
+                        continue;
                     }
                     self.needs_reauth = false;
                     self.auth_guard_code.clear();
@@ -1451,23 +1444,22 @@ impl SteamLauncher {
             task.cancel();
         }
         self.auth_login_state.invalidate_current();
-        // Fence the CLIENT too, not just the UI. Cancelling the worker stops the
-        // login future, but a future already past `commit_generation_fenced` has
-        // installed its connection and written `session.json`: the UI then
-        // discarded the success as stale and the account stayed live behind a
-        // login form. Bumping the connection generation rejects any commit that
-        // has not landed yet, and leaves an already-usable session alone, so
-        // cancelling a re-authentication is not a logout.
+        // Fence the CLIENT too, not just the UI. Cancelling the worker only drops
+        // the login future; a future already past its commit has installed the
+        // connection and written `session.json`, and a cancel arriving after that
+        // point would otherwise leave the user on a login form with a live
+        // account (handled on the result side by `classify_success`).
         //
-        // Only when a worker was actually running: there is no commit to fence
-        // otherwise, and bumping on every logout and panel close would be noise.
+        // Synchronous and ordered, which is the requirement: a replacement
+        // attempt captures its own fence when it starts, so this bump has to have
+        // happened by the time `handle_auth_submit` returns. Deferring it to a
+        // spawned task would let the replacement capture first and then be
+        // retired by the cancel that preceded it.
         //
-        // Spawned rather than awaited — the client state lock is held across
-        // connection work, and the egui thread must not block on it.
+        // It clears neither the connection nor `has_session`, so cancelling a
+        // re-authentication is not a logout.
         if worker_was_running {
-            let client = self.client.clone();
-            self.runtime
-                .spawn(async move { client.abandon_login_attempts().await });
+            self.client.abandon_login_attempts();
         }
         // The cancelled attempt can no longer raise or resolve a confirmation,
         // so any prompt it left behind describes an attempt that will never

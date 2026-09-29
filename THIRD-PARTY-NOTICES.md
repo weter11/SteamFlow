@@ -51,6 +51,15 @@ SOFTWARE.
 `vendor/steam-cdn` is a locally patched steam-cdn and keeps its upstream
 `LICENSE` (Apache License 2.0) in place at `vendor/steam-cdn/LICENSE`.
 
+## `machine_id.lock` is not a vendored-code concern
+
+`~/.config/SteamFlow/machine_id.lock` is created by SteamFlow, not shipped: it
+is the handle for a `flock(2)` used to serialize first-run machine-identity
+initialization between concurrent SteamFlow processes. Its presence means
+nothing — the kernel owns the lock and releases it when the process exits, which
+is why a crashed run cannot leave the identity permanently uninitializable. It is
+created `0600` like the other files in that directory.
+
 ## Three `reqwest` majors in `Cargo.lock`
 
 The lockfile carries reqwest 0.11.27, 0.12.28 and 0.13.5 at once. They come
