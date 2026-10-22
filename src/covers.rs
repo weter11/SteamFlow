@@ -6,12 +6,8 @@
 //!
 //! # Asset choice
 //!
-//! Steam's CDN exposes several artwork families per app. Only some of them
-//! are portrait 2:3 art suitable for the poster slot, and the names the
-//! previous implementation used (`hero_capsule_2x`, `library_capsule_2x`,
-//! `library_capsule`) do not exist on the CDN at all — they 404 for every
-//! appid, so the old priority chain spent three requests per game to reach
-//! art that did exist.
+//! Steam's CDN exposes several artwork families per app, and only some of
+//! them are portrait 2:3 art suitable for the poster slot.
 //!
 //! The order below is deliberate. The poster slot is 250x375 logical px, so
 //! the sharpest useful art is 500x750 device px at 2x scaling:
@@ -57,9 +53,8 @@ use serde::{Deserialize, Serialize};
 
 /// Schema version of the per-appid cover state file.
 ///
-/// Bumping this discards the previous schema (which had no version field and
-/// stored a single `cached_variant` plus a `failed` flag that was written but
-/// never read). See [`CoverState::migrate`].
+/// A file written under any other version is discarded and rebuilt from the
+/// cache, so an incompatible schema can never be read as current state.
 pub const STATE_VERSION: u32 = 2;
 
 /// How long a confirmed-missing asset is remembered before it is probed again.
@@ -296,8 +291,8 @@ pub enum FetchOutcome {
         /// `Last-Modified` of the response, if any.
         last_modified: Option<String>,
     },
-    // `Body` and `NotModified` carry the same validators; the doc comments
-    // above are repeated on purpose so each variant reads on its own.
+    // `Body` and `NotModified` carry the same validators, so each variant
+    // documents its own fields.
     /// The asset does not exist (HTTP 404). Definitive.
     NotFound,
     /// A transient failure: timeout, 5xx, 429, DNS error. Never persisted
@@ -341,6 +336,19 @@ pub trait CoverHttp: Send + Sync {
     async fn head(&self, url: &str) -> HeadOutcome;
 }
 
+/// What the store said about an app's published header image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreOutcome {
+    /// The store publishes a header image at this URL.
+    Found(String),
+    /// The app has no store page, so it publishes no artwork at all.
+    /// Definitive, and safe to record.
+    NoStorePage,
+    /// The store could not be asked, or answered with something unusable.
+    /// Says nothing about the app, so it must not be recorded.
+    Unavailable(String),
+}
+
 /// Resolves the store-published header image URL for an app.
 ///
 /// Steam moved newer titles off the hash-free `/steam/apps/<id>/<name>.jpg`
@@ -350,13 +358,13 @@ pub trait CoverHttp: Send + Sync {
 /// `header_image` field of the store's app-details response. A resolver is
 /// therefore the only way to reach artwork for those titles.
 ///
-/// Implementations must return `None` when the app has no store page (the
-/// app-details response reports `success: false`), which is the case for
-/// tools such as Proton and the Steam Linux Runtime.
+/// The three [`StoreOutcome`] answers are distinct on purpose: only a
+/// `NoStorePage` answer may be persisted as "no art". A lookup that failed,
+/// or whose body did not parse, must stay transient.
 #[async_trait::async_trait]
 pub trait StoreHeaderResolver: Send + Sync {
-    /// The store-published header image URL for `appid`, if there is one.
-    async fn resolve(&self, appid: u32) -> Option<String>;
+    /// Ask the store which header image, if any, `appid` publishes.
+    async fn resolve(&self, appid: u32) -> StoreOutcome;
 }
 
 /// A [`CoverHttp`] that never serves anything.
@@ -384,13 +392,15 @@ impl CoverHttp for DisabledCoverHttp {
 
 /// A [`StoreHeaderResolver`] that never resolves anything.
 ///
-/// Used by tests and by callers that only want the hash-free CDN path.
+/// Used by tests and by callers that only want the hash-free CDN path. Every
+/// app is reported as having no store page, which is true of this
+/// configuration: it never looks one up.
 pub struct NoStoreHeaderResolver;
 
 #[async_trait::async_trait]
 impl StoreHeaderResolver for NoStoreHeaderResolver {
-    async fn resolve(&self, _appid: u32) -> Option<String> {
-        None
+    async fn resolve(&self, _appid: u32) -> StoreOutcome {
+        StoreOutcome::NoStorePage
     }
 }
 
@@ -413,25 +423,54 @@ impl ReqwestStoreHeaderResolver {
 
 #[async_trait::async_trait]
 impl StoreHeaderResolver for ReqwestStoreHeaderResolver {
-    async fn resolve(&self, appid: u32) -> Option<String> {
+    async fn resolve(&self, appid: u32) -> StoreOutcome {
         let url =
             format!("https://store.steampowered.com/api/appdetails?appids={appid}&filters=basic");
-        let response = self.client.get(url).send().await.ok()?;
-        if !response.status().is_success() {
-            return None;
+        let response = match self.client.get(url).send().await {
+            Ok(response) => response,
+            Err(err) => return StoreOutcome::Unavailable(err.to_string()),
+        };
+        let status = response.status();
+        if !status.is_success() {
+            return StoreOutcome::Unavailable(format!(
+                "appdetails answered HTTP {}",
+                status.as_u16()
+            ));
         }
-        let json: serde_json::Value = response.json().await.ok()?;
-        let entry = json.get(appid.to_string())?;
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(err) => return StoreOutcome::Unavailable(err.to_string()),
+        };
+        // A 200 whose body does not parse as JSON is normally an HTML block
+        // page, not an answer about the app: reading it as "no store page"
+        // would record the app as art-less for a week.
+        let json: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(json) => json,
+            Err(err) => {
+                return StoreOutcome::Unavailable(format!("appdetails body was not JSON: {err}"))
+            }
+        };
+        let Some(entry) = json.get(appid.to_string()) else {
+            return StoreOutcome::Unavailable("appdetails named no app".to_string());
+        };
         // The API answers `{"<id>": {"success": false}}` for apps with no
         // store page. Those apps have no published artwork at all.
         if entry.get("success").and_then(serde_json::Value::as_bool) != Some(true) {
-            return None;
+            return StoreOutcome::NoStorePage;
         }
-        let header = entry
+        match entry
             .get("data")
             .and_then(|data| data.get("header_image"))
-            .and_then(serde_json::Value::as_str)?;
-        Some(header.split('?').next().unwrap_or(header).to_string())
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(header) => {
+                StoreOutcome::Found(header.split('?').next().unwrap_or(header).to_string())
+            }
+            // `success: true` without a `header_image` is a shape we do not
+            // recognise; treat it as a failed lookup rather than as proof
+            // that no art exists.
+            None => StoreOutcome::Unavailable("appdetails had no header_image".to_string()),
+        }
     }
 }
 
@@ -655,11 +694,16 @@ impl CoverService {
 
         let mut state = self.load_state(appid).await;
         let now = now_unix();
+        // Set when a variant was skipped because it is backing off after a
+        // transient failure. The answer is then "not known yet", not "no art":
+        // reporting `NoAsset` would put the UI on its 24 h cooldown.
+        let mut backing_off = false;
 
         // A cached, decodable file plus a fresh record means no traffic at
         // all. Check the preferred variants first so the best art is used.
         for variant in CoverVariant::ALL {
             if self.is_backed_off(appid, variant, now) {
+                backing_off = true;
                 continue;
             }
             let path = self.images_dir.join(variant.cache_file(appid));
@@ -711,6 +755,11 @@ impl CoverService {
         }
 
         self.save_state(appid, &state).await;
+        if backing_off {
+            return CoverResult::Missing(CoverError::Transient(
+                "a variant is backing off after a transient failure".to_string(),
+            ));
+        }
         CoverResult::Missing(CoverError::NoAsset)
     }
 
@@ -743,12 +792,6 @@ impl CoverService {
     /// path whose hash is exposed by the store's app-details API. This is the
     /// last resort in the chain: it yields a landscape banner (the header
     /// image), never a portrait.
-    /// Fetch the store-published header image for `appid`.
-    ///
-    /// Newer titles publish their artwork only under a content-addressed CDN
-    /// path whose hash is exposed by the store's app-details API. This is the
-    /// last resort in the chain: it yields a landscape banner (the header
-    /// image), never a portrait.
     async fn fetch_store_header(
         &self,
         appid: u32,
@@ -756,20 +799,30 @@ impl CoverService {
         now: u64,
     ) -> Result<Option<CoverArt>, CoverError> {
         let variant = CoverVariant::StoreHeader;
-        let Some(url) = self.store.resolve(appid).await else {
-            // The app has no store page, so it publishes no artwork at all.
-            // Record that so the store API is not asked again for a week.
-            *state.entry(variant) = VariantState::Absent { checked_at: now };
-            return Ok(None);
-        };
-        self.fetch_url(appid, variant, &url, state, now).await
+        match self.store.resolve(appid).await {
+            StoreOutcome::Found(url) => self.fetch_url(appid, variant, &url, state, now).await,
+            StoreOutcome::NoStorePage => {
+                // Definitive: the app has no store page, so it publishes no
+                // artwork at all. Record it so the store API is not asked
+                // again for a week.
+                *state.entry(variant) = VariantState::Absent { checked_at: now };
+                Ok(None)
+            }
+            StoreOutcome::Unavailable(message) => {
+                // The store could not be asked, or answered with something
+                // unusable. That says nothing about the app's artwork, so
+                // nothing is persisted and the variant is retried later.
+                tracing::warn!(
+                    appid,
+                    error = %message,
+                    "store header lookup failed transiently"
+                );
+                self.mark_backoff(appid, variant, now);
+                Err(CoverError::Transient(message))
+            }
+        }
     }
 
-    /// Fetch one variant, updating `state` in place.
-    ///
-    /// `Ok(None)` means "this variant does not exist, try another one";
-    /// `Err` means the fetch failed transiently and the whole attempt should
-    /// stop.
     /// Fetch one variant, updating `state` in place.
     ///
     /// `Ok(None)` means "this variant does not exist, try another one";
@@ -1049,16 +1102,13 @@ impl CoverService {
         };
         match serde_json::from_slice::<CoverState>(&raw) {
             Ok(state) if state.version == STATE_VERSION => state,
-            // An old-format file (no `version` field, or a different one)
-            // cannot be trusted: its `failed` flag was written but never
-            // read, and its `cached_variant` referred to assets that no
-            // longer exist. Start over rather than inherit that state.
+            // An unknown schema cannot be trusted, so the old records are
+            // discarded rather than inherited.
             _ => {
-                // The old schema also used different cache file names
+                // Old schemas also named their cache files differently
                 // (`<appid>_hero_capsule.jpg`, `<appid>_library_hero_2x.jpg`,
-                // ...). They are obsolete: the new variants fetch different
-                // assets under different names. Drop them so the cache does
-                // not keep megabytes of art nothing reads.
+                // ...). Those files belong to no current variant, so drop
+                // them instead of keeping megabytes of art nothing reads.
                 remove_obsolete_files(&self.images_dir, appid).await;
                 CoverState::new(appid)
             }
@@ -1202,11 +1252,9 @@ pub fn load_texture_bytes(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
 
 /// Remove cache files and state that belong to no current variant.
 ///
-/// Used by the migration path: the previous implementation stored
-/// `<appid>_<old_variant>.jpg` files under names such as
-/// `<appid>_hero_capsule.jpg` and `<appid>_header_image.jpg`. Those files are
-/// obsolete; anything that is still valid and decodable is kept by
-/// [`CoverService::ensure`] when it re-fetches.
+/// Old schemas named their files differently (`<appid>_hero_capsule.jpg`,
+/// `<appid>_header_image.jpg`), so a migrated directory can hold art that
+/// nothing reads. Current files are left alone.
 pub async fn remove_obsolete_files(images_dir: &Path, appid: u32) {
     let current: Vec<String> = CoverVariant::ALL
         .iter()
@@ -1404,6 +1452,9 @@ mod tests {
     /// A [`StoreHeaderResolver`] that serves a fixed URL per appid.
     struct FakeStore {
         urls: Mutex<HashMap<u32, String>>,
+        /// Lookups still to answer with an unusable body (a 200 carrying an
+        /// HTML page instead of the app-details JSON).
+        unusable: AtomicUsize,
         /// Number of times the resolver was consulted.
         calls: AtomicUsize,
     }
@@ -1412,12 +1463,18 @@ mod tests {
         fn new() -> Self {
             FakeStore {
                 urls: Mutex::new(HashMap::new()),
+                unusable: AtomicUsize::new(0),
                 calls: AtomicUsize::new(0),
             }
         }
 
         fn publish(&self, appid: u32, url: &str) {
             self.urls.lock().unwrap().insert(appid, url.to_string());
+        }
+
+        /// Make the next `times` lookups answer 200 with an unusable body.
+        fn fail_next(&self, times: usize) {
+            self.unusable.store(times, Ordering::SeqCst);
         }
 
         fn calls(&self) -> usize {
@@ -1427,9 +1484,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StoreHeaderResolver for FakeStore {
-        async fn resolve(&self, appid: u32) -> Option<String> {
+        async fn resolve(&self, appid: u32) -> StoreOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.urls.lock().unwrap().get(&appid).cloned()
+            if self.unusable.load(Ordering::SeqCst) > 0 {
+                self.unusable.fetch_sub(1, Ordering::SeqCst);
+                return StoreOutcome::Unavailable("200 with an HTML body".to_string());
+            }
+            match self.urls.lock().unwrap().get(&appid) {
+                Some(url) => StoreOutcome::Found(url.clone()),
+                None => StoreOutcome::NoStorePage,
+            }
         }
     }
 
@@ -1620,6 +1684,92 @@ mod tests {
             1,
             "the store must not be re-queried within the TTL"
         );
+    }
+
+    /// A store lookup whose 200 body is not the app-details JSON (an HTML
+    /// block page) says nothing about the app. It must not be recorded as
+    /// "no art", so the next session finds the real header with no state
+    /// cleared in between.
+    #[tokio::test]
+    async fn an_html_store_response_does_not_blacklist_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = Arc::new(FakeHttp::new());
+        let store = Arc::new(FakeStore::new());
+        let header =
+            "https://cdn.akamai.steamstatic.com/store_item_assets/steam/apps/570/abc/header.jpg";
+
+        // Only the store publishes art for this app.
+        for variant in CoverVariant::CDN {
+            http.remove(&variant.url(570).unwrap());
+        }
+        http.publish(header, jpeg_bytes(460, 215), Some("\"h1\""));
+        store.fail_next(1);
+
+        let service = CoverService::with_http_and_store(
+            http.clone(),
+            store.clone(),
+            dir.path().to_path_buf(),
+        );
+        let result = service.ensure(570).await;
+        assert!(
+            matches!(result, CoverResult::Missing(CoverError::Transient(_))),
+            "an unusable store body is transient, not a missing asset: {result:?}"
+        );
+
+        // Nothing may be persisted for the store header.
+        let raw = tokio::fs::read(dir.path().join("570_cover_state.json"))
+            .await
+            .unwrap();
+        let state: CoverState = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            !matches!(
+                state.get(CoverVariant::StoreHeader),
+                Some(VariantState::Absent { .. })
+            ),
+            "an unusable store body must not be persisted as absent"
+        );
+
+        // The store recovers. A new service on the same state (the backoff
+        // lives in memory only) must find the header.
+        store.publish(570, header);
+        let service = CoverService::with_http_and_store(
+            http.clone(),
+            store.clone(),
+            dir.path().to_path_buf(),
+        );
+        let result = service.ensure(570).await;
+        assert!(
+            matches!(result, CoverResult::Found(_)),
+            "the retry must find the store header: {result:?}"
+        );
+        let path = dir.path().join(CoverVariant::StoreHeader.cache_file(570));
+        assert_eq!(image_size(&path).await, Some((460, 215)));
+    }
+
+    /// A variant that is backing off must not be reported as absent: the
+    /// answer is still "unknown", so the UI must not start its 24 h cooldown.
+    #[tokio::test]
+    async fn a_backed_off_variant_is_not_reported_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = Arc::new(FakeHttp::new());
+        let service = make_service(http.clone(), dir.path());
+        let url = CoverVariant::Portrait2x.url(570).unwrap();
+        http.publish_garbage(&url);
+
+        let first = service.ensure(570).await;
+        assert!(matches!(
+            first,
+            CoverResult::Missing(CoverError::Transient(_))
+        ));
+        let before = http.calls().iter().filter(|call| **call == url).count();
+
+        let second = service.ensure(570).await;
+        assert!(
+            matches!(second, CoverResult::Missing(CoverError::Transient(_))),
+            "a backed-off variant must not be reported as absent: {second:?}"
+        );
+        let after = http.calls().iter().filter(|call| **call == url).count();
+        assert_eq!(before, after, "the backoff must suppress the request");
     }
 
     #[tokio::test]
@@ -2096,9 +2246,11 @@ mod tests {
             "an undecodable body must not be persisted as absent"
         );
 
-        // The CDN recovers.
+        // The CDN recovers. The backoff lives in memory only, so a new
+        // service on the same state (as after a restart) must succeed
+        // without anything being cleared.
         http.publish(&url, jpeg_bytes(600, 900), Some("\"v2\""));
-        service.backoff.lock().unwrap().clear();
+        let service = make_service(http.clone(), dir.path());
 
         let result = service.ensure(570).await;
         assert!(
