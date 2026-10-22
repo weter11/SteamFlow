@@ -75,6 +75,18 @@ pub const PRESENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a transient failure blocks a retry of the same variant.
 pub const TRANSIENT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
+/// How long the caller should wait before asking for a cover again after an
+/// ordinary attempt (a fresh download, or a definitive "no such asset").
+pub const COVER_RECHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long the caller should wait after a transient failure before asking
+/// again.
+///
+/// A timeout or a 5xx says nothing about the asset, so the cover must be
+/// retried long before the ordinary recheck interval - otherwise one flaky
+/// request blanks the poster for a day.
+pub const COVER_TRANSIENT_RETRY: Duration = Duration::from_secs(5 * 60);
+
 /// Poster slot size in logical pixels. The slot is 2:3.
 pub const POSTER_SIZE: (u32, u32) = (250, 375);
 
@@ -284,6 +296,8 @@ pub enum FetchOutcome {
         /// `Last-Modified` of the response, if any.
         last_modified: Option<String>,
     },
+    // `Body` and `NotModified` carry the same validators; the doc comments
+    // above are repeated on purpose so each variant reads on its own.
     /// The asset does not exist (HTTP 404). Definitive.
     NotFound,
     /// A transient failure: timeout, 5xx, 429, DNS error. Never persisted
@@ -343,6 +357,29 @@ pub trait CoverHttp: Send + Sync {
 pub trait StoreHeaderResolver: Send + Sync {
     /// The store-published header image URL for `appid`, if there is one.
     async fn resolve(&self, appid: u32) -> Option<String>;
+}
+
+/// A [`CoverHttp`] that never serves anything.
+///
+/// Used when the HTTP client cannot be built: every request fails as
+/// transient, so the cover is simply unavailable instead of the app
+/// panicking at startup.
+pub struct DisabledCoverHttp;
+
+#[async_trait::async_trait]
+impl CoverHttp for DisabledCoverHttp {
+    async fn get(
+        &self,
+        _url: &str,
+        _etag: Option<&str>,
+        _last_modified: Option<&str>,
+    ) -> FetchOutcome {
+        FetchOutcome::Transient("cover art is disabled".to_string())
+    }
+
+    async fn head(&self, _url: &str) -> HeadOutcome {
+        HeadOutcome::Transient("cover art is disabled".to_string())
+    }
 }
 
 /// A [`StoreHeaderResolver`] that never resolves anything.
@@ -529,6 +566,19 @@ pub enum CoverResult {
     Missing(CoverError),
 }
 
+/// How long the caller should wait before asking for a cover again.
+///
+/// The UI uses this to gate the next request: a transient failure must be
+/// retried soon, while a definitive answer is left alone.
+pub fn retry_after(result: &CoverResult) -> Duration {
+    match result {
+        CoverResult::Found(_) => COVER_RECHECK_INTERVAL,
+        CoverResult::Missing(CoverError::Transient(_))
+        | CoverResult::Missing(CoverError::Io(_)) => COVER_TRANSIENT_RETRY,
+        CoverResult::Missing(CoverError::NoAsset) => COVER_RECHECK_INTERVAL,
+    }
+}
+
 /// Fetch, cache and track cover art.
 ///
 /// One instance is shared by the whole app: it owns the single HTTP client and
@@ -649,6 +699,12 @@ impl CoverService {
                 }
                 Err(err) => {
                     self.save_state(appid, &state).await;
+                    // The network failed, but a cached copy may still be
+                    // perfectly good. Serve it rather than blanking the
+                    // poster: an offline app should show the art it has.
+                    if let Some(art) = self.best_cached_cover(appid, &state).await {
+                        return CoverResult::Found(art);
+                    }
                     return CoverResult::Missing(err);
                 }
             }
@@ -656,6 +712,29 @@ impl CoverService {
 
         self.save_state(appid, &state).await;
         CoverResult::Missing(CoverError::NoAsset)
+    }
+
+    /// The best cached cover for `appid`, ignoring freshness.
+    ///
+    /// Any variant recorded as present counts, even if its record is stale:
+    /// the point is to show *something* when the network is unavailable. A
+    /// variant whose file is missing or undecodable does not count.
+    async fn best_cached_cover(&self, appid: u32, state: &CoverState) -> Option<CoverArt> {
+        for variant in CoverVariant::ALL {
+            if !matches!(state.get(variant), Some(VariantState::Present { .. })) {
+                continue;
+            }
+            let path = self.images_dir.join(variant.cache_file(appid));
+            let Some(size) = image_size(&path).await else {
+                continue;
+            };
+            return Some(CoverArt {
+                variant,
+                path,
+                size,
+            });
+        }
+        None
     }
 
     /// Fetch the store-published header image for `appid`.
@@ -726,16 +805,28 @@ impl CoverService {
         now: u64,
     ) -> Result<Option<CoverArt>, CoverError> {
         let path = self.images_dir.join(variant.cache_file(appid));
-        let (etag, last_modified) = state
+        let (mut etag, mut last_modified) = state
             .get(variant)
             .map(|s| s.validators())
             .unwrap_or((None, None));
 
+        // A record may claim the asset is present while the file is gone (it
+        // was deleted, or a previous write was interrupted). The validators
+        // then describe a body we do not have: a conditional GET would come
+        // back 304 and leave us with no file at all. Drop them and fetch
+        // unconditionally.
+        let file_present = decodable(&path).await;
+        if !file_present {
+            etag = None;
+            last_modified = None;
+        }
+
         // A record with no validators cannot be revalidated with a
         // conditional GET. Compare cheaply instead: a HEAD that reports the
         // same body size proves the cached copy is current, so no body is
-        // downloaded.
-        if etag.is_none() && last_modified.is_none() {
+        // downloaded. This only applies when the cached file is actually
+        // there - otherwise there is nothing to compare against.
+        if file_present && etag.is_none() && last_modified.is_none() {
             if let Some(cached_bytes) = state.get(variant).and_then(record_bytes) {
                 let _permit = self.gate.acquire().await;
                 let started = std::time::Instant::now();
@@ -842,11 +933,23 @@ impl CoverService {
                         path,
                         size,
                     })),
-                    // The record says present but the file is gone: treat the
-                    // variant as absent so a later refresh can refetch it.
+                    // A 304 with no usable file on disk is not evidence that
+                    // the asset is missing: the server says it exists and is
+                    // unchanged. Recording it as absent would blacklist a
+                    // perfectly good asset for a week. Treat it as a
+                    // transient problem so it is retried.
                     None => {
-                        *state.entry(variant) = VariantState::Absent { checked_at: now };
-                        Ok(None)
+                        tracing::warn!(
+                            appid,
+                            variant = variant.key(),
+                            outcome = "not_modified_without_file",
+                            "server reported the asset unchanged but the cached file is unusable"
+                        );
+                        self.mark_backoff(appid, variant, now);
+                        Err(CoverError::Transient(format!(
+                            "{} answered 304 but the cached file is unusable",
+                            variant.key()
+                        )))
                     }
                 }
             }
@@ -863,11 +966,26 @@ impl CoverService {
                     elapsed_ms = elapsed.as_millis() as u64,
                     "cover variant downloaded"
                 );
-                // Reject a body that is not decodable: caching it would
-                // poison the cache and block every retry.
+                // A body that does not decode is not proof that the asset is
+                // missing: it can be an HTML error page, a truncated
+                // response, or a proxy interstitial. Recording it as absent
+                // would blacklist a perfectly good asset for a week, so treat
+                // it as a transient failure and retry later. The bad body is
+                // never written to the cache.
                 if !decodes(&bytes) {
-                    *state.entry(variant) = VariantState::Absent { checked_at: now };
-                    return Ok(None);
+                    tracing::warn!(
+                        appid,
+                        variant = variant.key(),
+                        outcome = "undecodable_body",
+                        bytes = bytes.len(),
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "server returned a body that is not an image"
+                    );
+                    self.mark_backoff(appid, variant, now);
+                    return Err(CoverError::Transient(format!(
+                        "{} returned a body that is not an image",
+                        variant.key()
+                    )));
                 }
                 if let Err(err) = write_atomic(&path, &bytes).await {
                     return Err(CoverError::Io(err.to_string()));
@@ -1118,6 +1236,7 @@ pub async fn remove_obsolete_files(images_dir: &Path, appid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1133,6 +1252,8 @@ mod tests {
         resources: Mutex<HashMap<String, FakeResource>>,
         /// URLs whose next request must fail transiently, with the count left.
         failures: Mutex<HashMap<String, usize>>,
+        /// URLs that always answer 304, whatever the client sends.
+        always_not_modified: Mutex<HashSet<String>>,
         /// Every URL requested, in order.
         calls: Mutex<Vec<String>>,
         /// Number of requests served.
@@ -1151,6 +1272,7 @@ mod tests {
             FakeHttp {
                 resources: Mutex::new(HashMap::new()),
                 failures: Mutex::new(HashMap::new()),
+                always_not_modified: Mutex::new(HashSet::new()),
                 calls: Mutex::new(Vec::new()),
                 count: AtomicUsize::new(0),
             }
@@ -1176,6 +1298,30 @@ mod tests {
         /// Make the next `times` requests for `url` fail transiently.
         fn fail_next(&self, url: &str, times: usize) {
             self.failures.lock().unwrap().insert(url.to_string(), times);
+        }
+
+        /// Make `url` always answer 304, whatever the client sends.
+        ///
+        /// Models a CDN that claims the asset is unchanged even when the
+        /// client has no copy of it.
+        fn always_not_modified(&self, url: &str) {
+            self.always_not_modified
+                .lock()
+                .unwrap()
+                .insert(url.to_string());
+        }
+
+        /// Publish a body that is *not* a decodable image (an HTML error
+        /// page served with a 200, as some CDNs do).
+        fn publish_garbage(&self, url: &str) {
+            self.resources.lock().unwrap().insert(
+                url.to_string(),
+                FakeResource {
+                    body: b"<html><body>Service Unavailable</body></html>".to_vec(),
+                    etag: Some("\"garbage\"".to_string()),
+                    last_modified: Some("Mon, 10 Feb 2025 17:57:16 GMT".to_string()),
+                },
+            );
         }
 
         fn calls(&self) -> Vec<String> {
@@ -1206,6 +1352,13 @@ mod tests {
                 }
             }
             drop(failures);
+
+            if self.always_not_modified.lock().unwrap().contains(url) {
+                return FetchOutcome::NotModified {
+                    etag: Some("\"v1\"".to_string()),
+                    last_modified: Some("Mon, 10 Feb 2025 17:57:16 GMT".to_string()),
+                };
+            }
 
             let resource = self.resources.lock().unwrap().get(url).cloned();
             let Some(resource) = resource else {
@@ -1772,6 +1925,207 @@ mod tests {
 
         assert!(!obsolete.exists(), "obsolete file must be removed");
         assert!(keep.exists(), "current file must be kept");
+    }
+
+    /// A 304 with no usable file on disk must not be recorded as "absent":
+    /// the server says the asset exists, so blacklisting it for a week would
+    /// be wrong.
+    #[tokio::test]
+    async fn a_304_without_a_cached_file_never_becomes_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = Arc::new(FakeHttp::new());
+        let service = make_service(http.clone(), dir.path());
+        let url = CoverVariant::Portrait2x.url(570).unwrap();
+
+        // A record that claims the asset is present, but no file exists and
+        // the server keeps answering 304.
+        let state = CoverState {
+            version: STATE_VERSION,
+            appid: 570,
+            variants: HashMap::from([(
+                CoverVariant::Portrait2x.key().to_string(),
+                VariantState::Present {
+                    etag: Some("\"v1\"".to_string()),
+                    last_modified: Some("Mon, 10 Feb 2025 17:57:16 GMT".to_string()),
+                    checked_at: 0,
+                    bytes: 1234,
+                },
+            )]),
+        };
+        tokio::fs::write(
+            dir.path().join("570_cover_state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+        http.always_not_modified(&url);
+
+        let result = service.ensure(570).await;
+        assert!(
+            matches!(result, CoverResult::Missing(CoverError::Transient(_))),
+            "a 304 without a file is a transient problem, not a missing asset"
+        );
+
+        // The record must not have been flipped to "absent".
+        let raw = tokio::fs::read(dir.path().join("570_cover_state.json"))
+            .await
+            .unwrap();
+        let state: CoverState = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            !matches!(
+                state.get(CoverVariant::Portrait2x),
+                Some(VariantState::Absent { .. })
+            ),
+            "a 304 must never blacklist the asset"
+        );
+    }
+
+    /// A transient failure must not blank a game whose art is already
+    /// cached: the cached copy is served instead.
+    #[tokio::test]
+    async fn offline_with_a_stale_cache_serves_the_cached_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = Arc::new(FakeHttp::new());
+        let service = make_service(http.clone(), dir.path());
+        let url = CoverVariant::Portrait2x.url(570).unwrap();
+
+        // The art was downloaded once, then the record went stale.
+        http.publish(&url, jpeg_bytes(600, 900), Some("\"v1\""));
+        service.ensure(570).await;
+        let path = dir.path().join(CoverVariant::Portrait2x.cache_file(570));
+        assert!(path.exists());
+        age_state(dir.path(), 570, PRESENT_TTL.as_secs() + 1).await;
+
+        // Now the network is down.
+        http.fail_next(&url, 1);
+
+        let result = service.ensure(570).await;
+        match result {
+            CoverResult::Found(art) => {
+                assert_eq!(art.variant, CoverVariant::Portrait2x);
+                assert!(art.path.exists());
+            }
+            other => panic!("expected the cached art, got {other:?}"),
+        }
+    }
+
+    /// The same, for a game that only has landscape art.
+    #[tokio::test]
+    async fn offline_with_a_stale_cache_serves_a_banner_only_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = Arc::new(FakeHttp::new());
+        let service = make_service(http.clone(), dir.path());
+
+        // No portrait art exists; the banner does.
+        for variant in [CoverVariant::Portrait2x, CoverVariant::Portrait] {
+            http.remove(&variant.url(570).unwrap());
+        }
+        let banner = CoverVariant::Banner.url(570).unwrap();
+        http.publish(&banner, jpeg_bytes(460, 215), Some("\"v1\""));
+        service.ensure(570).await;
+        age_state(dir.path(), 570, PRESENT_TTL.as_secs() + 1).await;
+
+        // The network is down for the banner too.
+        http.fail_next(&banner, 1);
+
+        let result = service.ensure(570).await;
+        match result {
+            CoverResult::Found(art) => {
+                assert_eq!(art.variant, CoverVariant::Banner);
+                assert!(art.path.exists());
+            }
+            other => panic!("expected the cached banner, got {other:?}"),
+        }
+    }
+
+    /// A record that claims the asset is present but whose file was deleted
+    /// must be refetched, not treated as a 304 with nothing to show.
+    #[tokio::test]
+    async fn a_deleted_file_with_a_matching_etag_is_refetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = Arc::new(FakeHttp::new());
+        let service = make_service(http.clone(), dir.path());
+        let url = CoverVariant::Portrait2x.url(570).unwrap();
+
+        http.publish(&url, jpeg_bytes(600, 900), Some("\"v1\""));
+        service.ensure(570).await;
+        let path = dir.path().join(CoverVariant::Portrait2x.cache_file(570));
+        assert!(path.exists());
+
+        // The file is deleted but the record still carries the ETag.
+        std::fs::remove_file(&path).unwrap();
+        age_state(dir.path(), 570, PRESENT_TTL.as_secs() + 1).await;
+
+        let result = service.ensure(570).await;
+        assert!(matches!(result, CoverResult::Found(_)));
+        assert!(
+            path.exists(),
+            "the deleted file must be downloaded again, not left missing"
+        );
+        assert_eq!(image_size(&path).await, Some((600, 900)));
+    }
+
+    /// A 200 whose body is not an image (an HTML error page) must not
+    /// blacklist the asset: the next attempt has to succeed.
+    #[tokio::test]
+    async fn an_html_body_then_real_art_succeeds_without_a_blackout() {
+        let dir = tempfile::tempdir().unwrap();
+        let http = Arc::new(FakeHttp::new());
+        let service = make_service(http.clone(), dir.path());
+        let url = CoverVariant::Portrait2x.url(570).unwrap();
+
+        // The CDN answers 200 with an HTML error page.
+        http.publish_garbage(&url);
+
+        let result = service.ensure(570).await;
+        assert!(
+            matches!(result, CoverResult::Missing(CoverError::Transient(_))),
+            "an undecodable body is a transient failure, not a missing asset"
+        );
+
+        // The state must not record it as absent.
+        let raw = tokio::fs::read(dir.path().join("570_cover_state.json"))
+            .await
+            .unwrap();
+        let state: CoverState = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            !matches!(
+                state.get(CoverVariant::Portrait2x),
+                Some(VariantState::Absent { .. })
+            ),
+            "an undecodable body must not be persisted as absent"
+        );
+
+        // The CDN recovers.
+        http.publish(&url, jpeg_bytes(600, 900), Some("\"v2\""));
+        service.backoff.lock().unwrap().clear();
+
+        let result = service.ensure(570).await;
+        assert!(
+            matches!(result, CoverResult::Found(_)),
+            "the retry must succeed"
+        );
+        let path = dir.path().join(CoverVariant::Portrait2x.cache_file(570));
+        assert_eq!(image_size(&path).await, Some((600, 900)));
+    }
+
+    /// The UI retries sooner after a transient failure than after a
+    /// definitive answer, so one flaky request does not blank a game for a
+    /// day.
+    #[test]
+    fn a_transient_error_is_retried_sooner_than_a_definitive_one() {
+        let transient = CoverResult::Missing(CoverError::Transient("timeout".into()));
+        let definitive = CoverResult::Missing(CoverError::NoAsset);
+        let found = CoverResult::Found(CoverArt {
+            variant: CoverVariant::Portrait2x,
+            path: PathBuf::from("/tmp/x.jpg"),
+            size: (600, 900),
+        });
+
+        assert!(retry_after(&transient) < retry_after(&definitive));
+        assert!(retry_after(&transient) < COVER_RECHECK_INTERVAL);
+        assert_eq!(retry_after(&definitive), COVER_RECHECK_INTERVAL);
+        assert_eq!(retry_after(&found), COVER_RECHECK_INTERVAL);
     }
 
     /// Age every record of `appid` by `seconds` so it becomes stale.

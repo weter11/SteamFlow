@@ -210,19 +210,35 @@ struct ActiveDownloadTask {
     samples: VecDeque<(std::time::Instant, u64)>,
 }
 
-
 /// How long, in seconds, the in-memory cover-request gate suppresses a
 /// re-spawn for the same appid. The *persistent* freshness decision lives in
 /// the cover state file; this only stops the per-frame respawn.
-const COVER_RECHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const COVER_RECHECK_INTERVAL_SECS: u64 = crate::covers::COVER_RECHECK_INTERVAL.as_secs();
 
 /// Build the shared cover service.
 ///
 /// One service owns the HTTP client, the store-header resolver and the
 /// concurrency limiter, so a library-wide refresh cannot turn into an
 /// `N x variants` request burst.
+///
+/// Neither a missing cache directory nor an HTTP client that cannot be built
+/// is fatal: the cover pipeline is simply unavailable, and the poster falls
+/// back to its title card.
 fn build_cover_service() -> crate::covers::CoverService {
-    let images_dir = opensteam_image_cache_dir().unwrap_or_default();
+    let images_dir = match opensteam_image_cache_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "cover cache directory unavailable; cover art disabled"
+            );
+            // An empty path would make every cache write fail with a
+            // confusing error, so point it at a directory that is never
+            // created and let the disabled HTTP client fail the requests
+            // cleanly.
+            std::path::PathBuf::from(".")
+        }
+    };
     match (
         crate::covers::ReqwestCoverHttp::new(),
         crate::covers::ReqwestStoreHeaderResolver::new(),
@@ -238,9 +254,7 @@ fn build_cover_service() -> crate::covers::CoverService {
                 "cover HTTP client unavailable; cover art disabled"
             );
             crate::covers::CoverService::with_http(
-                std::sync::Arc::new(
-                    crate::covers::ReqwestCoverHttp::new().expect("cover HTTP client"),
-                ),
+                std::sync::Arc::new(crate::covers::DisabledCoverHttp),
                 images_dir,
             )
         }
@@ -292,18 +306,22 @@ pub struct SteamLauncher {
     image_variant: HashMap<AppId, crate::covers::CoverVariant>,
     pending_images: HashSet<AppId>,
     pending_metadata: HashSet<AppId>,
-    /// Per-appid unix-seconds of the last `ensure_image_requested` spawn.
-    /// Gates the per-frame spawn in the game detail view: the spawned task
-    /// completes within the same frame and `pending_images` is cleared, so
-    /// without this the selected game's cover task respawns EVERY frame —
+    /// Per-appid seconds to wait before the next cover attempt.
+    ///
+    /// This gates the per-frame spawn in the game detail view: the spawned
+    /// task completes within the same frame and `pending_images` is cleared,
+    /// so without this the selected game's cover task respawns EVERY frame -
     /// re-decoding the cached JPEG + re-uploading the texture at full repaint
-    /// rate (~165 Hz = a pegged core). Refresh Library clears it to force a
-    /// full recheck.
-    last_cover_request: HashMap<AppId, u64>,
+    /// rate (~165 Hz = a pegged core).
+    ///
+    /// The value comes from the cover service's outcome: a definitive answer
+    /// waits for the full recheck interval, a transient failure retries
+    /// sooner. Refresh Library clears the map to force a full recheck.
+    cover_retry_after: HashMap<AppId, u64>,
     /// The cover pipeline: fetch, cache and per-appid state.
     cover_service: std::sync::Arc<crate::covers::CoverService>,
-    image_tx: Sender<(AppId, Option<crate::covers::CoverArt>)>,
-    image_rx: Receiver<(AppId, Option<crate::covers::CoverArt>)>,
+    image_tx: Sender<(AppId, crate::covers::CoverResult)>,
+    image_rx: Receiver<(AppId, crate::covers::CoverResult)>,
     selected_app: Option<AppId>,
     show_installed_only: bool,
     search_text: String,
@@ -405,7 +423,7 @@ impl SteamLauncher {
             cover_service: std::sync::Arc::new(build_cover_service()),
             pending_images: HashSet::new(),
             pending_metadata: HashSet::new(),
-            last_cover_request: HashMap::new(),
+            cover_retry_after: HashMap::new(),
             image_tx,
             image_rx,
             selected_app: None,
@@ -487,8 +505,11 @@ impl SteamLauncher {
         let mut drained = false;
         while let Ok((appid, result)) = self.image_rx.try_recv() {
             drained = true;
+            // How long to wait before the next attempt is decided by the
+            // outcome, so it has to be read before the result is consumed.
+            let retry_after = crate::covers::retry_after(&result);
             match result {
-                Some(art) => {
+                crate::covers::CoverResult::Found(art) => {
                     match crate::covers::load_texture_bytes(&art.path) {
                         Ok((rgba, width, height)) => {
                             let size = [width as usize, height as usize];
@@ -515,13 +536,22 @@ impl SteamLauncher {
                         }
                     }
                 }
-                None => {
+                crate::covers::CoverResult::Missing(err) => {
                     // No art is available for this app. The poster falls back
                     // to the title card; the reason is recorded in the cover
                     // state, so it is not retried on every frame.
-                    tracing::info!(appid, "no cover art available for app");
+                    tracing::info!(appid, ?err, "no cover art available for app");
                 }
             }
+            // A transient failure says nothing about the asset, so the next
+            // attempt must not wait for the full recheck interval. The
+            // cover service decides how long that is.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            self.cover_retry_after
+                .insert(appid, now + retry_after.as_secs());
             self.pending_images.remove(&appid);
         }
         drained
@@ -552,6 +582,12 @@ impl SteamLauncher {
 
     /// Ask the cover pipeline for this game's artwork, spawning the fetch if
     /// it is not already in flight.
+    fn ensure_image_requested(&mut self, appid: AppId) {
+        self.ensure_image_requested_with(appid, false)
+    }
+
+    /// Ask the cover pipeline for this game's artwork, spawning the fetch if
+    /// it is not already in flight.
     ///
     /// The gate is deliberately in-memory only: the *persistent* decision
     /// (is the cached copy still fresh? is the asset known to be absent?) lives
@@ -559,12 +595,6 @@ impl SteamLauncher {
     /// re-downloading. The previous implementation persisted a single
     /// `cached_variant` plus a `failed` flag that was written but never read,
     /// so one timeout blanked the cover for 24 hours.
-    fn ensure_image_requested(&mut self, appid: AppId) {
-        self.ensure_image_requested_with(appid, false)
-    }
-
-    /// Ask the cover pipeline for this game's artwork, spawning the fetch if
-    /// it is not already in flight.
     ///
     /// `force` bypasses the *freshness* window only: the fetch still uses
     /// conditional requests and never deletes a valid cached file. "Refresh
@@ -580,18 +610,20 @@ impl SteamLauncher {
         // re-decoding the cached JPEG + re-uploading the texture at full repaint
         // rate (~165 Hz = a pegged core). Refresh Library clears it to force a
         // full recheck.
+        // Wait until the previous attempt's cooldown has elapsed. The
+        // cooldown is set from that attempt's outcome, so a transient
+        // failure is retried soon while a definitive answer waits.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
-        if self
-            .last_cover_request
-            .get(&appid)
-            .is_some_and(|t| now.saturating_sub(*t) < COVER_RECHECK_INTERVAL_SECS)
-        {
-            return;
+        if let Some(cooldown) = self.cover_retry_after.get(&appid) {
+            if now < *cooldown {
+                return;
+            }
         }
-        self.last_cover_request.insert(appid, now);
+        self.cover_retry_after
+            .insert(appid, now + COVER_RECHECK_INTERVAL_SECS);
 
         self.pending_images.insert(appid);
         let tx = self.image_tx.clone();
@@ -623,13 +655,7 @@ impl SteamLauncher {
             // Always deliver a result, including on error: the receiver clears
             // the pending flag, so a dropped message would leave the poster
             // spinning forever.
-            let _ = tx.send((
-                appid,
-                match result {
-                    crate::covers::CoverResult::Found(art) => Some(art),
-                    crate::covers::CoverResult::Missing(_) => None,
-                },
-            ));
+            let _ = tx.send((appid, result));
         });
     }
 
@@ -1278,8 +1304,8 @@ impl SteamLauncher {
     fn recheck_missing_covers(&mut self) {
         self.pending_images.clear();
         // Clear the cadence gate so Refresh Library forces an immediate
-        // recheck of every game (bypasses the 24 h last_cover_request window).
-        self.last_cover_request.clear();
+        // recheck of every game (bypasses the cover cooldown window).
+        self.cover_retry_after.clear();
         let appids: Vec<AppId> = self.library.iter().map(|g| g.app_id).collect();
         for appid in appids {
             self.ensure_image_requested_with(appid, true);
