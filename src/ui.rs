@@ -15,7 +15,6 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::mpsc::{self, Receiver, Sender};
 use tokio::runtime::Runtime;
-use serde::{Deserialize, Serialize};
 
 pub type AppId = u32;
 
@@ -211,108 +210,88 @@ struct ActiveDownloadTask {
     samples: VecDeque<(std::time::Instant, u64)>,
 }
 
-/// Cover-art image variant, ordered by preference (Steam client / Proton 10.0
-/// convention): hero capsule (landscape) → library capsule → small header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum CoverVariant {
-    HeroCapsule2x,
-    HeroCapsule,
-    LibraryHero2x,
-    LibraryHero,
-    LibraryCapsule2x,
-    LibraryCapsule,
-    HeaderImage,
-}
 
-impl CoverVariant {
-    const ALL: [CoverVariant; 7] = [
-        CoverVariant::HeroCapsule2x,
-        CoverVariant::HeroCapsule,
-        CoverVariant::LibraryHero2x,
-        CoverVariant::LibraryHero,
-        CoverVariant::LibraryCapsule2x,
-        CoverVariant::LibraryCapsule,
-        CoverVariant::HeaderImage,
-    ];
-
-    fn tier(self) -> usize {
-        match self {
-            CoverVariant::HeroCapsule2x | CoverVariant::HeroCapsule => 0,
-            CoverVariant::LibraryHero2x
-            | CoverVariant::LibraryHero
-            | CoverVariant::LibraryCapsule2x
-            | CoverVariant::LibraryCapsule => 1,
-            CoverVariant::HeaderImage => 2,
-        }
-    }
-
-    fn file_suffix(self) -> &'static str {
-        match self {
-            CoverVariant::HeroCapsule2x => "hero_capsule_2x",
-            CoverVariant::HeroCapsule => "hero_capsule",
-            CoverVariant::LibraryHero2x => "library_hero_2x",
-            CoverVariant::LibraryHero => "library_hero",
-            CoverVariant::LibraryCapsule2x => "library_capsule_2x",
-            CoverVariant::LibraryCapsule => "library_capsule",
-            CoverVariant::HeaderImage => "header_image",
-        }
-    }
-
-    fn url(self, appid: AppId) -> String {
-        match self {
-            CoverVariant::HeroCapsule2x => {
-                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/hero_capsule_2x.jpg")
-            }
-            CoverVariant::HeroCapsule => {
-                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/hero_capsule.jpg")
-            }
-            CoverVariant::LibraryHero2x => {
-                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_hero_2x.jpg")
-            }
-            CoverVariant::LibraryHero => {
-                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_hero.jpg")
-            }
-            CoverVariant::LibraryCapsule2x => {
-                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_capsule_2x.jpg")
-            }
-            CoverVariant::LibraryCapsule => {
-                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/library_capsule.jpg")
-            }
-            CoverVariant::HeaderImage => {
-                format!("https://cdn.akamai.steamstatic.com/steam/apps/{appid}/header.jpg")
-            }
-        }
-    }
-
-    /// Strictly-better variants (lower index = higher priority).
-    fn better_than(self, other: CoverVariant) -> bool {
-        Self::ALL.iter().position(|v| *v == self) < Self::ALL.iter().position(|v| *v == other)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CoverFetchState {
-    cached_variant: Option<String>,
-    last_checked_unix_secs: u64,
-    failed: bool,
-}
-
+/// How long, in seconds, the in-memory cover-request gate suppresses a
+/// re-spawn for the same appid. The *persistent* freshness decision lives in
+/// the cover state file; this only stops the per-frame respawn.
 const COVER_RECHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+/// Build the shared cover service.
+///
+/// One service owns the HTTP client, the store-header resolver and the
+/// concurrency limiter, so a library-wide refresh cannot turn into an
+/// `N x variants` request burst.
+fn build_cover_service() -> crate::covers::CoverService {
+    let images_dir = opensteam_image_cache_dir().unwrap_or_default();
+    match (
+        crate::covers::ReqwestCoverHttp::new(),
+        crate::covers::ReqwestStoreHeaderResolver::new(),
+    ) {
+        (Ok(http), Ok(store)) => crate::covers::CoverService::with_http_and_store(
+            std::sync::Arc::new(http),
+            std::sync::Arc::new(store),
+            images_dir,
+        ),
+        (Err(err), _) | (_, Err(err)) => {
+            tracing::warn!(
+                error = %err,
+                "cover HTTP client unavailable; cover art disabled"
+            );
+            crate::covers::CoverService::with_http(
+                std::sync::Arc::new(
+                    crate::covers::ReqwestCoverHttp::new().expect("cover HTTP client"),
+                ),
+                images_dir,
+            )
+        }
+    }
+}
+
+/// Paint the gradient backdrop and border of the cover card.
+fn paint_cover_card_background(painter: &egui::Painter, rect: egui::Rect) {
+    let mut mesh = egui::epaint::Mesh::default();
+    let top_color = egui::Color32::from_rgb(32, 37, 46);
+    let bottom_color = egui::Color32::from_rgb(14, 16, 20);
+    mesh.colored_vertex(rect.left_top(), top_color);
+    mesh.colored_vertex(rect.right_top(), top_color);
+    mesh.colored_vertex(rect.right_bottom(), bottom_color);
+    mesh.colored_vertex(rect.left_bottom(), bottom_color);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::epaint::Shape::mesh(mesh));
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(58)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Paint the game name, wrapped across the cover card.
+fn paint_cover_card_title(painter: &egui::Painter, rect: egui::Rect, name: &str) {
+    let galley = painter.layout(
+        name.to_string(),
+        egui::FontId::proportional(20.0),
+        egui::Color32::from_gray(180),
+        rect.width() - 24.0,
+    );
+    painter.galley(
+        rect.center() - egui::vec2(galley.size().x * 0.5, galley.size().y * 0.5),
+        galley,
+        egui::Color32::from_gray(180),
+    );
+}
 
 pub struct SteamLauncher {
     runtime: Runtime,
     pub client: SteamClient,
     pub library: Vec<LibraryGame>,
     pub image_cache: HashMap<AppId, TextureHandle>,
-    /// Which variant the texture in `image_cache` was loaded from (used to
-    /// decide whether a better variant should be fetched/upgraded).
-    image_variant: HashMap<AppId, CoverVariant>,
+    /// Which variant the texture in `image_cache` was loaded from, so the UI
+    /// knows whether to draw it as a portrait poster or as a landscape banner.
+    image_variant: HashMap<AppId, crate::covers::CoverVariant>,
     pending_images: HashSet<AppId>,
     pending_metadata: HashSet<AppId>,
-    /// Session-only record of variants that failed to fetch (offline, timeout,
-    /// 404). Skipped on retry within the session; cleared by Refresh Library so
-    /// nothing is permanently negative-cached.
-    cover_fetch_failures: HashSet<(AppId, CoverVariant)>,
     /// Per-appid unix-seconds of the last `ensure_image_requested` spawn.
     /// Gates the per-frame spawn in the game detail view: the spawned task
     /// completes within the same frame and `pending_images` is cleared, so
@@ -321,8 +300,10 @@ pub struct SteamLauncher {
     /// rate (~165 Hz = a pegged core). Refresh Library clears it to force a
     /// full recheck.
     last_cover_request: HashMap<AppId, u64>,
-    image_tx: Sender<(AppId, CoverVariant, Option<String>)>,
-    image_rx: Receiver<(AppId, CoverVariant, Option<String>)>,
+    /// The cover pipeline: fetch, cache and per-appid state.
+    cover_service: std::sync::Arc<crate::covers::CoverService>,
+    image_tx: Sender<(AppId, Option<crate::covers::CoverArt>)>,
+    image_rx: Receiver<(AppId, Option<crate::covers::CoverArt>)>,
     selected_app: Option<AppId>,
     show_installed_only: bool,
     search_text: String,
@@ -421,9 +402,9 @@ impl SteamLauncher {
             library,
             image_cache: HashMap::new(),
             image_variant: HashMap::new(),
+            cover_service: std::sync::Arc::new(build_cover_service()),
             pending_images: HashSet::new(),
             pending_metadata: HashSet::new(),
-            cover_fetch_failures: HashSet::new(),
             last_cover_request: HashMap::new(),
             image_tx,
             image_rx,
@@ -504,38 +485,41 @@ impl SteamLauncher {
 
     fn poll_image_results(&mut self, ctx: &egui::Context) -> bool {
         let mut drained = false;
-        while let Ok((appid, variant, result)) = self.image_rx.try_recv() {
+        while let Ok((appid, result)) = self.image_rx.try_recv() {
             drained = true;
             match result {
-                Some(path) => {
-                    self.cover_fetch_failures.remove(&(appid, variant));
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        if let Ok(img) = image::load_from_memory(&bytes) {
-                            let rgba = img.to_rgba8();
-                            let size = [rgba.width() as usize, rgba.height() as usize];
-                            let color = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                Some(art) => {
+                    match crate::covers::load_texture_bytes(&art.path) {
+                        Ok((rgba, width, height)) => {
+                            let size = [width as usize, height as usize];
+                            let color = ColorImage::from_rgba_unmultiplied(size, &rgba);
                             let texture = ctx.load_texture(
                                 format!("cover_{appid}"),
                                 color,
                                 egui::TextureOptions::LINEAR,
                             );
                             self.image_cache.insert(appid, texture);
-                            self.image_variant.insert(appid, variant);
-                        } else {
-                            // Cache file exists but cannot be decoded — remove
-                            // it so a later selection/refresh can re-download
-                            // instead of looping on the corrupt file forever.
-                            let _ = std::fs::remove_file(&path);
+                            self.image_variant.insert(appid, art.variant);
+                        }
+                        Err(err) => {
+                            // The cached file cannot be decoded. Drop it so a
+                            // later attempt can fetch it again instead of
+                            // looping on the corrupt file forever.
+                            tracing::warn!(
+                                appid,
+                                path = %art.path.display(),
+                                error = %err,
+                                "cached cover art could not be decoded; discarding"
+                            );
+                            let _ = std::fs::remove_file(&art.path);
                         }
                     }
                 }
                 None => {
-                    // Fetch failed (offline, timeout, or non-200 response).
-                    // Remember the variant for THIS session only, so we don't
-                    // hammer the CDN every frame; Refresh Library clears it.
-                    // Any lower-priority cached texture stays visible meanwhile.
-                    // No permanent negative caching.
-                    self.cover_fetch_failures.insert((appid, variant));
+                    // No art is available for this app. The poster falls back
+                    // to the title card; the reason is recorded in the cover
+                    // state, so it is not retried on every frame.
+                    tracing::info!(appid, "no cover art available for app");
                 }
             }
             self.pending_images.remove(&appid);
@@ -566,22 +550,36 @@ impl SteamLauncher {
         });
     }
 
+    /// Ask the cover pipeline for this game's artwork, spawning the fetch if
+    /// it is not already in flight.
+    ///
+    /// The gate is deliberately in-memory only: the *persistent* decision
+    /// (is the cached copy still fresh? is the asset known to be absent?) lives
+    /// in the cover state file, so a restart re-reads it instead of
+    /// re-downloading. The previous implementation persisted a single
+    /// `cached_variant` plus a `failed` flag that was written but never read,
+    /// so one timeout blanked the cover for 24 hours.
     fn ensure_image_requested(&mut self, appid: AppId) {
+        self.ensure_image_requested_with(appid, false)
+    }
+
+    /// Ask the cover pipeline for this game's artwork, spawning the fetch if
+    /// it is not already in flight.
+    ///
+    /// `force` bypasses the *freshness* window only: the fetch still uses
+    /// conditional requests and never deletes a valid cached file. "Refresh
+    /// Library" sets it.
+    fn ensure_image_requested_with(&mut self, appid: AppId, force: bool) {
         if self.pending_images.contains(&appid) {
             return;
         }
 
-        // Cover fetch cadence gate: only (re)spawn the fetch task once per
-        // COVER_RECHECK_INTERVAL_SECS per appid. Without this gate the task
-        // completes within the same frame it is spawned (state file says the
-        // 24h window is still fresh → cached path sent back → pending_images
-        // cleared in poll_image_results), so the selected game's cover task
-        // respawns EVERY UI frame — re-decoding the cached JPEG in the tokio
-        // worker and re-uploading the texture on the UI thread at full repaint
-        // rate (165 Hz on a high-refresh display ≈ one pegged core). The
-        // once-per-day availability recheck still runs: when the interval
-        // elapses, the next spawn re-validates via HEAD. Refresh Library
-        // clears the map to force an immediate full recheck.
+        // Gate the per-frame spawn in the game detail view: the spawned task
+        // completes within the same frame and `pending_images` is cleared, so
+        // without this the selected game's cover task respawns EVERY frame —
+        // re-decoding the cached JPEG + re-uploading the texture at full repaint
+        // rate (~165 Hz = a pegged core). Refresh Library clears it to force a
+        // full recheck.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -595,144 +593,43 @@ impl SteamLauncher {
         }
         self.last_cover_request.insert(appid, now);
 
-        let best = self.image_variant.get(&appid).copied();
-        // The top variant still needs a once-per-day availability check.
-        let variant = best.unwrap_or(CoverVariant::HeroCapsule2x);
-
         self.pending_images.insert(appid);
         let tx = self.image_tx.clone();
-        let appid_for_task = appid;
-
+        let service = self.cover_service.clone();
         self.runtime.spawn(async move {
-            let Ok(cache_dir) = opensteam_image_cache_dir() else {
-                return;
+            let started = std::time::Instant::now();
+            let result = if force {
+                service.refresh(appid).await
+            } else {
+                service.ensure(appid).await
             };
-
-            if tokio::fs::create_dir_all(&cache_dir).await.is_err() {
-                return;
+            let elapsed = started.elapsed();
+            match &result {
+                crate::covers::CoverResult::Found(art) => tracing::info!(
+                    appid,
+                    variant = art.variant.key(),
+                    width = art.size.0,
+                    height = art.size.1,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "cover art ready"
+                ),
+                crate::covers::CoverResult::Missing(err) => tracing::info!(
+                    appid,
+                    error = ?err,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    "cover art unavailable"
+                ),
             }
-
-            let state_path = cache_dir.join(format!("{appid_for_task}_cover_state.json"));
-            let mut state = tokio::fs::read(&state_path)
-                .await
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<CoverFetchState>(&bytes).ok());
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default();
-            let cached = state.as_ref().and_then(|s| {
-                s.cached_variant.as_deref().and_then(|name| {
-                    CoverVariant::ALL
-                        .iter()
-                        .copied()
-                        .find(|v| v.file_suffix() == name)
-                })
-            });
-
-            let cache_path = |v: CoverVariant| {
-                cache_dir.join(format!("{appid_for_task}_{}.jpg", v.file_suffix()))
-            };
-            let valid_cache = |path: PathBuf| async move {
-                let Ok(bytes) = tokio::fs::read(path).await else {
-                    return false;
-                };
-                !bytes.is_empty() && image::load_from_memory(&bytes).is_ok()
-            };
-
-            if state
-                .as_ref()
-                .is_some_and(|s| now.saturating_sub(s.last_checked_unix_secs) < COVER_RECHECK_INTERVAL_SECS)
-            {
-                if let Some(cached) = cached {
-                    let path = cache_path(cached);
-                    if valid_cache(path.clone()).await {
-                        let _ = tx.send((
-                            appid_for_task,
-                            cached,
-                            Some(path.to_string_lossy().to_string()),
-                        ));
-                        return;
-                    }
-                }
-                let _ = tx.send((appid_for_task, variant, None));
-                return;
-            }
-
-            let cached = match cached {
-                Some(cached) if valid_cache(cache_path(cached)).await => Some(cached),
-                _ => None,
-            };
-            let candidates: Vec<CoverVariant> = CoverVariant::ALL
-                .iter()
-                .copied()
-                .filter(|v| {
-                    cached
-                        .map(|c| v.better_than(c) || (c.tier() == 0 && *v == c))
-                        .unwrap_or(true)
-                })
-                .collect();
-            let mut selected = cached;
-            for candidate in candidates {
-                let path = cache_path(candidate);
-                let should_revalidate = cached == Some(candidate) && candidate.tier() == 0;
-                if should_revalidate {
-                    let client = reqwest::Client::new();
-                    let check = async { client.head(candidate.url(appid_for_task)).send().await };
-                    if let Ok(Ok(response)) =
-                        tokio::time::timeout(std::time::Duration::from_secs(5), check).await
-                    {
-                        if response.status().is_success() {
-                            selected = Some(candidate);
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                if !should_revalidate && valid_cache(path.clone()).await {
-                    selected = Some(candidate);
-                    break;
-                }
-
-                let fetch = async { reqwest::get(candidate.url(appid_for_task)).await };
-                let Ok(Ok(response)) =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), fetch).await
-                else {
-                    continue;
-                };
-                if !response.status().is_success() {
-                    continue;
-                }
-                let Ok(bytes) = response.bytes().await else {
-                    continue;
-                };
-                if bytes.is_empty() || image::load_from_memory(&bytes).is_err() {
-                    continue;
-                }
-                if tokio::fs::write(&path, bytes).await.is_ok() {
-                    selected = Some(candidate);
-                    for lower in CoverVariant::ALL
-                        .iter()
-                        .filter(|v| candidate.tier() < v.tier())
-                    {
-                        let _ = tokio::fs::remove_file(cache_path(*lower)).await;
-                    }
-                    break;
-                }
-            }
-
-            state = Some(CoverFetchState {
-                cached_variant: selected.map(|v| v.file_suffix().to_string()),
-                last_checked_unix_secs: now,
-                failed: selected.is_none(),
-            });
-            if let Some(state) = &state {
-                if let Ok(bytes) = serde_json::to_vec(state) {
-                    let _ = tokio::fs::write(&state_path, bytes).await;
-                }
-            }
-            let result = selected.map(|v| cache_path(v).to_string_lossy().to_string());
-            let _ = tx.send((appid_for_task, selected.unwrap_or(variant), result));
+            // Always deliver a result, including on error: the receiver clears
+            // the pending flag, so a dropped message would leave the poster
+            // spinning forever.
+            let _ = tx.send((
+                appid,
+                match result {
+                    crate::covers::CoverResult::Found(art) => Some(art),
+                    crate::covers::CoverResult::Missing(_) => None,
+                },
+            ));
         });
     }
 
@@ -1371,28 +1268,28 @@ impl SteamLauncher {
         });
     }
 
-    /// Clears transient cover-art load failures and re-enqueues background
-    /// downloads for every library game whose best cover variant is still
-    /// missing or outdated. Games already showing the hero capsule are skipped;
-    /// games with only a lower-priority image cached get the upgrade chain
-    /// re-attempted (header_image → library_capsule_2x → hero_capsule_2x).
+    /// Re-enqueues a cover fetch for every library game.
+    ///
+    /// The cover service owns the per-appid decision about what still needs
+    /// checking: a fresh record with a decodable cached file costs nothing, a
+    /// stale record is revalidated with a conditional request, and a known
+    /// missing asset is not probed again. This only clears the in-memory
+    /// per-frame gate so the fetch is actually attempted.
     fn recheck_missing_covers(&mut self) {
         self.pending_images.clear();
-        self.cover_fetch_failures.clear();
         // Clear the cadence gate so Refresh Library forces an immediate
         // recheck of every game (bypasses the 24 h last_cover_request window).
         self.last_cover_request.clear();
         let appids: Vec<AppId> = self.library.iter().map(|g| g.app_id).collect();
         for appid in appids {
-            self.ensure_image_requested(appid);
+            self.ensure_image_requested_with(appid, true);
         }
     }
 
     fn refresh_library(&mut self) {
-        // Refresh Library also retries cover art: drop transient image-load
-        // error state and re-enqueue downloads for all missing covers (see
-        // ensure_image_requested — it re-validates the cache file first and
-        // deletes zero-byte/corrupt entries before re-downloading).
+        // Refresh Library also retries cover art: re-enqueue a fetch for every
+        // game. The cover service revalidates what it has and re-downloads
+        // only what actually changed.
         self.recheck_missing_covers();
         let mut client = self.client.clone();
         let tx = self.operation_tx.clone();
@@ -4606,73 +4503,93 @@ impl eframe::App for SteamLauncher {
                                     // the cover art / fallback card ===
                                     ui.allocate_ui(egui::vec2(250.0, 375.0), |ui| {
                                         ui.set_clip_rect(ui.max_rect());
-                                        if let Some(texture) = self.image_cache.get(&game.app_id) {
-                                            ui.add(egui::Image::new(texture).max_width(250.0));
-                                        } else {
-                                            // Styled fallback card: subtle vertical
-                                            // gradient + game title (or spinner while
-                                            // a cover download is in flight) — never
-                                            // a blank/broken texture.
-                                            let (rect, _response) = ui.allocate_exact_size(
-                                                egui::vec2(250.0, 375.0),
-                                                egui::Sense::hover(),
-                                            );
-                                            // Spinner is put BEFORE taking the
-                                            // painter handle (ui.put needs &mut ui).
-                                            if self.pending_images.contains(&game.app_id) {
-                                                ui.put(
-                                                    egui::Rect::from_center_size(
-                                                        rect.center() - egui::vec2(0.0, 14.0),
-                                                        egui::vec2(30.0, 30.0),
-                                                    ),
-                                                    egui::Spinner::new().size(30.0),
+                                        // Portrait art fills the poster slot.
+                                        // Landscape art (the fallback for apps
+                                        // that publish no portrait asset) is
+                                        // drawn as a banner fitted to the slot
+                                        // width, over the same gradient card,
+                                        // with the game title — never stretched.
+                                        let portrait = self
+                                            .image_variant
+                                            .get(&game.app_id)
+                                            .map(|variant| variant.is_portrait())
+                                            .unwrap_or(false);
+                                        match self.image_cache.get(&game.app_id) {
+                                            Some(texture) if portrait => {
+                                                ui.add(
+                                                    egui::Image::new(texture)
+                                                        .fit_to_exact_size(egui::vec2(250.0, 375.0)),
                                                 );
                                             }
-                                            let painter = ui.painter();
-                                            let mut mesh = egui::epaint::Mesh::default();
-                                            let top_color = egui::Color32::from_rgb(32, 37, 46);
-                                            let bottom_color = egui::Color32::from_rgb(14, 16, 20);
-                                            mesh.colored_vertex(rect.left_top(), top_color);
-                                            mesh.colored_vertex(rect.right_top(), top_color);
-                                            mesh.colored_vertex(rect.right_bottom(), bottom_color);
-                                            mesh.colored_vertex(rect.left_bottom(), bottom_color);
-                                            mesh.add_triangle(0, 1, 2);
-                                            mesh.add_triangle(0, 2, 3);
-                                            painter.add(egui::epaint::Shape::mesh(mesh));
-                                            painter.rect_stroke(
-                                                rect,
-                                                4.0,
-                                                egui::Stroke::new(
-                                                    1.0,
-                                                    egui::Color32::from_gray(58),
-                                                ),
-                                                egui::StrokeKind::Inside,
-                                            );
-                                            if self.pending_images.contains(&game.app_id) {
-                                                painter.text(
-                                                    egui::pos2(rect.center().x, rect.center().y + 24.0),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    "Loading cover art…",
-                                                    egui::FontId::proportional(14.0),
-                                                    egui::Color32::from_gray(140),
+                                            Some(texture) => {
+                                                // Landscape banner: keep the
+                                                // gradient card and the title,
+                                                // and lay the banner over the
+                                                // top of it at its own aspect.
+                                                let (rect, _response) = ui.allocate_exact_size(
+                                                    egui::vec2(250.0, 375.0),
+                                                    egui::Sense::hover(),
                                                 );
-                                            } else {
-                                                // Title card: game name wrapped across
-                                                // the card.
-                                                let galley = painter.layout(
-                                                    game.name.clone(),
-                                                    egui::FontId::proportional(20.0),
-                                                    egui::Color32::from_gray(180),
-                                                    rect.width() - 24.0,
+                                                let painter = ui.painter();
+                                                paint_cover_card_background(painter, rect);
+                                                let texture_size = texture.size_vec2();
+                                                // Fit the banner to the slot width,
+                                                // keeping its own aspect ratio.
+                                                let banner_height: f32 = if texture_size.x > 0.0 {
+                                                    (250.0 * texture_size.y / texture_size.x).min(250.0)
+                                                } else {
+                                                    117.0
+                                                };
+                                                let banner_rect = egui::Rect::from_min_size(
+                                                    rect.left_top(),
+                                                    egui::vec2(rect.width(), banner_height),
                                                 );
-                                                painter.galley(
-                                                    rect.center() - egui::vec2(
-                                                        galley.size().x * 0.5,
-                                                        galley.size().y * 0.5,
+                                                painter.image(
+                                                    texture.id(),
+                                                    banner_rect,
+                                                    egui::Rect::from_min_max(
+                                                        egui::pos2(0.0, 0.0),
+                                                        egui::pos2(1.0, 1.0),
                                                     ),
-                                                    galley,
-                                                    egui::Color32::from_gray(180),
+                                                    egui::Color32::WHITE,
                                                 );
+                                                paint_cover_card_title(painter, rect, &game.name);
+                                            }
+                                            None => {
+                                                // Styled fallback card: subtle vertical
+                                                // gradient + game title (or spinner while
+                                                // a cover download is in flight) — never
+                                                // a blank/broken texture.
+                                                let (rect, _response) = ui.allocate_exact_size(
+                                                    egui::vec2(250.0, 375.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                // Spinner is put BEFORE taking the
+                                                // painter handle (ui.put needs &mut ui).
+                                                if self.pending_images.contains(&game.app_id) {
+                                                    ui.put(
+                                                        egui::Rect::from_center_size(
+                                                            rect.center() - egui::vec2(0.0, 14.0),
+                                                            egui::vec2(30.0, 30.0),
+                                                        ),
+                                                        egui::Spinner::new().size(30.0),
+                                                    );
+                                                }
+                                                let painter = ui.painter();
+                                                paint_cover_card_background(painter, rect);
+                                                if self.pending_images.contains(&game.app_id) {
+                                                    painter.text(
+                                                        egui::pos2(rect.center().x, rect.center().y + 24.0),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        "Loading cover art…",
+                                                        egui::FontId::proportional(14.0),
+                                                        egui::Color32::from_gray(140),
+                                                    );
+                                                } else {
+                                                    // Title card: game name wrapped across
+                                                    // the card.
+                                                    paint_cover_card_title(painter, rect, &game.name);
+                                                }
                                             }
                                         }
                                     });
