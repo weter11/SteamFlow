@@ -1,8 +1,8 @@
 # SteamFlow History
 
-Covered up to: b12c52fe8dd8 (2026-02-28)
+Covered up to: 76d13f49bf7a (2026-03-25)
 
-Scope: 2026-02-13 – 2026-02-28 · 103 commits · 14 merged pull requests.
+Scope: 2026-02-13 – 2026-03-31 · 185 commits · 26 merged pull requests.
 
 ## February 2026
 
@@ -60,3 +60,30 @@ Each reason below was checked against the commit's own diff, not its subject lin
 - 762593c, d50bea3, a957d69, 8afeae0 — README/CONTRIBUTING/CI/documentation text only.
 
 Commits inside a documented PR's branch are covered by that PR's entry; a commit is listed individually only when its own diff changed behaviour.
+
+## March 2026
+
+2026-03-02: Steam launch stabilisation: overlay injection and CEF/steamwebhelper disabled, readiness detection by log mtime and already-running-instance check, MangoHud injection for raw Wine runners, runner component detection (bundled/prefix/system DXVK, VKD3D), and a SteamLaunchConfig (no-browser, no-friends, no-overlay, no-chat, no-VR, big-picture) exposed in settings. PR #22
+2026-03-03: Graphics layer management: DXVK, VKD3D and VKD3D-Proton installed into or removed from a prefix from the settings UI, with a GraphicsLayerConfig and generated DLL overrides. PR #23
+2026-03-04: WINEPREFIX resolution centralised in resolve_master_wineprefix and shared between the settings UI and the launch path, with improved master-prefix layout detection. PR #24
+2026-03-05: Launch refactored into a staged pipeline (resolve → prefix → components → command → spawn → finalize) behind a Runner abstraction, with structured per-session logging, stage timing and an override-conflict validator; unsafe default d3d/dxgi overrides dropped. PR #26
+2026-03-07: Diagnostics and preflight: effective-environment snapshot with sanity checks, preflight validation of exe/cwd/runner/prefix, per-DLL provider priority resolver (game-local > runner > system), per-profile graphics backend policy (Auto/WineD3D/DXVK/VKD3D), and per-session command/env/preflight artifacts. PR #27
+2026-03-07: Runner filesystem discovery with version parsing for wine-tkg and Proton layouts, plus authoritative game-path resolution. PR #28
+2026-03-08: WINEDLLPATH set for bundled DLLs and hybrid-graphics (PRIME) detection. PR #29
+2026-03-12: Per-game GPU selection, a conservative Auto graphics policy that stops aggressive environment injection, and a launch invariant validator that reports an effective launch configuration. PR #31
+2026-03-13: Architecture-aware strict DXVK policy: executable architecture detection feeds DLL validation and Wine log diagnostics. PR #32
+2026-03-15: Explicit DXVK made strict: no WineD3D fallback, strict-load and policy-violation invariants, and capability-set DLL validation. PR #33
+2026-03-17: Symlink deployment mode (component DLLs symlinked into the prefix), custom DXVK/VKD3D component paths, effective game prefix separated from runtime deployment, NVAPI component detection. PR #34
+2026-03-18: Launch verification record (verified / uncertain / failed_after_spawn) so an early-exiting process is no longer reported as a success; per-game NVAPI toggle; D3D10 and D3D10.1 validation. PR #35
+
+### March 2026 exclusions
+
+- 1105dd6 — Batman early-startup investigation: Wine log capture and pipeline instrumentation only.
+- 3477620 — Batman startup regression fix (invariant plus path handling); no new feature.
+- 9cae845 — stops emitting d3d10/d3d10_1 alias overrides; part of the same fix.
+- 71a4a7b — removes d3d10/d3d10_1 runtime logic and keeps real DXVK DLLs; fix-only.
+- eb1f22e — logs the Batman startup path next to Amnesia's for comparison; diagnostics only.
+- 76d13f4 — Batman early-startup fix plus extra environment diagnostics; fix-only.
+
+All 12 pull requests merged in March are documented above; no merged PR was skipped.
+
