@@ -1,9 +1,10 @@
 # SteamFlow History
 
-Covered up to: ba9c7b900987 (2026-07-31)
+Covered up to: 39699b3 (2026-08-15)
 
-Scope: 2026-02-13 – 2026-07-31 · 305 commits · 44 pull requests documented (43 merged in the range; PR #66 merged 2026-08-01 with a merge commit dated 2026-07-31).
-Entries: 61 — February 36, March 12, April 1, May 0, June 6, July 6.
+Scope: 2026-02-13 – 2026-08-15 · 400 author-dated commits · 58 pull requests documented of the 60 merged in range (#83 and #84 fall after this block's cutoff).
+Entries: 71 — February 36, March 12, April 1, May 0, June 6, July 7, August 9.
+PR dates follow their merge commits (e.g. PR #66: 2026-07-31).
 
 ## February 2026 — 36 entries
 
@@ -131,7 +132,7 @@ No new features or subsystems; documentation-only changes excluded.
 
 All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as exclusions above.
 
-## July 2026 — 6 entries
+## July 2026 — 7 entries
 
 2026-07-24: Steam Runtime readiness gate ahead of launch: signal-based polling with a 30 s cap and early exit, a per-game "requires Steam API" toggle, DX12 overlay suppression, and cached diagnostic parameters. PR #57
 2026-07-25: Per-game game runner override (Steam Runtime and game runner may differ), per-game Force WineD3D, a Smart Override action that matches the D3D12 policy to runner capabilities with vkd3d-proton → vkd3d fallback, and a Steam client self-update pin applied at launch. PR #60
@@ -139,6 +140,7 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 2026-07-27: Steam helper enforcement detached from game launch: disabled helpers (webhelper/CEF, friends) are enforced by PID with retries and a start-up delay, so a launch does not wait on them. PR #63
 2026-07-30: Wine Tools menu (winecfg, winefile, regedit, taskmgr) and a clean Windows Steam reinstall through the Wine uninstaller that stages user data aside, restores it afterwards, and can skip the client self-update. PR #65
 2026-07-31: Direct3D 7 (DX3–7) backend policy with D7VK auto/forced/off, VERSIONS.txt parsing for runner component versions, DXVK-NVAPI detection, an NVAPI checkbox in Graphics Rendering, and the Manual Overrides panel removed. PR #66
+2026-07-31: vkd3d-proton launches pair native d3d8/d3d9/d3d10core/d3d11 with DXVK's dxgi, the amd_ags builtin override applies only when the runner ships that builtin, and the effective-backend classifier keys off distinctive DLLs rather than dxgi alone. ba9c7b9
 
 ### July 2026 exclusions
 
@@ -147,3 +149,27 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 - ba9c7b9 (2026-07-31) — fix-only: native D3D/DXGI pairing for vkd3d-proton, conditional amd_ags override, and a stricter effective-backend classifier.
 
 6 of the 6 pull requests merged in July (API merged_at, 2026-07-01–2026-07-31) are documented above, plus PR #66 whose merged_at is 2026-08-01T00:27Z while its merge commit is dated 2026-07-31.
+
+## August 2026 — 9 entries (first half, 2026-08-01 → 2026-08-15)
+
+2026-08-01: Native Rhai game-fixup API: scripts call override_dll, disable_dll, disable_nvapi, set_reg_dword / set_reg_string, add_launch_arg and remove_env; fixup launch arguments and inline registry writes flow into the launch command, and translated protonfixes examples ship as seed scripts. PR #68
+2026-08-03: Windows Steam client onboarding: a Stage 1 login flow inside the launcher and Stage 2 registration of installed libraries in the Windows client, with session detection for modern Steam. PR #69
+2026-08-03: Steam client features are enabled by default and shown as positive controls (CEF browser, friends list, chat, overlay), with dependent options flagged while CEF is off. PR #71
+2026-08-05: Launch modes with a global selector — Steam-mediated and custom exec — Steam Features collapsed to a single CEF toggle, and library repair for the Windows client. PR #72 [steam-cdn] Read-only target files are made writable before the crate opens them for writing.
+2026-08-05: Downloads pause, resume and cancel from the launcher, with operation state carried through the download crate and reflected in the progress display. PR #76 [steam-cdn] Adds OperationController (pause/resume/cancel) and threads it, with aggregate progress callbacks, through manifest downloads.
+2026-08-05: File-level progress with an estimated remaining time, a reworked header layout, and cover-art retry. PR #77 [steam-cdn] download_depot reports per-file progress (path, done, total) beside the aggregate counter.
+2026-08-05: A multi-task progress queue, a Mods tab with a custom-executable launcher and mod-library indexing, and a cover-art priority chain (hero → library → header). PR #78
+2026-08-08: Depot access preflight with progress labels, and tier-aware cover-art fallbacks governed by a refresh cadence. PR #80 [steam-cdn] Depot VDF parsing moves to keyvalues_parser::parse and the crate builds without warnings.
+2026-08-15: Valve stack replication, Phases 1–3: pure-PE Proton 11.0, a native Rust Proton ABI, an environment-parity harness, VERSIONS.txt visibility, native prefix seeding, and master Steam session state synced into per-game prefixes. PR #82 [steam-cdn] Zstd (VSZa) chunk decoding added.
+
+### August 2026 exclusions
+
+- PR #67 (2026-08-01) — fix: game-local DLL priority becomes absolute and the amd_ags builtin override introduced by ba9c7b9 is removed; that supersedes the amd_ags part of the 2026-07-31 entry.
+- PR #73 (2026-08-05) — fix: [steam-cdn] SHA-1 chunk verification replaces the length-only resume skip in the crate; no launcher capability.
+- PR #74 (2026-08-05) — CI: workflow triggers reduced to a single push/PR run.
+- PR #79 (2026-08-06) — docs: AGENTS.md only.
+- PR #81 (2026-08-08) — fix: launch-option forwarding in the custom-exec path.
+- 0047c02, 5bd4cfd (2026-08-06) — agent-instruction documents (AGENTS.md rules, copilot instructions removed).
+- a06a58f (2026-08-08) — CI: pull_request trigger removed from rust.yaml.
+
+14 pull requests merged between 2026-08-01 and 2026-08-15 (API merged_at): 9 entries, 5 exclusions. The block stops at 39699b3, the merge of PR #82 and the last PR merge on that date; commits dated 2026-08-15 after it (f1873d5 onward, Phase 4.1–4.4) open the next block. PR #82's branch spans 2026-08-11 → 2026-08-15 and is included whole.
