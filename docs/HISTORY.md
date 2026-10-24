@@ -1,8 +1,8 @@
 # SteamFlow History
 
-Covered up to: 76d13f49bf7a (2026-03-25)
+Covered up to: ebf7f4420573 (2026-06-27)
 
-Scope: 2026-02-13 – 2026-03-31 · 185 commits · 26 merged pull requests.
+Scope: 2026-02-13 – 2026-06-27 · 229 commits · 37 merged pull requests.
 
 ## February 2026
 
@@ -88,3 +88,44 @@ All 14 pull requests merged in February are accounted for: 11 as entries, 3 as e
 
 All 12 pull requests merged in March are documented above; no merged PR was skipped.
 
+
+## April 2026
+
+2026-04-16: Windows Steam discovery toggle and per-game runtime option. PR #40
+
+### April 2026 exclusions
+
+- PR #36 (2026-04-15) — diagnostics only: Steam handoff diagnostics, running-instance detection, prefix resolution unification.
+- PR #37 (2026-04-16) — fix-only: SteamAPI visibility and per-game prefix settings.
+- PR #39 (2026-04-16) — CI maintenance: Node.js 20 deprecation and artifact uploads.
+- 3a40338, 5d4f33a — SteamAPI handshake diagnostics and prefix resolution fixes.
+
+## May 2026
+
+No new features or subsystems; documentation-only changes excluded.
+
+### May 2026 exclusions
+
+- c0222b7 — README clone-instruction text only.
+
+## June 2026
+
+2026-06-18: Emergency kill button (kill all Wine processes in a prefix) for prefix recovery. 5efe1c9
+2026-06-21: Modern Proton 11+ and CachyOS unified layout discovery. PR #46
+2026-06-21: Proton/Wine Manager in Settings. PR #47
+2026-06-21: Wine control panel settings action. PR #48
+2026-06-21: Steam and game runner routing split. PR #50
+2026-06-23: Repair/reinstall capability for the master Windows Steam prefix (backup/restore/repair lifecycle, full Steam Runtime lifecycle with bare Wine). PR #51
+
+### June 2026 exclusions
+
+- PR #43 (2026-06-18) — fix-only launch bugs; only the emergency kill button (5efe1c9) is documented above.
+- PR #56 (2026-06-25) — test relocation only.
+- 27a1fc1, dc2d8f7, 3f04f29, a308a0c, 284efb4, 087aefb, 5b84623, 93d3d32, ebf7f44 — diagnostic capture and WINEDEBUG experiments.
+- 30c0043, a558bca, 929e915 — launch-bug fixes.
+- d166f69, a9dd7ae — refactoring of component discovery (covered by PR #46).
+- f4b4d5c, e4e63a8, 46f96fa — covered by PR #47, PR #48, and PR #50.
+- a2c483b, 3aee8e4, 9596641 — covered by PR #51.
+- 36c5b87 — covered by PR #56.
+
+All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as exclusions above.
