@@ -2,7 +2,7 @@
 
 Covered up to: 488170b (2026-10-22)
 
-Scope: 2026-02-13 – 2026-10-24 · 442 author-dated commits · 68 merged pull requests documented.
+Scope: project commits on `main`, 2026-02-13 – 2026-10-24 (last project commit 2026-10-22) · 442 commits · 68 merged pull requests documented. The 15 documentation commits on this branch are not counted.
 Entries: 82 — February 36, March 12, April 1, May 0, June 6, July 7, August 17, September 2, October 1.
 PR dates follow their merge commits (e.g. PR #66: 2026-07-31); squash merges use the squash commit's date, and rebase merges the author date of the PR's final commit (PR #93: 2026-09-29).
 
@@ -140,13 +140,13 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 2026-07-27: Steam helper enforcement detached from game launch: disabled helpers (webhelper/CEF, friends) are enforced by PID with retries and a start-up delay, so a launch does not wait on them. PR #63
 2026-07-30: Wine Tools menu (winecfg, winefile, regedit, taskmgr) and a clean Windows Steam reinstall through the Wine uninstaller that stages user data aside, restores it afterwards, and can skip the client self-update. PR #65
 2026-07-31: Direct3D 7 (DX3–7) backend policy with D7VK auto/forced/off, VERSIONS.txt parsing for runner component versions, DXVK-NVAPI detection, an NVAPI checkbox in Graphics Rendering, and the Manual Overrides panel removed. PR #66
-2026-07-31: vkd3d-proton launches pair native d3d8/d3d9/d3d10core/d3d11 with DXVK's dxgi, the amd_ags builtin override applies only when the runner ships that builtin, and the effective-backend classifier keys off distinctive DLLs rather than dxgi alone. ba9c7b9
+2026-07-31: vkd3d-proton launches pair native d3d8/d3d9/d3d10core/d3d11 with DXVK's dxgi, the amd_ags builtin override applies only when the runner ships that builtin, and the effective-backend classifier keys off distinctive DLLs rather than dxgi alone; the amd_ags clause is superseded by PR #67 (2026-08-01), which drops that override. ba9c7b9
 
 ### July 2026 exclusions
 
 - PR #61 (2026-07-25) — internal helpers for runner and wineserver resolution (detect_wineserver_for_runner, kill_wineserver_in_prefix, resolve_effective_proton_name) serving runner-selection fixes; the runner-mixing capability is documented under PR #60.
 - a3f2f2c (2026-07-24) — CI configuration: Windows build steps commented out in .github/workflows/rust.yaml.
-- ba9c7b9 (2026-07-31) — fix-only: native D3D/DXGI pairing for vkd3d-proton, conditional amd_ags override, and a stricter effective-backend classifier.
+- ba9c7b9 (2026-07-31) — the fix-related portion is not described here; this functionality is covered in the entry at line 143.
 
 6 of the 6 pull requests merged in July (API merged_at, 2026-07-01–2026-07-31) are documented above, plus PR #66 whose merged_at is 2026-08-01T00:27Z while its merge commit is dated 2026-07-31.
 
@@ -201,7 +201,7 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 ## September 2026 — 2 entries
 
 2026-09-25: Connection-manager recovery: websocket resets recover transparently with bounded retry windows, recovery boundaries survive compound paths, and CLI test modes cover update, verify and install. PR #92
-2026-09-29: Steam login rebuilt on steam-vent 0.6.0 (vendored, with the upstream steam-vent PR #19): refresh-token login, cancelable password login on a persistent runtime, machine identity persisted outside session.json with owner-only atomic credential files, and connection-generation fencing of login commits. PR #93 [steam-cdn] The vendored crate moves to the split steam_vent_proto_* crates and a path-vendored steam-vent 0.6.0 (manifest and lockfile only).
+2026-09-29: Steam login rebuilt on steam-vent 0.6.0 (vendored, with the upstream steam-vent PR #19 — not SteamFlow PR #19): refresh-token login, cancelable password login on a persistent runtime, machine identity persisted outside session.json with owner-only atomic credential files, and connection-generation fencing of login commits. PR #93 [steam-cdn] The vendored crate moves to the split steam_vent_proto_* crates and a path-vendored steam-vent 0.6.0 (manifest and lockfile only).
 
 ### September 2026 exclusions
 
