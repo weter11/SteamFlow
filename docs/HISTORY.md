@@ -3,7 +3,7 @@
 Covered up to: 74c889a (2026-09-29)
 
 Scope: 2026-02-13 – 2026-09-30 · 436 author-dated commits · 67 merged pull requests documented.
-Entries: 79 — February 36, March 12, April 1, May 0, June 6, July 7, August 15, September 2.
+Entries: 81 — February 36, March 12, April 1, May 0, June 6, July 7, August 17, September 2.
 PR dates follow their merge commits (e.g. PR #66: 2026-07-31); squash merges use the squash commit's date, and rebase merges the author date of the PR's final commit (PR #93: 2026-09-29).
 
 ## February 2026 — 36 entries
@@ -150,12 +150,14 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 
 6 of the 6 pull requests merged in July (API merged_at, 2026-07-01–2026-07-31) are documented above, plus PR #66 whose merged_at is 2026-08-01T00:27Z while its merge commit is dated 2026-07-31.
 
-## August 2026 — 9 entries (first half, 2026-08-01 → 2026-08-15)
+## August 2026 — 11 entries (first half, 2026-08-01 → 2026-08-15)
 
+2026-08-01: Game-local DLL priority is absolute: a DLL the game ships itself is left untouched by override generation, and the blanket amd_ags override is dropped. PR #67
 2026-08-01: Native Rhai game-fixup API: scripts call override_dll, disable_dll, disable_nvapi, set_reg_dword / set_reg_string, add_launch_arg and remove_env; fixup launch arguments and inline registry writes flow into the launch command, and translated protonfixes examples ship as seed scripts. PR #68
 2026-08-03: Windows Steam client onboarding: a Stage 1 login flow inside the launcher and Stage 2 registration of installed libraries in the Windows client, with session detection for modern Steam. PR #69
 2026-08-03: Steam client features are enabled by default and shown as positive controls (CEF browser, friends list, chat, overlay), with dependent options flagged while CEF is off. PR #71
 2026-08-05: Launch modes with a global selector — Steam-mediated and custom exec — Steam Features collapsed to a single CEF toggle, and library repair for the Windows client. PR #72 [steam-cdn] Read-only target files are made writable before the crate opens them for writing.
+2026-08-05: Every on-disk chunk is checked against its manifest SHA-1 in all modes — install, update, repair and verify — with file length only a precondition for the check. PR #73 [steam-cdn] Resume and verify share one SHA-1 chunk check instead of a length-only skip.
 2026-08-05: Downloads pause, resume and cancel from the launcher, with operation state carried through the download crate and reflected in the progress display. PR #76 [steam-cdn] Adds OperationController (pause/resume/cancel) and threads it, with aggregate progress callbacks, through manifest downloads.
 2026-08-05: File-level progress with an estimated remaining time, a reworked header layout, and cover-art retry. PR #77 [steam-cdn] download_depot reports per-file progress (path, done, total) beside the aggregate counter.
 2026-08-05: A multi-task progress queue, a Mods tab with a custom-executable launcher and mod-library indexing, and a cover-art priority chain (hero → library → header). PR #78
@@ -164,15 +166,13 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 
 ### August 2026 exclusions
 
-- PR #67 (2026-08-01) — fix: game-local DLL priority becomes absolute and the amd_ags builtin override introduced by ba9c7b9 is removed; that supersedes the amd_ags part of the 2026-07-31 entry.
-- PR #73 (2026-08-05) — fix: [steam-cdn] SHA-1 chunk verification replaces the length-only resume skip in the crate; no launcher capability.
 - PR #74 (2026-08-05) — CI: workflow triggers reduced to a single push/PR run.
 - PR #79 (2026-08-06) — docs: AGENTS.md only.
 - PR #81 (2026-08-08) — fix: launch-option forwarding in the custom-exec path.
 - 0047c02, 5bd4cfd (2026-08-06) — agent-instruction documents (AGENTS.md rules, copilot instructions removed).
 - a06a58f (2026-08-08) — CI: pull_request trigger removed from rust.yaml.
 
-14 pull requests merged between 2026-08-01 and 2026-08-15 (API merged_at): 9 entries, 5 exclusions. The block stops at 39699b3, the merge of PR #82 and the last PR merge on that date; commits dated 2026-08-15 after it (f1873d5 onward, Phase 4.1–4.4) open the next block. PR #82's branch spans 2026-08-11 → 2026-08-15 and is included whole.
+14 pull requests merged between 2026-08-01 and 2026-08-15 (API merged_at): 11 entries, 3 exclusions. The block stops at 39699b3, the merge of PR #82 and the last PR merge on that date; commits dated 2026-08-15 after it (f1873d5 onward; Phase 4.1 starts at 3e05637) open the next block. PR #82's branch spans 2026-08-11 → 2026-08-15 and is included whole.
 
 ## August 2026 (second half) — 6 entries
 
@@ -190,7 +190,7 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 - PR #85 (2026-08-16) — docs: P2-RTX corruption investigation.
 - cfb639b (2026-08-15) — chore: runtime storage path moved to the config_dir convention.
 - a33f5f6, ff71bfe (2026-08-15) — Phase 4 status documents.
-- 6ea425e, 4dd1f14 (2026-08-15) — exec-bit handling for provisioned runtimes.
+- 6ea425e, 4dd1f14 (2026-08-15) — exec-bit handling for provisioned runtime trees (6ea425e also lands the Phase 4.4 note); this is what lets a downloaded runtime satisfy pressure-vessel preflight.
 - 9c1b5fa (2026-08-15) — test only.
 - 47fef59 (2026-08-22) — VRAM threshold tuning, reflected in the PR #88 entry.
 - d8319af (2026-08-31) — fix: custom-exec relative path.
@@ -201,7 +201,7 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 ## September 2026 — 2 entries
 
 2026-09-25: Connection-manager recovery: websocket resets recover transparently with bounded retry windows, recovery boundaries survive compound paths, and CLI test modes cover update, verify and install. PR #92
-2026-09-29: Steam login rebuilt on steam-vent 0.6.0 (vendored, with PR #19): refresh-token login, cancelable password login on a persistent runtime, machine identity persisted outside session.json with owner-only atomic credential files, and connection-generation fencing of login commits. PR #93 [steam-cdn] The vendored crate moves to the split steam_vent_proto_* crates and a path-vendored steam-vent 0.6.0 (manifest and lockfile only).
+2026-09-29: Steam login rebuilt on steam-vent 0.6.0 (vendored, with the upstream steam-vent PR #19): refresh-token login, cancelable password login on a persistent runtime, machine identity persisted outside session.json with owner-only atomic credential files, and connection-generation fencing of login commits. PR #93 [steam-cdn] The vendored crate moves to the split steam_vent_proto_* crates and a path-vendored steam-vent 0.6.0 (manifest and lockfile only).
 
 ### September 2026 exclusions
 
