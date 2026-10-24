@@ -67,15 +67,20 @@ attributed by ancestry; their PR comes from `GET /repos/weter11/SteamFlow/commit
 `src/cdn/manifest/error.rs` (+7: `From<TryGetError>`), `src/cdn/manifest/file.rs` (+2/−1: app_id passed to
 `get_chunk`), `src/cdn/manifest/mod.rs` (+4: app_id field). The full patch is in the appendix.
 
-## 4. Current tree vs 1.0.0 (`main` @ `488170b1`, 2026-10-22)
+## 4. Current tree vs 1.0.0 (`main` @ `488170b1`, author date 2026-10-22; committer date 2026-10-23)
 
 `diff -ru` of the published crate against `vendor/steam-cdn` as of `main`: 14 paths change — 13 modified,
-1 added (`vendor/steam-cdn/src/utils/zstd.rs`, new, 62 lines), none removed; +2037 / −1098 lines in total,
-of which `Cargo.lock` accounts for +1420 / −1010, leaving +617 / −88 in code and manifests.
+1 added (`vendor/steam-cdn/src/utils/zstd.rs`, new, 62 lines), none removed. The raw `diff -ru` reports 16
+paths, because `.cargo_vcs_info.json` and `.gitignore` are absent from the vendored tree; both are excluded
+from these figures, for the reason given under "Line endings" below.
+
+Figures measured with `git diff --numstat --no-index` over LF-normalised trees (1.0.0 vs `main@488170b1`):
++2043 / −1104 lines in total, of which `Cargo.lock` accounts for +1424 / −1014, leaving +619 / −90 in code
+and manifests.
 
 | Path | Added | Removed |
 |------|-------|---------|
-| `vendor/steam-cdn/Cargo.lock` | +1420 | −1010 |
+| `vendor/steam-cdn/Cargo.lock` | +1424 | −1014 |
 | `vendor/steam-cdn/Cargo.toml` | +17 | −2 |
 | `vendor/steam-cdn/examples/download_manifest.rs` | +5 | −9 |
 | `vendor/steam-cdn/src/cdn/depot.rs` | +1 | −1 |
@@ -83,7 +88,7 @@ of which `Cargo.lock` accounts for +1420 / −1010, leaving +617 / −88 in code
 | `vendor/steam-cdn/src/cdn/inner.rs` | +31 | −12 |
 | `vendor/steam-cdn/src/cdn/manifest/error.rs` | +7 | −0 |
 | `vendor/steam-cdn/src/cdn/manifest/file.rs` | +226 | −9 |
-| `vendor/steam-cdn/src/cdn/manifest/mod.rs` | +77 | −41 |
+| `vendor/steam-cdn/src/cdn/manifest/mod.rs` | +79 | −43 |
 | `vendor/steam-cdn/src/cdn/mod.rs` | +182 | −10 |
 | `vendor/steam-cdn/src/lib.rs` | +2 | −2 |
 | `vendor/steam-cdn/src/utils/mod.rs` | +1 | −0 |
@@ -92,19 +97,37 @@ of which `Cargo.lock` accounts for +1420 / −1010, leaving +617 / −88 in code
 
 Significant changes:
 
-- API. `CDNClient::new(connection)`, `CDNClient::with_server` / `with_servers`, `download_depot(app_id, depot_id,
-  manifest_gid, key, target_dir)`, `ManifestFile::download(depot_key, target_path, verify_mode, on_progress,
-  controller, …)`, and `OperationController` with `pause` / `resume` / `cancel` / `is_paused` / `is_cancelled`.
-  `web_api` is now a public module, `lib.rs` re-exports `OperationController`, and `ManifestError` gains
-  `From<TryGetError>`.
+- API. `CDNClient::new(connection)`, `CDNClient::with_server` / `with_servers`, and `OperationController` with
+  `pause` / `resume` / `cancel` / `is_paused` / `is_cancelled`. `web_api` is now a public module, `lib.rs`
+  re-exports `OperationController`, and `ManifestError` gains `From<TryGetError>`.
+- `CDNClient::download_depot` takes twelve parameters, in order: `app_id`, `depot_id`, `manifest_id`,
+  `depot_key`, `target_dir`, `manifest_request_code`, `verify_mode`, `abort_signal`, `operation_controller`,
+  `on_progress`, `on_manifest`, `on_file_progress`. None are omitted here.
+- `ManifestFile::download` takes `depot_key`, `target_path`, `verify_mode`, `abort_signal`,
+  `operation_controller`, `max_tasks`, `on_progress` — all seven, in that order.
+- `InnerClient::remote_cmd_with_auth` is new: it appends `?token=` to the URL and sends an `x-cdn-auth-token`
+  header when the selected server carries an auth token. Its `app_id` / `depot_id` parameters are declared but
+  unused (`_app_id`, `_depot_id`). `remote_cmd` still exists alongside it.
+- `CDNServer` now derives `Clone` and carries `auth_token: Option<String>`.
 - Dependencies. `steam-vent` 0.3 → path `../steam-vent` (the vendored 0.6.0 plus PR #19), split into
   `steam-vent-proto-common` 0.5.1 and `steam-vent-proto-steam` 0.5.2; added `sha1` 0.10, `tracing` 0.1,
-  `zstd` 0.13; `zip` 2.2 → 2.2.2.
-- Behaviour. Downloads are pausable and cancellable, verify mode runs a per-chunk deep check, resume compares
-  the length of an existing file, tool-replaced read-only targets are handled, on-disk casing is resolved before
-  verification, and chunk decoding covers zip, LZMA (`VZa`) and Zstd (`VSZa`, new `utils/zstd.rs`, added in PR #82 / 579293e).
-- Examples. `examples/download_manifest.rs` follows the new `get_manifest(app_id, …)` and
-  `download(depot_key, target_path, verify_mode, …)` signatures.
+  `zstd` 0.13; `zip` 2.2 → 2.2.2; `reqwest` is unchanged at 0.11. Imports move to `steam_vent_proto_common`
+  and `steam_vent_proto_steam`, and `depot.rs` switches from `Vdf::parse(vdf)` to
+  `keyvalues_parser::parse(vdf).map(Vdf::from)`.
+- Behaviour. SHA-1 verification of each chunk runs in every mode — install, update, repair and verify — since
+  PR #73 (`a3af687`, "hash-check chunks before resume-skip in all modes"); `verify_mode` survives as a parameter
+  and as a field in the "Corruption detected in chunk …" log line, but it does not gate the check. The length of
+  an existing file is only a precondition: a chunk is skipped only when its SHA-1 matches the manifest, so a
+  same-size corrupt chunk is re-fetched. Downloads are pausable and cancellable, tool-replaced read-only targets
+  are handled, on-disk casing is resolved before verification, and chunk decoding covers zip, LZMA (`VZa`) and
+  Zstd (`VSZa`, new `utils/zstd.rs`, added in PR #82 / 579293e).
+- Manifest parsing. `manifest/mod.rs` rewrites payload/metadata decoding: zip sniffing, the magic-wrapped
+  protobuf sequence and a raw-protobuf fallback, with `app_id` / `depot_id` / `manifest_gid` plumbed through.
+- Examples. `examples/download_manifest.rs` follows the new `get_manifest(app_id, …)` signature, but its
+  `download` call passes six arguments to the seven-parameter function, so the example does not compile. This
+  was established by counting arguments against the signature; the example was not built.
+- PR attribution. Commit `3429171` (the crate's `src/cdn/mod.rs` changes) is attributed to PR #77 because that
+  merge (`a97abd4`) first brought it into the history; PR #78 (`167c7cf`) contains it only as an ancestor.
 
 Line endings: the `.crate` ships CRLF in `Cargo.toml.orig` and `LICENSE`, while the vendored tree is LF. Both
 sides were normalised to LF (`sed 's/\r$//'`) before diffing, so line-ending-only differences are excluded, and
