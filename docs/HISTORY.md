@@ -3,8 +3,9 @@
 Covered up to: ebf7f4420573 (2026-06-27)
 
 Scope: 2026-02-13 – 2026-06-27 · 229 commits · 37 merged pull requests.
+Entries: 55 — February 36, March 12, April 1, May 0, June 6.
 
-## February 2026
+## February 2026 — 36 entries
 
 2026-02-13: Initial commit — Rust Steam client scaffold (steam-vent protocol, egui/eframe UI, Proton/Wine launch integration). 34ee632
 2026-02-13: Reorganize project folders (manifest parsing hardening). 15f0505
@@ -18,11 +19,11 @@ Scope: 2026-02-13 – 2026-06-27 · 229 commits · 37 merged pull requests.
 2026-02-15: Permissive VDF parsing, fuzzy VDF fallback, depot selection feedback, and install pipeline improvements. PR #4
 2026-02-16: Account tab, logout, and robust VDF parsing (PICS binary VDF, hybrid parsing, language filtering). PR #7
 2026-02-16: Depot Manager and selective installation. c4b591c
-2026-02-17: Server resolution added to game installation, with steam-cdn vendored for the hybrid download pipeline and strict CDN server filtering. PR #8 (merged from b3c661c, 0542112) [steam-cdn] Vendored steam-cdn 1.0.0 (patched for steam-vent 0.4) with CDNClient::download_depot and the CDNAuthToken handshake.
-2026-02-17: ContentServerDirectory service and CDN auth tokens. PR #9 [steam-cdn] Added ContentServerDirectory service and CDN auth token injection in the vendored crate.
-2026-02-17: Portability improvements, lazy metadata/image fetching, and download progress bar. PR #10 [steam-cdn] Improved CDN metadata resolution and lazy fetching in the vendored crate.
-2026-02-18: App manifest writer with version tracking, logo/asset refresh, and unified download pipeline with smart updates. PR #12 (merged from f871154, f876dab) [steam-cdn] Unified download pipeline with smart updates in the vendored crate.
-2026-02-18: Unified download pipeline, Verify Mode, Pause/Resume, custom launch options, and environment variables. PR #13 [steam-cdn] Unified download pipeline with Pause/Resume and Verify Mode in the vendored crate.
+2026-02-17: Server resolution added to game installation, with steam-cdn vendored for the hybrid download pipeline and strict CDN server filtering. PR #8 (merged from b3c661c, 0542112) [steam-cdn] Vendored steam-cdn 1.0.0 with a local patch adding `CDNClient::download_depot`, the `GetCDNAuthToken` handshake, and the steam-vent 0.3 → 0.4 bump.
+2026-02-17: ContentServerDirectory service and CDN auth tokens. PR #9 [steam-cdn] Added `x-cdn-auth-token` header and `?token=` propagation, plus zip detection in manifest deserialisation.
+2026-02-17: Portability improvements, lazy metadata/image fetching, and download progress bar. PR #10 [steam-cdn] Added `on_progress` / `on_manifest` callback hooks.
+2026-02-18: App manifest writer with version tracking, logo/asset refresh, and unified download pipeline with smart updates. PR #12 (merged from f871154, f876dab) [steam-cdn] Added `ManifestFile::download()` with per-chunk verification.
+2026-02-18: Unified download pipeline, Verify Mode, Pause/Resume, custom launch options, and environment variables. PR #13 [steam-cdn] Added existing-file length comparison for resume/delta; Verify Mode itself lives in SteamFlow, not in the crate.
 2026-02-18: Image cache directory support (config_dir, opensteam_image_cache_dir). 6bc4524
 2026-02-19: Library cache loaded on startup before session restoration. PR #17
 2026-02-20: Master Prefix architecture for Ghost Steam introduced. b0a195b
@@ -50,6 +51,7 @@ Each reason below was checked against the commit's own diff, not its subject lin
 - PR #1 (2026-02-14) — fix-only, compilation/clippy/CI: 050e18a, ac5184c, 2758f80.
 - PR #2 (2026-02-15) — fix-only, Tokio runtime panics, Proton path resolution, Steam identity for native Linux, platform/VDF/launch-option fixes: 4ce501a, ead3cf7, 087ee68, 9bd5300.
 - PR #20 (2026-02-27) — fix-only, runner mismatch, IPC safety lock, background Steam launch sequence: b96a56a, 9192d69, 51020a7.
+- PR #19 (2026-02-27) — diagnostic scaffolding: the "Ultimate Batch Debugger" is a debug block written into the generated .bat (a2fb219), not a feature.
 - 24ff957 — fix-only: background Steam launch made path-safe inside Wine's cmd.exe (`cd /d` before `start steam.exe`).
 - 41ff40d — debug prints plus a get_launch_info → get_product_info rename; no behaviour change.
 - 51bb2cde — VDF/depot debug logging (hex dump) plus one unit test for should_keep_depot().
@@ -60,9 +62,9 @@ Each reason below was checked against the commit's own diff, not its subject lin
 
 Commits inside a documented PR's branch are covered by that PR's entry; a commit is listed individually only when its own diff changed behaviour.
 
-All 14 pull requests merged in February are accounted for: 11 as entries, 3 as exclusions above.
+All 14 pull requests merged in February are accounted for: 10 entries, 4 exceptions.
 
-## March 2026
+## March 2026 — 12 entries
 
 2026-03-02: Steam launch stabilisation: overlay injection and CEF/steamwebhelper disabled, readiness detection by log mtime and already-running-instance check, MangoHud injection for raw Wine runners, runner component detection (bundled/prefix/system DXVK, VKD3D), and a SteamLaunchConfig (no-browser, no-friends, no-overlay, no-chat, no-VR, big-picture) exposed in settings. PR #22
 2026-03-03: Graphics layer management: DXVK, VKD3D and VKD3D-Proton installed into or removed from a prefix from the settings UI, with a GraphicsLayerConfig and generated DLL overrides. PR #23
@@ -89,18 +91,17 @@ All 14 pull requests merged in February are accounted for: 11 as entries, 3 as e
 All 12 pull requests merged in March are documented above; no merged PR was skipped.
 
 
-## April 2026
+## April 2026 — 1 entry
 
-2026-04-16: Windows Steam discovery toggle and per-game runtime option. PR #40
+2026-04-19: Windows Steam discovery toggle and per-game runtime option. PR #40
 
 ### April 2026 exclusions
 
 - PR #36 (2026-04-15) — diagnostics only: Steam handoff diagnostics, running-instance detection, prefix resolution unification.
 - PR #37 (2026-04-16) — fix-only: SteamAPI visibility and per-game prefix settings.
 - PR #39 (2026-04-16) — CI maintenance: Node.js 20 deprecation and artifact uploads.
-- 3a40338, 5d4f33a — SteamAPI handshake diagnostics and prefix resolution fixes.
 
-## May 2026
+## May 2026 — 0 entries
 
 No new features or subsystems; documentation-only changes excluded.
 
@@ -108,7 +109,7 @@ No new features or subsystems; documentation-only changes excluded.
 
 - c0222b7 — README clone-instruction text only.
 
-## June 2026
+## June 2026 — 6 entries
 
 2026-06-18: Emergency kill button (kill all Wine processes in a prefix) for prefix recovery. 5efe1c9
 2026-06-21: Modern Proton 11+ and CachyOS unified layout discovery. PR #46
@@ -121,7 +122,7 @@ No new features or subsystems; documentation-only changes excluded.
 
 - PR #43 (2026-06-18) — fix-only launch bugs; only the emergency kill button (5efe1c9) is documented above.
 - PR #56 (2026-06-25) — test relocation only.
-- 27a1fc1, dc2d8f7, 3f04f29, a308a0c, 284efb4, 087aefb, 5b84623, 93d3d32, ebf7f44 — diagnostic capture and WINEDEBUG experiments.
+- PR #57 (merged 2026-07-24) — diagnostic capture and WINEDEBUG experiments: 27a1fc1, dc2d8f7, 3f04f29, a308a0c, 284efb4, 087aefb, 5b84623, 93d3d32, ebf7f44; the PR's remaining three commits (78073ca, b9927f3, 3951421) are dated 2026-07-24 and belong to the July section.
 - 30c0043, a558bca, 929e915 — launch-bug fixes.
 - d166f69, a9dd7ae — refactoring of component discovery (covered by PR #46).
 - f4b4d5c, e4e63a8, 46f96fa — covered by PR #47, PR #48, and PR #50.
