@@ -1,9 +1,9 @@
 # SteamFlow History
 
-Covered up to: ebf7f4420573 (2026-06-27)
+Covered up to: ba9c7b900987 (2026-07-31)
 
-Scope: 2026-02-13 – 2026-06-27 · 229 commits · 37 merged pull requests.
-Entries: 55 — February 36, March 12, April 1, May 0, June 6.
+Scope: 2026-02-13 – 2026-07-31 · 305 commits · 44 pull requests documented (43 merged in the range; PR #66 merged 2026-08-01 with a merge commit dated 2026-07-31).
+Entries: 61 — February 36, March 12, April 1, May 0, June 6, July 6.
 
 ## February 2026 — 36 entries
 
@@ -130,3 +130,20 @@ No new features or subsystems; documentation-only changes excluded.
 - 36c5b87 — covered by PR #56.
 
 All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as exclusions above.
+
+## July 2026 — 6 entries
+
+2026-07-24: Steam Runtime readiness gate ahead of launch: signal-based polling with a 30 s cap and early exit, a per-game "requires Steam API" toggle, DX12 overlay suppression, and cached diagnostic parameters. PR #57
+2026-07-25: Per-game game runner override (Steam Runtime and game runner may differ), per-game Force WineD3D, a Smart Override action that matches the D3D12 policy to runner capabilities with vkd3d-proton → vkd3d fallback, and a Steam client self-update pin applied at launch. PR #60
+2026-07-26: Steam feature enforcement after start-up: CEF/webhelper processes spawned in the prefix are detected once Steam is up and dropped to chmod 000, steamservice.exe joins the kill list, Steam respawns with the user's feature settings, and the no-VR / big-picture toggles are removed. PR #62
+2026-07-27: Steam helper enforcement detached from game launch: disabled helpers (webhelper/CEF, friends) are enforced by PID with retries and a start-up delay, so a launch does not wait on them. PR #63
+2026-07-30: Wine Tools menu (winecfg, winefile, regedit, taskmgr) and a clean Windows Steam reinstall through the Wine uninstaller that stages user data aside, restores it afterwards, and can skip the client self-update. PR #65
+2026-07-31: Direct3D 7 (DX3–7) backend policy with D7VK auto/forced/off, VERSIONS.txt parsing for runner component versions, DXVK-NVAPI detection, an NVAPI checkbox in Graphics Rendering, and the Manual Overrides panel removed. PR #66
+
+### July 2026 exclusions
+
+- PR #61 (2026-07-25) — internal helpers for runner and wineserver resolution (detect_wineserver_for_runner, kill_wineserver_in_prefix, resolve_effective_proton_name) serving runner-selection fixes; the runner-mixing capability is documented under PR #60.
+- a3f2f2c (2026-07-24) — CI configuration: Windows build steps commented out in .github/workflows/rust.yaml.
+- ba9c7b9 (2026-07-31) — fix-only: native D3D/DXGI pairing for vkd3d-proton, conditional amd_ags override, and a stricter effective-backend classifier.
+
+6 of the 6 pull requests merged in July (API merged_at, 2026-07-01–2026-07-31) are documented above, plus PR #66 whose merged_at is 2026-08-01T00:27Z while its merge commit is dated 2026-07-31.
