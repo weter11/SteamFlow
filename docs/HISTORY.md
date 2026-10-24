@@ -1,10 +1,10 @@
 # SteamFlow History
 
-Covered up to: 39699b3 (2026-08-15)
+Covered up to: 74c889a (2026-09-29)
 
-Scope: 2026-02-13 – 2026-08-15 · 400 author-dated commits · 58 pull requests documented of the 60 merged in range (#83 and #84 fall after this block's cutoff).
-Entries: 71 — February 36, March 12, April 1, May 0, June 6, July 7, August 9.
-PR dates follow their merge commits (e.g. PR #66: 2026-07-31).
+Scope: 2026-02-13 – 2026-09-30 · 436 author-dated commits · 67 merged pull requests documented.
+Entries: 79 — February 36, March 12, April 1, May 0, June 6, July 7, August 15, September 2.
+PR dates follow their merge commits (e.g. PR #66: 2026-07-31); squash merges use the squash commit's date, and rebase merges the author date of the PR's final commit (PR #93: 2026-09-29).
 
 ## February 2026 — 36 entries
 
@@ -173,3 +173,39 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 - a06a58f (2026-08-08) — CI: pull_request trigger removed from rust.yaml.
 
 14 pull requests merged between 2026-08-01 and 2026-08-15 (API merged_at): 9 entries, 5 exclusions. The block stops at 39699b3, the merge of PR #82 and the last PR merge on that date; commits dated 2026-08-15 after it (f1873d5 onward, Phase 4.1–4.4) open the next block. PR #82's branch spans 2026-08-11 → 2026-08-15 and is included whole.
+
+## August 2026 (second half) — 6 entries
+
+2026-08-15: Steam modes and containerised launches: SteamMode (Auto / Offline Emulated / Online Containerized), a local steam_api emulator for clientless launches, SteamRT4 runtime provisioning with pressure-vessel and bwrap command building, a containerised launch pipeline with a Steam IPC bridge, and a runtime repair command with UI status. 3e05637, 6f3212a, 6cc5e18, b8e9d19
+2026-08-15: Windows Steam onboarding runs automatically when no session exists, and Shared-mode custom-exec launches prefer the prefix that holds a persisted login. fba444b, a587508
+2026-08-15: Configuration guard that rejects Online Containerized with a non-Proton runner at save time. PR #84
+2026-08-16: The launcher repaints only when work arrives, so an idle window stays at ~0% CPU. PR #86
+2026-08-16: dxvk_enabled=false is honoured end to end: the resolver offers no DXVK candidates, game-local DLLs still win, and clean and RTX Remix runner profiles are separated. PR #87
+2026-08-22: Pre-launch VRAM guard with a warning modal (75% threshold), the installed beta branch shown in the properties panel, and the egui/eframe stack at 0.36.1. PR #88
+
+### August 2026 exclusions (second half)
+
+- f1873d5 (2026-08-15) — fix: custom-exec honours the effective prefix mode (runner-mismatch guard).
+- PR #83 (2026-08-15) — docs: Phase 4 umbrella overview.
+- PR #85 (2026-08-16) — docs: P2-RTX corruption investigation.
+- cfb639b (2026-08-15) — chore: runtime storage path moved to the config_dir convention.
+- a33f5f6, ff71bfe (2026-08-15) — Phase 4 status documents.
+- 6ea425e, 4dd1f14 (2026-08-15) — exec-bit handling for provisioned runtimes.
+- 9c1b5fa (2026-08-15) — test only.
+- 47fef59 (2026-08-22) — VRAM threshold tuning, reflected in the PR #88 entry.
+- d8319af (2026-08-31) — fix: custom-exec relative path.
+- 75c80ca, 55c5b6f, d6fba3a (2026-08-31) — audit document revisions.
+
+6 of the 6 pull requests merged in 2026-08-15–2026-08-31 and not already documented (#83–#88) are accounted for: 4 entries, 2 exclusions.
+
+## September 2026 — 2 entries
+
+2026-09-25: Connection-manager recovery: websocket resets recover transparently with bounded retry windows, recovery boundaries survive compound paths, and CLI test modes cover update, verify and install. PR #92
+2026-09-29: Steam login rebuilt on steam-vent 0.6.0 (vendored, with PR #19): refresh-token login, cancelable password login on a persistent runtime, machine identity persisted outside session.json with owner-only atomic credential files, and connection-generation fencing of login commits. PR #93 [steam-cdn] The vendored crate moves to the split steam_vent_proto_* crates and a path-vendored steam-vent 0.6.0 (manifest and lockfile only).
+
+### September 2026 exclusions
+
+- PR #90 (2026-09-01) — docs: README project status and architecture overview.
+- e2735f4 (2026-09-01) — docs: README status revision.
+
+3 of the 3 pull requests merged in 2026-09-01–2026-09-30 (#90, #92, #93) are accounted for: 2 entries, 1 exclusion. PR #93 was rebase-merged, so it has no merge commit: its date is the author date of its final commit and its PR number comes from the commits/{sha}/pulls API.
