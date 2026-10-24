@@ -18,11 +18,11 @@ Scope: 2026-02-13 – 2026-06-27 · 229 commits · 37 merged pull requests.
 2026-02-15: Permissive VDF parsing, fuzzy VDF fallback, depot selection feedback, and install pipeline improvements. PR #4
 2026-02-16: Account tab, logout, and robust VDF parsing (PICS binary VDF, hybrid parsing, language filtering). PR #7
 2026-02-16: Depot Manager and selective installation. c4b591c
-2026-02-17: Server resolution added to game installation, with steam-cdn vendored for the hybrid download pipeline and strict CDN server filtering. PR #8 (merged from b3c661c, 0542112)
-2026-02-17: ContentServerDirectory service and CDN auth tokens. PR #9
-2026-02-17: Portability improvements, lazy metadata/image fetching, and download progress bar. PR #10
-2026-02-18: App manifest writer with version tracking, logo/asset refresh, and unified download pipeline with smart updates. PR #12 (merged from f871154, f876dab)
-2026-02-18: Unified download pipeline, Verify Mode, Pause/Resume, custom launch options, and environment variables. PR #13
+2026-02-17: Server resolution added to game installation, with steam-cdn vendored for the hybrid download pipeline and strict CDN server filtering. PR #8 (merged from b3c661c, 0542112) [steam-cdn] Vendored steam-cdn 1.0.0 (patched for steam-vent 0.4) with CDNClient::download_depot and the CDNAuthToken handshake.
+2026-02-17: ContentServerDirectory service and CDN auth tokens. PR #9 [steam-cdn] Added ContentServerDirectory service and CDN auth token injection in the vendored crate.
+2026-02-17: Portability improvements, lazy metadata/image fetching, and download progress bar. PR #10 [steam-cdn] Improved CDN metadata resolution and lazy fetching in the vendored crate.
+2026-02-18: App manifest writer with version tracking, logo/asset refresh, and unified download pipeline with smart updates. PR #12 (merged from f871154, f876dab) [steam-cdn] Unified download pipeline with smart updates in the vendored crate.
+2026-02-18: Unified download pipeline, Verify Mode, Pause/Resume, custom launch options, and environment variables. PR #13 [steam-cdn] Unified download pipeline with Pause/Resume and Verify Mode in the vendored crate.
 2026-02-18: Image cache directory support (config_dir, opensteam_image_cache_dir). 6bc4524
 2026-02-19: Library cache loaded on startup before session restoration. PR #17
 2026-02-20: Master Prefix architecture for Ghost Steam introduced. b0a195b
