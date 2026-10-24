@@ -29,19 +29,18 @@ Scope: 2026-02-13 – 2026-03-31 · 185 commits · 26 merged pull requests.
 2026-02-20: Windows Proton launch environment injection and shielding (WINEPATH, SteamGameId, working directory, env shields). ff83210
 2026-02-20: "Trojan Horse" batch script for registry healing and DRM reliability. 303bd65
 2026-02-20: Background Steam and game launch unified into a single batch script. e2bc51c
-2026-02-21: Properties modal removed; beta-branch selection and environment-variable editing moved into the per-game Properties tab, with lazy "Check for Beta Branches" and a persistent edit buffer that no longer resets every frame. 8a36327
+2026-02-21: Properties modal removed; beta-branch selection and environment-variable editing moved into the per-game Properties tab, with lazy "Check for Beta Branches" and a persistent edit buffer that does not reset every frame. 8a36327
 2026-02-24: Master Prefix architecture finalized (environment shields, native vstdlib/tier0 DLL forcing). b7db597
 2026-02-25: Prefix Surgery added to Trojan Horse script. 6c36f7d
 2026-02-25: Trojan Horse script drops a physical steam_appid.txt for Source Engine games and the Steam boot wait grows to 10 s. 9e33c0c
-2026-02-25: Launch script invoked through `cmd /c`, with tasklist output redirected to a physical C:\steamflow_debug.txt. b933f32
+2026-02-25: Launch script invoked through `cmd /c`. b933f32
 2026-02-26: Ghost Executable evasion (ghost_steam.exe decoy) — temporary experiment; reverted the same day in 33573fc. b41f9dc
 2026-02-26: Trojan Horse script simplified: ghost decoy, DLL nuking (Prefix Surgery) and registry healing dropped; runner resolution extended to bare wine/wine64 binaries. 33573fc
 2026-02-26: Smart runner resolution and standard Wine command structure. b66b9b0
 2026-02-26: Batch script replaced with native Rust process orchestration. 765f87a
 2026-02-26: Master Prefix architecture merged. PR #18
-2026-02-27: Ultimate Batch Debugger added to Windows Proton launch script. PR #19
-2026-02-28: Proton launch logic refactored: master steam.exe discovery helper, WINEPREFIX derived by walking up from steam.exe, actionable error when Steam is not installed. 18d8944
-2026-02-28: SteamPrefixMode (shared master prefix vs per-game prefix) added to settings and per-game Properties; Cloud Sync upload now actually gated by the cloud-sync toggle. 084c947
+2026-02-28: Proton launch logic refactored: master steam.exe discovery helper, WINEPREFIX derived by walking up from steam.exe. 18d8944
+2026-02-28: SteamPrefixMode (shared master prefix vs per-game prefix) added to settings and per-game Properties; Cloud Sync upload gated by the cloud-sync toggle. 084c947
 2026-02-28: Proton runner decoupled from Steam Runtime toggle. PR #21
 
 ### February 2026 exclusions
@@ -76,7 +75,7 @@ All 14 pull requests merged in February are accounted for: 11 as entries, 3 as e
 2026-03-13: Architecture-aware strict DXVK policy: executable architecture detection feeds DLL validation and Wine log diagnostics. PR #32
 2026-03-15: Explicit DXVK made strict: no WineD3D fallback, strict-load and policy-violation invariants, and capability-set DLL validation. PR #33
 2026-03-17: Symlink deployment mode (component DLLs symlinked into the prefix), custom DXVK/VKD3D component paths, effective game prefix separated from runtime deployment, NVAPI component detection. PR #34
-2026-03-18: Launch verification record (verified / uncertain / failed_after_spawn) so an early-exiting process is no longer reported as a success; per-game NVAPI toggle; D3D10 and D3D10.1 validation. PR #35
+2026-03-18: Launch verification record (verified / uncertain / failed_after_spawn) for early-exiting processes; per-game NVAPI toggle; D3D10 and D3D10.1 validation. PR #35
 
 ### March 2026 exclusions
 
