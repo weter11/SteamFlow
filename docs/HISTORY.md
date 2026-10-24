@@ -1,9 +1,9 @@
 # SteamFlow History
 
-Covered up to: 74c889a (2026-09-29)
+Covered up to: 488170b (2026-10-22)
 
-Scope: 2026-02-13 – 2026-09-30 · 436 author-dated commits · 67 merged pull requests documented.
-Entries: 81 — February 36, March 12, April 1, May 0, June 6, July 7, August 17, September 2.
+Scope: 2026-02-13 – 2026-10-24 · 442 author-dated commits · 68 merged pull requests documented.
+Entries: 82 — February 36, March 12, April 1, May 0, June 6, July 7, August 17, September 2, October 1.
 PR dates follow their merge commits (e.g. PR #66: 2026-07-31); squash merges use the squash commit's date, and rebase merges the author date of the PR's final commit (PR #93: 2026-09-29).
 
 ## February 2026 — 36 entries
@@ -209,3 +209,13 @@ All 11 pull requests merged in April-June are accounted for: 6 as entries, 5 as 
 - e2735f4 (2026-09-01) — docs: README status revision.
 
 3 of the 3 pull requests merged in 2026-09-01–2026-09-30 (#90, #92, #93) are accounted for: 2 entries, 1 exclusion. PR #93 was rebase-merged, so it has no merge commit: its date is the author date of its final commit and its PR number comes from the commits/{sha}/pulls API.
+
+## October 2026 — 1 entry
+
+2026-10-22: Cover-art service with per-variant cache state: every art variant is cached and revalidated on its own, a transient store lookup backs off while the cached asset stays on screen, a good asset is kept through transient failures, obsolete cache files migrate away, and the UI draws artwork undistorted and always delivers a result. PR #94
+
+### October 2026 exclusions
+
+- None. All six commits in this block belong to PR #94; its test (e4b77e5) and formatting (450ff32) commits are covered by the entry, and no other commits landed in October.
+
+1 of the 1 pull requests merged in 2026-10-01–2026-10-24 (#94) is documented. PR #94 was rebase-merged, so its date is the author date of its final commit, 488170b (2026-10-22), and its PR number comes from the commits/{sha}/pulls API. `vendor/steam-cdn` is unchanged in this block (`git log 74c889a..488170b -- vendor/steam-cdn` is empty), so no [steam-cdn] line applies.
