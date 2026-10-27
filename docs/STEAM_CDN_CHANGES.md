@@ -43,7 +43,7 @@ no path move is involved, so `--follow` changes nothing. Dates are author dates.
 | 16 | 7ee8e9a | 2026-02-18 | #13 | Unify download pipeline and implement Verify Mode | new functionality | `vendor/steam-cdn/Cargo.toml`, `vendor/steam-cdn/examples/download_manifest.rs`, `vendor/steam-cdn/src/cdn/manifest/file.rs`, `vendor/steam-cdn/src/cdn/mod.rs`; `Cargo.lock`, `README.md`, `src/install.rs` (+2 more) |
 | 17 | cb57329 | 2026-02-18 | #13 | Implement Pause/Resume and Unified Download Pipeline | new functionality | `vendor/steam-cdn/examples/download_manifest.rs`, `vendor/steam-cdn/src/cdn/manifest/file.rs`, `vendor/steam-cdn/src/cdn/mod.rs`; `src/depot_browser.rs`, `src/models.rs`, `src/steam_client.rs` (+1 more) |
 | 18 | fbe906a | 2026-08-05 | #72 | fix(steam-cdn): chmod u+w before opening target for write | bug fix | `vendor/steam-cdn/src/cdn/manifest/file.rs` |
-| 19 | a3af687 | 2026-08-05 | #73 | fix(steam-cdn): hash-check chunks before resume-skip in all modes | bug fix | `vendor/steam-cdn/src/cdn/manifest/file.rs` |
+| 19 | a3af687 | 2026-08-05 | #73 | fix(steam-cdn): hash-check chunks before resume-skip in all modes (existing on-disk bytes only; fetched chunks are written without a hash) | bug fix | `vendor/steam-cdn/src/cdn/manifest/file.rs` |
 | 20 | e77ad16 | 2026-08-05 | #76 | Thread operation controller through downloads | new functionality | `vendor/steam-cdn/src/cdn/manifest/file.rs`, `vendor/steam-cdn/src/cdn/mod.rs`; `src/models.rs`, `src/steam_client.rs`, `src/ui.rs` |
 | 21 | 983b921 | 2026-08-05 | #76 | Polish lifecycle and operation controls | new functionality | `vendor/steam-cdn/src/lib.rs`; `src/depot_browser.rs`, `src/models.rs`, `src/steam_client.rs` (+1 more) |
 | 22 | cab5ed9 | 2026-08-05 | #76 | fix(ui,steam-cdn): progress bar, pause/cancel visibility, case-insensitive verify paths | bug fix | `vendor/steam-cdn/src/cdn/manifest/file.rs`, `vendor/steam-cdn/src/cdn/mod.rs`; `src/steam_client.rs`, `src/ui.rs` |
@@ -114,13 +114,16 @@ Significant changes:
   `zstd` 0.13; `zip` 2.2 → 2.2.2; `reqwest` is unchanged at 0.11. Imports move to `steam_vent_proto_common`
   and `steam_vent_proto_steam`, and `depot.rs` switches from `Vdf::parse(vdf)` to
   `keyvalues_parser::parse(vdf).map(Vdf::from)`.
-- Behaviour. SHA-1 verification of each chunk runs in every mode — install, update, repair and verify — since
-  PR #73 (`a3af687`, "hash-check chunks before resume-skip in all modes"); `verify_mode` survives as a parameter
-  and as a field in the "Corruption detected in chunk …" log line, but it does not gate the check. The length of
-  an existing file is only a precondition: a chunk is skipped only when its SHA-1 matches the manifest, so a
-  same-size corrupt chunk is re-fetched. Downloads are pausable and cancellable, tool-replaced read-only targets
-  are handled, on-disk casing is resolved before verification, and chunk decoding covers zip, LZMA (`VZa`) and
-  Zstd (`VSZa`, new `utils/zstd.rs`, added in PR #82 / 579293e).
+- Behaviour. Chunks already on disk are SHA-1 checked against the manifest in every mode — install, update,
+  repair and verify — since PR #73 (`a3af687`, "hash-check chunks before resume-skip in all modes"), and such a
+  chunk is skipped only when its hash matches, so a same-size corrupt chunk is re-fetched. Freshly downloaded
+  chunks are not compared against the manifest hash: `get_chunk` decrypts and decompresses the response and
+  `download` writes it at the chunk offset without hashing it. `ManifestFile::sha_content()`, the per-file hash,
+  has no callers. `verify_mode` survives as a parameter and as a field in the "Corruption detected in chunk …"
+  log line, but it does not gate the check, and the length of an existing file is only a precondition for
+  hashing. Downloads are pausable and cancellable, tool-replaced read-only targets are handled, on-disk casing
+  is resolved before verification, and chunk decoding covers zip, LZMA (`VZa`) and Zstd (`VSZa`, new
+  `utils/zstd.rs`, added in PR #82 / 579293e).
 - Manifest parsing. `manifest/mod.rs` rewrites payload/metadata decoding: zip sniffing, the magic-wrapped
   protobuf sequence and a raw-protobuf fallback, with `app_id` / `depot_id` / `manifest_gid` plumbed through.
 - Examples. `examples/download_manifest.rs` follows the new `get_manifest(app_id, …)` signature, but its
@@ -143,7 +146,8 @@ sides were normalised to LF (`sed 's/\r$//'`) before diffing, so line-ending-onl
 
 - Commits in list: 29; PRs referenced: 12 (PR #8, #9, #10, #12, #13, #72, #73, #76, #77, #80, #82, #93).
 - Source: crates.io, `steam-cdn` 1.0.0, SHA-256 `48a8311e…ce71eca`, git `5506382590450a77e11c77026aa03cbd7a74cd3d`.
-- Initial patch: 6 files, +117 / −6. Current tree: 14 paths, +2037 / −1098.
+- Initial patch: 6 files, +117 / −6. Current tree: 14 paths, +2043 / −1104 (`Cargo.lock` +1424 / −1014; code
+  and manifests +619 / −90).
 - Verified: 29 of 29 commits present and tabulated; 29 of 29 PR
   attributions correct (26 by merge ancestry, 3 via the commits/pulls API for the rebase-merged PR #93); 12 of 12
   cited PRs merged.
